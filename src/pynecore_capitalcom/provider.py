@@ -1,18 +1,17 @@
-from typing import Callable, cast
+from typing import Callable
 from dataclasses import dataclass
-import sys
-
-if sys.version_info >= (3, 12):
-    from typing import override
-else:
-    def override(func):
-        return func
+from time import time as epoch
 from datetime import datetime, time, UTC, timedelta
+from base64 import standard_b64encode, standard_b64decode
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from functools import lru_cache
 
-from pynecore.core.plugin import ProviderPlugin
+import httpx
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_v1_5
+
+from pynecore.core.plugin import ProviderPlugin, override
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from pynecore.types.ohlcv import OHLCV
 
@@ -45,15 +44,6 @@ TYPES = {
 
 
 def encrypt_password(password: str, encryption_key: str, timestamp: int | None = None):
-    from time import time as epoch
-    try:
-        from base64 import standard_b64encode, standard_b64decode
-        from Crypto.PublicKey import RSA
-        from Crypto.Cipher import PKCS1_v1_5
-    except ImportError:
-        raise ImportError('The "pycryptodome" package is required for Capital.com provider. Please install it by '
-                          'running `pip install pycryptodome`')
-
     if timestamp is None:
         timestamp = int(epoch())
     payload = password + '|' + str(timestamp)
@@ -85,7 +75,7 @@ class CapitalComConfig:
     """API password for authentication"""
 
 
-class CapitalComProvider(ProviderPlugin):
+class CapitalComProvider(ProviderPlugin[CapitalComConfig]):
     """
     Capital.com data provider plugin.
     """
@@ -145,11 +135,6 @@ class CapitalComProvider(ProviderPlugin):
         Call General API endpoints.
         """
         from json import JSONDecodeError
-        try:
-            import httpx
-        except ImportError:
-            raise ImportError('The "httpx" package is required for Capital.com provider. Please install it by '
-                              'running `pip install httpx`')
 
         headers = {'X-CAP-API-KEY': self.config.api_key}
         if self.security_token:
@@ -227,7 +212,7 @@ class CapitalComProvider(ProviderPlugin):
         Get market details of a symbol.
         """
         assert self.symbol is not None
-        return cast(dict, self('markets/' + self.symbol, method='get'))
+        return self('markets/' + self.symbol, method='get')
 
     def get_historical_prices(self, time_from: datetime = None, time_to: datetime = None,
                               limit=1000) -> dict:
@@ -271,9 +256,9 @@ class CapitalComProvider(ProviderPlugin):
         # Get opening hours and sessions
         opening_hours_data = instrument['openingHours']
 
-        def timetz(t: time, tz: str) -> time:
-            dt = datetime.now(ZoneInfo(tz))
-            dt = dt.replace(hour=t.hour, minute=t.minute, second=t.second, microsecond=t.microsecond)
+        def timetz(_t: time, _tz: str) -> time:
+            dt = datetime.now(ZoneInfo(_tz))
+            dt = dt.replace(hour=_t.hour, minute=_t.minute, second=_t.second, microsecond=_t.microsecond)
             dt = dt.astimezone(ZoneInfo(self.timezone))
             return dt.time()
 
