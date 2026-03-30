@@ -1,0 +1,10 @@
+pyproject.toml
+src/pynecore_capitalcom/__init__.py
+src/pynecore_capitalcom/provider.py
+src/pynesys_pynecore_capitalcom.egg-info/PKG-INFO
+src/pynesys_pynecore_capitalcom.egg-info/SOURCES.txt
+src/pynesys_pynecore_capitalcom.egg-info/dependency_links.txt
+src/pynesys_pynecore_capitalcom.egg-info/entry_points.txt
+src/pynesys_pynecore_capitalcom.egg-info/requires.txt
+src/pynesys_pynecore_capitalcom.egg-info/top_level.txt
+tests/test_capitalcom_provider.py
