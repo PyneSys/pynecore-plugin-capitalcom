@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from functools import lru_cache
 
-from pynecore.providers.provider import Provider
+from pynecore.core.plugin import ProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from pynecore.types.ohlcv import OHLCV
 
@@ -85,7 +85,7 @@ class CapitalComConfig:
     """API password for authentication"""
 
 
-class CapitalComProvider(Provider):
+class CapitalComProvider(ProviderPlugin):
     """
     Capital.com data provider plugin.
     """
