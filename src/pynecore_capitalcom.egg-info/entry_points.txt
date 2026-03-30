@@ -1,2 +1,0 @@
-[pyne.provider]
-capitalcom = pynecore_capitalcom:CapitalComProvider

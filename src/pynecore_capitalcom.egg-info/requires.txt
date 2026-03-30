@@ -1,3 +1,0 @@
-pynesys-pynecore>=6.4
-httpx
-pycryptodome
