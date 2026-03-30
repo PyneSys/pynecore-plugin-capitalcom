@@ -91,8 +91,6 @@ class CapitalComProvider(Provider):
     """
 
     plugin_name = "Capital.com"
-    plugin_version = "1.0.0"
-    min_pynecore_version = "6.5"
     Config = CapitalComConfig
 
     timezone = 'US/Eastern'
