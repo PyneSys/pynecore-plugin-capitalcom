@@ -6,12 +6,15 @@ from base64 import standard_b64encode, standard_b64decode
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from functools import lru_cache
+import asyncio
+import json
 
 import httpx
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 
-from pynecore.core.plugin import ProviderPlugin, override
+from pynecore.core.plugin import LiveProviderPlugin, override
+from pynecore.core.plugin.live_provider import BarUpdate
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from pynecore.types.ohlcv import OHLCV
 
@@ -19,6 +22,9 @@ __all__ = ['CapitalComProvider']
 
 URL = 'https://api-capital.backend-capital.com'
 URL_DEMO = 'https://demo-api-capital.backend-capital.com'
+
+WS_URL = 'wss://api-streaming-capital.backend-capital.com/connect'
+WS_URL_DEMO = 'wss://demo-api-streaming-capital.backend-capital.com/connect'
 
 ENDPOINT_PREFIX = '/api/v1/'
 
@@ -75,9 +81,9 @@ class CapitalComConfig:
     """API password for authentication"""
 
 
-class CapitalComProvider(ProviderPlugin[CapitalComConfig]):
+class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
     """
-    Capital.com data provider plugin.
+    Capital.com data provider plugin with live streaming support.
     """
 
     plugin_name = "Capital.com"
@@ -127,6 +133,15 @@ class CapitalComProvider(ProviderPlugin[CapitalComConfig]):
         self.security_token = None
         self.cst_token = None
         self.session_data = {}
+
+        # Live streaming state
+        self._ws = None
+        self._last_bar_timestamp: int | None = None
+        self._last_bar_ohlcv: OHLCV | None = None
+        self._update_queue: asyncio.Queue | None = None
+        self._listen_task: asyncio.Task | None = None
+        self._ping_task: asyncio.Task | None = None
+        self._tick_volume: int = 0
 
     # Basic API calls
 
@@ -354,13 +369,26 @@ class CapitalComProvider(ProviderPlugin[CapitalComConfig]):
 
                     if t > tt:
                         raise StopIteration
+                    bid_o = float(p['openPrice']['bid'])
+                    bid_h = float(p['highPrice']['bid'])
+                    bid_l = float(p['lowPrice']['bid'])
+                    bid_c = float(p['closePrice']['bid'])
+                    ask_o = float(p['openPrice']['ask'])
+                    ask_h = float(p['highPrice']['ask'])
+                    ask_l = float(p['lowPrice']['ask'])
+                    ask_c = float(p['closePrice']['ask'])
+
                     ohlcv = OHLCV(
-                        timestamp=int(t.timestamp()),
-                        open=float(p['openPrice']['bid']),
-                        high=float(p['highPrice']['bid']),
-                        low=float(p['lowPrice']['bid']),
-                        close=float(p['closePrice']['bid']),
+                        timestamp=int(t.replace(tzinfo=UTC).timestamp()),
+                        open=bid_o, high=bid_h, low=bid_l, close=bid_c,
                         volume=float(p['lastTradedVolume']),
+                        extra_fields={
+                            'ask_open': ask_o,
+                            'ask_high': ask_h,
+                            'ask_low': ask_l,
+                            'ask_close': ask_c,
+                            'spread': abs(ask_c - bid_c),
+                        },
                     )
 
                     self.save_ohlcv_data(ohlcv)
@@ -374,3 +402,158 @@ class CapitalComProvider(ProviderPlugin[CapitalComConfig]):
 
         if on_progress:
             on_progress(tt)
+
+    # --- LiveProviderPlugin methods ---
+
+    async def _send(self, destination: str, payload: dict | None = None,
+                    correlation_id: str = "1") -> None:
+        """Send a JSON message over the WebSocket."""
+        msg = {
+            "destination": destination,
+            "correlationId": correlation_id,
+            "cst": self.cst_token,
+            "securityToken": self.security_token,
+        }
+        if payload:
+            msg["payload"] = payload
+        await self._ws.send(json.dumps(msg))
+
+    async def _listen_loop(self) -> None:
+        """Background task: read WebSocket messages and route them to the queue."""
+        try:
+            async for raw in self._ws:
+                data = json.loads(raw)
+                dest = data.get("destination", "")
+                if dest == "OHLCMarketData":
+                    await self._update_queue.put(data.get("payload", {}))
+                elif dest == "marketData":
+                    self._tick_volume += 1
+        except Exception:
+            pass
+
+    async def _ping_loop(self) -> None:
+        """Background task: keep the WebSocket session alive."""
+        try:
+            while True:
+                await asyncio.sleep(540)  # 9 min (session timeout is 10 min)
+                await self._send("ping", correlation_id="ping")
+        except asyncio.CancelledError:
+            pass
+
+    @override
+    async def connect(self) -> None:
+        """Establish REST session and WebSocket connection for live streaming."""
+        try:
+            import websockets
+        except ImportError:
+            raise ImportError(
+                "websockets is required for live data. Install it with: pip install websockets"
+            )
+
+        # Ensure REST session tokens exist
+        if not self.cst_token or not self.security_token:
+            self.create_session()
+
+        url = WS_URL_DEMO if self.config.demo else WS_URL
+        self._ws = await websockets.connect(url)
+
+        self._update_queue = asyncio.Queue()
+        self._tick_volume = 0
+
+        # Start background tasks
+        self._listen_task = asyncio.create_task(self._listen_loop())
+        self._ping_task = asyncio.create_task(self._ping_loop())
+
+        # Subscribe to OHLC candles and market data (for tick volume)
+        xchg_tf = self.to_exchange_timeframe(self.timeframe)
+        await self._send("OHLCMarketData.subscribe", {
+            "epics": [self.symbol],
+            "resolutions": [xchg_tf],
+            "type": "classic",
+        }, correlation_id="ohlc_sub")
+
+        await self._send("marketData.subscribe", {
+            "epics": [self.symbol],
+        }, correlation_id="market_sub")
+
+    @override
+    async def disconnect(self) -> None:
+        """Unsubscribe, cancel background tasks, and close the WebSocket."""
+        if self._ws and not self._ws.close_code is not None:
+            try:
+                xchg_tf = self.to_exchange_timeframe(self.timeframe)
+                await self._send("OHLCMarketData.unsubscribe", {
+                    "epics": [self.symbol],
+                    "resolutions": [xchg_tf],
+                }, correlation_id="ohlc_unsub")
+                await self._send("marketData.unsubscribe", {
+                    "epics": [self.symbol],
+                }, correlation_id="market_unsub")
+            except Exception:
+                pass
+
+        if self._ping_task:
+            self._ping_task.cancel()
+            self._ping_task = None
+        if self._listen_task:
+            self._listen_task.cancel()
+            self._listen_task = None
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+
+        self._update_queue = None
+        self._last_bar_timestamp = None
+        self._last_bar_ohlcv = None
+        self._tick_volume = 0
+
+    @property
+    @override
+    def is_connected(self) -> bool:
+        """Whether the WebSocket connection is active."""
+        return self._ws is not None and not self._ws.close_code is not None
+
+    @override
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> BarUpdate:
+        """
+        Wait for the next OHLCV update from Capital.com WebSocket.
+
+        Detects bar closure by tracking timestamp changes. Tick volume is
+        accumulated from the ``marketData`` stream (each tick = +1 volume).
+
+        :param symbol: Symbol (epic) in Capital.com format (e.g. "EURUSD").
+        :param timeframe: Timeframe in TradingView format (e.g. "1", "60", "1D").
+        :return: BarUpdate with OHLCV data and closed/open status.
+        """
+        payload = await self._update_queue.get()
+
+        timestamp = int(payload["t"] / 1000)
+        current_ohlcv = OHLCV(
+            timestamp=timestamp,
+            open=float(payload["o"]),
+            high=float(payload["h"]),
+            low=float(payload["l"]),
+            close=float(payload["c"]),
+            volume=float(self._tick_volume),
+        )
+
+        if (self._last_bar_timestamp is not None
+                and timestamp != self._last_bar_timestamp):
+            closed_bar = self._last_bar_ohlcv
+            # Finalize closed bar's volume with the accumulated tick count
+            closed_bar = OHLCV(
+                timestamp=closed_bar.timestamp,
+                open=closed_bar.open,
+                high=closed_bar.high,
+                low=closed_bar.low,
+                close=closed_bar.close,
+                volume=float(self._tick_volume),
+            )
+            self._tick_volume = 0  # New bar starts fresh
+            self._last_bar_timestamp = timestamp
+            self._last_bar_ohlcv = current_ohlcv
+            return BarUpdate(ohlcv=closed_bar, is_closed=True)
+
+        self._last_bar_timestamp = timestamp
+        self._last_bar_ohlcv = current_ohlcv
+        return BarUpdate(ohlcv=current_ohlcv, is_closed=False)

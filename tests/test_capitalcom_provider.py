@@ -126,12 +126,9 @@ def __test_capitalcom_real_data_download__(tmp_path):
     from pynecore.core.config import ensure_config
     from pynecore_capitalcom.provider import CapitalComConfig
 
-    capitalcom_toml = config_dir / "capitalcom.toml"
+    capitalcom_toml = config_dir / "plugins" / "capitalcom.toml"
     if not capitalcom_toml.exists():
-        # Try legacy providers.toml
-        providers_toml = config_dir / "providers.toml"
-        if not providers_toml.exists():
-            pytest.skip("No capitalcom.toml or providers.toml found")
+        pytest.skip("No config/plugins/capitalcom.toml found")
 
     config = ensure_config(CapitalComConfig, capitalcom_toml)
 
