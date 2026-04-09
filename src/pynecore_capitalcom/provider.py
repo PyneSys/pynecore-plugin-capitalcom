@@ -14,7 +14,6 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 
 from pynecore.core.plugin import LiveProviderPlugin, override
-from pynecore.core.plugin.live_provider import BarUpdate
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from pynecore.types.ohlcv import OHLCV
 
@@ -60,7 +59,7 @@ def encrypt_password(password: str, encryption_key: str, timestamp: int | None =
     return ciphertext
 
 
-class CaptialComError(ValueError):
+class CapitalComError(ValueError):
     ...
 
 
@@ -130,9 +129,11 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
         :param config: Pre-loaded CapitalComConfig instance.
         """
         super().__init__(symbol=symbol, timeframe=timeframe, ohlv_dir=ohlv_dir, config=config)
-        self.security_token = None
-        self.cst_token = None
-        self.session_data = {}
+        assert self.config is not None, "CapitalComConfig is required"
+        self.config: CapitalComConfig = self.config
+        self.security_token: str | None = None
+        self.cst_token: str | None = None
+        self.session_data: dict = {}
 
         # Live streaming state
         self._ws = None
@@ -145,7 +146,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
 
     # Basic API calls
 
-    def __call__(self, endpoint: str, *, data: dict = None, method='post', _level=0) -> dict | list[dict]:
+    def __call__(self, endpoint: str, *, data: dict | None = None, method: str = 'post', _level: int = 0) -> dict:
         """
         Call General API endpoints.
         """
@@ -158,7 +159,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
             headers['CST'] = self.cst_token
 
         method = method.lower()
-        params = dict(headers=headers, timeout=50.0)
+        params: dict[str, dict | float | None] = dict(headers=headers, timeout=50.0)
         if method == 'get':
             params['params'] = data
         elif method in ('post', 'put'):
@@ -171,14 +172,14 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
         try:
             dict_res = res.json()
         except JSONDecodeError:
-            raise CaptialComError(f"JSON Error: {res.text}")
+            raise CapitalComError(f"JSON Error: {res.text}")
 
         if res.is_error:
             if dict_res['errorCode'] in ('error.security.client-token-missing', 'error.null.client.token') \
                     and self.config.user_email and self.config.api_password and _level < 3:
                 self.create_session()
                 return self(endpoint=endpoint, data=data, method=method, _level=_level + 1)
-            raise CaptialComError(f"API error occured: {dict_res['errorCode']}")
+            raise CapitalComError(f"API error occured: {dict_res['errorCode']}")
 
         try:
             self.security_token = res.headers['X-SECURITY-TOKEN']
@@ -265,6 +266,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
         """
         Update symbol info from the exchange, including opening hours and sessions.
         """
+        assert self.timeframe is not None
         market_details = self.get_single_market_details()
         instrument = market_details['instrument']
 
@@ -394,7 +396,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
                     self.save_ohlcv_data(ohlcv)
                     tf = t + timedelta(minutes=1)
 
-        except CaptialComError:
+        except CapitalComError:
             pass
 
         except StopIteration:
@@ -408,7 +410,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
     async def _send(self, destination: str, payload: dict | None = None,
                     correlation_id: str = "1") -> None:
         """Send a JSON message over the WebSocket."""
-        msg = {
+        msg: dict[str, str | dict | None] = {
             "destination": destination,
             "correlationId": correlation_id,
             "cst": self.cst_token,
@@ -416,10 +418,12 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
         }
         if payload:
             msg["payload"] = payload
+        assert self._ws is not None
         await self._ws.send(json.dumps(msg))
 
     async def _listen_loop(self) -> None:
         """Background task: read WebSocket messages and route them to the queue."""
+        assert self._ws is not None and self._update_queue is not None
         try:
             async for raw in self._ws:
                 data = json.loads(raw)
@@ -428,7 +432,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
                     await self._update_queue.put(data.get("payload", {}))
                 elif dest == "marketData":
                     self._tick_volume += 1
-        except Exception:
+        except (ConnectionError, asyncio.CancelledError):
             pass
 
     async def _ping_loop(self) -> None:
@@ -465,6 +469,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
         self._ping_task = asyncio.create_task(self._ping_loop())
 
         # Subscribe to OHLC candles and market data (for tick volume)
+        assert self.timeframe is not None and self.symbol is not None
         xchg_tf = self.to_exchange_timeframe(self.timeframe)
         await self._send("OHLCMarketData.subscribe", {
             "epics": [self.symbol],
@@ -479,7 +484,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
     @override
     async def disconnect(self) -> None:
         """Unsubscribe, cancel background tasks, and close the WebSocket."""
-        if self._ws and not self._ws.close_code is not None:
+        if self._ws and self._ws.close_code is None and self.timeframe and self.symbol:
             try:
                 xchg_tf = self.to_exchange_timeframe(self.timeframe)
                 await self._send("OHLCMarketData.unsubscribe", {
@@ -489,7 +494,7 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
                 await self._send("marketData.unsubscribe", {
                     "epics": [self.symbol],
                 }, correlation_id="market_unsub")
-            except Exception:
+            except (ConnectionError, asyncio.CancelledError):
                 pass
 
         if self._ping_task:
@@ -511,10 +516,10 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
     @override
     def is_connected(self) -> bool:
         """Whether the WebSocket connection is active."""
-        return self._ws is not None and not self._ws.close_code is not None
+        return self._ws is not None and self._ws.close_code is None
 
     @override
-    async def watch_ohlcv(self, symbol: str, timeframe: str) -> BarUpdate:
+    async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
         """
         Wait for the next OHLCV update from Capital.com WebSocket.
 
@@ -523,8 +528,9 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
 
         :param symbol: Symbol (epic) in Capital.com format (e.g. "EURUSD").
         :param timeframe: Timeframe in TradingView format (e.g. "1", "60", "1D").
-        :return: BarUpdate with OHLCV data and closed/open status.
+        :return: OHLCV with ``is_closed=True`` for a final bar, ``False`` for intra-bar updates.
         """
+        assert self._update_queue is not None
         payload = await self._update_queue.get()
 
         timestamp = int(payload["t"] / 1000)
@@ -535,25 +541,21 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
             low=float(payload["l"]),
             close=float(payload["c"]),
             volume=float(self._tick_volume),
+            is_closed=False,
         )
 
         if (self._last_bar_timestamp is not None
                 and timestamp != self._last_bar_timestamp):
-            closed_bar = self._last_bar_ohlcv
-            # Finalize closed bar's volume with the accumulated tick count
-            closed_bar = OHLCV(
-                timestamp=closed_bar.timestamp,
-                open=closed_bar.open,
-                high=closed_bar.high,
-                low=closed_bar.low,
-                close=closed_bar.close,
+            assert self._last_bar_ohlcv is not None
+            closed_bar = self._last_bar_ohlcv._replace(
                 volume=float(self._tick_volume),
+                is_closed=True,
             )
-            self._tick_volume = 0  # New bar starts fresh
+            self._tick_volume = 0
             self._last_bar_timestamp = timestamp
             self._last_bar_ohlcv = current_ohlcv
-            return BarUpdate(ohlcv=closed_bar, is_closed=True)
+            return closed_bar
 
         self._last_bar_timestamp = timestamp
         self._last_bar_ohlcv = current_ohlcv
-        return BarUpdate(ohlcv=current_ohlcv, is_closed=False)
+        return current_ohlcv
