@@ -121,14 +121,14 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
             raise ValueError(f"Unsupported timeframe for Capital.com: {timeframe}")
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
-                 ohlv_dir: Path | None = None, config: object | None = None):
+                 ohlcv_dir: Path | None = None, config: object | None = None):
         """
         :param symbol: The symbol to get data for.
         :param timeframe: The timeframe in TradingView format.
-        :param ohlv_dir: The directory to save OHLCV data.
+        :param ohlcv_dir: The directory to save OHLCV data.
         :param config: Pre-loaded CapitalComConfig instance.
         """
-        super().__init__(symbol=symbol, timeframe=timeframe, ohlv_dir=ohlv_dir, config=config)
+        super().__init__(symbol=symbol, timeframe=timeframe, ohlcv_dir=ohlcv_dir, config=config)
         assert self.config is not None, "CapitalComConfig is required"
         self.config: CapitalComConfig = self.config
         self.security_token: str | None = None
