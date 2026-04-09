@@ -432,8 +432,11 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
                     await self._update_queue.put(data.get("payload", {}))
                 elif dest == "marketData":
                     self._tick_volume += 1
-        except (ConnectionError, asyncio.CancelledError):
+        except asyncio.CancelledError:
             pass
+        except Exception:
+            if self._update_queue is not None:
+                await self._update_queue.put(None)
 
     async def _ping_loop(self) -> None:
         """Background task: keep the WebSocket session alive."""
@@ -532,6 +535,9 @@ class CapitalComProvider(LiveProviderPlugin[CapitalComConfig]):
         """
         assert self._update_queue is not None
         payload = await self._update_queue.get()
+
+        if payload is None:
+            raise ConnectionError("WebSocket listener disconnected")
 
         timestamp = int(payload["t"] / 1000)
         current_ohlcv = OHLCV(
