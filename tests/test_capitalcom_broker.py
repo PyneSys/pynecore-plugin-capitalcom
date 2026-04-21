@@ -638,6 +638,38 @@ def __test_recover_submitted_row_single_activity_match_promotes__(tmp_path):
     store.close()
 
 
+def __test_recover_disposition_unknown_promotes_via_activity_match__(tmp_path):
+    """Rows left in ``disposition_unknown`` after a POST timeout are
+    treated as a superset of ``submitted`` by the recovery loop — the
+    POST may or may not have landed, so an activity-match resolution is
+    the same call the dossier §5.1 #3 prescribes for the pre-ref case.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': [
+            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+             'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'recovered',
+             'type': 'POSITION', 'status': 'EXECUTED'},
+        ]},
+    })
+    import datetime as _dt
+    ts_ms = int(_dt.datetime(2026, 4, 21, 10, 0, 0,
+                             tzinfo=_dt.UTC).timestamp() * 1000)
+    ctx.upsert_order('parked-coid', symbol='EURUSD', side='buy', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='Long',
+                     intent_key='Long')
+    ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+        (ts_ms, 'parked-coid'),
+    )
+    asyncio.run(broker._recover_in_flight_submissions())
+    row = ctx.get_order('parked-coid')
+    assert row.state == 'confirmed'
+    assert row.exchange_order_id == 'recovered'
+    store.close()
+
+
 def __test_recover_submitted_row_multi_match_raises_manual_intervention__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions', 'get'): {'positions': []},

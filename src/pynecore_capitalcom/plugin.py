@@ -2773,7 +2773,12 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         activities = activity_resp.get('activities') or []
 
         for row in list(self.store_ctx.iter_live_orders()):
-            if row.state == 'submitted':
+            # ``disposition_unknown`` rows are a superset of ``submitted``
+            # for recovery purposes — the POST either never went out or
+            # went out without a response. Same resolution strategy: try
+            # a stored ref first, then fall back to a confidence-ranked
+            # activity match.
+            if row.state in ('submitted', 'disposition_unknown'):
                 await self._recover_submitted_row(
                     row, activities, pos_by_ref, wo_by_ref,
                 )
