@@ -9,11 +9,11 @@ packages.find = { where = ["src"] }
 [project]
 name = "pynesys-pynecore-capitalcom"
 version = "1.0.0"
-description = "Capital.com data provider plugin for PyneCore"
+description = "Capital.com integration for PyneCore"
 authors = [{ name = "PYNESYS LLC", email = "hello@pynesys.com" }]
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = ["pynesys-pynecore>=6.5", "httpx", "pycryptodome", "websockets"]
 
 [project.entry-points."pyne.plugin"]
-capitalcom = "pynecore_capitalcom:CapitalComProvider"
+capitalcom = "pynecore_capitalcom:CapitalCom"

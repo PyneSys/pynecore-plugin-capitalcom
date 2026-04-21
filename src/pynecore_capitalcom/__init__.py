@@ -1,3 +1,7 @@
-from .provider import CapitalComProvider
+from .plugin import CapitalCom, CapitalComConfig, CapitalComError
 
-__all__ = ['CapitalComProvider']
+__all__ = [
+    'CapitalCom',
+    'CapitalComConfig',
+    'CapitalComError',
+]

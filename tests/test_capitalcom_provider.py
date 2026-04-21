@@ -3,14 +3,13 @@
 """
 from pathlib import Path
 import pytest
-import tomllib
 import json
 import logging
 from datetime import datetime, UTC
 import os
 import tempfile
 
-from pynecore_capitalcom import CapitalComProvider
+from pynecore_capitalcom import CapitalCom
 from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.cli.app import app_state
 
@@ -25,33 +24,33 @@ def main():
 def __test_capitalcom_timeframe_conversion__():
     """Test timeframe conversion for CapitalCom provider"""
     # TradingView to CapitalCom conversion - according to the actual implementation
-    assert CapitalComProvider.to_exchange_timeframe("1") == "MINUTE"
-    assert CapitalComProvider.to_exchange_timeframe("5") == "MINUTE_5"
-    assert CapitalComProvider.to_exchange_timeframe("15") == "MINUTE_15"
-    assert CapitalComProvider.to_exchange_timeframe("30") == "MINUTE_30"
-    assert CapitalComProvider.to_exchange_timeframe("60") == "HOUR"
-    assert CapitalComProvider.to_exchange_timeframe("240") == "HOUR_4"
-    assert CapitalComProvider.to_exchange_timeframe("1D") == "DAY"
-    assert CapitalComProvider.to_exchange_timeframe("1W") == "WEEK"
+    assert CapitalCom.to_exchange_timeframe("1") == "MINUTE"
+    assert CapitalCom.to_exchange_timeframe("5") == "MINUTE_5"
+    assert CapitalCom.to_exchange_timeframe("15") == "MINUTE_15"
+    assert CapitalCom.to_exchange_timeframe("30") == "MINUTE_30"
+    assert CapitalCom.to_exchange_timeframe("60") == "HOUR"
+    assert CapitalCom.to_exchange_timeframe("240") == "HOUR_4"
+    assert CapitalCom.to_exchange_timeframe("1D") == "DAY"
+    assert CapitalCom.to_exchange_timeframe("1W") == "WEEK"
     with pytest.raises(ValueError):
-        CapitalComProvider.to_exchange_timeframe("1M")  # Not directly supported in TIMEFRAMES
+        CapitalCom.to_exchange_timeframe("1M")  # Not directly supported in TIMEFRAMES
 
     # CapitalCom to TradingView conversion - according to the actual implementation
-    assert CapitalComProvider.to_tradingview_timeframe("MINUTE") == "1"
-    assert CapitalComProvider.to_tradingview_timeframe("MINUTE_5") == "5"
-    assert CapitalComProvider.to_tradingview_timeframe("MINUTE_15") == "15"
-    assert CapitalComProvider.to_tradingview_timeframe("MINUTE_30") == "30"
-    assert CapitalComProvider.to_tradingview_timeframe("HOUR") == "60"
-    assert CapitalComProvider.to_tradingview_timeframe("HOUR_4") == "240"
-    assert CapitalComProvider.to_tradingview_timeframe("DAY") == "1D"
-    assert CapitalComProvider.to_tradingview_timeframe("WEEK") == "1W"
+    assert CapitalCom.to_tradingview_timeframe("MINUTE") == "1"
+    assert CapitalCom.to_tradingview_timeframe("MINUTE_5") == "5"
+    assert CapitalCom.to_tradingview_timeframe("MINUTE_15") == "15"
+    assert CapitalCom.to_tradingview_timeframe("MINUTE_30") == "30"
+    assert CapitalCom.to_tradingview_timeframe("HOUR") == "60"
+    assert CapitalCom.to_tradingview_timeframe("HOUR_4") == "240"
+    assert CapitalCom.to_tradingview_timeframe("DAY") == "1D"
+    assert CapitalCom.to_tradingview_timeframe("WEEK") == "1W"
 
     # Test invalid formats
     with pytest.raises(ValueError):
-        CapitalComProvider.to_exchange_timeframe("invalid")
+        CapitalCom.to_exchange_timeframe("invalid")
 
     with pytest.raises(ValueError):
-        CapitalComProvider.to_tradingview_timeframe("invalid")
+        CapitalCom.to_tradingview_timeframe("invalid")
 
 
 def __test_capitalcom_provider_path_handling__(tmp_path):
@@ -60,7 +59,7 @@ def __test_capitalcom_provider_path_handling__(tmp_path):
     data_dir.mkdir()
 
     # Test path construction for different symbol formats
-    path = CapitalComProvider.get_ohlcv_path("CAPITALCOM:US500", "1D", data_dir)
+    path = CapitalCom.get_ohlcv_path("CAPITALCOM:US500", "1D", data_dir)
 
     # Verify paths are created correctly
     assert "capitalcom_CAPITALCOM_US500_1D.ohlcv" in str(path)
@@ -124,13 +123,14 @@ def __test_capitalcom_real_data_download__(tmp_path):
 
     # Check if capitalcom config exists
     from pynecore.core.config import ensure_config
-    from pynecore_capitalcom.provider import CapitalComConfig
+    from pynecore_capitalcom import CapitalComConfig
 
     capitalcom_toml = config_dir / "plugins" / "capitalcom.toml"
     if not capitalcom_toml.exists():
         pytest.skip("No config/plugins/capitalcom.toml found")
 
     config = ensure_config(CapitalComConfig, capitalcom_toml)
+    assert isinstance(config, CapitalComConfig)
 
     # Verify minimal required configuration exists
     if not config.user_email or not config.api_key or not config.api_password:
@@ -157,22 +157,25 @@ def __test_capitalcom_real_data_download__(tmp_path):
 
     # Check if a reference file with expected data already exists
     test_data_path = Path(__file__).parent / "capitalcom_test_data.json"
-    expected_data = None
+    expected_data: list | None = None
 
     if test_data_path.exists() and not force_save_reference:
+        # noinspection PyBroadException
         try:
             with open(test_data_path, 'r') as f:
-                expected_data = json.load(f)
+                loaded = json.load(f)
+            assert isinstance(loaded, list)
+            expected_data = loaded
             print(f"Loaded reference data from {test_data_path}")
         except Exception as e:
             print(f"Could not load reference data: {e}")
             expected_data = None
 
     # Create provider instance
-    provider = CapitalComProvider(
+    provider = CapitalCom(
         symbol=symbol,
         timeframe=timeframe,
-        ohlv_dir=data_dir,
+        ohlcv_dir=data_dir,
         config=config
     )
 
@@ -246,6 +249,7 @@ def __test_capitalcom_real_data_download__(tmp_path):
                         "Timestamps not in ascending order"
 
             else:
+                assert expected_data is not None
                 # Compare the actual results with the expected data
                 # We'll check the first 10 candles as they should be stable
                 check_count = min(10, len(actual_candles), len(expected_data))
