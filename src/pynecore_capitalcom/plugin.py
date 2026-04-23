@@ -78,7 +78,6 @@ URL = 'https://api-capital.backend-capital.com'
 URL_DEMO = 'https://demo-api-capital.backend-capital.com'
 
 WS_URL = 'wss://api-streaming-capital.backend-capital.com/connect'
-WS_URL_DEMO = 'wss://demo-api-streaming-capital.backend-capital.com/connect'
 
 ENDPOINT_PREFIX = '/api/v1/'
 
@@ -797,8 +796,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             await self._load_activity_cursor_from_events()
             await self._recover_in_flight_submissions()
 
-        url = WS_URL_DEMO if self.config.demo else WS_URL
-        self._ws = await websockets.connect(url)
+        self._ws = await websockets.connect(WS_URL)
 
         self._update_queue = asyncio.Queue()
         self._tick_volume = 0
