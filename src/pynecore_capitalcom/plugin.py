@@ -34,6 +34,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeRateLimitError,
     InsufficientMarginError,
     OrderDispositionUnknownError,
+    OrderSkippedByPlugin,
     UnexpectedCancelError,
 )
 from pynecore.core.broker.idempotency import (
@@ -447,6 +448,11 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         self._listen_task: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
         self._tick_volume: int = 0
+        # Latest tick quote snapshot, updated by each ``quote`` event and
+        # attached to every OHLCV emitted by ``watch_ohlcv`` so the spinner
+        # and the per-bar OHLCV log can show ``bid``, ``ask`` and ``spread``.
+        self._last_bid: float | None = None
+        self._last_ask: float | None = None
 
         # Broker state
         self._account_preferences: dict | None = None
@@ -684,10 +690,6 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 for p in ps:
                     t = datetime.fromisoformat(p['snapshotTimeUTC'])
 
-                    if p['lastTradedVolume'] <= 1.0:
-                        tf = t + timedelta(minutes=1)
-                        continue
-
                     if t > tt:
                         raise StopIteration
                     bid_o = float(p['openPrice']['bid'])
@@ -741,17 +743,40 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         await self._ws.send(json.dumps(msg))
 
     async def _listen_loop(self) -> None:
-        """Background task: read WebSocket messages and route them."""
+        """Background task: read WebSocket messages and route them.
+
+        The Capital.com WS protocol distinguishes *subscribe-request* names
+        from *event* names: the client sends ``OHLCMarketData.subscribe`` /
+        ``marketData.subscribe`` but the server pushes OHLC bars on
+        ``ohlc.event`` and tick quotes on ``quote`` (see the research
+        dossier §6 and the official reference at
+        https://open-api.capital.com/).  Matching on the subscribe name
+        here would silently discard every update.
+
+        Events are routed to ``_update_queue`` as ``("ohlc", payload)`` or
+        ``("quote", None)`` tuples. The consumer (``watch_ohlcv``) turns a
+        ``quote`` tick into a synthetic intra-bar OHLCV update so the
+        live spinner and tick hooks see fresh bid/ask at every tick, not
+        only on bar close.
+        """
         assert self._ws is not None and self._update_queue is not None
         # noinspection PyBroadException
         try:
             async for raw in self._ws:
                 data = json.loads(raw)
                 dest = data.get("destination", "")
-                if dest == "OHLCMarketData":
-                    await self._update_queue.put(data.get("payload", {}))
-                elif dest == "marketData":
+                if dest == "ohlc.event":
+                    await self._update_queue.put(("ohlc", data.get("payload") or {}))
+                elif dest == "quote":
+                    payload = data.get("payload") or {}
+                    bid = payload.get("bid")
+                    ofr = payload.get("ofr")
+                    if bid is not None:
+                        self._last_bid = float(bid)
+                    if ofr is not None:
+                        self._last_ask = float(ofr)
                     self._tick_volume += 1
+                    await self._update_queue.put(("quote", None))
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -846,6 +871,8 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         self._last_bar_timestamp = None
         self._last_bar_ohlcv = None
         self._tick_volume = 0
+        self._last_bid = None
+        self._last_ask = None
 
     @property
     @override
@@ -867,37 +894,88 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             ``False`` for intra-bar updates.
         """
         assert self._update_queue is not None
-        payload = await self._update_queue.get()
+        while True:
+            item = await self._update_queue.get()
+            if item is None:
+                raise ConnectionError("WebSocket listener disconnected")
+            event_type, payload = item
+            if event_type == "ohlc":
+                return self._on_ohlc_event(payload)
+            synth = self._synth_from_quote()
+            if synth is not None:
+                return synth
+            # Quote arrived before any OHLC baseline — keep waiting.
 
-        if payload is None:
-            raise ConnectionError("WebSocket listener disconnected")
+    def _extra_fields(self) -> dict[str, float] | None:
+        """Build the bid/ask/spread snapshot for ``OHLCV.extra_fields``."""
+        if self._last_bid is None or self._last_ask is None:
+            return None
+        return {
+            "bid_close": self._last_bid,
+            "ask_close": self._last_ask,
+            "spread": self._last_ask - self._last_bid,
+        }
 
+    def _on_ohlc_event(self, payload: dict) -> OHLCV:
+        """Turn an ``ohlc.event`` payload into a *closed* OHLCV.
+
+        Capital.com pushes ``ohlc.event`` only at bar close: the official
+        Java sample accumulates intra-bar price into a local ``OHLCBar``
+        from the ``quote`` tick stream and never relies on the server for
+        intra-bar OHLC. Every ``ohlc.event`` we receive therefore already
+        represents a completed bar, so we flag ``is_closed=True`` on the
+        first one — a timestamp-change detector would miss the first bar
+        and delay the OHLCV log by a full period.
+
+        Intra-bar updates (spinner, tick hooks) come exclusively from
+        :meth:`_synth_from_quote`.
+        """
         timestamp = int(payload["t"] / 1000)
-        current_ohlcv = OHLCV(
+        closed = OHLCV(
             timestamp=timestamp,
             open=float(payload["o"]),
             high=float(payload["h"]),
             low=float(payload["l"]),
             close=float(payload["c"]),
             volume=float(self._tick_volume),
+            extra_fields=self._extra_fields(),
+            is_closed=True,
+        )
+        self._tick_volume = 0
+        self._last_bar_timestamp = timestamp
+        self._last_bar_ohlcv = closed
+        return closed
+
+    def _synth_from_quote(self) -> OHLCV | None:
+        """Synthesize an intra-bar OHLCV from the latest tick quote.
+
+        ``ohlc.event`` only pushes on bar close at some resolutions; the
+        live spinner and tick hooks would then freeze between closes. To
+        keep them fresh we emit a synthetic intra-bar OHLCV on each
+        ``quote`` tick: O/H/L are kept from the current bar, ``close`` is
+        the latest bid (Capital.com OHLC is bid-side for
+        ``type: "classic"``), and H/L widen as the tick moves. The
+        ``extra_fields`` snapshot carries the current bid/ask/spread so
+        consumers can render real-time quotes.
+
+        Returns ``None`` if no OHLC baseline has been received yet — the
+        caller then waits for the next event.
+        """
+        if self._last_bar_ohlcv is None or self._last_bid is None:
+            return None
+        new_close = self._last_bid
+        new_high = max(self._last_bar_ohlcv.high, new_close)
+        new_low = min(self._last_bar_ohlcv.low, new_close)
+        synth = self._last_bar_ohlcv._replace(
+            high=new_high,
+            low=new_low,
+            close=new_close,
+            volume=float(self._tick_volume),
+            extra_fields=self._extra_fields(),
             is_closed=False,
         )
-
-        if (self._last_bar_timestamp is not None
-                and timestamp != self._last_bar_timestamp):
-            assert self._last_bar_ohlcv is not None
-            closed_bar = self._last_bar_ohlcv._replace(
-                volume=float(self._tick_volume),
-                is_closed=True,
-            )
-            self._tick_volume = 0
-            self._last_bar_timestamp = timestamp
-            self._last_bar_ohlcv = current_ohlcv
-            return closed_bar
-
-        self._last_bar_timestamp = timestamp
-        self._last_bar_ohlcv = current_ohlcv
-        return current_ohlcv
+        self._last_bar_ohlcv = synth
+        return synth
 
     # --- BrokerPlugin: capabilities + read-only state ----------------------
 
@@ -986,18 +1064,19 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         """Snap ``qty`` to the nearest multiple of ``rules.lot_step``.
 
         Uses :func:`round` (banker-free here — lot steps are decimal) on
-        the step count, then multiplies back out. Never returns below
-        ``rules.min_size``; a strategy that requests ``0`` still lands
-        above the floor so the exchange's own reject carries the useful
-        error instead of a silent no-op.
+        the step count, then multiplies back out. Below-min-size is the
+        caller's concern: silently inflating to ``rules.min_size`` would
+        make the exchange's executed size diverge from the strategy's
+        ``intent.qty`` and corrupt every downstream sizing assumption
+        (bracket full-row check, position accounting, P&L). The entry
+        path raises :class:`OrderSkippedByPlugin` *before* calling this
+        helper, so a runtime sizing model that yields a too-small qty
+        becomes a logged skip rather than silent up-inflation.
         """
         if rules.lot_step <= 0.0:
             return qty
         units = round(qty / rules.lot_step)
-        snapped = units * rules.lot_step
-        if snapped < rules.min_size:
-            return rules.min_size
-        return snapped
+        return units * rules.lot_step
 
     async def get_balance(self) -> dict[str, float]:
         """Return ``{currency: available}`` for the active account.
@@ -1215,6 +1294,20 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             )
 
         rules = await self._get_instrument_rules(intent.symbol)
+        if rules.min_size > 0 and intent.qty < rules.min_size:
+            raise OrderSkippedByPlugin(
+                f"Skipping {intent.symbol} {intent.side.upper()} entry "
+                f"id={intent.pine_id!r}: qty={intent.qty} below Capital.com "
+                f"minimum size {rules.min_size}. No order sent.",
+                intent_key=intent.intent_key,
+                reason="below_min_size",
+                context={
+                    'symbol': intent.symbol,
+                    'side': intent.side,
+                    'qty': intent.qty,
+                    'min_size': rules.min_size,
+                },
+            )
         quantized_qty = self._quantize_size(intent.qty, rules)
         direction = "BUY" if intent.side == 'buy' else "SELL"
 
