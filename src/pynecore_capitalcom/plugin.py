@@ -61,6 +61,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.plugin import override
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
+from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 if TYPE_CHECKING:
@@ -670,9 +671,23 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
                        on_progress: Callable[[datetime], None] | None = None,
                        limit: int | None = None):
-        """Download OHLCV data between ``time_from`` and ``time_to``."""
+        """Download OHLCV data between ``time_from`` and ``time_to``.
+
+        The Capital.com REST ``/prices`` endpoint includes the currently-
+        forming open bar as the last entry of the response. We drop it
+        here so warmup gets fully-closed bars only — otherwise the very
+        next WS push (the close of that same bar) would arrive with the
+        same timestamp as the last warmup bar and the script_runner
+        would have to treat it as an in-place refinement, which makes
+        the logged bar_index appear stuck at the warmup boundary.
+        """
         tf = time_from.replace(tzinfo=None)
         tt = (time_to if time_to is not None else datetime.now(UTC)).replace(tzinfo=None)
+
+        # Bars that close *after* this cutoff are still forming — drop them.
+        assert self.timeframe is not None
+        interval = timedelta(seconds=in_seconds(self.timeframe))
+        now_naive = datetime.now(UTC).replace(tzinfo=None)
 
         try:
             d = None
@@ -691,6 +706,17 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     t = datetime.fromisoformat(p['snapshotTimeUTC'])
 
                     if t > tt:
+                        raise StopIteration
+                    if t + interval > now_naive:
+                        # Still-forming bar — its close has not happened
+                        # yet, so it is not historical data. Capital.com
+                        # places the open bar at the END of its REST
+                        # response, so any subsequent entry would also be
+                        # in the future: stop the outer download here and
+                        # let the WS feed deliver the close on the bar
+                        # boundary. Using ``continue`` would risk an
+                        # infinite loop if ``tf`` failed to advance past
+                        # the partial bar on a re-request.
                         raise StopIteration
                     bid_o = float(p['openPrice']['bid'])
                     bid_h = float(p['highPrice']['bid'])
@@ -900,7 +926,11 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 raise ConnectionError("WebSocket listener disconnected")
             event_type, payload = item
             if event_type == "ohlc":
-                return self._on_ohlc_event(payload)
+                bar = self._on_ohlc_event(payload)
+                if bar is not None:
+                    return bar
+                # Ask-side duplicate of the same bar close — skip and wait.
+                continue
             synth = self._synth_from_quote()
             if synth is not None:
                 return synth
@@ -916,7 +946,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             "spread": self._last_ask - self._last_bid,
         }
 
-    def _on_ohlc_event(self, payload: dict) -> OHLCV:
+    def _on_ohlc_event(self, payload: dict) -> OHLCV | None:
         """Turn an ``ohlc.event`` payload into a *closed* OHLCV.
 
         Capital.com pushes ``ohlc.event`` only at bar close: the official
@@ -927,9 +957,20 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         first one — a timestamp-change detector would miss the first bar
         and delay the OHLCV log by a full period.
 
+        With ``"type": "classic"`` the server emits *two* ``ohlc.event``
+        payloads per close — one ``priceType="bid"`` and one
+        ``priceType="ask"``. We only consume the bid candle (Pine OHLC is
+        bid-side); the ask close is already exposed via the ``quote``
+        stream in ``extra_fields["ask_close"]``. Returning ``None`` for
+        ask payloads keeps :meth:`watch_ohlcv` looping for the next
+        event instead of double-emitting the bar close.
+
         Intra-bar updates (spinner, tick hooks) come exclusively from
         :meth:`_synth_from_quote`.
         """
+        price_type = str(payload.get("priceType", "bid")).lower()
+        if price_type != "bid":
+            return None
         timestamp = int(payload["t"] / 1000)
         closed = OHLCV(
             timestamp=timestamp,
