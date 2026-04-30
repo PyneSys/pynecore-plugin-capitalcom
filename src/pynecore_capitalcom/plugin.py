@@ -2718,7 +2718,13 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 self.store_ctx.close_order(other.client_order_id)
         raise UnexpectedCancelError(
             f"Bot-owned order disappeared unexpectedly: "
-            f"coid={row.client_order_id!r} deal_id={row.exchange_order_id!r}"
+            f"coid={row.client_order_id!r} deal_id={row.exchange_order_id!r}",
+            context={
+                'client_order_id': row.client_order_id,
+                'exchange_order_id': row.exchange_order_id,
+                'symbol': row.symbol,
+                'policy': policy,
+            },
         )
 
     # --- Trailing activation monitor --------------------------------------
