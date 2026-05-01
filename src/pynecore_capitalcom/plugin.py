@@ -1502,6 +1502,18 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             self.store_ctx.set_order_state(coid, 'confirmed')
             if is_filled_market:
                 self.store_ctx.set_filled(coid, filled_size)
+                # Persist the confirm-side fill price so the activity
+                # poll can recover it when the row arrives with
+                # ``level=0`` AND the same poll's ``/positions``
+                # snapshot is also empty for this dealId — happens when
+                # the fill lands *between* the snapshot and activity
+                # fetches in one poll cycle.
+                if level_confirmed > 0.0:
+                    existing = self.store_ctx.get_order(coid)
+                    if existing is not None:
+                        merged_extras = dict(existing.extras or {})
+                        merged_extras['confirm_level'] = level_confirmed
+                        self.store_ctx.upsert_order(coid, extras=merged_extras)
             self.store_ctx.log_event(
                 'confirmed', client_order_id=coid,
                 exchange_order_id=deal_id, intent_key=intent.intent_key,
@@ -2483,8 +2495,19 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             occasionally returns market-entry activity rows without the
             execution price — without this fallback the resulting
             :class:`OrderEvent` carries ``fill_price=0.0`` and
-            :meth:`BrokerPosition.record_fill` silently drops it,
-            stranding ``position.size`` at zero.
+            :meth:`BrokerPosition.record_fill` rejects it.
+
+            Fill-price resolution chain (first non-zero wins):
+
+            1. ``activity.level`` — the normal happy path.
+            2. ``position_snapshot['position']['level']`` — recovers
+               the price when the activity row leaves it blank but the
+               position is already open in the same poll's snapshot.
+            3. ``row.extras['confirm_level']`` — the price the confirm
+               step reported at :meth:`execute_entry` time, persisted
+               specifically for the race where the fill lands
+               *between* the poll's ``/positions`` and
+               ``/history/activity`` fetches, so neither carries it.
         """
         activity_type = (activity.get('type') or '').upper()
         status = (activity.get('status') or '').upper()
@@ -2496,6 +2519,16 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             fallback_level = float(pos_data.get('level') or 0.0)
             if fallback_level > 0.0:
                 level = fallback_level
+        if level <= 0.0:
+            # Last-resort fallback: the price the confirm step reported
+            # at execute_entry time, persisted into ``extras`` (see the
+            # PERSIST dealId block in :meth:`execute_entry`). Covers the
+            # poll-cycle race where the fill lands between the
+            # ``/positions`` snapshot and ``/history/activity`` fetches,
+            # so neither carries the price.
+            confirm_level = float((row.extras or {}).get('confirm_level') or 0.0)
+            if confirm_level > 0.0:
+                level = confirm_level
         now_ts = epoch_time()
 
         side = row.side
