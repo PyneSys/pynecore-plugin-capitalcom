@@ -2478,6 +2478,61 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             event = self._activity_to_event(a, row, position_snapshot)
             if event is not None:
                 yield event
+                if (event.event_type == 'filled'
+                        and event.leg_type in (
+                            LegType.TAKE_PROFIT,
+                            LegType.STOP_LOSS,
+                            LegType.TRAILING_STOP,
+                        )):
+                    # Position-attached bracket fully closed: the entry's
+                    # dealId vanishes from /positions and the OCA partner
+                    # leg is auto-cancelled by the exchange. Close the
+                    # entry + both bracket rows so ``_reconcile_snapshot``
+                    # does not stamp ``missing_pending_since`` on a
+                    # next-poll-no-longer-there row.
+                    self._close_bracket_after_natural_close(row)
+
+    def _close_bracket_after_natural_close(self, entry_row: 'OrderRow') -> None:
+        """Stamp the entry + bracket-leg rows with ``natural_close_at``.
+
+        Called after a TP / SL / TRAILING_STOP fill on a position-attached
+        bracket — Capital.com closes the position and auto-cancels the
+        OCA partner.  Without this stamp, ``_reconcile_snapshot`` later
+        sees the entry row's dealId missing from ``/positions`` +
+        ``/workingorders``, stamps ``missing_pending_since``, and
+        ``_missing_pending_tracker`` eventually raises a false
+        :class:`UnexpectedCancelError`.
+
+        The rows are NOT physically closed — :meth:`execute_exit` and
+        :meth:`modify_exit` look up the entry row by ``pine_entry_id``
+        on every Pine ``strategy.exit`` re-emission, and
+        ``close_order`` would make those lookups fail.  The flag is
+        instead read by :meth:`_reconcile_snapshot` and
+        :meth:`_missing_pending_tracker` to skip the missing-pending
+        accounting for these rows.
+        """
+        if self.store_ctx is None:
+            return
+        now_ts = epoch_time()
+        deal_id = entry_row.exchange_order_id
+        bracket_coids: list[str] = []
+        if deal_id:
+            for r in list(self.store_ctx.iter_live_orders(symbol=entry_row.symbol)):
+                if (r.extras or {}).get('parent_deal_id') == deal_id:
+                    bracket_coids.append(r.client_order_id)
+        for coid in (*bracket_coids, entry_row.client_order_id):
+            row = self.store_ctx.get_order(coid)
+            if row is None:
+                continue
+            extras = dict(row.extras or {})
+            extras['natural_close_at'] = now_ts
+            self.store_ctx.upsert_order(coid, extras=extras)
+        self.store_ctx.log_event(
+            'bracket_natural_close',
+            client_order_id=entry_row.client_order_id,
+            exchange_order_id=deal_id,
+            payload={'bracket_coids': bracket_coids, 'flagged_at': now_ts},
+        )
 
     def _activity_to_event(
             self, activity: dict, row: 'OrderRow',
@@ -2514,27 +2569,66 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         source = (activity.get('source') or '').upper()
         size = float(activity.get('size') or row.qty)
         level = float(activity.get('level') or 0.0)
+
+        # A closing leg on a position-attached bracket: the activity
+        # references the entry row's dealId (TP/SL share the entry's
+        # dealId on Capital.com), so the entry row's ``confirm_level``
+        # is the *open* price — wrong for the close fallback. The
+        # corresponding bracket row's ``tp_level`` / ``sl_level`` is
+        # the right source instead.
+        row_leg_kind = (row.extras or {}).get('leg_kind')
+        is_closing_leg = (
+            activity_type == 'POSITION'
+            and status in ('EXECUTED', 'ACCEPTED')
+            and (source in ('TP', 'SL') or row_leg_kind in ('tp', 'sl'))
+        )
+
         if level <= 0.0 and position_snapshot is not None:
             pos_data = position_snapshot.get('position') or {}
             fallback_level = float(pos_data.get('level') or 0.0)
             if fallback_level > 0.0:
                 level = fallback_level
-        if level <= 0.0:
-            # Last-resort fallback: the price the confirm step reported
-            # at execute_entry time, persisted into ``extras`` (see the
-            # PERSIST dealId block in :meth:`execute_entry`). Covers the
-            # poll-cycle race where the fill lands between the
-            # ``/positions`` snapshot and ``/history/activity`` fetches,
-            # so neither carries the price.
+        if level <= 0.0 and is_closing_leg:
+            # Closing-leg fallback: bracket row's tp_level / sl_level.
+            leg_kind_for_fallback = (
+                'tp' if source == 'TP' or row_leg_kind == 'tp' else 'sl'
+            )
+            leg_row = self._find_bracket_leg_row(row, leg_kind_for_fallback)
+            if leg_row is not None:
+                leg_level = (leg_row.tp_level if leg_kind_for_fallback == 'tp'
+                             else leg_row.sl_level)
+                if leg_level is not None and float(leg_level) > 0.0:
+                    level = float(leg_level)
+        if level <= 0.0 and not is_closing_leg:
+            # Entry-leg last-resort fallback: the price the confirm step
+            # reported at :meth:`execute_entry` time, persisted into
+            # ``extras`` (see the PERSIST dealId block in
+            # :meth:`execute_entry`). Covers the poll-cycle race where
+            # the fill lands between the ``/positions`` snapshot and
+            # ``/history/activity`` fetches, so neither carries the
+            # price. Closing legs deliberately skip this — for them the
+            # entry's confirm_level is the open price, not the close
+            # price.
             confirm_level = float((row.extras or {}).get('confirm_level') or 0.0)
             if confirm_level > 0.0:
                 level = confirm_level
         now_ts = epoch_time()
 
-        side = row.side
+        # Closing-leg side is the OPPOSITE of the matched entry row's
+        # side. Capital.com's ``direction`` field on a TP/SL close
+        # activity reports the POSITION direction (``'BUY'`` for a long
+        # being closed), NOT the closing trade direction — verified
+        # live 2026-05-01. Without this flip
+        # ``BrokerPosition.record_fill`` reads ``side='buy'`` on a
+        # long-closing fill, computes a positive ``signed_delta``, and
+        # ADDS to the existing long instead of reducing it.
+        if is_closing_leg:
+            side = 'sell' if row.side == 'buy' else 'buy'
+        else:
+            side = row.side
         order_type = _order_type_from_row(row, activity_type)
         kind = (row.extras or {}).get('kind', 'position')
-        leg_kind = (row.extras or {}).get('leg_kind')
+        leg_kind = row_leg_kind
 
         leg_type: LegType | None = None
         event_type: str | None = None
@@ -2603,6 +2697,31 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             leg_type=leg_type,
         )
 
+    def _find_bracket_leg_row(
+            self, entry_row: 'OrderRow', leg_kind: str,
+    ) -> 'OrderRow | None':
+        """Look up the bracket TP or SL row attached to ``entry_row``.
+
+        ``execute_exit`` registers each bracket leg under
+        ``extras['parent_deal_id'] == entry_row.exchange_order_id``
+        with ``extras['leg_kind']`` of ``'tp'`` or ``'sl'``.
+
+        ``find_by_ref('bracket_deal_id', deal_id)`` cannot be used —
+        ``add_ref`` UNIQUEs on ``(run_instance_id, ref_type, ref_value)``,
+        so the SL ``add_ref`` clobbers the TP one in
+        :meth:`execute_exit`. Linear scan over live orders for the
+        symbol is acceptable: a realistic one-way Pine strategy has
+        well under 10 live rows at any time.
+        """
+        if self.store_ctx is None or not entry_row.exchange_order_id:
+            return None
+        for r in self.store_ctx.iter_live_orders(symbol=entry_row.symbol):
+            rextras = r.extras or {}
+            if (rextras.get('parent_deal_id') == entry_row.exchange_order_id
+                    and rextras.get('leg_kind') == leg_kind):
+                return r
+        return None
+
     async def _reconcile_snapshot(
             self,
             positions_by_deal: dict[str, dict],
@@ -2623,6 +2742,13 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         for row in list(self.store_ctx.iter_live_orders()):
             did = row.exchange_order_id
             if not did:
+                continue
+            # Rows flagged by ``_close_bracket_after_natural_close`` are
+            # known-closed on the exchange (TP/SL fired and the position
+            # vanished as expected). Skip the missing-pending accounting
+            # — otherwise the grace window would still raise a false
+            # ``UnexpectedCancelError``.
+            if (row.extras or {}).get('natural_close_at') is not None:
                 continue
             pos = positions_by_deal.get(did)
             work = working_by_deal.get(did)
@@ -2732,8 +2858,15 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         grace = max(5.0, self.config.poll_interval_seconds * 5.0)
         now_ts = epoch_time()
         for row in list(self.store_ctx.iter_live_orders()):
-            since = (row.extras or {}).get('missing_pending_since')
+            extras = row.extras or {}
+            since = extras.get('missing_pending_since')
             if since is None:
+                continue
+            # Defensive: ``_reconcile_snapshot`` already skips
+            # naturally-closed rows from being stamped, but double-guard
+            # against any historical stamp surviving on a row that was
+            # later flagged as natural close.
+            if extras.get('natural_close_at') is not None:
                 continue
             if (now_ts - float(since)) < grace:
                 continue

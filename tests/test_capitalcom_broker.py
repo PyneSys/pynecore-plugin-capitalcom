@@ -249,7 +249,7 @@ from pynecore.core.broker.exceptions import (  # noqa: E402
     InsufficientMarginError,
 )
 from pynecore.core.broker.models import (  # noqa: E402
-    CancelIntent, CloseIntent, ExitIntent, OrderStatus,
+    CancelIntent, CloseIntent, ExitIntent, LegType, OrderStatus,
 )
 from pynecore_capitalcom import (  # noqa: E402
     InvalidStopDistanceError, OrderNotFoundError,
@@ -954,3 +954,296 @@ def __test_map_exception_httpx_timeout_becomes_connection_error__():
     from pynecore.core.broker.exceptions import ExchangeConnectionError
     mapped = broker._map_exception(err)
     assert isinstance(mapped, ExchangeConnectionError)
+
+
+# =======================================================================
+# Natural-close regression tests — TP/SL fill on a bracket-attached entry.
+# Three structural bugs are covered:
+#   (A) Entry + bracket rows must be closed in BrokerStore so
+#       ``_reconcile_snapshot`` does not stamp ``missing_pending_since``
+#       and ``_missing_pending_tracker`` does not raise a false
+#       ``UnexpectedCancelError`` after the grace window.
+#   (B) The emitted ``OrderEvent.order.side`` for a closing leg must come
+#       from the activity's ``direction`` field (opposite of the entry's
+#       side), not from the matched entry row's side. Otherwise
+#       ``BrokerPosition.record_fill`` adds to the position instead of
+#       reducing it, doubling the local Pine-side size on every TP/SL
+#       fill while the exchange already closed the position.
+#   (C) The fill-price ``level<=0`` fallback must NOT use the entry row's
+#       ``extras['confirm_level']`` for a closing leg — that is the
+#       entry price, not the close price. For closing legs the bracket
+#       leg row's ``tp_level`` / ``sl_level`` is the right source.
+# =======================================================================
+
+
+def _seed_bracket_setup(ctx, *, entry_side='buy', tp_price=1.17699,
+                        sl_price=1.17636, confirm_level=1.17667,
+                        deal_id='deal-L', entry_coid='coid-entry',
+                        tp_coid='coid-tp', sl_coid='coid-sl',
+                        symbol='EURUSD', qty=1.0, pine_id='Long'):
+    """Seed a confirmed entry row + bracket TP/SL rows mirroring what
+    :meth:`execute_entry` + :meth:`execute_exit` would produce.
+
+    Returns the entry / TP / SL CO-IDs so the caller can assert on them.
+    """
+    ctx.upsert_order(
+        entry_coid, symbol=symbol, side=entry_side, qty=qty,
+        state='confirmed', pine_entry_id=pine_id,
+        exchange_order_id=deal_id,
+        extras={'kind': 'position', 'confirm_level': confirm_level},
+    )
+    ctx.add_ref(entry_coid, 'deal_id', deal_id)
+    exit_side = 'sell' if entry_side == 'buy' else 'buy'
+    ctx.upsert_order(
+        tp_coid, symbol=symbol, side=exit_side, qty=qty,
+        state='confirmed', pine_entry_id=pine_id, from_entry=pine_id,
+        tp_level=tp_price,
+        extras={'leg_kind': 'tp', 'parent_deal_id': deal_id},
+    )
+    ctx.upsert_order(
+        sl_coid, symbol=symbol, side=exit_side, qty=qty,
+        state='confirmed', pine_entry_id=pine_id, from_entry=pine_id,
+        sl_level=sl_price,
+        extras={'leg_kind': 'sl', 'parent_deal_id': deal_id},
+    )
+    return entry_coid, tp_coid, sl_coid
+
+
+def __test_process_activity_tp_fill_flags_entry_and_bracket_rows__(tmp_path):
+    """Bug A: a TP fill on a Capital.com native bracket closes the
+    position and auto-cancels the OCA partner leg. The plugin must
+    stamp the entry + both bracket rows with ``extras['natural_close_at']``
+    so the next ``_reconcile_snapshot`` poll does not mistake the
+    now-vanished ``dealId`` for a missing protective order.
+
+    The rows are kept LIVE in BrokerStore on purpose: subsequent
+    ``execute_exit`` / ``modify_exit`` calls (Pine re-emits
+    ``strategy.exit`` on every bar even after a close) need to find
+    the entry row by ``pine_entry_id`` until Pine's next entry
+    replaces it. Closing the row physically would break that lookup.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx)
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'TP',
+        'epic': 'EURUSD', 'direction': 'SELL',
+        'size': 1.0, 'level': 1.17700,
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.TAKE_PROFIT
+    assert events[0].event_type == 'filled'
+
+    # All three rows stay live, but each carries the natural_close_at flag.
+    for coid in (e_coid, tp_coid, sl_coid):
+        row = ctx.get_order(coid)
+        assert row is not None, f"row {coid!r} must remain live in BrokerStore"
+        assert row.closed_ts_ms is None, (
+            f"row {coid!r} must NOT be physically closed — "
+            "execute_exit/modify_exit need to find it"
+        )
+        assert (row.extras or {}).get('natural_close_at') is not None, (
+            f"row {coid!r} must carry the natural_close_at flag so "
+            "_reconcile_snapshot skips its missing-pending accounting"
+        )
+    store.close()
+
+
+def __test_modify_exit_finds_entry_row_after_natural_close__(tmp_path):
+    """Regression: after a TP/SL fills naturally, Pine still re-emits
+    ``strategy.exit`` on the next bar (its emission is unconditional
+    in broker mode — only the simulator gates it via open trades).
+    The sync engine then calls ``modify_exit`` which looks up the
+    entry row by ``pine_entry_id``. The naturally-closed entry row
+    must remain findable; it is only flagged, not physically closed.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'attach2'},
+        ('confirms/attach2', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    _seed_bracket_setup(ctx)
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SL',
+        'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0, 'level': 1.17630,
+    }
+
+    async def feed_close():
+        async for _ in broker._process_activity([activity]):
+            pass
+
+    asyncio.run(feed_close())
+
+    # Now the SL has fired; the entry row is flagged but live. Pine
+    # re-emits a new bracket with shifted prices — execute_exit must
+    # still find the entry row.
+    new_env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.18000, sl_price=1.17000,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    legs = asyncio.run(broker.execute_exit(new_env))
+    assert len(legs) == 2  # tp + sl synthesised
+    store.close()
+
+
+def __test_process_activity_closing_leg_side_is_opposite_of_entry__(tmp_path):
+    """Bug B (corrected): Capital.com's ``direction`` field on a TP/SL
+    close activity reports the POSITION direction (``'BUY'`` for a long
+    being closed), NOT the closing trade direction. So ``side`` cannot
+    be read off ``direction`` alone — the closing-leg side must be the
+    opposite of ``row.side`` (the matched entry row's open direction).
+
+    Without this flip ``BrokerPosition.record_fill`` reads
+    ``side='buy'`` on a long-closing fill, computes a positive
+    ``signed_delta``, and ADDS to the existing long instead of
+    reducing it — doubling the local Pine-side size while the
+    exchange already closed the position.
+
+    The test feeds the realistic Capital.com payload — ``direction='BUY'``
+    on a long position's SL fill — and asserts the emitted event side
+    is ``'sell'``.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_bracket_setup(ctx)  # long entry, side='buy'
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SL',
+        'epic': 'EURUSD', 'direction': 'BUY',  # position direction, not trade
+        'size': 1.0, 'level': 1.17630,
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.STOP_LOSS
+    assert events[0].order.side == 'sell', (
+        "closing-leg side must be the opposite of the entry's side; "
+        f"got {events[0].order.side!r} (record_fill would add to the "
+        "position instead of reducing it)"
+    )
+    store.close()
+
+
+def __test_process_activity_short_closing_leg_side_is_buy__(tmp_path):
+    """Mirror of the long-close case: a short entry (``side='sell'``)
+    closing via TP fill emits ``side='buy'`` regardless of what
+    Capital.com puts in ``direction``.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_bracket_setup(ctx, entry_side='sell')
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'TP',
+        'epic': 'EURUSD', 'direction': 'SELL',  # position direction
+        'size': 1.0, 'level': 1.17699,
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.TAKE_PROFIT
+    assert events[0].order.side == 'buy'
+    store.close()
+
+
+def __test_process_activity_tp_fill_uses_leg_tp_level_not_entry_confirm__(tmp_path):
+    """Bug C: ``level=0`` fallback chain must NOT use the entry's
+    ``extras['confirm_level']`` for a closing leg — that is the entry
+    price, not the close price. The bracket TP row's ``tp_level`` is
+    the correct fallback when Capital.com leaves the activity row's
+    ``level`` blank on a TP fill.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_bracket_setup(
+        ctx,
+        confirm_level=1.17667,  # entry price — must NOT be reused for TP
+        tp_price=1.17699,        # bracket TP — this is the correct fallback
+    )
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'TP',
+        'epic': 'EURUSD', 'direction': 'SELL',
+        'size': 1.0, 'level': 0.0,   # the offending Capital.com gap
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity], None):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1
+    assert events[0].fill_price == 1.17699, (
+        f"TP fill price must fall back to bracket TP row's tp_level, "
+        f"got {events[0].fill_price!r} (likely entry's confirm_level — wrong)"
+    )
+    store.close()
+
+
+def __test_natural_close_does_not_stamp_missing_pending__(tmp_path):
+    """Integration: full TP fill sequence must not stamp the entry row
+    with ``missing_pending_since``, so the grace-window watchdog does
+    not later raise a false ``UnexpectedCancelError``.
+
+    Arranges the same poll cycle the production code runs:
+      1. ``_process_activity`` consumes the TP fill (and must close all
+         three bracket rows as a side-effect).
+      2. ``_reconcile_snapshot`` runs against empty positions / working
+         maps (the position is gone — that is what triggers the bug
+         today). With the rows already closed, the snapshot must NOT
+         see them in ``iter_live_orders`` and therefore must NOT stamp
+         ``missing_pending_since``.
+      3. ``_missing_pending_tracker`` must not raise.
+    """
+    broker, store, ctx = _make_broker(
+        tmp_path,
+        config=_make_config(
+            on_unexpected_cancel='stop',
+            poll_interval_seconds=0.1,
+        ),
+    )
+    e_coid, _, _ = _seed_bracket_setup(ctx)
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SL',
+        'epic': 'EURUSD', 'direction': 'SELL',
+        'size': 1.0, 'level': 1.17630,
+    }
+
+    async def run_poll():
+        async for _ in broker._process_activity([activity]):
+            pass
+        # /positions and /workingorders are now empty (position closed).
+        async for _ in broker._reconcile_snapshot({}, {}):
+            pass
+        async for _ in broker._missing_pending_tracker({}, {}):
+            pass
+
+    asyncio.run(run_poll())  # must not raise
+
+    row = ctx.get_order(e_coid)
+    assert row is None or 'missing_pending_since' not in (row.extras or {}), (
+        f"entry row must not be stamped missing — extras={row.extras!r}"
+    )
