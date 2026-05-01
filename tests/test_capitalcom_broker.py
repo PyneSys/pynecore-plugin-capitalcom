@@ -584,6 +584,92 @@ def __test_process_activity_external_is_logged_and_skipped__(tmp_path):
     store.close()
 
 
+def __test_process_activity_unmatched_then_matched_emits_on_second_poll__(tmp_path):
+    """Race: ``execute_entry``'s confirm step has not yet attached the
+    deal_id when the watch_orders poller first sees the EXECUTED activity.
+    The first poll classifies it as external (logged once, fingerprint NOT
+    cached). The bot then runs ``add_ref('deal_id', …)``. The second poll
+    re-evaluates the same activity, finds the row, and emits the fill.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    # Bot has dispatched the entry but not yet attached the deal_id ref.
+    ctx.upsert_order('coid', symbol='EURUSD', side='buy', qty=1.0,
+                     state='server_ref_seen', pine_entry_id='Long',
+                     extras={'kind': 'position'})
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'd-late',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'DEALER',
+        'size': 1.0, 'level': 1.10,
+    }
+
+    async def drain(acts):
+        out = []
+        async for ev in broker._process_activity(acts):
+            out.append(ev)
+        return out
+
+    first = asyncio.run(drain([activity]))
+    assert first == []  # row not yet linked to deal_id
+
+    # Bot's confirm step lands.
+    ctx.add_ref('coid', 'deal_id', 'd-late')
+    ctx.set_exchange_id('coid', 'd-late')
+    ctx.set_order_state('coid', 'confirmed')
+
+    second = asyncio.run(drain([activity]))
+    assert len(second) == 1
+    assert second[0].event_type == 'filled'
+    assert second[0].pine_id == 'Long'
+
+    # And a third poll should NOT re-emit (now in seen_fingerprints).
+    third = asyncio.run(drain([activity]))
+    assert third == []
+
+    # external_activity_ignored logged exactly once across the three polls.
+    kinds = [
+        r['kind'] for r in ctx._store._conn.execute(
+            "SELECT kind FROM events WHERE run_instance_id = ?",
+            (ctx.run_instance_id,),
+        )
+    ]
+    assert kinds.count('external_activity_ignored') == 1
+    assert kinds.count('activity_processed') == 1
+    store.close()
+
+
+def __test_process_activity_fills_zero_level_from_position_snapshot__(tmp_path):
+    """Capital.com sometimes returns a market-entry activity row with an
+    empty/zero ``level`` field.  The fill price must be back-filled from
+    the same poll cycle's ``GET /positions`` snapshot — otherwise the
+    resulting :class:`OrderEvent` carries ``fill_price=0.0`` and
+    :meth:`BrokerPosition.record_fill` silently drops it, stranding
+    ``position.size`` at zero.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='d1', extras={'kind': 'position'})
+    ctx.add_ref('coid', 'deal_id', 'd1')
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'd1',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'DEALER',
+        'size': 1.0, 'level': 0.0,
+    }
+    positions_by_deal = {'d1': {'position': {'dealId': 'd1', 'level': 1.17341}}}
+
+    async def drain(acts, snap):
+        out = []
+        async for ev in broker._process_activity(acts, snap):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain([activity], positions_by_deal))
+    assert len(events) == 1
+    assert events[0].event_type == 'filled'
+    assert events[0].fill_price == 1.17341
+    store.close()
+
+
 def __test_process_activity_fingerprint_dedups_in_session__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path)
     # Seed an owned row

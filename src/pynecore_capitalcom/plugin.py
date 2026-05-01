@@ -353,9 +353,19 @@ class _ActivityCursor:
     whose payload carries the same SHA-1 fingerprint, so
     :meth:`CapitalCom._load_activity_cursor_from_events` can replay the
     last-24h window at ``connect()`` time.
+
+    ``external_logged_fingerprints`` is a session-only set tracking
+    activities that we observed *without* a matching bot-owned row. These
+    are NOT dedup-cached (because the row may attach on a later poll once
+    ``add_ref('deal_id', …)`` lands — a real race in the entry path
+    between ``execute_entry``'s POST→/confirms and the watch_orders
+    poller). The set just keeps the ``external_activity_ignored`` log
+    one-shot per row within the session; truly external activities age
+    out of Capital.com's 60-second rolling window without further noise.
     """
     last_date_utc: str | None = None
     seen_fingerprints: set[str] = field(default_factory=set)
+    external_logged_fingerprints: set[str] = field(default_factory=set)
 
 
 class CapitalCom(BrokerPlugin[CapitalComConfig]):
@@ -2355,7 +2365,8 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 working_by_deal[str(did)] = wo
 
         async for ev in self._process_activity(
-                activity_resp.get('activities') or []):
+                activity_resp.get('activities') or [],
+                positions_by_deal):
             yield ev
         async for ev in self._reconcile_snapshot(
                 positions_by_deal, working_by_deal):
@@ -2368,6 +2379,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
 
     async def _process_activity(
             self, activities: list[dict],
+            positions_by_deal: dict[str, dict] | None = None,
     ) -> AsyncIterator[OrderEvent]:
         """Convert activity rows to events, with fingerprint-based dedup.
 
@@ -2376,6 +2388,14 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         see the reference-plugin external-order policy in the broker
         plugin plan. The sync engine would otherwise try to reconcile
         orders it never placed, which is an invariant violation.
+
+        :param positions_by_deal: Optional snapshot from the same poll
+            cycle's ``GET /positions`` response, keyed by ``dealId``.
+            Forwarded to :meth:`_activity_to_event` as a fallback source
+            for the fill price — Capital.com leaves the activity row's
+            ``level`` empty (= ``0.0``) on some market entries, and the
+            position snapshot is the authoritative open price for those
+            cases.
         """
         cursor = self._activity_cursor
         activities_sorted = sorted(
@@ -2390,23 +2410,44 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 continue
             if fingerprint in cursor.seen_fingerprints:
                 continue
-            cursor.seen_fingerprints.add(fingerprint)
-            if not cursor.last_date_utc or date_utc > cursor.last_date_utc:
-                cursor.last_date_utc = date_utc
 
             row: 'OrderRow | None' = None
             if deal_id and self.store_ctx is not None:
                 row = self.store_ctx.find_by_ref('deal_id', deal_id)
 
             if row is None:
-                # Log-only for external activity; do not emit.
-                if self.store_ctx is not None:
+                # Two cases land here:
+                #   (a) Genuinely external activity (manual broker action,
+                #       another bot using the same account, etc.).
+                #   (b) Race against our own ``execute_entry``: the activity
+                #       arrived before ``add_ref('deal_id', …)`` finished
+                #       writing the link row.
+                # We can't tell them apart from this poll alone, so we keep
+                # the activity *retryable* — do NOT add the fingerprint to
+                # ``seen_fingerprints`` and do NOT advance ``last_date_utc``.
+                # The next poll re-evaluates: if the bot's confirm step has
+                # caught up, the row attaches and the fill emits normally.
+                # Truly external rows fall out of Capital.com's 60s rolling
+                # window without further noise; the
+                # ``external_logged_fingerprints`` set keeps the audit log
+                # one-shot per row within the session.
+                if (self.store_ctx is not None
+                        and fingerprint not in cursor.external_logged_fingerprints):
+                    cursor.external_logged_fingerprints.add(fingerprint)
                     self.store_ctx.log_event(
                         'external_activity_ignored',
                         exchange_order_id=deal_id or None,
                         payload={'activity': a, 'fingerprint': fingerprint},
                     )
                 continue
+
+            # Row is matched — promote out of the external-logged set in
+            # case a previous poll caught the race window, and record the
+            # activity as fully processed (dedup + cursor advance).
+            cursor.external_logged_fingerprints.discard(fingerprint)
+            cursor.seen_fingerprints.add(fingerprint)
+            if not cursor.last_date_utc or date_utc > cursor.last_date_utc:
+                cursor.last_date_utc = date_utc
 
             if self.store_ctx is not None:
                 self.store_ctx.log_event(
@@ -2418,24 +2459,43 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                              'source': a.get('source')},
                 )
 
-            event = self._activity_to_event(a, row)
+            position_snapshot = (
+                positions_by_deal.get(deal_id)
+                if positions_by_deal and deal_id else None
+            )
+            event = self._activity_to_event(a, row, position_snapshot)
             if event is not None:
                 yield event
 
     def _activity_to_event(
             self, activity: dict, row: 'OrderRow',
+            position_snapshot: dict | None = None,
     ) -> OrderEvent | None:
         """Map a Capital.com activity row to an :class:`OrderEvent`.
 
         Returns ``None`` when the row does not correspond to an order-
         lifecycle transition the sync engine needs (e.g. a ``UPDATE``
         without size change).
+
+        :param position_snapshot: Optional ``GET /positions`` row for the
+            same ``dealId``, used to recover the fill price when the
+            activity row's ``level`` field is empty / zero.  Capital.com
+            occasionally returns market-entry activity rows without the
+            execution price — without this fallback the resulting
+            :class:`OrderEvent` carries ``fill_price=0.0`` and
+            :meth:`BrokerPosition.record_fill` silently drops it,
+            stranding ``position.size`` at zero.
         """
         activity_type = (activity.get('type') or '').upper()
         status = (activity.get('status') or '').upper()
         source = (activity.get('source') or '').upper()
         size = float(activity.get('size') or row.qty)
         level = float(activity.get('level') or 0.0)
+        if level <= 0.0 and position_snapshot is not None:
+            pos_data = position_snapshot.get('position') or {}
+            fallback_level = float(pos_data.get('level') or 0.0)
+            if fallback_level > 0.0:
+                level = fallback_level
         now_ts = epoch_time()
 
         side = row.side
