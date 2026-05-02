@@ -1578,15 +1578,18 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         # and ``from_entry IS NULL`` (entries have no from_entry). Filtering
         # the SQL by ``from_entry`` would wrongly exclude it — filter by
         # ``symbol`` only and disambiguate in Python.
-        target_row: 'OrderRow | None' = None
-        if self.store_ctx is not None:
-            for row in self.store_ctx.iter_live_orders(symbol=intent.symbol):
-                if (row.state == 'confirmed'
-                        and row.pine_entry_id == intent.from_entry
-                        and row.exchange_order_id
-                        and (row.extras or {}).get('kind') == 'position'):
-                    target_row = row
-                    break
+        #
+        # Skip rows flagged with ``natural_close_at``: after a TP/SL
+        # closes the position, the entry row stays live in BrokerStore
+        # so subsequent ``modify_exit`` lookups still work for the
+        # *same* entry. Once Pine opens a *new* entry under the same
+        # ``pine_entry_id`` (e.g. ``'Long'`` again), both rows match
+        # the search criteria — without this skip the iteration would
+        # return the old (already-closed-on-the-broker) row and the
+        # PUT would 404 with ``error.not-found.dealId``.
+        target_row: 'OrderRow | None' = self._find_active_entry_row(
+            intent.symbol, intent.from_entry,
+        )
         if target_row is None or not target_row.exchange_order_id:
             raise ExchangeOrderRejectedError(
                 f"Capital execute_exit: no confirmed entry row for "
@@ -2181,17 +2184,11 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             return await super().modify_exit(old, new)
 
         # Locate the parent position row via its confirmed entry. Same
-        # NULL-vs-from_entry subtlety as :meth:`execute_exit` — filter on
-        # symbol only, disambiguate in Python.
-        target_row: 'OrderRow | None' = None
-        if self.store_ctx is not None:
-            for row in self.store_ctx.iter_live_orders(symbol=new_i.symbol):
-                if (row.state == 'confirmed'
-                        and row.pine_entry_id == new_i.from_entry
-                        and row.exchange_order_id
-                        and (row.extras or {}).get('kind') == 'position'):
-                    target_row = row
-                    break
+        # NULL-vs-from_entry + natural_close_at skip as :meth:`execute_exit`
+        # — see :meth:`_find_active_entry_row`.
+        target_row: 'OrderRow | None' = self._find_active_entry_row(
+            new_i.symbol, new_i.from_entry,
+        )
         if target_row is None or not target_row.exchange_order_id:
             return await super().modify_exit(old, new)
 
@@ -2696,6 +2693,41 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             from_entry=row.from_entry,
             leg_type=leg_type,
         )
+
+    def _find_active_entry_row(
+            self, symbol: str, pine_entry_id: str | None,
+    ) -> 'OrderRow | None':
+        """Locate the live, ACTIVE entry row for ``pine_entry_id``.
+
+        Used by :meth:`execute_exit` and :meth:`modify_exit` to find
+        the parent position. After a TP/SL natural close the entry row
+        stays live (so further modify_exit lookups for the same entry
+        keep working) but carries an ``extras['natural_close_at']``
+        flag — that row is closed on the broker's side and must NOT
+        be returned. Pine reusing the same ``pine_entry_id`` on a new
+        entry produces two rows with the same id; this helper picks
+        the active one by skipping flagged rows. If multiple active
+        rows match (should not happen in one-way mode) the most
+        recently created wins.
+        """
+        if self.store_ctx is None:
+            return None
+        best: 'OrderRow | None' = None
+        for row in self.store_ctx.iter_live_orders(symbol=symbol):
+            if row.state != 'confirmed':
+                continue
+            if row.pine_entry_id != pine_entry_id:
+                continue
+            if not row.exchange_order_id:
+                continue
+            extras = row.extras or {}
+            if extras.get('kind') != 'position':
+                continue
+            if extras.get('natural_close_at') is not None:
+                continue
+            if best is None or row.created_ts_ms > best.created_ts_ms:
+                best = row
+        return best
 
     def _find_bracket_leg_row(
             self, entry_row: 'OrderRow', leg_kind: str,

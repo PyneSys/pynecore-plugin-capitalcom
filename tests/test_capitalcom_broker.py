@@ -1057,18 +1057,72 @@ def __test_process_activity_tp_fill_flags_entry_and_bracket_rows__(tmp_path):
     store.close()
 
 
-def __test_modify_exit_finds_entry_row_after_natural_close__(tmp_path):
-    """Regression: after a TP/SL fills naturally, Pine still re-emits
-    ``strategy.exit`` on the next bar (its emission is unconditional
-    in broker mode — only the simulator gates it via open trades).
-    The sync engine then calls ``modify_exit`` which looks up the
-    entry row by ``pine_entry_id``. The naturally-closed entry row
-    must remain findable; it is only flagged, not physically closed.
+def __test_execute_exit_skips_natural_close_flagged_row_picks_new_entry__(tmp_path):
+    """Re-entry after natural close: the OLD entry row stays live in
+    BrokerStore but flagged with ``natural_close_at`` (so prior
+    ``modify_exit`` lookups keep working until Pine actually re-emits
+    a new bracket). Once Pine opens a NEW entry under the same
+    ``pine_entry_id``, two rows match the search. The plugin must
+    pick the new (active, unflagged) row and PUT against its dealId,
+    NOT the old one — otherwise Capital.com returns
+    ``error.not-found.dealId`` (404) and the dispatch crashes.
     """
     broker, store, ctx = _make_broker(tmp_path, responses={
-        ('positions/deal-L', 'put'): {'dealReference': 'attach2'},
-        ('confirms/attach2', 'get'): {'dealStatus': 'ACCEPTED'},
+        ('positions/deal-NEW', 'put'): {'dealReference': 'attach-new'},
+        ('confirms/attach-new', 'get'): {'dealStatus': 'ACCEPTED'},
     })
+    # Old entry row, naturally closed (TP/SL fired earlier).
+    ctx.upsert_order(
+        'coid-old', symbol='EURUSD', side='buy', qty=1.0,
+        state='confirmed', pine_entry_id='Long',
+        exchange_order_id='deal-OLD',
+        extras={'kind': 'position',
+                'confirm_level': 1.17500,
+                'natural_close_at': 1700000000.0},
+    )
+    ctx.add_ref('coid-old', 'deal_id', 'deal-OLD')
+    # New entry row from Pine's re-entry on a later bar.
+    ctx.upsert_order(
+        'coid-new', symbol='EURUSD', side='buy', qty=1.0,
+        state='confirmed', pine_entry_id='Long',
+        exchange_order_id='deal-NEW',
+        extras={'kind': 'position', 'confirm_level': 1.17800},
+    )
+    ctx.add_ref('coid-new', 'deal_id', 'deal-NEW')
+
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.17900, sl_price=1.17750,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    legs = asyncio.run(broker.execute_exit(env))
+    assert len(legs) == 2
+
+    # The PUT must target the NEW dealId, not the flagged OLD one.
+    puts = [c for c in broker._calls
+            if c[0].startswith('positions/') and c[1] == 'put']
+    assert len(puts) == 1
+    assert puts[0][0] == 'positions/deal-NEW', (
+        f"PUT must target the active entry (deal-NEW), got {puts[0][0]!r}"
+    )
+    store.close()
+
+
+def __test_execute_exit_rejects_when_only_flagged_entry_exists__(tmp_path):
+    """Counterpart to the re-entry test: when the ONLY entry row for
+    the requested ``pine_entry_id`` is flagged with ``natural_close_at``
+    (the position closed on the broker, no new entry yet), the plugin
+    must reject the exit dispatch — PUT'ing against a closed dealId
+    would 404 with ``error.not-found.dealId`` and crash the engine.
+
+    The sync engine's ``_cleanup_closed_position`` normally clears
+    the matching exit intent before this state is observable, but
+    a same-bar race could still feed an exit dispatch through; this
+    test pins the fail-loud behaviour.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
     _seed_bracket_setup(ctx)
     activity = {
         'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
@@ -1082,9 +1136,6 @@ def __test_modify_exit_finds_entry_row_after_natural_close__(tmp_path):
 
     asyncio.run(feed_close())
 
-    # Now the SL has fired; the entry row is flagged but live. Pine
-    # re-emits a new bracket with shifted prices — execute_exit must
-    # still find the entry row.
     new_env = DispatchEnvelope(
         intent=ExitIntent(
             pine_id='Bracket', from_entry='Long', symbol='EURUSD',
@@ -1092,8 +1143,8 @@ def __test_modify_exit_finds_entry_row_after_natural_close__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    legs = asyncio.run(broker.execute_exit(new_env))
-    assert len(legs) == 2  # tp + sl synthesised
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_exit(new_env))
     store.close()
 
 
