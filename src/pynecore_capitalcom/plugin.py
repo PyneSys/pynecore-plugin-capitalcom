@@ -815,8 +815,8 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     await self._update_queue.put(("ohlc", data.get("payload") or {}))
                 elif dest == "quote":
                     payload = data.get("payload") or {}
-                    bid = payload.get("bid")
-                    ofr = payload.get("ofr")
+                    bid: float | str | None = payload.get("bid")
+                    ofr: float | str | None = payload.get("ofr")
                     if bid is not None:
                         self._last_bid = float(bid)
                     if ofr is not None:
@@ -945,16 +945,17 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             if item is None:
                 raise ConnectionError("WebSocket listener disconnected")
             event_type, payload = item
+            result: OHLCV | None
             if event_type == "ohlc":
-                bar = self._on_ohlc_event(payload)
-                if bar is not None:
-                    return bar
-                # Ask-side duplicate of the same bar close — skip and wait.
-                continue
-            synth = self._synth_from_quote()
-            if synth is not None:
-                return synth
-            # Quote arrived before any OHLC baseline — keep waiting.
+                # ``_on_ohlc_event`` returns None for ask-side duplicates;
+                # skip and wait for the next event in that case.
+                result = self._on_ohlc_event(payload)
+            else:
+                # Quote arrived before any OHLC baseline yields None;
+                # keep waiting until the first ``ohlc.event`` lands.
+                result = self._synth_from_quote()
+            if result is not None:
+                return result
 
     def _extra_fields(self) -> dict[str, float] | None:
         """Build the bid/ask/spread snapshot for ``OHLCV.extra_fields``."""
@@ -1439,7 +1440,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 cause=net if isinstance(net, Exception) else None,
             ) from net
 
-        deal_ref = resp.get('dealReference')
+        deal_ref: str | None = resp.get('dealReference')
         if not deal_ref:
             if self.store_ctx is not None:
                 self.store_ctx.set_order_state(coid, 'disposition_unknown')
@@ -1858,11 +1859,10 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             )
 
         # --- Partial close branch (emulated opposite POST) ---
-        return await self._execute_close_partial(envelope, coid, intent, rules)
+        return await self._execute_close_partial(coid, intent, rules)
 
     async def _execute_close_partial(
             self,
-            envelope: DispatchEnvelope,
             coid: str,
             intent: CloseIntent,
             rules: _InstrumentRules,
@@ -1934,7 +1934,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                          'qty': intent.qty, 'error': str(net)},
             ) from net
 
-        deal_ref = post_resp.get('dealReference')
+        deal_ref: str | None = post_resp.get('dealReference')
         if deal_ref and self.store_ctx is not None:
             self.store_ctx.add_ref(coid, 'deal_reference', deal_ref)
             self.store_ctx.set_order_state(coid, 'server_ref_seen')
@@ -2390,8 +2390,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         async for ev in self._reconcile_snapshot(
                 positions_by_deal, working_by_deal):
             yield ev
-        async for ev in self._trailing_activation_monitor(positions_by_deal):
-            yield ev
+        await self._trailing_activation_monitor(positions_by_deal)
         async for ev in self._missing_pending_tracker(
                 working_by_deal, positions_by_deal):
             yield ev
@@ -2418,7 +2417,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         """
         cursor = self._activity_cursor
         activities_sorted = sorted(
-            activities, key=lambda a: a.get('dateUTC') or '',
+            activities, key=lambda x: x.get('dateUTC') or '',
         )
         for a in activities_sorted:
             date_utc = a.get('dateUTC') or ''
@@ -2851,7 +2850,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 pos_data = pos.get('position') or {}
                 current_size = float(pos_data.get('size') or 0.0)
                 cumulative = _compute_cumulative_fill(row.qty, current_size)
-                if cumulative > row.filled_qty + 1e-9 and cumulative < row.qty:
+                if row.filled_qty + 1e-9 < cumulative < row.qty:
                     self.store_ctx.set_filled(row.client_order_id, cumulative)
                     self.store_ctx.log_event(
                         'partial_fill_detected',
@@ -2901,7 +2900,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         now_ts = epoch_time()
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
-            since = extras.get('missing_pending_since')
+            since: float | None = extras.get('missing_pending_since')
             if since is None:
                 continue
             # Defensive: ``_reconcile_snapshot`` already skips
@@ -2999,7 +2998,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
 
     async def _trailing_activation_monitor(
             self, positions_by_deal: dict[str, dict],
-    ) -> AsyncIterator[OrderEvent]:
+    ) -> None:
         """3-state client-side trailing activation machine.
 
         Pine's ``trail_price`` + ``trail_offset`` semantics: the trailing
@@ -3072,8 +3071,8 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
 
             # state 'activating' (possibly just transitioned) — verify
             # from the snapshot and promote to active on confirmation.
-            pos_data = pos.get('position') or {}
-            if pos_data.get('trailingStop') is True:
+            pos_data = pos.get('position', {})
+            if pos_data.get('trailingStop'):
                 new_extras = {
                     k: v for k, v in (row.extras or {}).items()
                     if k not in ('trail_state', 'trail_activation_price')
@@ -3090,9 +3089,6 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     exchange_order_id=row.exchange_order_id,
                     payload={'distance': row.trailing_distance},
                 )
-        # Nothing to yield — the monitor only mutates state.
-        return
-        yield  # pragma: no cover — keep the generator signature
 
     # --- Connect / recovery -----------------------------------------------
 
@@ -3110,30 +3106,14 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         if self.store_ctx is None:
             return
         cutoff_ms = int((epoch_time() - 86400.0) * 1000)
-        # Direct SQL is unavoidable here — RunContext has no event query
-        # API, and adding one is outside this plugin's scope. Access is
-        # intra-package, read-only, and the query is simple enough that
-        # the coupling risk is low.
-        conn = self.store_ctx._store._conn
-        rows = conn.execute(
-            "SELECT payload FROM events "
-            "WHERE run_instance_id = ? AND kind = 'activity_processed' "
-            "AND ts_ms >= ? ORDER BY ts_ms ASC",
-            (self.store_ctx.run_instance_id, cutoff_ms),
-        ).fetchall()
         cursor = self._activity_cursor
-        for row in rows:
-            raw = row['payload']
-            if not raw:
-                continue
-            try:
-                payload = json.loads(raw)
-            except ValueError:
-                continue
-            fp = payload.get('fingerprint')
+        for payload in self.store_ctx.iter_events_by_kind_since(
+                'activity_processed', cutoff_ms,
+        ):
+            fp: str | None = payload.get('fingerprint')
             if fp:
                 cursor.seen_fingerprints.add(fp)
-            date_utc = payload.get('dateUTC')
+            date_utc: str | None = payload.get('dateUTC')
             if date_utc and (cursor.last_date_utc is None
                              or date_utc > cursor.last_date_utc):
                 cursor.last_date_utc = date_utc
@@ -3201,7 +3181,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
     ) -> None:
         """Resolve a ``submitted`` row with multi-factor confidence."""
         assert self.store_ctx is not None
-        stored_ref = (row.extras or {}).get('deal_reference')
+        stored_ref: str | None = (row.extras or {}).get('deal_reference')
         if stored_ref:
             hit = pos_by_ref.get(stored_ref) or wo_by_ref.get(stored_ref)
             if hit is not None:
@@ -3282,7 +3262,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
     ) -> None:
         """Resolve a ``server_ref_seen`` row — confirm first, snapshot fallback."""
         assert self.store_ctx is not None
-        ref = (row.extras or {}).get('deal_reference')
+        ref: str | None = (row.extras or {}).get('deal_reference')
         if not ref:
             return
         try:
