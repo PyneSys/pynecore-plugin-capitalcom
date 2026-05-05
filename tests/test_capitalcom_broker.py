@@ -840,13 +840,7 @@ def __test_trailing_monitor_pending_crosses_activation__(tmp_path):
         'position': {'trailingStop': False},
     }}
 
-    async def drain():
-        out = []
-        async for ev in broker._trailing_activation_monitor(positions):
-            out.append(ev)
-        return out
-
-    asyncio.run(drain())
+    asyncio.run(broker._trailing_activation_monitor(positions))
     row = ctx.get_order('sl-coid')
     assert row.extras.get('trail_state') == 'activating'
     assert any(c[0] == 'positions/deal-L' and c[1] == 'put'
@@ -867,11 +861,7 @@ def __test_trailing_monitor_activating_to_active_on_snapshot__(tmp_path):
         'position': {'trailingStop': True},  # exchange confirms
     }}
 
-    async def drain():
-        async for _ in broker._trailing_activation_monitor(positions):
-            pass
-
-    asyncio.run(drain())
+    asyncio.run(broker._trailing_activation_monitor(positions))
     row = ctx.get_order('sl-coid')
     assert 'trail_state' not in (row.extras or {})
     assert row.trailing_stop is True
