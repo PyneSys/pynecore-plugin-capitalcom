@@ -7,6 +7,7 @@ import pytest
 
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
+    BrokerError,
     ExchangeCapabilityError,
     ExchangeRateLimitError,
     ExchangeOrderRejectedError,
@@ -700,6 +701,179 @@ def __test_execute_cancel_no_match_is_noop__(tmp_path):
     store.close()
 
 
+def __test_execute_cancel_filled_position_is_noop__(tmp_path):
+    """Cancel after the entry has filled must NOT close the position.
+
+    TV-verified ``strategy.cancel(entry_id)`` semantics: once the entry
+    has filled, the cancel is a no-op. The plugin guards against a stale
+    cancel intent slipping through and turning into a market close via
+    ``DELETE /positions/{dealId}``.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long', symbol='EURUSD'),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    ok = asyncio.run(broker.execute_cancel(env))
+    assert ok is True
+    # No DELETE on /positions or /workingorders must be issued.
+    assert not any(c[1] == 'delete' for c in broker._calls), (
+        f"cancel of filled position must not DELETE, calls={broker._calls}"
+    )
+    store.close()
+
+
+def __test_execute_cancel_bracket_leg_clears_via_put__(tmp_path):
+    """Bracket leg cancel sends ``PUT /positions`` with one level cleared.
+
+    The bracket TP/SL row carries no ``exchange_order_id`` (the level is
+    a position attribute, not a separate order); a DELETE on the row id
+    is meaningless. The plugin must instead clear the leg's level via
+    PUT, leaving the sister leg untouched.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'cxl-ref'},
+        ('confirms/cxl-ref', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-tp', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long',
+                     extras={'leg_kind': 'tp', 'parent_deal_id': 'deal-L'})
+    env = DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long', symbol='EURUSD',
+                            from_entry='Long'),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    ok = asyncio.run(broker.execute_cancel(env))
+    assert ok is True
+    put_calls = [c for c in broker._calls if c[1] == 'put']
+    assert len(put_calls) == 1, f"expected one PUT, got {broker._calls}"
+    endpoint, _, body = put_calls[0]
+    assert endpoint == 'positions/deal-L'
+    # TP cancel → only profitLevel cleared; stopLevel untouched (omitted).
+    assert body == {'profitLevel': None}
+    # Mirror the execute_exit/modify_exit minta: a confirm round-trip on
+    # the returned dealReference must follow the bracket PUT (TTL-bounded
+    # endpoint, also seeds activity stream).
+    assert any(c[0] == 'confirms/cxl-ref' and c[1] == 'get'
+               for c in broker._calls), (
+        f"bracket cancel must confirm dealReference, calls={broker._calls}"
+    )
+    store.close()
+
+
+def __test_execute_cancel_entry_does_not_clear_brackets__(tmp_path):
+    """Entry-side ``cancel(entry_id)`` must NOT remove protective brackets.
+
+    Bracket rows store ``pine_entry_id == entry_id`` (so subsequent
+    ``execute_exit`` lookups find them). A ``CancelIntent`` with
+    ``from_entry=None`` therefore matches the bracket row by
+    ``pine_entry_id``. The plugin must skip those bracket rows on entry
+    cancels — otherwise an intended-no-op cancel of a filled entry would
+    clear TP/SL on a live position.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    # Filled entry plus its TP and SL bracket rows.
+    ctx.upsert_order('coid-e', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    ctx.upsert_order('coid-tp', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', tp_level=1.20,
+                     extras={'leg_kind': 'tp', 'parent_deal_id': 'deal-L'})
+    ctx.upsert_order('coid-sl', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', sl_level=1.10,
+                     extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L'})
+    env = DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long', symbol='EURUSD'),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    ok = asyncio.run(broker.execute_cancel(env))
+    assert ok is True
+    # No PUT, no DELETE — the cancel of a filled entry is a complete no-op
+    # on the broker side; brackets must remain.
+    assert not any(c[1] in ('put', 'delete') for c in broker._calls), (
+        f"entry cancel must not touch brackets, calls={broker._calls}"
+    )
+    # Bracket rows still live in the store.
+    assert ctx.get_order('coid-tp') is not None
+    assert ctx.get_order('coid-sl') is not None
+    store.close()
+
+
+def __test_execute_cancel_trailing_sl_disables_native_trailing__(tmp_path):
+    """Trailing SL cancel must send ``trailingStop: False`` not just ``stopLevel: None``.
+
+    A native trailing stop on Capital.com is gated by the ``trailingStop``
+    flag plus ``stopDistance``. Clearing only ``stopLevel`` would close
+    the local row but leave the broker still managing a trailing stop on
+    the position.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {},
+    })
+    ctx.upsert_order('coid-sl', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', trailing_distance=0.0050,
+                     trailing_stop=True,
+                     extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L'})
+    env = DispatchEnvelope(
+        intent=CancelIntent(pine_id='SL', symbol='EURUSD',
+                            from_entry='Long'),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    ok = asyncio.run(broker.execute_cancel(env))
+    assert ok is True
+    put_calls = [c for c in broker._calls if c[1] == 'put']
+    assert len(put_calls) == 1, f"expected one PUT, got {broker._calls}"
+    _, _, body = put_calls[0]
+    assert body.get('trailingStop') is False, (
+        f"trailing SL cancel must disable trailingStop, body={body}"
+    )
+    assert body.get('stopLevel') is None
+    store.close()
+
+
+def __test_execute_cancel_does_not_sweep_unrelated_entries__(tmp_path):
+    """``intent.from_entry=None`` must not sweep other entries with no from_entry.
+
+    Two pending working orders sit on the same symbol with different
+    ``pine_entry_id``s and no ``from_entry``. A cancel for one ID must
+    DELETE only that order — the previous matching predicate
+    ``row.from_entry == intent.from_entry`` falsely treated
+    ``None == None`` as a match for every other entry.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/w-L1', 'delete'): {},
+        ('workingorders/w-L2', 'delete'): {},
+    })
+    ctx.upsert_order('coid-w1', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long1',
+                     exchange_order_id='w-L1',
+                     extras={'kind': 'working'})
+    ctx.upsert_order('coid-w2', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long2',
+                     exchange_order_id='w-L2',
+                     extras={'kind': 'working'})
+    env = DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long1', symbol='EURUSD'),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    ok = asyncio.run(broker.execute_cancel(env))
+    assert ok is True
+    deleted = [c[0] for c in broker._calls if c[1] == 'delete']
+    assert deleted == ['workingorders/w-L1'], (
+        f"only Long1 should be deleted, got {deleted}"
+    )
+    store.close()
+
+
 def __test_modify_entry_size_change_falls_back_to_super__(tmp_path):
     # With size change the override delegates to super().modify_entry,
     # which is cancel+execute. We assert that by verifying a DELETE was
@@ -1016,6 +1190,40 @@ def __test_trailing_monitor_pending_crosses_activation__(tmp_path):
     assert row.extras.get('trail_state') == 'activating'
     assert any(c[0] == 'positions/deal-L' and c[1] == 'put'
                for c in broker._calls)
+    store.close()
+
+
+def __test_trailing_monitor_pending_stays_pending_on_put_failure__(tmp_path):
+    """Transient PUT failure must not advance the row past ``pending``.
+
+    If the first activation PUT raises a ``BrokerError``, the row must
+    stay in ``pending`` so the next tick re-enters the send path.
+    Previously the row flipped to ``activating`` *before* the PUT, so a
+    failed PUT left the protective trailing stop inactive forever.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/deal-L', 'put'): BrokerError("transient"),
+    })
+    ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', trailing_distance=0.005,
+                     extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L',
+                             'trail_state': 'pending',
+                             'trail_activation_price': 1.15})
+    positions = {'deal-L': {
+        'market': {'epic': 'EURUSD', 'bid': 1.1502, 'offer': 1.1504},
+        'position': {'trailingStop': False},
+    }}
+
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    row = ctx.get_order('sl-coid')
+    assert row.extras.get('trail_state') == 'pending', (
+        f"failed PUT must leave trail_state pending, got "
+        f"{row.extras.get('trail_state')!r}"
+    )
+    # The PUT was attempted exactly once this tick.
+    put_calls = [c for c in broker._calls if c[1] == 'put']
+    assert len(put_calls) == 1
     store.close()
 
 
