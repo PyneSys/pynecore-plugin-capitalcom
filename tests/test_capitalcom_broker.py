@@ -252,7 +252,7 @@ from pynecore.core.broker.models import (  # noqa: E402
     CancelIntent, CloseIntent, ExitIntent, LegType, OrderStatus,
 )
 from pynecore_capitalcom import (  # noqa: E402
-    InvalidStopDistanceError, OrderNotFoundError,
+    InvalidStopDistanceError, InvalidTakeProfitDistanceError, OrderNotFoundError,
 )
 
 _RULES_RESP = {
@@ -447,6 +447,177 @@ def __test_execute_exit_trailing_with_activation_defers_put__(tmp_path):
     # SL row carries pending trail_state
     sl_row = ctx.get_order(legs[0].client_order_id)
     assert sl_row.extras.get('trail_state') == 'pending'
+    store.close()
+
+
+def __test_get_instrument_rules_ttl_expiry_refetches__(tmp_path, monkeypatch):
+    """Cache honours ``instrument_rules_ttl_seconds``: a stale entry forces
+    a re-fetch instead of indefinite reuse."""
+    broker, store, _ = _make_broker(
+        tmp_path,
+        config=_make_config(instrument_rules_ttl_seconds=30.0),
+    )
+    fake_now = {'t': 1_000_000.0}
+    monkeypatch.setattr(
+        'pynecore_capitalcom.plugin.epoch_time', lambda: fake_now['t'],
+    )
+    asyncio.run(broker._get_instrument_rules('EURUSD'))
+    fetch_calls = [c for c in broker._calls if c[0] == 'markets/EURUSD']
+    assert len(fetch_calls) == 1
+    fake_now['t'] += 5.0
+    asyncio.run(broker._get_instrument_rules('EURUSD'))
+    assert len([c for c in broker._calls if c[0] == 'markets/EURUSD']) == 1
+    fake_now['t'] += 60.0
+    asyncio.run(broker._get_instrument_rules('EURUSD'))
+    assert len([c for c in broker._calls if c[0] == 'markets/EURUSD']) == 2
+    store.close()
+
+
+def _rules_resp_with_snapshot(bid: float, offer: float) -> dict:
+    """Variant of :data:`_RULES_RESP` carrying a ``snapshot`` block so the
+    plugin's pre-check can read a live mid quote during pre-validation tests."""
+    return {**_RULES_RESP, 'snapshot': {'bid': bid, 'offer': offer}}
+
+
+def __test_execute_exit_pre_validates_sl_distance__(tmp_path):
+    """SL closer than ``minNormalStopOrLimitDistance`` from the live mid
+    raises before any PUT is issued."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.10000, 1.10002),
+        ('positions/deal-L', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    # min_stop_or_limit_distance from _RULES_RESP = 0.0001; mid = 1.10001;
+    # SL at 1.10005 → distance 0.00004 < 0.0001 ⇒ rejected.
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='SL', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, sl_price=1.10005,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(InvalidStopDistanceError) as exc:
+        asyncio.run(broker.execute_exit(env))
+    assert abs(exc.value.min_distance - 0.0001) < 1e-9
+    assert not any(
+        c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
+    ), "PUT must not be issued when pre-check rejects"
+    store.close()
+
+
+def __test_execute_exit_pre_validates_tp_distance__(tmp_path):
+    """TP closer than the symmetric minimum raises
+    :class:`InvalidTakeProfitDistanceError` before any PUT."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.10000, 1.10002),
+        ('positions/deal-L', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='TP', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.10003,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(InvalidTakeProfitDistanceError) as exc:
+        asyncio.run(broker.execute_exit(env))
+    assert abs(exc.value.min_distance - 0.0001) < 1e-9
+    assert not any(
+        c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
+    )
+    store.close()
+
+
+def __test_execute_exit_pre_check_uses_live_mid_not_entry_fill__(tmp_path):
+    """When price has drifted away from the entry, a valid SL near current
+    mid must NOT be rejected on the basis of distance to ``confirm_level``."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        # Entry filled at 1.10000, market now at 1.11000 — SL at 1.10900
+        # is 100 pips from the entry but only 10 pips from the live mid;
+        # min distance is 0.0001 so this is well above the floor.
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.10999, 1.11001),
+        ('positions/deal-L', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position', 'confirm_level': 1.10000})
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='SL', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, sl_price=1.10900,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    legs = asyncio.run(broker.execute_exit(env))
+    assert any(leg.id.endswith(':sl') for leg in legs)
+    assert any(
+        c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
+    ), "PUT must be issued when SL distance is valid against live mid"
+    store.close()
+
+
+def __test_modify_exit_pre_validates_distance__(tmp_path):
+    """``modify_exit`` runs the same proactive distance check before PUT."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.20000, 1.20002),
+        ('positions/deal-L', 'put'): {'dealReference': 'amend'},
+        ('confirms/amend', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    # mid = 1.20001; new SL = 1.19996 → distance 0.00005 < 0.0001 ⇒ rejected.
+    old_intent = ExitIntent(
+        pine_id='Br', from_entry='Long', symbol='EURUSD',
+        side='sell', qty=1.0, sl_price=1.19500, tp_price=1.20800,
+    )
+    new_intent = ExitIntent(
+        pine_id='Br', from_entry='Long', symbol='EURUSD',
+        side='sell', qty=1.0, sl_price=1.19996, tp_price=1.20800,
+    )
+    old_env = DispatchEnvelope(
+        intent=old_intent, run_tag='test', bar_ts_ms=1700000000000,
+    )
+    new_env = DispatchEnvelope(
+        intent=new_intent, run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(InvalidStopDistanceError):
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    assert not any(
+        c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
+    )
+    store.close()
+
+
+def __test_get_instrument_rules_prefers_normal_distance_over_controlled_risk__(tmp_path):
+    """Capital.com brackets are normal stops; the wider controlled-risk
+    minimum must NOT shadow ``minNormalStopOrLimitDistance`` when both
+    values are quoted."""
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): {
+            'dealingRules': {
+                'minStepDistance': {'value': 0.01},
+                'minDealSize': {'value': 0.01},
+                'minNormalStopOrLimitDistance': {'value': 0.0001},
+                'minControlledRiskStopDistance': {'value': 0.0050},
+            },
+            'instrument': {'lotSize': 0.01},
+        },
+    })
+    rules = asyncio.run(broker._get_instrument_rules('EURUSD'))
+    assert abs(rules.min_stop_or_limit_distance - 0.0001) < 1e-12
     store.close()
 
 

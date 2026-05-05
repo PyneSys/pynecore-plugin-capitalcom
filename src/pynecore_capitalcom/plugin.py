@@ -204,14 +204,23 @@ class _InstrumentRules:
     Capital.com returns these on ``GET /markets/{epic}`` as the
     ``dealingRules`` + ``instrument`` blocks. Three values are load-bearing
     for order sizing: ``lot_step`` (granularity of the ``size`` param),
-    ``min_size`` (the smallest accepted ``size``), and ``min_sl_distance``
-    (dynamic, used to pre-filter obviously-rejectable SL/TP levels before
-    the round-trip). Everything else is currently unused by the plugin.
+    ``min_size`` (the smallest accepted ``size``), and
+    ``min_stop_or_limit_distance`` — the dynamic minimum that
+    ``minNormalStopOrLimitDistance`` carries; it applies symmetrically to
+    both stop level and limit (take-profit) level, used to pre-filter
+    obviously-rejectable bracket levels before the round-trip.
+
+    ``fetched_at`` is the epoch second the entry was cached at; the lookup
+    re-fetches once it ages past
+    :attr:`CapitalComConfig.instrument_rules_ttl_seconds`. Capital.com
+    widens the minimum during volatile sessions, so unbounded caching
+    would silently drift out of date.
     """
     epic: str
     lot_step: float
     min_size: float
-    min_sl_distance: float
+    min_stop_or_limit_distance: float
+    fetched_at: float
 
 
 def _bracket_leg_id(deal_id: str, kind: str) -> str:
@@ -327,6 +336,16 @@ class CapitalComConfig:
     account has hedging mode enabled. The base :class:`BrokerPlugin`
     semantics are one-way Pine — hedging mode belongs on a future
     ``HedgeBrokerPlugin`` subclass."""
+
+    instrument_rules_ttl_seconds: float = 300.0
+    """Seconds before a cached :class:`_InstrumentRules` entry must be
+    re-fetched.
+
+    Capital.com widens ``minNormalStopOrLimitDistance`` during volatile
+    sessions; an indefinitely-cached value would silently disable the
+    pre-check. Five minutes is conservative — it bounds the staleness to
+    one news-event window without flooding the rate-limited markets endpoint.
+    """
 
     on_unexpected_cancel: str = "stop"
     """Policy when a bot-owned order disappears without the bot cancelling it.
@@ -1082,44 +1101,158 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             idempotency_native=False,
         )
 
-    async def _get_instrument_rules(self, epic: str) -> _InstrumentRules:
-        """Return cached dealing rules for ``epic``, fetching on first use.
+    async def _fetch_market(
+            self, epic: str,
+    ) -> tuple[_InstrumentRules, float | None]:
+        """Pull ``/markets/{epic}`` once and parse out everything callers
+        need.
 
-        The plugin rounds every ``size`` field through ``lot_step`` before
-        hitting the exchange: Capital.com rejects non-multiples with
-        ``error.invalid.size``, and an implicit rounding at the REST
-        boundary is a silent data-loss bug waiting to happen. Centralising
-        the lookup also keeps the ``min_sl_distance`` pre-check in one
-        place — the research dossier §6 describes how the value widens in
-        volatile sessions and must be re-read, not hard-coded.
+        Returns the parsed :class:`_InstrumentRules` (also stored in the
+        TTL cache under ``epic``) plus the snapshot mid quote derived from
+        ``snapshot.bid`` / ``snapshot.offer`` — ``None`` when the response
+        omits a tradable snapshot. The two consumers split here:
+        :meth:`_get_instrument_rules` only takes the rules, while
+        :meth:`_get_current_mid_price` only takes the mid; sharing this
+        single call keeps the bracket-distance pre-check from doubling
+        the network round-trip when both are needed in the same flow.
 
-        :param epic: Capital.com market identifier (e.g. ``"EURUSD"``).
-        :return: A :class:`_InstrumentRules` with the three fields the
-            execute path actually uses.
+        Capital.com publishes ``minNormalStopOrLimitDistance`` for the
+        regular bracket attach this plugin issues; the controlled-risk
+        minimum is wider and only applies to guaranteed stops, which the
+        plugin never requests. Falling back to the controlled value would
+        pre-reject perfectly valid normal-bracket orders on markets where
+        both values are quoted — so the normal distance is preferred and
+        the controlled-risk value is the last-resort fallback only.
         """
-        cached = self._instrument_rules_cache.get(epic)
-        if cached is not None:
-            return cached
+        now = epoch_time()
         details = await self._call('markets/' + epic, method='get')
         dealing = details.get('dealingRules') or {}
         instrument = details.get('instrument') or {}
+        snapshot = details.get('snapshot') or {}
         lot_step = float(
             (dealing.get('minStepDistance') or {}).get('value', 0.01)
             or instrument.get('lotSize', 0.01)
         )
         min_size = float((dealing.get('minDealSize') or {}).get('value', lot_step))
-        min_sl_distance = float(
-            (dealing.get('minControlledRiskStopDistance') or {}).get('value', 0.0)
-            or (dealing.get('minNormalStopOrLimitDistance') or {}).get('value', 0.0)
+        min_stop_or_limit_distance = float(
+            (dealing.get('minNormalStopOrLimitDistance') or {}).get('value', 0.0)
+            or (dealing.get('minControlledRiskStopDistance') or {}).get('value', 0.0)
         )
         rules = _InstrumentRules(
             epic=epic,
             lot_step=lot_step if lot_step > 0.0 else 0.01,
             min_size=min_size,
-            min_sl_distance=min_sl_distance,
+            min_stop_or_limit_distance=min_stop_or_limit_distance,
+            fetched_at=now,
         )
         self._instrument_rules_cache[epic] = rules
+        bid_raw = snapshot.get('bid')
+        offer_raw = snapshot.get('offer')
+        mid: float | None = None
+        if isinstance(bid_raw, (int, float)) and isinstance(offer_raw, (int, float)):
+            mid = (float(bid_raw) + float(offer_raw)) / 2.0
+        return rules, mid
+
+    async def _get_instrument_rules(self, epic: str) -> _InstrumentRules:
+        """Return cached dealing rules for ``epic``, fetching on first use
+        or after the TTL window elapses.
+
+        The plugin rounds every ``size`` field through ``lot_step`` before
+        hitting the exchange: Capital.com rejects non-multiples with
+        ``error.invalid.size``, and an implicit rounding at the REST
+        boundary is a silent data-loss bug waiting to happen. The cache
+        honours :attr:`CapitalComConfig.instrument_rules_ttl_seconds` so
+        ``minNormalStopOrLimitDistance`` widening during volatile sessions
+        does not get masked by a stale entry.
+
+        :param epic: Capital.com market identifier (e.g. ``"EURUSD"``).
+        :return: A :class:`_InstrumentRules` with the four fields the
+            execute path actually uses, plus the freshness timestamp.
+        """
+        now = epoch_time()
+        cached = self._instrument_rules_cache.get(epic)
+        ttl = self.config.instrument_rules_ttl_seconds
+        if cached is not None and (ttl <= 0.0 or now - cached.fetched_at < ttl):
+            return cached
+        rules, _ = await self._fetch_market(epic)
         return rules
+
+    async def _get_current_mid_price(self, epic: str) -> float | None:
+        """Always-fresh ``snapshot.bid + snapshot.offer`` mid for the
+        proactive bracket-distance pre-check.
+
+        Capital.com validates ``stopLevel``/``profitLevel`` against the
+        live quote rather than the entry's fill price, so the pre-check
+        must read a fresh snapshot every time. ``None`` propagates to the
+        validators as "no anchor — let the broker decide", keeping the
+        REST round-trip authoritative when the snapshot block is missing.
+
+        Side effect: the underlying ``/markets/{epic}`` call also refreshes
+        the :class:`_InstrumentRules` cache, so a subsequent
+        :meth:`_get_instrument_rules` in the same flow is a cache hit.
+        """
+        _, mid = await self._fetch_market(epic)
+        return mid
+
+    @staticmethod
+    def _validate_sl_distance(
+            rules: _InstrumentRules,
+            reference_price: float | None,
+            sl_price: float,
+    ) -> None:
+        """Raise :class:`InvalidStopDistanceError` if ``sl_price`` is closer
+        than the cached minimum distance to ``reference_price``.
+
+        ``reference_price`` is the entry's confirmed fill level (the
+        broker's actual anchor is the live mid quote, but the bracket is
+        attached to a confirmed position so the entry price is the closest
+        proxy available without an extra REST round-trip). Pre-rejecting
+        here turns an obvious script bug ("offset less than min distance")
+        into a logged skip instead of an exchange-side rejection. When
+        ``reference_price`` is missing or non-positive the check is a
+        no-op — the REST round-trip remains the authoritative gate.
+        """
+        if reference_price is None or reference_price <= 0.0:
+            return
+        if rules.min_stop_or_limit_distance <= 0.0:
+            return
+        distance = abs(reference_price - sl_price)
+        if distance < rules.min_stop_or_limit_distance:
+            raise InvalidStopDistanceError(
+                f"Capital.com pre-check: stop distance {distance:.6f} for "
+                f"{rules.epic} is below current minimum "
+                f"{rules.min_stop_or_limit_distance:.6f} "
+                f"(reference={reference_price}, sl={sl_price}).",
+                min_distance=rules.min_stop_or_limit_distance,
+            )
+
+    @staticmethod
+    def _validate_tp_distance(
+            rules: _InstrumentRules,
+            reference_price: float | None,
+            tp_price: float,
+    ) -> None:
+        """Raise :class:`InvalidTakeProfitDistanceError` if ``tp_price`` is
+        closer than the cached minimum distance to ``reference_price``.
+
+        Capital.com applies ``minNormalStopOrLimitDistance`` symmetrically
+        to both legs — the same threshold gates ``stopLevel`` and
+        ``profitLevel``. See :meth:`_validate_sl_distance` for the
+        anchor-price discussion.
+        """
+        if reference_price is None or reference_price <= 0.0:
+            return
+        if rules.min_stop_or_limit_distance <= 0.0:
+            return
+        distance = abs(reference_price - tp_price)
+        if distance < rules.min_stop_or_limit_distance:
+            raise InvalidTakeProfitDistanceError(
+                f"Capital.com pre-check: take-profit distance {distance:.6f} "
+                f"for {rules.epic} is below current minimum "
+                f"{rules.min_stop_or_limit_distance:.6f} "
+                f"(reference={reference_price}, tp={tp_price}).",
+                min_distance=rules.min_stop_or_limit_distance,
+            )
 
     @staticmethod
     def _quantize_size(qty: float, rules: _InstrumentRules) -> float:
@@ -1582,6 +1715,10 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         """
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
+        # Fresh market data: ``_get_current_mid_price`` also refreshes the
+        # rules cache as a side effect, so the subsequent rules lookup is
+        # a single in-process dict read rather than a second REST call.
+        mid_price = await self._get_current_mid_price(intent.symbol)
         rules = await self._get_instrument_rules(intent.symbol)
 
         # --- Resolve target row ---
@@ -1616,6 +1753,19 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 f"Capital.com bracket is full-row only (row_qty={target_row.qty}, "
                 f"intent_qty={intent.qty}). Core validation should have "
                 f"rejected this script at startup.",
+            )
+
+        # --- Pre-validate bracket distances before assembling the body ---
+        # Capital.com checks distance against the live mid quote, not the
+        # entry's fill price — using ``confirm_level`` would falsely reject
+        # a valid bracket whenever price has drifted away from the entry.
+        if intent.sl_price is not None:
+            self._validate_sl_distance(
+                rules, mid_price, float(intent.sl_price),
+            )
+        if intent.tp_price is not None:
+            self._validate_tp_distance(
+                rules, mid_price, float(intent.tp_price),
             )
 
         # --- Build body + decide trailing deferral ---
@@ -2201,6 +2351,19 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         )
         if target_row is None or not target_row.exchange_order_id:
             return await super().modify_exit(old, new)
+
+        # Live mid drives the pre-check: Capital.com validates against the
+        # current quote, not the entry's confirmed level.
+        mid_price = await self._get_current_mid_price(new_i.symbol)
+        rules = await self._get_instrument_rules(new_i.symbol)
+        if new_i.sl_price is not None:
+            self._validate_sl_distance(
+                rules, mid_price, float(new_i.sl_price),
+            )
+        if new_i.tp_price is not None:
+            self._validate_tp_distance(
+                rules, mid_price, float(new_i.tp_price),
+            )
 
         body: dict = {}
         if new_i.tp_price is not None:
