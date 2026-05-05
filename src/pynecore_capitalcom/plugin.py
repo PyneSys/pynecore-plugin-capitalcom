@@ -751,6 +751,16 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     )
 
                     self.save_ohlcv_data(ohlcv)
+                    # Seed the live synth pipeline so the very first WS
+                    # quote can produce an intra-bar update — without this
+                    # the spinner would stay empty until the first
+                    # ``ohlc.event`` (bar close) populates a baseline.
+                    # ``_last_bar_ohlcv``'s timestamp matches the last
+                    # warmup bar, so script_runner sees the synth as an
+                    # intra-bar update (``is_new_bar=False``) and does
+                    # not advance ``bar_index``.
+                    self._last_bar_ohlcv = ohlcv
+                    self._last_bar_timestamp = ohlcv.timestamp
                     tf = t + timedelta(minutes=1)
 
         except CapitalComError:
