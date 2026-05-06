@@ -94,7 +94,7 @@ def __test_broker_capabilities_match_dossier__():
     assert caps.partial_qty_bracket_exit is CapabilityLevel.UNSUPPORTED
     assert caps.oca_cancel is CapabilityLevel.SOFTWARE
     assert caps.amend_order is CapabilityLevel.PARTIAL_NATIVE
-    assert caps.cancel_all is CapabilityLevel.UNSUPPORTED
+    assert caps.cancel_all is CapabilityLevel.SOFTWARE
     assert caps.reduce_only is CapabilityLevel.SOFTWARE
     assert caps.watch_orders is CapabilityLevel.SOFTWARE
     assert caps.fetch_position is CapabilityLevel.NATIVE

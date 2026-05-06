@@ -1085,8 +1085,11 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
           and ``PUT /positions/{id}`` amend level / SL / TP / risk flags
           in-place, but ``size`` is **not** amendable on either endpoint.
           Size changes need cancel+recreate.
-        - ``cancel_all = UNSUPPORTED`` — no batch endpoint; the runner
-          does not currently surface this capability to scripts.
+        - ``cancel_all = SOFTWARE`` — no batch endpoint on Capital.com,
+          but Pine ``strategy.cancel_all()`` is delivered end-to-end: the
+          position drops every tracked entry/exit dict, and the sync
+          engine's diff loop dispatches one ``DELETE /workingorders/{id}``
+          per previously active intent on the next ``sync()``.
         - ``reduce_only = SOFTWARE`` — upheld via the one-way netting
           model: an opposite-side ``POST /positions`` reduces / closes the
           existing row instead of opening a counter-leg. Declaring
@@ -1113,7 +1116,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             partial_qty_bracket_exit=CapabilityLevel.UNSUPPORTED,
             oca_cancel=CapabilityLevel.SOFTWARE,
             amend_order=CapabilityLevel.PARTIAL_NATIVE,
-            cancel_all=CapabilityLevel.UNSUPPORTED,
+            cancel_all=CapabilityLevel.SOFTWARE,
             reduce_only=CapabilityLevel.SOFTWARE,
             watch_orders=CapabilityLevel.SOFTWARE,
             fetch_position=CapabilityLevel.NATIVE,
