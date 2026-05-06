@@ -13,7 +13,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
 )
 from pynecore.core.broker.models import (
-    DispatchEnvelope, EntryIntent, OrderType,
+    CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType,
 )
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
@@ -87,20 +87,18 @@ def __test_broker_capabilities_match_dossier__():
     """Capability struct mirrors the research dossier §3."""
     broker = _FakeBroker(config=_make_config())
     caps = broker.get_capabilities()
-    assert caps.stop_order is True
-    assert caps.stop_limit_order is False
-    assert caps.trailing_stop is True
-    assert caps.tp_sl_bracket is True
-    assert caps.tp_sl_bracket_native is True
-    assert caps.oca_cancel_native is False
-    assert caps.amend_order is True
-    assert caps.cancel_all is False
-    assert caps.reduce_only is True
-    assert caps.watch_orders is True
-    assert caps.fetch_position is True
-    assert caps.client_id_echo is False
-    assert caps.idempotency_native is False
-    assert caps.partial_qty_bracket_exit is False
+    assert caps.stop_order is CapabilityLevel.NATIVE
+    assert caps.stop_limit_order is CapabilityLevel.UNSUPPORTED
+    assert caps.trailing_stop is CapabilityLevel.NATIVE
+    assert caps.tp_sl_bracket is CapabilityLevel.NATIVE
+    assert caps.partial_qty_bracket_exit is CapabilityLevel.UNSUPPORTED
+    assert caps.oca_cancel is CapabilityLevel.SOFTWARE
+    assert caps.amend_order is CapabilityLevel.PARTIAL_NATIVE
+    assert caps.cancel_all is CapabilityLevel.UNSUPPORTED
+    assert caps.reduce_only is CapabilityLevel.SOFTWARE
+    assert caps.watch_orders is CapabilityLevel.SOFTWARE
+    assert caps.fetch_position is CapabilityLevel.NATIVE
+    assert caps.idempotency is CapabilityLevel.SOFTWARE
 
 
 def __test_broker_get_balance_selects_preferred_account__():

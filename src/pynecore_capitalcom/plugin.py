@@ -46,6 +46,7 @@ from pynecore.core.broker.idempotency import (
 )
 from pynecore.core.broker.models import (
     CancelIntent,
+    CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
     EntryIntent,
@@ -1063,42 +1064,60 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
     def get_capabilities(self) -> ExchangeCapabilities:
         """Declared capabilities per the research dossier §3.
 
-        ``tp_sl_bracket_native=True`` is a *full-row* bracket: Capital.com
-        attaches the SL/TP as attributes of the entire position. A Pine
-        ``strategy.exit(qty=N, from_entry=...)`` with ``N`` less than the
-        total entry qty cannot be expressed — ``partial_qty_bracket_exit``
-        is therefore declared ``False`` and the core validator rejects
-        such scripts at startup (see :mod:`pynecore.core.broker.validation`).
+        See :class:`~pynecore.core.broker.models.CapabilityLevel` for the
+        semantics of each level. Capital.com specifics:
 
-        ``watch_orders=True`` advertises the polling event stream
-        implemented by :meth:`watch_orders`: Capital.com has no WebSocket
-        order channel, so the plugin emulates one with an AsyncIterator
-        that fuses ``GET /positions`` + ``GET /workingorders`` +
-        ``GET /history/activity`` snapshots. Cadence and backoff live on
-        :class:`CapitalComConfig`.
-
-        ``reduce_only=True`` is software-upheld via the netting execution
-        model — in one-way mode an opposite ``POST /positions`` reduces
-        or closes the current exposure instead of opening a counter-leg.
-        Declaring ``False`` here would break
-        :mod:`pynecore.core.broker.validation` and the plugin could not
-        run any script that touches ``strategy.exit`` / ``strategy.close``.
+        - ``tp_sl_bracket = NATIVE`` — a single ``POST /positions`` call
+          atomically attaches the TP/SL as *position attributes* (full-row,
+          see ``partial_qty_bracket_exit``).
+        - ``partial_qty_bracket_exit = UNSUPPORTED`` — the bracket is
+          full-row only; a Pine ``strategy.exit(qty=N, from_entry=...)``
+          with ``N`` less than the total entry qty cannot be expressed and
+          the validator rejects such scripts at startup.
+        - ``trailing_stop = NATIVE`` — server-side, points-only via
+          ``trailingStop=true, stopDistance``. Mutually exclusive with
+          ``guaranteedStop``.
+        - ``oca_cancel = SOFTWARE`` — Capital.com has no exchange-side OCA
+          group between independent working orders; the sync engine emits
+          cancels itself when one leg fills. The position-attribute bracket
+          is a separate capability covered by ``tp_sl_bracket``, not OCA.
+        - ``amend_order = PARTIAL_NATIVE`` — ``PUT /workingorders/{id}``
+          and ``PUT /positions/{id}`` amend level / SL / TP / risk flags
+          in-place, but ``size`` is **not** amendable on either endpoint.
+          Size changes need cancel+recreate.
+        - ``cancel_all = UNSUPPORTED`` — no batch endpoint; the runner
+          does not currently surface this capability to scripts.
+        - ``reduce_only = SOFTWARE`` — upheld via the one-way netting
+          model: an opposite-side ``POST /positions`` reduces / closes the
+          existing row instead of opening a counter-leg. Declaring
+          UNSUPPORTED here would break the validator and prevent any
+          script that touches ``strategy.exit`` / ``strategy.close``.
+        - ``watch_orders = SOFTWARE`` — no WebSocket order channel; the
+          plugin emulates one with an AsyncIterator that fuses
+          ``GET /positions`` + ``GET /workingorders`` +
+          ``GET /history/activity`` snapshots. Cadence and backoff live on
+          :class:`CapitalComConfig`.
+        - ``fetch_position = NATIVE`` — ``GET /positions`` returns the
+          live position(s) directly.
+        - ``idempotency = SOFTWARE`` — the server generates the
+          ``dealReference``; the plugin dedups locally using its SQLite
+          store keyed by :attr:`DispatchEnvelope.client_order_id`.
+          Restart-safe recovery is intact; the exchange does not enforce
+          dedup at the API.
         """
         return ExchangeCapabilities(
-            stop_order=True,
-            stop_limit_order=False,
-            trailing_stop=True,
-            tp_sl_bracket=True,
-            tp_sl_bracket_native=True,
-            partial_qty_bracket_exit=False,
-            oca_cancel_native=False,
-            amend_order=True,
-            cancel_all=False,
-            reduce_only=True,
-            watch_orders=True,
-            fetch_position=True,
-            client_id_echo=False,
-            idempotency_native=False,
+            stop_order=CapabilityLevel.NATIVE,
+            stop_limit_order=CapabilityLevel.UNSUPPORTED,
+            trailing_stop=CapabilityLevel.NATIVE,
+            tp_sl_bracket=CapabilityLevel.NATIVE,
+            partial_qty_bracket_exit=CapabilityLevel.UNSUPPORTED,
+            oca_cancel=CapabilityLevel.SOFTWARE,
+            amend_order=CapabilityLevel.PARTIAL_NATIVE,
+            cancel_all=CapabilityLevel.UNSUPPORTED,
+            reduce_only=CapabilityLevel.SOFTWARE,
+            watch_orders=CapabilityLevel.SOFTWARE,
+            fetch_position=CapabilityLevel.NATIVE,
+            idempotency=CapabilityLevel.SOFTWARE,
         )
 
     async def _fetch_market(
