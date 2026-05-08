@@ -23,9 +23,11 @@ from zoneinfo import ZoneInfo
 import httpx
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
+from websockets.exceptions import WebSocketException
 
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
+    BracketAttachAfterFillRejectedError,
     BrokerError,
     BrokerManualInterventionError,
     ExchangeCapabilityError,
@@ -73,7 +75,9 @@ __all__ = [
     'CapitalComConfig',
     'CapitalComError',
     'InvalidStopDistanceError',
+    'InvalidStopMaxValueError',
     'InvalidTakeProfitDistanceError',
+    'InvalidTakeProfitMaxValueError',
     'OrderNotFoundError',
 ]
 
@@ -118,8 +122,10 @@ _AUTH_ERROR_CODES = frozenset({
 
 _NOT_FOUND_DEAL_ID_CODE = 'error.not-found.dealId'
 _NOT_FOUND_DEAL_REF_CODE = 'error.not-found.dealReference'
-_INVALID_STOP_PREFIX = 'error.invalid.stoploss.minvalue'
-_INVALID_TP_PREFIX = 'error.invalid.takeprofit.minvalue'
+_INVALID_STOP_MIN_PREFIX = 'error.invalid.stoploss.minvalue'
+_INVALID_STOP_MAX_PREFIX = 'error.invalid.stoploss.maxvalue'
+_INVALID_TP_MIN_PREFIX = 'error.invalid.takeprofit.minvalue'
+_INVALID_TP_MAX_PREFIX = 'error.invalid.takeprofit.maxvalue'
 _INVALID_LEVERAGE_CODE = 'error.invalid.leverage.value'
 
 # Valid ``on_unexpected_cancel`` policy values — keep in sync with the base
@@ -176,6 +182,46 @@ class InvalidTakeProfitDistanceError(ExchangeOrderRejectedError):
     def __init__(self, message: str, *, min_distance: float) -> None:
         super().__init__(message)
         self.min_distance = min_distance
+
+
+class InvalidStopMaxValueError(ExchangeOrderRejectedError):
+    """Capital.com rejected an order because the requested stop level is
+    on the wrong side of the maximum the instrument's current spread
+    permits.
+
+    Side-aware: a long position's SL must be strictly below the current
+    bid, a short position's SL strictly above the current ask. When the
+    requested level violates that bound the exchange returns
+    ``error.invalid.stoploss.maxvalue: <X>`` where ``X`` is the boundary
+    level (NOT a distance — the absolute price beyond which the SL
+    cannot be placed).
+
+    Distinct from :class:`InvalidStopDistanceError` (which carries a
+    *distance* below the instrument's minimum) — semantically a
+    different problem and a different correction strategy.
+
+    :ivar max_value: The maximum allowed stop level (price, not
+        distance) reported by Capital.com at rejection time.
+    """
+
+    def __init__(self, message: str, *, max_value: float) -> None:
+        super().__init__(message)
+        self.max_value = max_value
+
+
+class InvalidTakeProfitMaxValueError(ExchangeOrderRejectedError):
+    """Capital.com rejected an order because the requested take-profit
+    level violates the maximum the instrument's current spread permits.
+
+    Twin of :class:`InvalidStopMaxValueError` for the profit leg.
+
+    :ivar max_value: The maximum allowed TP level (price, not distance)
+        reported by Capital.com at rejection time.
+    """
+
+    def __init__(self, message: str, *, max_value: float) -> None:
+        super().__init__(message)
+        self.max_value = max_value
 
 
 class OrderNotFoundError(ExchangeOrderRejectedError):
@@ -300,6 +346,45 @@ def _activity_fingerprint(activity: dict) -> str:
         'dateUTC', 'dealId', 'type', 'status', 'source', 'level', 'size',
     ))
     return hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]
+
+
+def _parse_opening_hours_segment(oh: str) -> tuple[time, time] | None:
+    """Parse one Capital.com ``openingHours`` segment into ``(start, end)``.
+
+    Each per-day entry has the shape ``"HH:MM - HH:MM"`` where either side may
+    be ``"00:00"`` to denote midnight (open from / closed at the day boundary).
+    Whitespace around the dash and around the times is optional.
+
+    The two times are returned as :class:`datetime.time` values in the *source*
+    timezone reported by Capital — the caller is responsible for converting
+    them to ``self.timezone``. ``time(0, 0)`` represents midnight on either
+    side; the caller uses that to decide whether to emit a session_start /
+    session_end marker (midnight is the day boundary, not a real transition).
+
+    Returns ``None`` for empty input or any segment that cannot be parsed
+    (closed-day markers, multi-segment lines with stray dashes, malformed
+    time strings) — invalid segments are silently skipped by the caller.
+    """
+    parts = oh.split('-')
+    if len(parts) != 2:
+        return None
+    raw_start = parts[0].strip()
+    raw_end = parts[1].strip()
+    # A bare ``"-"`` (or any segment where one side is empty after
+    # stripping) is a closed-day marker, NOT a 24h session. Defaulting an
+    # empty side to ``time(0, 0)`` would round-trip to ``(00:00, 00:00)``,
+    # which the caller treats as a 24h shape — silently flipping the
+    # market open all day. Both sides must be explicit times; reject
+    # the segment otherwise so the caller's ``parsed is None`` skip
+    # fires.
+    if not raw_start or not raw_end:
+        return None
+    try:
+        start = time.fromisoformat(raw_start)
+        end = time.fromisoformat(raw_end)
+    except ValueError:
+        return None
+    return start, end
 
 
 @dataclass
@@ -478,12 +563,18 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         self._update_queue: asyncio.Queue | None = None
         self._listen_task: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
+        self._feed_watchdog_task: asyncio.Task | None = None
         self._tick_volume: int = 0
         # Latest tick quote snapshot, updated by each ``quote`` event and
         # attached to every OHLCV emitted by ``watch_ohlcv`` so the spinner
         # and the per-bar OHLCV log can show ``bid``, ``ask`` and ``spread``.
         self._last_bid: float | None = None
         self._last_ask: float | None = None
+        # Wall-clock of the last received WS payload (any destination —
+        # ohlc.event, quote, ping pong, etc.). Used by the stale-feed
+        # watchdog: when the connection is TCP-alive but the server stops
+        # streaming market data, this stamp is the only signal we have.
+        self._last_payload_ts: float = 0.0
 
         # Broker state
         self._account_preferences: dict | None = None
@@ -493,6 +584,19 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         # static during a trading session (lot step, min size); the plugin
         # refetches on explicit cache invalidation only.
         self._instrument_rules_cache: dict[str, _InstrumentRules] = {}
+        # Monotonic counter bumped at the start of every :meth:`_poll_once`.
+        # ``_process_activity`` stamps it alongside ``close_event_yielded_at``
+        # so :meth:`_reconcile_snapshot` can tell apart the poll that
+        # *created* the breadcrumb (must keep — same stale snapshot is
+        # what observed the deal alive while ``/history/activity`` had
+        # already reported its close) from a *later* poll where the deal
+        # is still observed alive against a freshly fetched snapshot
+        # (safe to clear — race did not resolve as a full close). Without
+        # this gating the clear runs in the same poll that stamped, which
+        # then routes the next-poll disappearance through
+        # ``missing_pending_since`` and raises a false
+        # :class:`UnexpectedCancelError`.
+        self._current_poll_id: int = 0
 
     # --- REST core ----------------------------------------------------------
 
@@ -634,34 +738,113 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
 
         opening_hours_data = instrument['openingHours']
 
-        def timetz(_t: time, _tz: str) -> time:
-            dt = datetime.now(ZoneInfo(_tz))
-            dt = dt.replace(hour=_t.hour, minute=_t.minute,
-                            second=_t.second, microsecond=_t.microsecond)
-            dt = dt.astimezone(ZoneInfo(self.timezone))
-            return dt.time()
-
         from pynecore.types.weekdays import Weekdays
         tz = opening_hours_data['zone']
         opening_hours = []
         session_starts = []
         session_ends = []
 
+        # Anchor a (source_day, source_time) pair on a real date in the
+        # source tz so the conversion captures BOTH the time-of-day and
+        # the day shift (e.g. Tokyo Mon 09:00 → US/Eastern Sun 19:00).
+        # Returning only ``.time()`` like the previous ``timetz`` helper
+        # silently dropped the day shift and made sessions fire on the
+        # wrong local weekday for any market whose opening hours zone
+        # crosses local midnight against ``self.timezone``.
+        # ``datetime.combine`` with ``ZoneInfo`` resolves DST on the
+        # target date itself, not on ``now()``.
+        def to_local_dt(_t: time, _tz: str, _day_val: int) -> datetime:
+            now_src = datetime.now(ZoneInfo(_tz))
+            target_date = (now_src + timedelta(
+                days=(_day_val - now_src.weekday()) % 7,
+            )).date()
+            src_dt = datetime.combine(target_date, _t, tzinfo=ZoneInfo(_tz))
+            return src_dt.astimezone(ZoneInfo(self.timezone))
+
+        midnight = time(hour=0, minute=0)
         for day in ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']:
             ohs = opening_hours_data[day]
             day_val = Weekdays[day.capitalize()]
             for oh in ohs:
-                oh = oh.replace('00:00', '').strip()
-                if oh.startswith('-'):
-                    t = timetz(time.fromisoformat(oh[2:]), tz)
-                    opening_hours.append(
-                        SymInfoInterval(day=day_val.value, start=time(hour=0, minute=0), end=t))
-                    session_ends.append(SymInfoSession(day=day_val.value, time=t))
-                elif oh.endswith('-'):
-                    t = timetz(time.fromisoformat(oh[:-2]), tz)
-                    opening_hours.append(
-                        SymInfoInterval(day=day_val.value, start=t, end=time(hour=0, minute=0)))
-                    session_starts.append(SymInfoSession(day=day_val.value, time=t))
+                parsed = _parse_opening_hours_segment(oh)
+                if parsed is None:
+                    continue
+                start_raw, end_raw = parsed
+                if start_raw == midnight and end_raw == midnight:
+                    # 24h source-day ("00:00 - 00:00"). PyneCore's
+                    # ``_check_session`` treats ``start == end`` as a zero
+                    # length session and reads the symbol as closed for
+                    # the day, so encode the source day as
+                    # ``00:00 - 23:59:59`` and run it through the same
+                    # TZ-shift + local-midnight split path as a normal
+                    # segment — for crypto/forex the per-source-day
+                    # pieces stitch back into a continuous local week.
+                    start_for_tz = time(0, 0, 0)
+                    end_for_tz = time(23, 59, 59)
+                    emit_start_marker = False
+                    emit_end_marker = False
+                else:
+                    start_for_tz = start_raw
+                    # Midnight in the source zone is the day-boundary
+                    # sentinel: ``"17:00 - 00:00"`` means "open from 17:00
+                    # to end-of-source-day". Treating that 00:00 literally
+                    # would either build a zero-length interval (if the
+                    # sentinel converts to local midnight too) or stretch
+                    # the interval an extra day past the boundary. Encode
+                    # the boundary as ``23:59:59`` of the same source day
+                    # before TZ conversion so the local split at midnight
+                    # behaves identically to a non-sentinel end.
+                    end_for_tz = (time(23, 59, 59) if end_raw == midnight
+                                  else end_raw)
+                    # Markers fire on every real boundary — midnight in
+                    # the source zone is NOT a real boundary (it is a
+                    # day-roll sentinel). A non-midnight source that
+                    # happens to convert to local midnight is still a
+                    # real boundary and emits.
+                    emit_start_marker = start_raw != midnight
+                    emit_end_marker = end_raw != midnight
+
+                start_dt = to_local_dt(start_for_tz, tz, day_val.value)
+                end_dt = to_local_dt(end_for_tz, tz, day_val.value)
+                # Source-side overnight (end <= start in source) — bump
+                # the end into the next source-day before conversion.
+                # Capital.com's per-day openingHours doesn't list this
+                # shape today, but the guard avoids a malformed empty /
+                # negative interval if the encoding ever changes.
+                if end_dt <= start_dt:
+                    end_dt = end_dt + timedelta(days=1)
+
+                if start_dt.date() == end_dt.date():
+                    opening_hours.append(SymInfoInterval(
+                        day=start_dt.weekday(),
+                        start=start_dt.time(),
+                        end=end_dt.time(),
+                    ))
+                else:
+                    # The local interval crosses local midnight — split
+                    # so ``_check_session`` can match candles on both
+                    # local weekdays. Its overnight handling only catches
+                    # post-midnight candles when there is a separate
+                    # ``(next_day, 00:00, …)`` entry to match against.
+                    opening_hours.append(SymInfoInterval(
+                        day=start_dt.weekday(),
+                        start=start_dt.time(),
+                        end=time(23, 59, 59),
+                    ))
+                    opening_hours.append(SymInfoInterval(
+                        day=end_dt.weekday(),
+                        start=time(0, 0, 0),
+                        end=end_dt.time(),
+                    ))
+
+                if emit_start_marker:
+                    session_starts.append(SymInfoSession(
+                        day=start_dt.weekday(), time=start_dt.time(),
+                    ))
+                if emit_end_marker:
+                    session_ends.append(SymInfoSession(
+                        day=end_dt.weekday(), time=end_dt.time(),
+                    ))
 
         dealing_rules = market_details['dealingRules']
         mintick = dealing_rules['minStepDistance']["value"]
@@ -720,17 +903,24 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         now_naive = datetime.now(UTC).replace(tzinfo=None)
 
         try:
-            d = None
+            previous_tf: datetime | None = None
             while tf < tt:
                 if on_progress:
                     on_progress(tf)
+
+                # Stuck-cursor guard: Capital occasionally returns the
+                # same forming bar (or empty payload) and ``tf`` would
+                # oscillate at the same position forever. Bail out
+                # rather than spin — the caller (``run.py`` retry loop /
+                # ``data.py`` bar-count check) decides what to do next.
+                if previous_tf is not None and tf <= previous_tf:
+                    break
+                previous_tf = tf
 
                 res: dict = self.get_historical_prices(time_from=tf, limit=limit or 1000)
                 if not res or not res['prices']:
                     break
                 ps = res['prices']
-                if len(ps) == 1 and d is not None:
-                    break
 
                 for p in ps:
                     t = datetime.fromisoformat(p['snapshotTimeUTC'])
@@ -783,9 +973,6 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     self._last_bar_timestamp = ohlcv.timestamp
                     tf = t + timedelta(minutes=1)
 
-        except CapitalComError:
-            pass
-
         except StopIteration:
             pass
 
@@ -826,13 +1013,29 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         only on bar close.
         """
         assert self._ws is not None and self._update_queue is not None
+        # Bind the queue locally so the sentinel-emit in ``finally``
+        # always targets the queue THIS listener was started against.
+        # If a disconnect/reconnect cycle replaces ``self._update_queue``
+        # before this task's cancellation reaches ``finally``, the old
+        # ``self._update_queue`` reference would point at the NEW
+        # connection's queue and a stale ``None`` would land on it —
+        # ``watch_ohlcv`` would raise ``ConnectionError`` on an
+        # otherwise healthy reconnect. Reading ``self._update_queue``
+        # in the body too keeps the producer/consumer pair pinned for
+        # the lifetime of this listener.
+        queue = self._update_queue
+        # Initialise the stale-feed stamp at the first iteration of the
+        # loop so the watchdog does not fire while we are still in the
+        # subscribe handshake (no market payloads yet by definition).
+        self._last_payload_ts = epoch_time()
         # noinspection PyBroadException
         try:
             async for raw in self._ws:
+                self._last_payload_ts = epoch_time()
                 data = json.loads(raw)
                 dest = data.get("destination", "")
                 if dest == "ohlc.event":
-                    await self._update_queue.put(("ohlc", data.get("payload") or {}))
+                    await queue.put(("ohlc", data.get("payload") or {}))
                 elif dest == "quote":
                     payload = data.get("payload") or {}
                     bid: float | str | None = payload.get("bid")
@@ -842,21 +1045,90 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     if ofr is not None:
                         self._last_ask = float(ofr)
                     self._tick_volume += 1
-                    await self._update_queue.put(("quote", None))
+                    await queue.put(("quote", None))
         except asyncio.CancelledError:
             pass
         except Exception:
-            # Any listener failure (protocol error, JSON decode, socket
-            # drop, ...) must unblock the consumer via a sentinel.
-            if self._update_queue is not None:
-                await self._update_queue.put(None)
+            pass
+        finally:
+            # Live runner reconnect is gated on a ``None`` sentinel in
+            # the listener's queue. Emit it on EVERY exit reason — a
+            # clean close from :meth:`_feed_watchdog_loop` forcing
+            # ``_ws.close()`` ends the ``async for`` normally (no
+            # Exception), so without the ``finally`` the consumer would
+            # be silently stranded. The local ``queue`` binding ensures
+            # the sentinel goes to THIS listener's queue, never to a
+            # successor connection's queue established by a fast
+            # disconnect/reconnect cycle.
+            #
+            # The consumer queue is unbounded, so ``put_nowait`` cannot
+            # fail with ``QueueFull`` — no try/except needed.
+            queue.put_nowait(None)
 
     async def _ping_loop(self) -> None:
-        """Background task: keep the WebSocket session alive."""
+        """Background task: heartbeat the WS session at exchange-grade cadence.
+
+        Two roles in one loop:
+
+        * Session keepalive — Capital.com closes the WS session after
+          10 minutes of inactivity; any application-level ping resets
+          that timer.
+        * Feed-liveness probe — every server pong is routed back
+          through :meth:`_listen_loop`, which stamps
+          :attr:`_last_payload_ts`. With a 5s cadence the watchdog has
+          three pong opportunities inside its 15s staleness window, so
+          a half-open pipe (TCP alive, no market payloads) is forced
+          to reconnect quickly even when the symbol has no fresh
+          ticks.
+        """
         try:
             while True:
-                await asyncio.sleep(540)  # 9 min (session timeout is 10 min)
-                await self._send("ping", correlation_id="ping")
+                await asyncio.sleep(5)
+                try:
+                    await self._send("ping", correlation_id="ping")
+                except (WebSocketException, OSError):
+                    # A failed send already implies the socket is
+                    # going down; let the listener's exit deliver the
+                    # sentinel and the live runner own the reconnect.
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def _feed_watchdog_loop(self) -> None:
+        """Force-reconnect when the WS pipe is silent past the staleness window.
+
+        WS-protocol ping/pong (5s/5s) catches TCP-level drops; the
+        application-level ping/pong (5s in :meth:`_ping_loop`) covers
+        Capital.com's session keepalive AND, more importantly, gives
+        the listener a payload to stamp every 5s even on a quiet
+        symbol. If :attr:`_last_payload_ts` ages beyond
+        ``STALE_THRESHOLD_S`` despite both, the server is talking to
+        us on a dead feed — close the WS so :meth:`_listen_loop`
+        exits, the sentinel reaches ``watch_ohlcv``, and the live
+        runner reconnects.
+        """
+        stale_threshold_s = 15.0
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                if self._last_payload_ts == 0.0:
+                    continue
+                silent_for = epoch_time() - self._last_payload_ts
+                if silent_for <= stale_threshold_s:
+                    continue
+                if self._ws is None or self._ws.close_code is not None:
+                    continue
+                # Reset the stamp BEFORE awaiting the close so a
+                # second pass through the loop doesn't double-fire
+                # while the close is still in flight; the listener's
+                # finally clause delivers the sentinel.
+                self._last_payload_ts = 0.0
+                try:
+                    await self._ws.close(code=4000, reason="feed-stale")
+                except (WebSocketException, OSError):
+                    # Already-broken socket: the listener's finally is
+                    # what guarantees the sentinel anyway.
+                    pass
         except asyncio.CancelledError:
             pass
 
@@ -887,13 +1159,20 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             await self._load_activity_cursor_from_events()
             await self._recover_in_flight_submissions()
 
-        self._ws = await websockets.connect(WS_URL)
+        # WS ping/pong cadence: default `websockets` is 20s/20s = up to
+        # 40s before a half-open connection is dropped. On a 1-minute
+        # strategy that is too coarse — tighten to 5s/5s (≤10s detect)
+        # so a TCP-level outage propagates inside one bar.
+        self._ws = await websockets.connect(
+            WS_URL, ping_interval=5, ping_timeout=5,
+        )
 
         self._update_queue = asyncio.Queue()
         self._tick_volume = 0
 
         self._listen_task = asyncio.create_task(self._listen_loop())
         self._ping_task = asyncio.create_task(self._ping_loop())
+        self._feed_watchdog_task = asyncio.create_task(self._feed_watchdog_loop())
 
         assert self.timeframe is not None and self.symbol is not None
         xchg_tf = self.to_exchange_timeframe(self.timeframe)
@@ -926,6 +1205,9 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         if self._ping_task:
             self._ping_task.cancel()
             self._ping_task = None
+        if self._feed_watchdog_task:
+            self._feed_watchdog_task.cancel()
+            self._feed_watchdog_task = None
         if self._listen_task:
             self._listen_task.cancel()
             self._listen_task = None
@@ -1807,7 +2089,29 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         sl_coid = envelope.client_order_id(KIND_EXIT_SL)
 
         # --- PERSIST-FIRST the TP leg row ---
+        # ``parent_coid`` lets ``_resolve_bracket_leg_disposition`` route
+        # ``record_resolution`` to the same id the engine parked under
+        # (``OrderDispositionUnknownError(client_order_id=target_row.client_order_id)``
+        # below); without it the leg row would only know the parent's
+        # *deal_id*, which is not the engine's park key.
+        #
+        # **Reopen on retry**: when an earlier dispatch on this same
+        # ``DispatchEnvelope`` (run_tag, pine_id, bar_ts_ms, retry_seq)
+        # placed a leg row that was later flipped ``rejected`` and
+        # closed by :meth:`_record_bracket_resolution`, the engine drops
+        # the active intent and re-dispatches on the next sync. If that
+        # retry lands within the same Pine bar the COIDs are identical
+        # (``DispatchEnvelope.client_order_id`` is a pure function of
+        # the envelope), so this upsert hits the existing row but does
+        # not touch ``closed_ts_ms`` — leaving the row invisible to
+        # ``iter_live_orders``, reconcile, and the bracket-deal-id ref
+        # lookup. Mirror the :meth:`modify_exit` reopen pattern: clear
+        # ``closed_ts_ms`` if a prior cycle closed this COID before
+        # writing the live-leg fields.
         if intent.tp_price is not None and self.store_ctx is not None:
+            tp_existing = self.store_ctx.get_order(tp_coid)
+            if tp_existing is not None and tp_existing.closed_ts_ms is not None:
+                self.store_ctx.reopen_order(tp_coid)
             self.store_ctx.upsert_order(
                 tp_coid,
                 symbol=intent.symbol,
@@ -1818,13 +2122,24 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 from_entry=intent.from_entry,
                 pine_entry_id=intent.from_entry,
                 tp_level=intent.tp_price,
-                extras={'leg_kind': 'tp', 'parent_deal_id': deal_id},
+                extras={
+                    'leg_kind': 'tp',
+                    'parent_deal_id': deal_id,
+                    'parent_coid': target_row.client_order_id,
+                },
             )
             self.store_ctx.add_ref(tp_coid, 'bracket_deal_id', deal_id)
 
         has_sl_leg = (intent.sl_price is not None or intent.trail_offset is not None)
         if has_sl_leg and self.store_ctx is not None:
-            sl_extras: dict = {'leg_kind': 'sl', 'parent_deal_id': deal_id}
+            sl_existing = self.store_ctx.get_order(sl_coid)
+            if sl_existing is not None and sl_existing.closed_ts_ms is not None:
+                self.store_ctx.reopen_order(sl_coid)
+            sl_extras: dict = {
+                'leg_kind': 'sl',
+                'parent_deal_id': deal_id,
+                'parent_coid': target_row.client_order_id,
+            }
             if trail_pending:
                 sl_extras['trail_activation_price'] = intent.trail_price
                 sl_extras['trail_offset'] = intent.trail_offset
@@ -1848,19 +2163,167 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         # --- PUT the bracket (skipped entirely when body is empty, e.g.
         # trailing-with-activation only — the activation monitor issues
         # the PUT on the crossing tick) ---
+        #
+        # Failure handling:
+        #   * Network timeout / connection drop: bracket may or may not
+        #     have landed; flip leg rows to ``disposition_unknown`` so the
+        #     reconcile snapshot can promote them, and raise
+        #     :class:`OrderDispositionUnknownError`.  Engine parks the
+        #     intent and re-evaluates next sync.
+        #   * Synchronous broker error / REJECTED confirm: bracket is
+        #     definitely NOT attached.  Roll back the persisted TP/SL
+        #     leg rows (close + audit event) so a restart cannot see a
+        #     stale ``submitted`` protective leg, then raise.
+        # Only legs actually present in the PUT body (TP, fixed SL, or
+        # immediate native trailing) are subject to ambiguous-PUT
+        # recovery. A pending-trail SL leg lives in BrokerStore but the
+        # broker has no knowledge of it yet — flagging it as
+        # ``disposition_unknown`` would route it through
+        # :meth:`_resolve_bracket_leg_disposition`, which can only see
+        # ``trailingStop=True`` on the parent (it isn't yet) and would
+        # therefore wrongly mark the row ``rejected`` and close it.
+        sl_in_body = (
+            intent.sl_price is not None
+            or (intent.trail_offset is not None and not trail_pending)
+        )
         if body:
-            resp = await self._call(
-                f'positions/{deal_id}', data=body, method='put',
-            )
+            try:
+                resp = await self._call(
+                    f'positions/{deal_id}', data=body, method='put',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError) as net:
+                self._mark_bracket_legs_disposition_unknown(
+                    intent=intent, parent_coid=target_row.client_order_id,
+                    deal_id=deal_id,
+                    tp_coid=tp_coid if intent.tp_price is not None else None,
+                    sl_coid=sl_coid if sl_in_body else None,
+                    reason=str(net), stage='put',
+                )
+                # Pending-trail SL was deliberately NOT in the PUT body,
+                # so its disposition is unambiguous: the broker never
+                # heard about it. The post-PUT block that normally
+                # promotes ``submitted`` → ``confirmed`` does not run
+                # because we're about to raise — without this explicit
+                # promote, the row stays as ``submitted`` and (a)
+                # ``_recover_in_flight_submissions`` treats it as an
+                # in-flight broker submission on the next restart, and
+                # (b) ``_trailing_activation_monitor`` may eventually
+                # PUT the activation while the row's ``state`` is still
+                # the pre-PUT placeholder. Confirm it locally now —
+                # the activation monitor owns the row's lifecycle from
+                # here on.
+                if (has_sl_leg and not sl_in_body
+                        and self.store_ctx is not None):
+                    self.store_ctx.set_order_state(sl_coid, 'confirmed')
+                raise OrderDispositionUnknownError(
+                    f"Capital bracket PUT positions/{deal_id} ambiguous: {net}",
+                    client_order_id=target_row.client_order_id,
+                    cause=net if isinstance(net, Exception) else None,
+                ) from net
+            except (CapitalComError, BrokerError) as exc:
+                # `_call` runs `_map_exception` and re-raises 4xx as
+                # mapped subclasses (`ExchangeOrderRejectedError`,
+                # `InvalidStopDistanceError`, `InvalidStopMaxValueError`,
+                # `InvalidTakeProfitDistanceError`,
+                # `InvalidTakeProfitMaxValueError`, `OrderNotFoundError`,
+                # `InsufficientMarginError`, `ExchangeRateLimitError`,
+                # `AuthenticationError`). All of these mean the PUT did
+                # not attach the bracket — roll back the persisted leg
+                # rows. ``ExchangeConnectionError`` cannot reach this
+                # branch because the network ``except`` above already
+                # absorbs it.
+                self._rollback_bracket_legs(
+                    intent=intent, parent_coid=target_row.client_order_id,
+                    deal_id=deal_id,
+                    tp_coid=tp_coid if intent.tp_price is not None else None,
+                    sl_coid=sl_coid if has_sl_leg else None,
+                    reason='put_failed',
+                )
+                # The parent ENTRY is filled and committed; only the
+                # bracket attach failed, so the position is OPEN AND
+                # UNPROTECTED. Surface this distinctly so the sync
+                # engine can dispatch a defensive market close instead
+                # of halting (which would leave the unprotected fill
+                # exposed indefinitely). The original mapped exception
+                # is preserved on ``__cause__`` for log correlation.
+                raise BracketAttachAfterFillRejectedError(
+                    f"Capital bracket attach rejected after entry fill "
+                    f"(deal_id={deal_id}): {exc}",
+                    position_deal_id=deal_id,
+                    position_coid=target_row.client_order_id,
+                    symbol=intent.symbol,
+                    position_side=target_row.side,
+                    qty=target_row.qty,
+                    from_entry=intent.from_entry,
+                ) from exc
+
             new_ref = resp.get('dealReference')
             if new_ref:
-                attach_confirm = await self._call(
-                    f'confirms/{new_ref}', method='get',
-                )
+                try:
+                    attach_confirm = await self._call(
+                        f'confirms/{new_ref}', method='get',
+                    )
+                except (httpx.TimeoutException, httpx.RequestError,
+                        ConnectionError, ExchangeConnectionError,
+                        CapitalComError, BrokerError) as net:
+                    # PUT landed, confirm read failed: state on the
+                    # exchange is unknown until the next /positions
+                    # snapshot reveals the real SL/TP. We catch BOTH
+                    # network/timeout AND mapped broker errors here:
+                    # the PUT already returned a ``dealReference``, so
+                    # the bracket may already be attached — a confirm
+                    # GET that 404s (``OrderNotFoundError``), 429s
+                    # (``ExchangeRateLimitError``) or otherwise lands
+                    # on the mapped-broker-error path is just as
+                    # ambiguous as a network timeout. Without this
+                    # branch the persisted TP/SL rows would stay in
+                    # ``submitted`` with no ``OrderDispositionUnknownError``
+                    # park record, so :meth:`_resolve_bracket_leg_disposition`
+                    # would never get a chance to promote or reject
+                    # them — leaving an orphan that can only be cleaned
+                    # up manually.
+                    self._mark_bracket_legs_disposition_unknown(
+                        intent=intent, parent_coid=target_row.client_order_id,
+                        deal_id=deal_id,
+                        tp_coid=tp_coid if intent.tp_price is not None else None,
+                        sl_coid=sl_coid if sl_in_body else None,
+                        reason=str(net), stage='confirm',
+                        deal_reference=new_ref,
+                    )
+                    # Same reasoning as the PUT-timeout path above —
+                    # pending-trail SL is purely local; promote it to
+                    # ``confirmed`` so the activation monitor + recovery
+                    # see a coherent state.
+                    if (has_sl_leg and not sl_in_body
+                            and self.store_ctx is not None):
+                        self.store_ctx.set_order_state(sl_coid, 'confirmed')
+                    raise OrderDispositionUnknownError(
+                        f"Capital bracket confirm {new_ref} ambiguous: {net}",
+                        client_order_id=target_row.client_order_id,
+                        cause=net if isinstance(net, Exception) else None,
+                    ) from net
                 if (attach_confirm.get('dealStatus') or '').upper() == 'REJECTED':
                     reason = attach_confirm.get('reason') or 'unknown'
-                    raise ExchangeOrderRejectedError(
-                        f"Capital bracket attach REJECTED: {reason}",
+                    self._rollback_bracket_legs(
+                        intent=intent, parent_coid=target_row.client_order_id,
+                        deal_id=deal_id,
+                        tp_coid=tp_coid if intent.tp_price is not None else None,
+                        sl_coid=sl_coid if has_sl_leg else None,
+                        reason=reason,
+                    )
+                    # See the put_failed branch above — same unprotected
+                    # position semantics, raised distinctly so the sync
+                    # engine triggers a defensive close.
+                    raise BracketAttachAfterFillRejectedError(
+                        f"Capital bracket attach REJECTED after entry fill "
+                        f"(deal_id={deal_id}): {reason}",
+                        position_deal_id=deal_id,
+                        position_coid=target_row.client_order_id,
+                        symbol=intent.symbol,
+                        position_side=target_row.side,
+                        qty=target_row.qty,
+                        from_entry=intent.from_entry,
                     )
 
         # --- Mark legs confirmed + persist risk on entry row ---
@@ -2487,45 +2950,941 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 rules, mid_price, float(new_i.tp_price),
             )
 
+        # Pine ``trail_price`` + ``trail_offset`` defers native trailing
+        # until the activation monitor sees the threshold crossed. The
+        # PUT must NOT include ``trailingStop`` in that case — the leg
+        # row is persisted in ``pending`` state below and the activation
+        # monitor issues its own PUT later.
+        trail_pending = (
+            new_i.trail_offset is not None and new_i.trail_price is not None
+        )
         body: dict = {}
         if new_i.tp_price is not None:
             body['profitLevel'] = float(new_i.tp_price)
+        elif old_i.tp_price is not None:
+            # TP removal: Capital.com preserves any field NOT mentioned
+            # in the PUT, so without this explicit null the old
+            # ``profitLevel`` stays live on the position even though
+            # BrokerStore / ``_active_intents`` no longer carry the
+            # TP — the position could later close at a stale level the
+            # engine believes was removed. Mirrors the cancel-bracket-leg
+            # flow's ``profitLevel: null`` clear (see ``execute_cancel``).
+            body['profitLevel'] = None
         if new_i.sl_price is not None:
             body['stopLevel'] = float(new_i.sl_price)
-        if new_i.trail_offset is not None and new_i.trail_price is None:
+        elif (old_i.sl_price is not None
+                and new_i.trail_offset is None):
+            # Fixed SL removal: Capital.com preserves any field NOT
+            # mentioned in the PUT, so without this explicit null the
+            # old ``stopLevel`` stays live on the position even though
+            # BrokerStore / ``_active_intents`` no longer carry the
+            # SL — the position could later close at a stale level the
+            # engine believes was removed. Mirrors the TP-removal
+            # explicit clear above and ``execute_cancel``'s
+            # ``stopLevel: null`` flow. The ``trail_offset is None``
+            # guard avoids a redundant clear on the fixed-SL → trailing
+            # transition: ``trailingStop=True`` + ``stopDistance``
+            # below replace the prior fixed stop atomically.
+            body['stopLevel'] = None
+        if new_i.trail_offset is not None and not trail_pending:
             body['trailingStop'] = True
             body['stopDistance'] = float(new_i.trail_offset)
-        if not body:
+        elif (old_i.trail_offset is not None
+                and old_i.trail_price is None
+                and new_i.trail_offset is None):
+            # Native-trailing removal: Capital.com keeps the prior
+            # ``trailingStop`` flag active unless we explicitly clear it
+            # in the PUT body. Covers both transitions:
+            #   * trail → fixed SL: without this branch the broker keeps
+            #     trailing while the leg row records a fixed stop —
+            #     :meth:`_activity_to_event` would classify the fill as
+            #     ``LegType.STOP_LOSS`` even though the exchange ran a
+            #     trailing stop, mispricing the close.
+            #   * trail → no stop at all (e.g. ``TP+trail`` → ``TP``):
+            #     the broker would silently keep trailing while local
+            #     state shows the position unprotected, leaving live
+            #     risk active that the engine no longer tracks.
+            body['trailingStop'] = False
+        if trail_pending and (
+                old_i.sl_price is not None
+                or (old_i.trail_offset is not None
+                    and old_i.trail_price is None)):
+            # Transitioning to pending trailing from a broker-side
+            # active stop (fixed SL or immediate native trailing).
+            # Capital.com preserves any field NOT mentioned in the PUT,
+            # so the prior protective leg would stay live while
+            # BrokerStore is rewritten as ``trail_state='pending'`` —
+            # the position would close at the OLD stop before Pine's
+            # activation price is reached. Send an explicit clear:
+            # ``stopLevel: null`` removes the fixed stop (matches the
+            # cancel-bracket-leg flow), and ``trailingStop: false``
+            # disables the native trailing flag if it was set. We only
+            # null out ``stopLevel`` when the new intent did not also
+            # specify a fixed SL (defensive — Pine's pending trail and
+            # a fixed SL are mutually exclusive in practice).
+            if new_i.sl_price is None:
+                body['stopLevel'] = None
+            body['trailingStop'] = False
+        # Persist pending-trail SL legs even when the PUT body is empty
+        # (e.g. amend that adds only ``trail_price`` + ``trail_offset``):
+        # the activation monitor needs the row, and skipping it here
+        # would leave the position protected only by whatever the broker
+        # already had.
+        needs_persist = (
+            new_i.tp_price is not None
+            or new_i.sl_price is not None
+            or new_i.trail_offset is not None
+        )
+        # Pending-trail-only old exit + empty new exit: the body is
+        # empty (the prior leg was purely local — no broker stop to
+        # actively clear in the PUT) and ``needs_persist`` is False
+        # (the new intent has no leg to seed), but the previously
+        # ``confirmed`` SL row still carries ``trail_state='pending'``
+        # in extras. ``_trailing_activation_monitor`` would later PUT
+        # ``trailingStop=true`` against that stale row when the
+        # threshold crossed — actively attaching a stop Pine has
+        # already removed. The leg retirement branch below handles
+        # all three SL shapes (fixed SL, immediate native trail,
+        # pending trail), but only fires once we get past this early
+        # return. The other two shapes naturally populate ``body``
+        # (``stopLevel: None`` / ``trailingStop: false``), so the
+        # gap is specific to pending-trail-only.
+        needs_pending_trail_retire = (
+            old_i.trail_offset is not None
+            and old_i.trail_price is not None
+            and new_i.tp_price is None
+            and new_i.sl_price is None
+            and new_i.trail_offset is None
+        )
+        if not body and not needs_persist and not needs_pending_trail_retire:
             return []
 
-        resp = await self._call(
-            f'positions/{target_row.exchange_order_id}',
-            data=body, method='put',
+        deal_id = target_row.exchange_order_id
+        tp_coid = new.client_order_id(KIND_EXIT_TP)
+        sl_coid = new.client_order_id(KIND_EXIT_SL)
+        # Existing leg rows for the parent — marked ``disposition_unknown``
+        # below if the PUT or confirm GET goes ambiguous, so the snapshot
+        # reconcile path (:meth:`_resolve_bracket_leg_disposition`) can
+        # promote them to attached/closed against the next /positions
+        # poll. ``_find_bracket_leg_row`` returns the *current* live row
+        # under the parent dealId and leg_kind, which is what we have
+        # to flip — the ``new``-envelope coid may not match the live
+        # row's coid (different bar / different envelope identity).
+        existing_tp = self._find_bracket_leg_row(target_row, 'tp')
+        existing_sl = self._find_bracket_leg_row(target_row, 'sl')
+        # When an existing leg is found, it owns the live row — keep
+        # working under THAT row's COID so the post-PUT mirror UPDATEs
+        # the same row instead of inserting a duplicate keyed by the
+        # new envelope's COID. ``DispatchEnvelope.client_order_id`` is a
+        # pure function of the envelope, so a later-bar amend produces
+        # a different ``tp_coid``/``sl_coid`` than the original attach
+        # used. Without this redirection ``get_order(tp_coid)`` would
+        # miss the live leg, the INSERT branch would create a second
+        # live TP row, and ``_find_bracket_leg_row`` could later return
+        # the stale one — mispricing fills.
+        effective_tp_coid = (
+            existing_tp.client_order_id if existing_tp is not None else tp_coid
         )
-        new_ref = resp.get('dealReference')
-        if new_ref:
-            await self._call(f'confirms/{new_ref}', method='get')
+        effective_sl_coid = (
+            existing_sl.client_order_id if existing_sl is not None else sl_coid
+        )
+        # TP-removal symmetry: when the PUT actively clears the broker-
+        # side TP (``profitLevel: None`` set above), the same ambiguous-
+        # outcome handling applies as for an attach. Without flipping
+        # the existing TP row to ``disposition_unknown`` on PUT/confirm
+        # timeout, ``_resolve_bracket_leg_disposition`` would have no
+        # row to reconcile against the parent's actual ``profitLevel``
+        # — the engine raises ``OrderDispositionUnknownError`` and parks
+        # the dispatch, but the leg row stays ``confirmed`` with the
+        # OLD ``tp_level`` forever, leaving a phantom TP visible to
+        # ``_find_bracket_leg_row`` and natural-close bookkeeping. If
+        # the broker did apply the clear, the phantom is plain wrong;
+        # if it did not, the leg is still attached and the row should
+        # be promoted back to ``confirmed``. The reconciler decides by
+        # comparing ``row.tp_level`` against the parent's live
+        # ``profitLevel`` — but only for ``disposition_unknown`` rows.
+        clears_broker_tp = (
+            old_i.tp_price is not None and new_i.tp_price is None
+        )
+        ambiguous_tp_coid = (
+            effective_tp_coid
+            if (new_i.tp_price is not None
+                or (clears_broker_tp and existing_tp is not None))
+            else None
+        )
+        # Pending-trail SL is purely local until the activation monitor
+        # PUTs it, so the broker has no leg to flip — exclude it from
+        # ambiguous recovery (otherwise the snapshot reconcile would
+        # see ``trailingStop=False`` on the parent and wrongly mark the
+        # row rejected).
+        sl_in_body = (
+            new_i.sl_price is not None
+            or (new_i.trail_offset is not None and not trail_pending)
+        )
+        # Exception: a fixed/native-active → pending-trail transition has
+        # ``sl_in_body=False`` (the new pending-trail leg is purely local)
+        # but the PUT body still ACTIVELY CLEARS the broker-side stop
+        # (``stopLevel=None`` / ``trailingStop=False`` set above). If that
+        # PUT or its confirm times out after Capital.com applied the clear,
+        # the existing SL leg row would stay ``confirmed`` in BrokerStore
+        # forever — the snapshot reconcile only visits ``disposition_unknown``
+        # rows, so the local state would silently keep showing a protective
+        # leg the broker has dropped, leaving the position unprotected.
+        # Flip the existing live SL row into ambiguous recovery for that
+        # transition: ``_resolve_bracket_leg_disposition`` then compares
+        # the row's prior level against the broker's actual ``stopLevel`` /
+        # ``trailingStop`` — broker cleared → mismatch → ``rejected`` →
+        # engine re-dispatches; broker did not get the PUT → match →
+        # ``attached`` → row preserved.
+        sl_clears_broker_active = trail_pending and (
+            old_i.sl_price is not None
+            or (old_i.trail_offset is not None and old_i.trail_price is None)
+        )
+        # Fixed-SL removal symmetry with the TP-clear case above. The
+        # PUT body now carries ``stopLevel: None`` (added above) when
+        # an existing fixed SL is removed without a trailing
+        # replacement — same ambiguous-outcome reasoning. Pending-trail
+        # is excluded from the SL-clear set: an old pending-trail leg
+        # was purely local (``_trailing_activation_monitor`` had not
+        # PUT it yet), so the broker has no leg to ambiguously flip.
+        # An old immediate native trailing ALSO carries
+        # ``trailingStop: false`` in the body (set in the
+        # native-trailing removal branch above), so it counts as a
+        # broker-side clear here.
+        sl_clears_broker_no_replacement = (
+            new_i.sl_price is None
+            and new_i.trail_offset is None
+            and (
+                old_i.sl_price is not None
+                or (old_i.trail_offset is not None
+                    and old_i.trail_price is None)
+            )
+        )
+        ambiguous_sl_coid = (
+            effective_sl_coid
+            if sl_in_body
+            or (sl_clears_broker_active and existing_sl is not None)
+            or (sl_clears_broker_no_replacement and existing_sl is not None)
+            else None
+        )
 
+        # Bind narrowed locals so the seed helper below has stable types
+        # without re-asserting (closures don't carry narrowing).
+        store_ctx = self.store_ctx
+        seed_intent: ExitIntent = new_i
+        seed_target: 'OrderRow' = target_row
+
+        def _seed_added_legs_disposition_unknown() -> None:
+            """Seed leg rows for newly-added (not pre-existing) legs.
+
+            ``modify_exit`` mirrors leg state AFTER the PUT, unlike
+            ``execute_exit`` which persist-firsts. When the amend ADDs a
+            leg that had no prior row, the ambiguous-PUT/confirm path has
+            nothing to flip — the next snapshot reconcile would have no
+            row to compare against the parent ``profitLevel`` /
+            ``stopLevel`` and the broker-attached new leg would stay
+            invisible to BrokerStore. Pre-seed those rows here in
+            ``disposition_unknown`` so the reconcile snapshot owns
+            promotion or rejection.
+
+            Closed-row case: a previous attach for the same envelope
+            could have closed the row (e.g. ``_rollback_bracket_legs``
+            on a prior synchronous REJECTED, or a ``not_attached``
+            resolution from an earlier ambiguous round). ``upsert_order``
+            only updates fields and leaves ``closed_ts_ms`` set, so
+            ``iter_live_orders`` would keep skipping the row and the
+            snapshot reconcile would never resolve the parked dispatch.
+            Treat closed rows as absent: reopen first, then upsert.
+            Mirrors the post-PUT mirror's closed-row guard.
+            """
+            if store_ctx is None:
+                return
+            if seed_intent.tp_price is not None and existing_tp is None:
+                tp_existing = store_ctx.get_order(tp_coid)
+                if tp_existing is not None and tp_existing.closed_ts_ms is not None:
+                    store_ctx.reopen_order(tp_coid)
+                store_ctx.upsert_order(
+                    tp_coid,
+                    symbol=seed_intent.symbol,
+                    side=seed_intent.side,
+                    qty=seed_target.qty,
+                    state='disposition_unknown',
+                    intent_key=seed_intent.intent_key + '\0TP',
+                    from_entry=seed_intent.from_entry,
+                    pine_entry_id=seed_intent.from_entry,
+                    tp_level=float(seed_intent.tp_price),
+                    extras={
+                        'leg_kind': 'tp',
+                        'parent_deal_id': deal_id,
+                        'parent_coid': seed_target.client_order_id,
+                    },
+                )
+                store_ctx.add_ref(tp_coid, 'bracket_deal_id', deal_id)
+            if sl_in_body and existing_sl is None:
+                sl_existing = store_ctx.get_order(sl_coid)
+                if sl_existing is not None and sl_existing.closed_ts_ms is not None:
+                    store_ctx.reopen_order(sl_coid)
+                store_ctx.upsert_order(
+                    sl_coid,
+                    symbol=seed_intent.symbol,
+                    side=seed_intent.side,
+                    qty=seed_target.qty,
+                    state='disposition_unknown',
+                    intent_key=seed_intent.intent_key + '\0SL',
+                    from_entry=seed_intent.from_entry,
+                    pine_entry_id=seed_intent.from_entry,
+                    sl_level=(float(seed_intent.sl_price)
+                              if seed_intent.sl_price is not None else None),
+                    trailing_distance=(float(seed_intent.trail_offset)
+                                       if seed_intent.trail_offset is not None else None),
+                    trailing_stop=(
+                        seed_intent.trail_offset is not None and not trail_pending
+                    ),
+                    extras={
+                        'leg_kind': 'sl',
+                        'parent_deal_id': deal_id,
+                        'parent_coid': seed_target.client_order_id,
+                    },
+                )
+                store_ctx.add_ref(sl_coid, 'bracket_deal_id', deal_id)
+            elif (
+                trail_pending
+                and existing_sl is None
+                and seed_intent.trail_offset is not None
+                and seed_intent.trail_price is not None
+            ):
+                # Pending-trail SL is purely local — the activation
+                # monitor PUTs it later when the threshold is crossed —
+                # so it never appears in the PUT body and ``sl_in_body``
+                # is False. But on an ambiguous PUT/confirm path the
+                # exception unwinds BEFORE the post-PUT mirror inserts
+                # this row. Without persisting it here the row never
+                # exists: ``_trailing_activation_monitor`` has nothing
+                # to activate (its only gate is
+                # ``extras['trail_state'] in ('pending', 'activating')``)
+                # and the engine, after resolving any other ambiguous
+                # leg as ``attached``, leaves ``_active_intents`` with
+                # the new pending-trail intent and considers the
+                # dispatch done — the position is silently left
+                # without the requested trailing protection.
+                #
+                # Persist with ``state='confirmed'`` (NOT
+                # ``disposition_unknown``): the broker has no leg to
+                # resolve here — the pending-trail row is a local
+                # bookkeeping anchor for the activation monitor, and
+                # ``_resolve_bracket_leg_disposition`` would see
+                # ``trailingStop=False`` on the parent and wrongly mark
+                # this row rejected. The ambiguous PUT path covers any
+                # OTHER leg in the same body via ``ambiguous_*_coid``;
+                # the pending-trail leg just needs to exist.
+                pending_extras: dict = {
+                    'leg_kind': 'sl',
+                    'parent_deal_id': deal_id,
+                    'parent_coid': seed_target.client_order_id,
+                    'trail_activation_price': seed_intent.trail_price,
+                    'trail_offset': seed_intent.trail_offset,
+                    'trail_state': 'pending',
+                }
+                pending_existing = store_ctx.get_order(sl_coid)
+                if (pending_existing is not None
+                        and pending_existing.closed_ts_ms is not None):
+                    store_ctx.reopen_order(sl_coid)
+                store_ctx.upsert_order(
+                    sl_coid,
+                    symbol=seed_intent.symbol,
+                    side=seed_intent.side,
+                    qty=seed_target.qty,
+                    state='confirmed',
+                    intent_key=seed_intent.intent_key + '\0SL',
+                    from_entry=seed_intent.from_entry,
+                    pine_entry_id=seed_intent.from_entry,
+                    sl_level=None,
+                    trailing_distance=float(seed_intent.trail_offset),
+                    trailing_stop=False,
+                    extras=pending_extras,
+                )
+                store_ctx.add_ref(sl_coid, 'bracket_deal_id', deal_id)
+
+        def _mark_existing_sl_force_rejected_on_pending_trail() -> None:
+            """Stamp ``force_disposition_rejected`` on the existing SL row.
+
+            Background: when the amend transitions an existing
+            broker-active SL (fixed or immediate native trail) into a
+            pending-trail, the PUT body actively clears the broker-side
+            stop. Marking the existing SL row as ``disposition_unknown``
+            alone is NOT enough — :meth:`_resolve_bracket_leg_disposition`
+            compares the row's OLD ``sl_level`` / ``trailing_distance``
+            against the parent's actual ``stopLevel`` / ``trailingStop``,
+            which only tells us whether the broker applied the clear. It
+            does NOT tell us whether the new pending-trail intent was
+            satisfied, because the pending-trail leg is purely local
+            (the activation monitor PUTs it later).
+
+            Concrete failure mode without this marker: Capital.com did
+            NOT apply the PUT (timeout before reaching the broker), so
+            the old stop is still live. Reconcile sees row.sl_level ==
+            parent.stopLevel → ``attached`` → records resolution
+            ``'attached'`` for the parent COID. The engine clears the
+            modify park but keeps ``_active_intents[key]`` at the new
+            pending-trail intent, considers the dispatch done, and
+            never retries. Local intent diverges from broker risk:
+            BrokerStore says pending-trail, broker has the old fixed
+            stop.
+
+            Fix: force the resolver to record ``'rejected'`` for this
+            transition regardless of broker comparison. Engine sees
+            ``kind_is_modify=True`` and the modify-rejected branch
+            restores ``_active_intents[key]`` from the pre-modify
+            snapshot, keeps ``_order_mapping`` (live original entry
+            order), drops the envelope. Next sync's
+            ``_diff_and_dispatch`` sees Pine new ≠ active old and calls
+            ``_dispatch_modify`` → ``modify_exit(old, new)`` runs again.
+            The retry's ``existing_sl`` lookup now returns ``None`` (the
+            row was closed by the resolver), so the body adds the
+            explicit ``stopLevel=None`` / ``trailingStop=False`` clear
+            (driven by ``old_i`` carrying the prior broker-active stop)
+            and the post-PUT mirror inserts a fresh pending-trail row.
+
+            The marker only kicks in on this specific transition; it
+            does NOT touch rows whose new intent reuses an active
+            broker leg type (those still resolve via level comparison).
+            """
+            if (self.store_ctx is None
+                    or not sl_clears_broker_active
+                    or existing_sl is None):
+                return
+            existing_extras = dict(existing_sl.extras or {})
+            existing_extras['force_disposition_rejected'] = True
+            self.store_ctx.upsert_order(
+                existing_sl.client_order_id,
+                extras=existing_extras,
+            )
+
+        def _persist_existing_legs_attempted_target() -> None:
+            """Refresh existing leg rows to the attempted new target.
+
+            Background: ``_mark_bracket_legs_disposition_unknown`` only
+            flips ``state='disposition_unknown'``; it does NOT update
+            ``tp_level`` / ``sl_level`` / ``trailing_distance`` /
+            ``trailing_stop``. The next ``_resolve_bracket_leg_disposition``
+            then compares the row's stale OLD level against the broker's
+            actual ``profitLevel`` / ``stopLevel`` / ``stopDistance``,
+            so a PUT that never reached Capital.com (broker still has
+            the old level) looks like ``attached`` because old == old —
+            the engine then clears the modify park while
+            ``_active_intents[key]`` already advanced to the new intent,
+            leaving the engine convinced the change landed while the
+            broker silently kept the prior risk level (or kept a
+            previously-removed leg when the modify was a clear).
+
+            Fix: write the new intent's target onto the existing leg row
+            BEFORE flipping it to ``disposition_unknown``. The resolver
+            then compares the attempted target against broker:
+              * Broker applied → match → ``'attached'`` (correct: row
+                already reflects the new state).
+              * Broker NOT applied → mismatch → ``'rejected'`` → engine
+                restores pre-modify ``_active_intents`` and re-dispatches
+                ``modify_exit`` next sync, eventually consistent.
+
+            For clears (new field is ``None``), ``_levels_match(None, *)``
+            always returns False, so the resolver always records
+            ``'rejected'`` even when the broker successfully applied the
+            clear — one wasted retry round-trip but no desync. The
+            alternative (special-casing None==None in the resolver) adds
+            edge cases without buying meaningful efficiency.
+
+            Pending-trail target transitions are short-circuited to
+            ``'rejected'`` by ``force_disposition_rejected`` (set above)
+            regardless of the level update, so the level fields written
+            here are inert for that path — but writing them keeps the
+            BrokerStore risk snapshot truthful.
+
+            Pending-trail extras (``trail_state`` /
+            ``trail_activation_price`` / ``trail_offset``) are dropped
+            from the existing SL row whenever the new intent is NOT
+            pending-trail. Without this, a transition out of pending
+            (e.g. pending-trail → fixed SL) that resolves as
+            ``'attached'`` would leave the row ``state='confirmed'``
+            with ``trail_state='pending'`` still in extras, and
+            ``_trailing_activation_monitor`` would later PUT a trailing
+            stop against a row whose attempted target was a fixed stop.
+            """
+            if self.store_ctx is None:
+                return
+            if existing_tp is not None:
+                self.store_ctx.upsert_order(
+                    existing_tp.client_order_id,
+                    tp_level=(float(new_i.tp_price)
+                              if new_i.tp_price is not None else None),
+                )
+            if existing_sl is not None:
+                # Read the row DB-fresh: an earlier helper
+                # (``_mark_existing_sl_force_rejected_on_pending_trail``)
+                # may have just stamped ``force_disposition_rejected``
+                # into extras; the in-memory ``existing_sl`` snapshot
+                # was captured before that write and would clobber the
+                # marker if used as the merge base.
+                cur = self.store_ctx.get_order(existing_sl.client_order_id)
+                cur_extras = dict((cur.extras if cur is not None else None) or {})
+                new_is_pending_trail = (
+                    new_i.trail_offset is not None
+                    and new_i.trail_price is not None
+                )
+                if not new_is_pending_trail:
+                    for key in (
+                            'trail_state',
+                            'trail_activation_price',
+                            'trail_offset',
+                    ):
+                        cur_extras.pop(key, None)
+                self.store_ctx.upsert_order(
+                    existing_sl.client_order_id,
+                    sl_level=(float(new_i.sl_price)
+                              if new_i.sl_price is not None else None),
+                    trailing_distance=(float(new_i.trail_offset)
+                                       if new_i.trail_offset is not None else None),
+                    trailing_stop=(
+                        new_i.trail_offset is not None and not trail_pending
+                    ),
+                    extras=cur_extras,
+                )
+
+        if body:
+            try:
+                resp = await self._call(
+                    f'positions/{target_row.exchange_order_id}',
+                    data=body, method='put',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError) as net:
+                # PUT outcome ambiguous: Capital.com may have already
+                # applied the amend (cleared ``stopLevel`` / flipped
+                # ``trailingStop`` for a pending-trail transition) while
+                # BrokerStore still shows the old leg state. Without
+                # this branch the leg rows stay pristine and the engine
+                # gets a raw network error, leaving the position
+                # unprotected/unmanaged until manual intervention. Flip
+                # the existing legs to ``disposition_unknown`` so the
+                # next ``_reconcile_snapshot`` resolves them against the
+                # broker's authoritative state, and raise the parked
+                # disposition error so the engine retries the dispatch.
+                _seed_added_legs_disposition_unknown()
+                _mark_existing_sl_force_rejected_on_pending_trail()
+                _persist_existing_legs_attempted_target()
+                self._mark_bracket_legs_disposition_unknown(
+                    intent=new_i, parent_coid=target_row.client_order_id,
+                    deal_id=deal_id,
+                    tp_coid=ambiguous_tp_coid,
+                    sl_coid=ambiguous_sl_coid,
+                    reason=str(net), stage='put',
+                )
+                raise OrderDispositionUnknownError(
+                    f"Capital modify_exit PUT positions/{deal_id} "
+                    f"ambiguous: {net}",
+                    client_order_id=target_row.client_order_id,
+                    cause=net if isinstance(net, Exception) else None,
+                ) from net
+            new_ref = resp.get('dealReference')
+            if new_ref:
+                try:
+                    modify_confirm = await self._call(
+                        f'confirms/{new_ref}', method='get',
+                    )
+                except (httpx.TimeoutException, httpx.RequestError,
+                        ConnectionError, ExchangeConnectionError,
+                        CapitalComError, BrokerError) as net:
+                    # PUT landed (got a dealReference) but confirm read
+                    # failed — same ambiguity as the PUT-timeout branch.
+                    # Mapped broker errors (404 OrderNotFoundError, 429
+                    # ExchangeRateLimitError, etc.) on the confirm GET
+                    # are treated identically to network failures here:
+                    # the broker may already have applied the amend, so
+                    # we cannot persist new leg state and we cannot
+                    # claim the old state is intact either. Mirror
+                    # :meth:`execute_exit`'s confirm-error path.
+                    _seed_added_legs_disposition_unknown()
+                    _mark_existing_sl_force_rejected_on_pending_trail()
+                    _persist_existing_legs_attempted_target()
+                    self._mark_bracket_legs_disposition_unknown(
+                        intent=new_i, parent_coid=target_row.client_order_id,
+                        deal_id=deal_id,
+                        tp_coid=ambiguous_tp_coid,
+                        sl_coid=ambiguous_sl_coid,
+                        reason=str(net), stage='confirm',
+                        deal_reference=new_ref,
+                    )
+                    raise OrderDispositionUnknownError(
+                        f"Capital modify_exit confirm {new_ref} "
+                        f"ambiguous: {net}",
+                        client_order_id=target_row.client_order_id,
+                        cause=net if isinstance(net, Exception) else None,
+                    ) from net
+                # ``dealStatus='REJECTED'`` means Capital.com refused the
+                # amend (e.g. SL/TP outside the live spread, attach
+                # constraint violation while adding a fresh leg). The
+                # PUT returns 200 with a dealReference regardless — the
+                # rejection only surfaces in the confirm payload. Without
+                # this guard the code below would persist the new TP/SL
+                # leg rows as ``state='confirmed'`` even though the
+                # broker kept the previous bracket state, leaving
+                # BrokerStore showing a protective leg that does not
+                # exist on the exchange. Mirror :meth:`execute_exit`'s
+                # bracket-attach REJECTED branch: bail before any state
+                # mutation. No rollback is needed here — none of the
+                # store mutations below have run yet, and Capital.com
+                # has retained whatever risk levels were active before
+                # the rejected PUT.
+                if (modify_confirm.get('dealStatus') or '').upper() == 'REJECTED':
+                    reason = modify_confirm.get('reason') or 'unknown'
+                    if self.store_ctx is not None:
+                        self.store_ctx.log_event(
+                            'modify_exit_rejected',
+                            client_order_id=target_row.client_order_id,
+                            exchange_order_id=target_row.exchange_order_id,
+                            intent_key=new_i.intent_key,
+                            payload={'reason': reason,
+                                     'tp': new_i.tp_price,
+                                     'sl': new_i.sl_price,
+                                     'trail_offset': new_i.trail_offset},
+                        )
+                    raise ExchangeOrderRejectedError(
+                        f"Capital position amend REJECTED: {reason}",
+                    )
         if self.store_ctx is not None:
+            # ``trailing_stop`` MUST be passed even when False, otherwise
+            # ``set_risk`` treats ``None`` as "no change" and a prior
+            # ``True`` survives the amend. The native-trailing → fixed-SL
+            # transition (``old_i.trail_offset is not None`` /
+            # ``new_i.trail_offset is None`` / ``new_i.sl_price is not None``)
+            # would then leave ``row.trailing_stop=True`` on the parent
+            # entry: Capital fires the SL fill activity against the
+            # entry's dealId, :meth:`_activity_to_event` reads
+            # ``row.trailing_stop`` from THAT row, and would emit
+            # :class:`LegType.TRAILING_STOP` for what the broker
+            # actually executed as a fixed stop — desyncing fill
+            # classification. Use the same formula
+            # :meth:`execute_exit` uses (``trail_pending=False`` means
+            # the native trailing is broker-active right now).
             self.store_ctx.set_risk(
                 target_row.client_order_id,
                 sl=new_i.sl_price, tp=new_i.tp_price,
                 trailing_distance=new_i.trail_offset,
+                trailing_stop=(
+                    new_i.trail_offset is not None and not trail_pending
+                ),
             )
+            # Removal-amend clears: ``set_risk`` treats ``None`` as
+            # "leave unchanged" (see :meth:`RunContext.set_risk` —
+            # explicitly documented), so an amend that REMOVES a
+            # protective leg leaves the parent entry row's stale
+            # ``tp_level`` / ``sl_level`` / ``trailing_distance`` in
+            # BrokerStore. The PUT body already cleared the broker
+            # side (``profitLevel: None`` / ``stopLevel: None`` /
+            # ``trailingStop: False``) and the leg rows have been
+            # retired below, but without these explicit ``None``
+            # writes BrokerStore's durable risk snapshot diverges
+            # from Capital.com — misleading later debug / analytics
+            # readers and any future diff/recovery code that walks
+            # the entry row's risk columns. ``upsert_order`` writes
+            # any field it finds in ``**fields``, so passing
+            # ``tp_level=None`` etc. lands a SQL ``NULL`` (the
+            # ``set_risk`` filter that drops ``None`` is the only
+            # reason a direct call is needed).
+            risk_clears: dict[str, float | None] = {}
+            if old_i.tp_price is not None and new_i.tp_price is None:
+                risk_clears['tp_level'] = None
+            if old_i.sl_price is not None and new_i.sl_price is None:
+                risk_clears['sl_level'] = None
+            if (old_i.trail_offset is not None
+                    and new_i.trail_offset is None):
+                risk_clears['trailing_distance'] = None
+            if risk_clears:
+                self.store_ctx.upsert_order(
+                    target_row.client_order_id, **risk_clears,
+                )
+            # Mirror the new TP/SL onto the bracket leg rows. The entry
+            # row's risk fields drive ``modify_exit`` lookups; the leg
+            # rows' ``tp_level`` / ``sl_level`` drive the closing-leg
+            # fill-price fallback in :meth:`_activity_to_event` (Capital
+            # occasionally returns the close activity with ``level=0``).
+            # Without this mirror, an amended TP that fires would route
+            # the OLD level into ``BrokerPosition.record_fill``.
+            #
+            # When the leg did not exist before (e.g. an SL-only bracket
+            # is amended to add TP, or vice versa), the PUT above attaches
+            # it server-side and we must INSERT the row from scratch with
+            # the same fields :meth:`execute_exit` uses — otherwise the
+            # leg would be invisible to ``_resolve_bracket_leg_disposition``,
+            # ``_find_bracket_leg_row`` (level=0 fallback), and restart
+            # recovery, even though Capital.com is enforcing it.
+            # The PUT + confirm above already succeeded (otherwise an
+            # exception unwound the call), so any leg row we INSERT here
+            # is already attached on the broker side — persist as
+            # ``confirmed``. Using ``submitted`` would make
+            # ``_recover_in_flight_submissions`` treat the row as an
+            # unresolved dispatch on restart and either retry or stall
+            # in recovery, even though the bracket is live.
+            #
+            # Closed-row case: a previous attach for this same COID
+            # could have been rolled back (REJECTED confirm →
+            # :meth:`_rollback_bracket_legs` flips state and stamps
+            # ``closed_ts_ms``). ``get_order`` still returns that row,
+            # so a plain "exists?" check would route into the UPDATE
+            # branch and leave ``closed_ts_ms`` set —
+            # ``iter_live_orders`` would keep skipping the leg even
+            # though the broker just attached it. Treat closed rows
+            # as absent: reopen the row first (clears
+            # ``closed_ts_ms``), then upsert with the live-leg fields.
+            if new_i.tp_price is None and old_i.tp_price is not None:
+                # TP removal mirror: the PUT body's ``profitLevel: None``
+                # clear above already retired the broker-side TP. The
+                # previously ``confirmed`` TP leg row would otherwise
+                # linger live: confirmed bracket legs carry no
+                # ``exchange_order_id``, so :meth:`_reconcile_snapshot`
+                # cannot retire them via deal-id matching, and
+                # :meth:`_resolve_bracket_leg_disposition` only revisits
+                # ``disposition_unknown`` rows. Without this branch
+                # BrokerStore would advertise a phantom TP leg the
+                # broker no longer enforces, misleading later
+                # ``_find_bracket_leg_row`` lookups, restart recovery,
+                # and ``_close_bracket_after_natural_close`` bookkeeping
+                # that walks ``parent_deal_id``. Mirror of the SL
+                # retirement below for ``trail_offset`` removal.
+                tp_existing = self.store_ctx.get_order(effective_tp_coid)
+                if (tp_existing is not None
+                        and tp_existing.closed_ts_ms is None):
+                    self.store_ctx.set_order_state(
+                        effective_tp_coid, 'rejected',
+                    )
+                    self.store_ctx.close_order(effective_tp_coid)
+                    self.store_ctx.log_event(
+                        'bracket_leg_retired_on_modify',
+                        client_order_id=effective_tp_coid,
+                        exchange_order_id=deal_id,
+                        intent_key=new_i.intent_key,
+                        payload={
+                            'leg_kind': 'tp',
+                            'reason': 'tp_removed',
+                            'old_tp_price': old_i.tp_price,
+                        },
+                    )
+            if new_i.tp_price is not None:
+                tp_existing = self.store_ctx.get_order(effective_tp_coid)
+                if tp_existing is None or tp_existing.closed_ts_ms is not None:
+                    if tp_existing is not None:
+                        self.store_ctx.reopen_order(effective_tp_coid)
+                    self.store_ctx.upsert_order(
+                        effective_tp_coid,
+                        symbol=new_i.symbol,
+                        side=new_i.side,
+                        qty=target_row.qty,
+                        state='confirmed',
+                        intent_key=new_i.intent_key + '\0TP',
+                        from_entry=new_i.from_entry,
+                        pine_entry_id=new_i.from_entry,
+                        tp_level=float(new_i.tp_price),
+                        extras={
+                            'leg_kind': 'tp',
+                            'parent_deal_id': deal_id,
+                            'parent_coid': target_row.client_order_id,
+                        },
+                    )
+                    self.store_ctx.add_ref(
+                        effective_tp_coid, 'bracket_deal_id', deal_id,
+                    )
+                else:
+                    # Live row exists — UPDATE it under its own COID.
+                    # ``state`` is forced back to ``confirmed`` because an
+                    # earlier ambiguous PUT/confirm could have flipped the
+                    # row to ``disposition_unknown``; this amend just
+                    # succeeded, so the leg is unambiguously attached.
+                    self.store_ctx.upsert_order(
+                        effective_tp_coid,
+                        state='confirmed',
+                        tp_level=float(new_i.tp_price),
+                    )
+            if new_i.sl_price is not None or new_i.trail_offset is not None:
+                sl_existing = self.store_ctx.get_order(effective_sl_coid)
+                if sl_existing is None or sl_existing.closed_ts_ms is not None:
+                    if sl_existing is not None:
+                        self.store_ctx.reopen_order(effective_sl_coid)
+                    sl_extras: dict = {
+                        'leg_kind': 'sl',
+                        'parent_deal_id': deal_id,
+                        'parent_coid': target_row.client_order_id,
+                    }
+                    # Pending-trail leg: stash the activation threshold
+                    # and offset under the same keys that
+                    # :meth:`_trailing_activation_monitor` reads. Without
+                    # ``trail_state='pending'`` the monitor would skip
+                    # this row and the protective trailing stop would
+                    # never attach, even though the row otherwise looks
+                    # like a live SL leg.
+                    if trail_pending:
+                        sl_extras['trail_activation_price'] = new_i.trail_price
+                        sl_extras['trail_offset'] = new_i.trail_offset
+                        sl_extras['trail_state'] = 'pending'
+                    self.store_ctx.upsert_order(
+                        effective_sl_coid,
+                        symbol=new_i.symbol,
+                        side=new_i.side,
+                        qty=target_row.qty,
+                        state='confirmed',
+                        intent_key=new_i.intent_key + '\0SL',
+                        from_entry=new_i.from_entry,
+                        pine_entry_id=new_i.from_entry,
+                        sl_level=(float(new_i.sl_price)
+                                  if new_i.sl_price is not None else None),
+                        trailing_distance=(float(new_i.trail_offset)
+                                           if new_i.trail_offset is not None else None),
+                        trailing_stop=(
+                            new_i.trail_offset is not None and not trail_pending
+                        ),
+                        extras=sl_extras,
+                    )
+                    self.store_ctx.add_ref(
+                        effective_sl_coid, 'bracket_deal_id', deal_id,
+                    )
+                else:
+                    # ``trailing_stop`` MUST be re-stamped — amending
+                    # a fixed SL to native trailing (or vice versa)
+                    # changes the leg's classification, and
+                    # :meth:`_activity_to_event` reads ``row.trailing_stop``
+                    # off this stored row to decide between
+                    # ``LegType.STOP_LOSS`` and ``LegType.TRAILING_STOP``
+                    # on the eventual fill.
+                    #
+                    # The pending-trail trio
+                    # (``trail_state`` / ``trail_activation_price`` /
+                    # ``trail_offset`` extras) must be kept in sync with
+                    # ``trail_pending``. Two failure modes the symmetry
+                    # avoids:
+                    #   * Amend fixed → pending: without writing the
+                    #     extras here, ``_trailing_activation_monitor``
+                    #     never sees ``trail_state='pending'`` and the
+                    #     protective trailing stop never activates
+                    #     (the PUT body was intentionally skipped, so
+                    #     the broker has no trailing either).
+                    #   * Amend pending → anything else: stale
+                    #     ``trail_state``/``trail_activation_price``
+                    #     would make the monitor still try to activate a
+                    #     leg that is no longer pending, racing the next
+                    #     amend.
+                    new_sl_extras = dict(sl_existing.extras or {})
+                    if trail_pending:
+                        new_sl_extras['trail_activation_price'] = new_i.trail_price
+                        new_sl_extras['trail_offset'] = new_i.trail_offset
+                        new_sl_extras['trail_state'] = 'pending'
+                    else:
+                        # Leaving pending trailing: drop ALL three trail
+                        # extras — ``trail_offset`` MUST go too, otherwise
+                        # ``_resolve_bracket_leg_disposition`` keeps
+                        # treating this row as a trailing leg
+                        # (``is_trailing_leg = leg_kind == 'sl' and
+                        # bool(row.trailing_distance or rextras
+                        # .get('trail_offset'))``) and the next ambiguous
+                        # amend recovery would resolve a fixed stop
+                        # against the parent's ``trailingStop`` /
+                        # ``stopDistance`` instead of ``stopLevel`` —
+                        # marking the leg rejected even when the broker
+                        # has the fixed SL attached. Immediate native
+                        # trailing (the other branch hitting this else)
+                        # carries its offset on ``row.trailing_distance``
+                        # which takes precedence in the resolver, so
+                        # dropping the extras shadow is safe there too.
+                        new_sl_extras.pop('trail_state', None)
+                        new_sl_extras.pop('trail_activation_price', None)
+                        new_sl_extras.pop('trail_offset', None)
+                    self.store_ctx.upsert_order(
+                        effective_sl_coid,
+                        state='confirmed',
+                        sl_level=(float(new_i.sl_price)
+                                  if new_i.sl_price is not None else None),
+                        trailing_distance=(float(new_i.trail_offset)
+                                           if new_i.trail_offset is not None else None),
+                        trailing_stop=(
+                            new_i.trail_offset is not None and not trail_pending
+                        ),
+                        extras=new_sl_extras,
+                    )
+            elif (old_i.sl_price is not None
+                    or old_i.trail_offset is not None):
+                # The amend removed the protective stop entirely (no
+                # fixed SL, no trail in the new intent). All three
+                # prior shapes need the SL leg row retired here:
+                #   * Native-active trailing (``trail_offset`` set,
+                #     ``trail_price`` is None): the PUT body's
+                #     ``trailingStop: false`` clear already retired
+                #     the broker-side leg.
+                #   * Fixed SL (``sl_price`` set, no trail): the PUT
+                #     body's ``stopLevel: None`` clear (added in the
+                #     same pass) already retired the broker-side
+                #     stop.
+                #   * Pending trailing (``trail_offset`` and
+                #     ``trail_price`` both set): the leg was purely
+                #     local — ``_trailing_activation_monitor`` had not
+                #     yet sent a ``trailingStop=true`` PUT — so the
+                #     broker has nothing to clear, but the local row
+                #     still carries ``trail_state='pending'`` in
+                #     extras and the monitor would later activate a
+                #     trailing stop Pine has already removed.
+                # In every case the previously ``confirmed`` SL row
+                # would otherwise linger live: confirmed bracket legs
+                # carry no ``exchange_order_id``, so
+                # :meth:`_reconcile_snapshot` cannot retire them via
+                # deal-id matching, and
+                # :meth:`_resolve_bracket_leg_disposition` only
+                # revisits ``disposition_unknown`` rows. Without this
+                # retire BrokerStore would keep advertising a phantom
+                # protective leg the broker no longer enforces, later
+                # leg lookups (``_find_bracket_leg_row``, restart
+                # recovery, ``_close_bracket_after_natural_close``
+                # bookkeeping) would operate on stale stop state, and
+                # — for the pending-trail case specifically —
+                # ``_trailing_activation_monitor`` would re-PUT a
+                # trailing stop on the next tick where the activation
+                # threshold is crossed.
+                if old_i.sl_price is not None:
+                    reason = 'fixed_sl_removed_no_replacement'
+                elif old_i.trail_price is not None:
+                    reason = 'pending_trail_removed_no_replacement'
+                else:
+                    reason = 'native_trail_removed_no_replacement'
+                sl_existing = self.store_ctx.get_order(effective_sl_coid)
+                if (sl_existing is not None
+                        and sl_existing.closed_ts_ms is None):
+                    self.store_ctx.set_order_state(
+                        effective_sl_coid, 'rejected',
+                    )
+                    self.store_ctx.close_order(effective_sl_coid)
+                    self.store_ctx.log_event(
+                        'bracket_leg_retired_on_modify',
+                        client_order_id=effective_sl_coid,
+                        exchange_order_id=deal_id,
+                        intent_key=new_i.intent_key,
+                        payload={
+                            'leg_kind': 'sl',
+                            'reason': reason,
+                            'old_sl_price': old_i.sl_price,
+                            'old_trail_offset': old_i.trail_offset,
+                            'old_trail_price': old_i.trail_price,
+                        },
+                    )
             self.store_ctx.log_event(
                 'modify_exit',
                 client_order_id=target_row.client_order_id,
                 exchange_order_id=target_row.exchange_order_id,
                 intent_key=new_i.intent_key,
                 payload={'tp': new_i.tp_price, 'sl': new_i.sl_price,
-                         'trail_offset': new_i.trail_offset},
+                         'trail_offset': new_i.trail_offset,
+                         'tp_coid': effective_tp_coid,
+                         'sl_coid': effective_sl_coid,
+                         'envelope_tp_coid': tp_coid,
+                         'envelope_sl_coid': sl_coid},
             )
 
         legs: list[ExchangeOrder] = []
         now_ts = epoch_time()
-        deal_id = target_row.exchange_order_id
-        tp_coid = new.client_order_id(KIND_EXIT_TP)
-        sl_coid = new.client_order_id(KIND_EXIT_SL)
         if new_i.tp_price is not None:
             legs.append(ExchangeOrder(
                 id=_bracket_leg_id(deal_id, 'tp'),
@@ -2536,7 +3895,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 price=new_i.tp_price, stop_price=None,
                 average_fill_price=None, status=OrderStatus.OPEN,
                 timestamp=now_ts, fee=0.0, fee_currency='',
-                reduce_only=True, client_order_id=tp_coid,
+                reduce_only=True, client_order_id=effective_tp_coid,
             ))
         if new_i.sl_price is not None or new_i.trail_offset is not None:
             legs.append(ExchangeOrder(
@@ -2551,7 +3910,7 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 price=None, stop_price=new_i.sl_price,
                 average_fill_price=None, status=OrderStatus.OPEN,
                 timestamp=now_ts, fee=0.0, fee_currency='',
-                reduce_only=True, client_order_id=sl_coid,
+                reduce_only=True, client_order_id=effective_sl_coid,
             ))
         return legs
 
@@ -2645,6 +4004,11 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         The trailing monitor runs last since it depends on the current
         positions snapshot bid/offer.
         """
+        # Bump *before* fetching the snapshots so any defer-stamp written
+        # by :meth:`_process_activity` is keyed to the snapshot that
+        # caused the defer; :meth:`_reconcile_snapshot` then refuses to
+        # clear breadcrumbs whose poll-id matches the current cycle.
+        self._current_poll_id += 1
         positions_resp = await self._call('positions', method='get')
         working_resp = await self._call('workingorders', method='get')
         last_period = max(60, int(self.config.poll_interval_seconds * 10))
@@ -2704,6 +4068,14 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         activities_sorted = sorted(
             activities, key=lambda x: x.get('dateUTC') or '',
         )
+        # Cursor watermark guard: once we defer a row in this batch, no
+        # further activity in the same batch may advance ``last_date_utc``.
+        # The batch is sorted ascending by ``dateUTC``, so any row after
+        # the first defer is at-or-after the deferred timestamp; advancing
+        # cursor past that timestamp would make the next poll's
+        # ``date_utc < cursor.last_date_utc`` guard permanently drop the
+        # deferred row and silently desync the strategy.
+        deferred_in_batch = False
         for a in activities_sorted:
             date_utc = a.get('dateUTC') or ''
             deal_id = str(a.get('dealId') or '')
@@ -2745,11 +4117,136 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 continue
 
             # Row is matched — promote out of the external-logged set in
-            # case a previous poll caught the race window, and record the
-            # activity as fully processed (dedup + cursor advance).
+            # case a previous poll caught the race window. Dedup commit
+            # and cursor advance happen after the deferral guard below.
             cursor.external_logged_fingerprints.discard(fingerprint)
+
+            position_snapshot = (
+                positions_by_deal.get(deal_id)
+                if positions_by_deal and deal_id else None
+            )
+            event = self._activity_to_event(a, row, position_snapshot)
+
+            # DEFER guard: a closing-leg fill with no resolvable price
+            # (Capital.com sometimes leaves ``level`` empty on closes
+            # whose position is already gone from ``/positions`` by the
+            # time we poll). Yielding ``fill_price=0`` lets
+            # ``BrokerPosition.record_fill`` ignore the event AND the
+            # post-yield ``natural_close_at`` stamp would suppress
+            # reconcile recovery, leaving the strategy internally open
+            # while the broker is closed. Skip the dedup commit + cursor
+            # advance so the next poll re-evaluates with a fresh
+            # ``positions_by_deal`` snapshot. If the activity rolls out
+            # of Capital.com's 60s history window before a price
+            # surfaces, :meth:`_reconcile_snapshot` still detects the
+            # vanished deal and routes through the missing-pending grace
+            # window (UnexpectedCancelError), which is preferable to a
+            # silent desync.
+            if (event is not None
+                    and event.event_type == 'filled'
+                    and (event.fill_price or 0.0) <= 0.0
+                    and event.leg_type in (
+                        LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                        LegType.TRAILING_STOP, LegType.CLOSE,
+                    )):
+                # Distinguish vanished-deal cases (snapshot reconcile's
+                # vanished-deal recovery handles them) from manual
+                # partial closes where the deal is still alive: a
+                # ``LegType.CLOSE`` activity (USER / DEALER on an
+                # already-filled entry) with ``level=0`` while
+                # ``/positions`` still carries the deal is a partial
+                # reduction that snapshot reconcile cannot detect —
+                # :meth:`_reconcile_snapshot`'s partial-fill check
+                # ``row.filled_qty + 1e-9 < cumulative`` is unreachable
+                # once the entry is fully filled (``row.filled_qty ==
+                # row.qty``), so once the activity rolls out of
+                # Capital.com's 60s history window the local position
+                # would stay larger than the broker forever. Resolve
+                # the price with the live mid as a proxy and let the
+                # event flow through. Bracket TP/SL/TRAILING_STOP and
+                # full-close activities keep the original defer: their
+                # broker leg is gone post-fill, vanished-deal recovery
+                # via :meth:`_reconcile_snapshot` reaches them, and
+                # the bracket-leg level fallback in
+                # :meth:`_activity_to_event` already covers the
+                # in-window case.
+                deal_alive_with_size = False
+                if (event.leg_type == LegType.CLOSE
+                        and deal_id and positions_by_deal
+                        and deal_id in positions_by_deal):
+                    pos_snap = (
+                        positions_by_deal[deal_id].get('position') or {}
+                    )
+                    deal_alive_with_size = (
+                        float(pos_snap.get('size') or 0.0) > 0.0
+                    )
+                proxy_price: float | None = None
+                if deal_alive_with_size:
+                    try:
+                        proxy_price = await self._get_current_mid_price(
+                            row.symbol,
+                        )
+                    except (httpx.TimeoutException, httpx.RequestError,
+                            ConnectionError, ExchangeConnectionError,
+                            CapitalComError, BrokerError):
+                        proxy_price = None
+                if proxy_price is not None and proxy_price > 0.0:
+                    # Re-emit the event with the proxy price; the
+                    # downstream yield path stamps the close-event
+                    # breadcrumb, persists ``entry_filled_at``, etc.
+                    # Live mid is not the exact close mid (no REST
+                    # endpoint exposes it after the fact), but it is
+                    # close enough to keep
+                    # :meth:`BrokerPosition.record_fill` from
+                    # ignoring the reduction — the alternative is a
+                    # silent desync. Carry the source activity's
+                    # ``size`` as ``fill_qty`` so the engine reduces
+                    # by exactly the manual close amount.
+                    event = OrderEvent(
+                        order=event.order,
+                        event_type=event.event_type,
+                        fill_price=proxy_price,
+                        fill_qty=event.fill_qty,
+                        timestamp=event.timestamp,
+                        pine_id=event.pine_id,
+                        from_entry=event.from_entry,
+                        leg_type=event.leg_type,
+                        fee=event.fee,
+                        fee_currency=event.fee_currency,
+                    )
+                    if self.store_ctx is not None:
+                        self.store_ctx.log_event(
+                            'partial_manual_close_proxy_priced',
+                            exchange_order_id=deal_id,
+                            client_order_id=row.client_order_id,
+                            payload={'fingerprint': fingerprint,
+                                     'dateUTC': date_utc,
+                                     'deal_id': deal_id,
+                                     'type': a.get('type'),
+                                     'status': a.get('status'),
+                                     'source': a.get('source'),
+                                     'proxy_price': proxy_price},
+                        )
+                else:
+                    deferred_in_batch = True
+                    if self.store_ctx is not None:
+                        self.store_ctx.log_event(
+                            'activity_close_deferred_no_price',
+                            exchange_order_id=deal_id,
+                            client_order_id=row.client_order_id,
+                            payload={'fingerprint': fingerprint,
+                                     'dateUTC': date_utc,
+                                     'deal_id': deal_id,
+                                     'type': a.get('type'),
+                                     'status': a.get('status'),
+                                     'source': a.get('source')},
+                        )
+                    continue
+
             cursor.seen_fingerprints.add(fingerprint)
-            if not cursor.last_date_utc or date_utc > cursor.last_date_utc:
+            if (not deferred_in_batch
+                    and (not cursor.last_date_utc
+                         or date_utc > cursor.last_date_utc)):
                 cursor.last_date_utc = date_utc
 
             if self.store_ctx is not None:
@@ -2758,30 +4255,106 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     exchange_order_id=deal_id,
                     client_order_id=row.client_order_id,
                     payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
+                             'deal_id': deal_id,
                              'type': a.get('type'), 'status': a.get('status'),
                              'source': a.get('source')},
                 )
 
-            position_snapshot = (
-                positions_by_deal.get(deal_id)
-                if positions_by_deal and deal_id else None
-            )
-            event = self._activity_to_event(a, row, position_snapshot)
             if event is not None:
-                yield event
+                # Stamp the entry row before yielding its first
+                # filled-as-ENTRY activity so :meth:`_activity_to_event`
+                # can recognise subsequent ``USER`` / ``DEALER`` activities
+                # for the same dealId as manual closes (Capital.com nets
+                # per dealId — without the stamp the close routes as an
+                # entry add). Persisting BEFORE the yield is critical:
+                # the ``activity_processed`` log + cursor advance above
+                # are already durable, so a crash or cancellation between
+                # this point and the consumer's resumption would dedupe
+                # the entry on restart but leave ``entry_filled_at``
+                # missing, misclassifying any later manual close as
+                # ``LegType.ENTRY``.
+                if (event.event_type == 'filled'
+                        and event.leg_type == LegType.ENTRY
+                        and (row.extras or {}).get('kind') == 'position'
+                        and not (row.extras or {}).get('entry_filled_at')
+                        and self.store_ctx is not None):
+                    refreshed = self.store_ctx.get_order(row.client_order_id)
+                    base_extras = dict((refreshed or row).extras or {})
+                    base_extras['entry_filled_at'] = epoch_time()
+                    self.store_ctx.upsert_order(
+                        row.client_order_id, extras=base_extras,
+                    )
+                # Stamp the close-event breadcrumb / natural-close teardown
+                # BEFORE yielding, for the same reason as the entry stamp
+                # above: the ``activity_processed`` log + cursor advance
+                # are already durable at this point, so a crash or
+                # cancellation between the yield and the legacy post-yield
+                # branch would dedupe the activity on restart but leave
+                # the breadcrumb missing. Next poll's vanished deal would
+                # then fall into ``missing_pending_since`` /
+                # :class:`UnexpectedCancelError` instead of the intended
+                # natural-close teardown (or, for the still-present-deal
+                # race, the snapshot would lack the breadcrumb that
+                # ``_reconcile_snapshot`` relies on to upgrade to a
+                # teardown without waiting for the grace window).
                 if (event.event_type == 'filled'
                         and event.leg_type in (
                             LegType.TAKE_PROFIT,
                             LegType.STOP_LOSS,
                             LegType.TRAILING_STOP,
+                            LegType.CLOSE,
                         )):
-                    # Position-attached bracket fully closed: the entry's
-                    # dealId vanishes from /positions and the OCA partner
-                    # leg is auto-cancelled by the exchange. Close the
-                    # entry + both bracket rows so ``_reconcile_snapshot``
-                    # does not stamp ``missing_pending_since`` on a
-                    # next-poll-no-longer-there row.
-                    self._close_bracket_after_natural_close(row)
+                    # Bracket / manual close handling: the same-poll
+                    # ``positions_by_deal`` snapshot decides whether
+                    # this fill actually retired the position.
+                    #   * Deal absent / size <= 0 → full close. Tear
+                    #     down the entry + bracket rows so
+                    #     :meth:`_reconcile_snapshot` does not stamp
+                    #     ``missing_pending_since`` on the now-gone
+                    #     dealId next poll.
+                    #   * Deal still present at size > 0 → either a
+                    #     PARTIAL close (``USER`` / ``DEALER`` reduced
+                    #     the deal — the OCA bracket stays attached
+                    #     to the remaining exposure) or a race where
+                    #     ``/history/activity`` is ahead of
+                    #     ``/positions`` in this same poll. Stamping
+                    #     ``natural_close_at`` here would orphan the
+                    #     live exposure: ``execute_exit`` / ``modify_exit``
+                    #     and reconcile would skip the still-open
+                    #     remainder. Leave a ``close_event_yielded_at``
+                    #     breadcrumb instead — :meth:`_reconcile_snapshot`
+                    #     reads it on a subsequent poll: if the deal has
+                    #     since vanished, that's the race resolving and
+                    #     the row is upgraded to a teardown without
+                    #     waiting for the missing-pending grace window
+                    #     (which would otherwise raise a false
+                    #     :class:`UnexpectedCancelError`).
+                    deal_remaining: float | None = None
+                    if (deal_id and positions_by_deal
+                            and deal_id in positions_by_deal):
+                        pos_snap = (
+                            positions_by_deal[deal_id].get('position') or {}
+                        )
+                        deal_remaining = float(pos_snap.get('size') or 0.0)
+                    if deal_remaining is None or deal_remaining <= 0.0:
+                        self._close_bracket_after_natural_close(row)
+                    elif self.store_ctx is not None:
+                        refreshed = self.store_ctx.get_order(row.client_order_id)
+                        if refreshed is not None:
+                            mark_extras = dict(refreshed.extras or {})
+                            mark_extras['close_event_yielded_at'] = epoch_time()
+                            # Tie the breadcrumb to the current poll cycle so
+                            # :meth:`_reconcile_snapshot` does not clear it
+                            # against the same stale snapshot that triggered
+                            # the defer here. See ``_current_poll_id`` in
+                            # ``__init__`` for the rationale.
+                            mark_extras['close_event_yielded_at_poll_id'] = (
+                                self._current_poll_id
+                            )
+                            self.store_ctx.upsert_order(
+                                row.client_order_id, extras=mark_extras,
+                            )
+                yield event
 
     def _close_bracket_after_natural_close(self, entry_row: 'OrderRow') -> None:
         """Stamp the entry + bracket-leg rows with ``natural_close_at``.
@@ -2825,6 +4398,281 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             payload={'bracket_coids': bracket_coids, 'flagged_at': now_ts},
         )
 
+    def _rollback_bracket_legs(
+            self, *, intent: 'ExitIntent', parent_coid: str, deal_id: str,
+            tp_coid: str | None, sl_coid: str | None, reason: str,
+    ) -> None:
+        """Retire the persisted TP/SL leg rows after a confirmed attach failure.
+
+        Called when the broker either rejected the bracket synchronously
+        (PUT 4xx / REJECTED confirm) or the response signals that no
+        protective leg is in place.  The rows were upserted as
+        ``submitted`` BEFORE the PUT so a crash mid-call would still
+        replay deterministically; once we know the attach is dead, the
+        rows must NOT linger in BrokerStore — otherwise a restart's
+        recovery path treats them as live protective legs and the
+        reconcile snapshot has no matching exchange artifact.
+
+        Physically closes the rows (``close_order`` sets
+        ``closed_ts_ms``); ``iter_live_orders`` will then skip them, and
+        the audit event records the cause.
+        """
+        if self.store_ctx is None:
+            return
+        coids = [c for c in (tp_coid, sl_coid) if c is not None]
+        for coid in coids:
+            row = self.store_ctx.get_order(coid)
+            if row is None:
+                continue
+            self.store_ctx.set_order_state(coid, 'rejected')
+            self.store_ctx.close_order(coid)
+        self.store_ctx.log_event(
+            'bracket_attach_rollback',
+            client_order_id=parent_coid,
+            exchange_order_id=deal_id,
+            intent_key=intent.intent_key,
+            payload={'reason': reason, 'tp_coid': tp_coid, 'sl_coid': sl_coid,
+                     'tp_level': intent.tp_price, 'sl_level': intent.sl_price,
+                     'trail_offset': intent.trail_offset},
+        )
+
+    def _mark_bracket_legs_disposition_unknown(
+            self, *, intent: 'ExitIntent', parent_coid: str, deal_id: str,
+            tp_coid: str | None, sl_coid: str | None, reason: str,
+            stage: str, deal_reference: str | None = None,
+    ) -> None:
+        """Flip TP/SL leg rows to ``disposition_unknown`` after an ambiguous PUT.
+
+        Network failure mid-PUT (or mid-confirm) leaves the exchange's
+        bracket state opaque until the next reconcile snapshot.  The
+        rows stay live so the snapshot can promote them; the engine
+        meanwhile receives :class:`OrderDispositionUnknownError` and
+        parks the intent.
+        """
+        if self.store_ctx is None:
+            return
+        coids = [c for c in (tp_coid, sl_coid) if c is not None]
+        for coid in coids:
+            if self.store_ctx.get_order(coid) is None:
+                continue
+            self.store_ctx.set_order_state(coid, 'disposition_unknown')
+        payload: dict = {'reason': reason, 'stage': stage,
+                         'tp_coid': tp_coid, 'sl_coid': sl_coid}
+        if deal_reference is not None:
+            payload['deal_reference'] = deal_reference
+        self.store_ctx.log_event(
+            'bracket_attach_disposition_unknown',
+            client_order_id=parent_coid,
+            exchange_order_id=deal_id,
+            intent_key=intent.intent_key,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _levels_match(expected: object, actual: object,
+                      tol: float = 1e-6) -> bool:
+        """Float-compare two server-vs-local price levels with NaN tolerance.
+
+        Both arguments may be ``None`` or non-numeric (Capital.com sometimes
+        returns ``None`` for unset bracket legs). Returns ``False`` for any
+        non-numeric or missing input.
+        """
+        if expected is None or actual is None:
+            return False
+        try:
+            return abs(float(actual) - float(expected)) < tol  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+
+    def _resolve_bracket_leg_disposition(
+            self, row: 'OrderRow', leg_kind: str,
+            positions_by_deal: dict[str, dict],
+            *,
+            bracket_resolutions: dict[str, bool] | None = None,
+            bracket_attached_coids: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Resolve a ``disposition_unknown`` bracket leg row from the parent.
+
+        Capital.com bracket legs share the parent position's deal_id and
+        carry no ``exchange_order_id``; the standard snapshot recovery
+        path (which keys off ``exchange_order_id``) cannot see them. This
+        helper consults the parent position's ``profitLevel`` /
+        ``stopLevel`` (or ``trailingStop`` / ``stopDistance`` for trailing
+        legs) to decide whether the original PUT actually attached the
+        bracket and updates the leg row accordingly.
+
+        The leg-level row state change is applied immediately. The
+        parent-level resolution intended for the engine's parked dispatch
+        is *aggregated* (not written) when ``bracket_resolutions`` is
+        provided — see the rationale in :meth:`_reconcile_snapshot`. The
+        caller flushes the aggregate after processing every leg in the
+        same poll cycle. When ``bracket_resolutions`` is ``None`` the
+        helper falls back to writing per-leg directly (legacy callers
+        and tests that drive the helper without an aggregator).
+
+        :param bracket_resolutions: Aggregator keyed by parent COID. Each
+            leg ANDs into the value (``True`` = all legs attached so far,
+            ``False`` = at least one leg rejected — wins after flush).
+        """
+        if self.store_ctx is None:
+            return
+        rextras = row.extras or {}
+        parent_deal_id = rextras.get('parent_deal_id')
+        if not parent_deal_id:
+            return
+        parent_coid = rextras.get('parent_coid')
+
+        is_trailing_leg = leg_kind == 'sl' and bool(
+            row.trailing_distance or rextras.get('trail_offset')
+        )
+
+        parent = positions_by_deal.get(str(parent_deal_id))
+        if parent is None:
+            # Parent position vanished. Whether the bracket ever attached
+            # is moot; either way the leg has nothing to protect now.
+            self._record_bracket_resolution(
+                row=row, leg_kind=leg_kind, resolution_label='parent_gone',
+                attached=False, parent_deal_id=str(parent_deal_id),
+                parent_coid=parent_coid,
+                bracket_resolutions=bracket_resolutions,
+                bracket_attached_coids=bracket_attached_coids,
+            )
+            return
+
+        if rextras.get('force_disposition_rejected'):
+            # ``modify_exit`` stamps this marker when an existing
+            # broker-active SL leg is being transitioned into a
+            # local-only pending-trail. The OLD row's level/distance
+            # comparison can lie: if the broker did NOT apply the PUT
+            # (timeout before reaching it), the old stop is still live
+            # and a naïve compare would record ``attached``, clearing
+            # the modify park while the new pending-trail intent
+            # remains unsatisfied. Force a ``rejected`` resolution so
+            # the engine's modify-rejected branch restores the
+            # pre-modify ``_active_intents`` snapshot and re-runs
+            # ``modify_exit`` next sync (whose retry will explicitly
+            # clear the broker-side stop and persist the pending-trail
+            # row).
+            self._record_bracket_resolution(
+                row=row, leg_kind=leg_kind,
+                resolution_label='transition_force_rejected',
+                attached=False, parent_deal_id=str(parent_deal_id),
+                parent_coid=parent_coid,
+                bracket_resolutions=bracket_resolutions,
+                bracket_attached_coids=bracket_attached_coids,
+            )
+            return
+
+        parent_pos = parent.get('position') or {}
+        if is_trailing_leg:
+            # Trailing SL on Capital.com is identified by the position's
+            # ``trailingStop`` flag plus a matching ``stopDistance``; the
+            # server-side level itself moves with price so a profit/stop
+            # *level* comparison is meaningless here.
+            expected_distance = (
+                row.trailing_distance
+                if row.trailing_distance is not None
+                else rextras.get('trail_offset')
+            )
+            actual_distance = parent_pos.get('stopDistance')
+            trailing_active = bool(parent_pos.get('trailingStop'))
+            attached = trailing_active and self._levels_match(
+                expected_distance, actual_distance,
+            )
+        elif leg_kind == 'tp':
+            attached = self._levels_match(
+                row.tp_level, parent_pos.get('profitLevel'),
+            )
+        else:
+            attached = self._levels_match(
+                row.sl_level, parent_pos.get('stopLevel'),
+            )
+
+        self._record_bracket_resolution(
+            row=row, leg_kind=leg_kind,
+            resolution_label='attached' if attached else 'not_attached',
+            attached=attached, parent_deal_id=str(parent_deal_id),
+            parent_coid=parent_coid,
+            bracket_resolutions=bracket_resolutions,
+            bracket_attached_coids=bracket_attached_coids,
+        )
+
+    def _record_bracket_resolution(
+            self, *, row: 'OrderRow', leg_kind: str,
+            resolution_label: str, attached: bool,
+            parent_deal_id: str, parent_coid: str | None,
+            bracket_resolutions: dict[str, bool] | None = None,
+            bracket_attached_coids: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Apply a bracket-leg resolution: row state, park, audit event.
+
+        ``attached``: leg row → ``confirmed``; persisted park resolution
+        → ``'attached'`` so the engine clears the park but keeps the
+        ExitIntent active.
+
+        ``not attached`` (level mismatch or parent gone): leg row →
+        ``rejected`` + closed; persisted park resolution → ``'rejected'``
+        so the engine drops the active ExitIntent and re-dispatches on
+        the next sync, restoring protection.
+
+        ``parent_coid`` is taken from the leg's extras (written by
+        :meth:`execute_exit` at row creation time). When it is missing
+        — pre-migration rows on a freshly upgraded process — the row
+        state still flips correctly but the engine cannot re-dispatch
+        until the next manual operator nudge; that is the safest
+        degradation, the alternative would be guessing which COID to
+        unpark.
+
+        :param bracket_resolutions: When provided, the parent-level
+            resolution is *aggregated* into this dict (one leg's
+            ``False`` wins) instead of being written immediately. The
+            caller flushes the aggregate to ``record_resolution`` after
+            processing every leg in the same poll cycle. Eliminates the
+            per-leg race against the engine's
+            :meth:`_consume_plugin_resolutions`. Pass ``None`` for
+            non-snapshot callers (e.g. unit tests).
+        """
+        assert self.store_ctx is not None  # caller guards this
+        if attached:
+            self.store_ctx.set_order_state(row.client_order_id, 'confirmed')
+        else:
+            self.store_ctx.set_order_state(row.client_order_id, 'rejected')
+            self.store_ctx.close_order(row.client_order_id)
+        if parent_coid is not None:
+            if bracket_resolutions is not None:
+                # AND-aggregate: any rejected leg wins over attached.
+                # ``setdefault`` seeds with True so the first leg's
+                # outcome holds; subsequent legs only flip True → False.
+                bracket_resolutions[parent_coid] = (
+                    bracket_resolutions.setdefault(parent_coid, True)
+                    and attached
+                )
+                # Track every leg promoted to ``confirmed`` in this
+                # batch so the aggregate flush can retire them if a
+                # sibling later flips the parent to ``rejected``.
+                # Without this, a mixed outcome (e.g. TP attached, SL
+                # not_attached) leaves the TP row live while the engine
+                # drops the parent dispatch and re-dispatches with new
+                # COIDs — duplicate bracket rows under the same parent.
+                if attached and bracket_attached_coids is not None:
+                    bracket_attached_coids.setdefault(
+                        parent_coid, [],
+                    ).append(row.client_order_id)
+            else:
+                self.store_ctx.record_resolution(
+                    parent_coid, 'attached' if attached else 'rejected',
+                )
+        self.store_ctx.log_event(
+            'bracket_disposition_resolved',
+            client_order_id=row.client_order_id,
+            exchange_order_id=parent_deal_id,
+            payload={
+                'leg_kind': leg_kind,
+                'resolution': resolution_label,
+                'parent_coid': parent_coid,
+            },
+        )
+
     def _activity_to_event(
             self, activity: dict, row: 'OrderRow',
             position_snapshot: dict | None = None,
@@ -2847,13 +4695,24 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
 
             1. ``activity.level`` — the normal happy path.
             2. ``position_snapshot['position']['level']`` — recovers
-               the price when the activity row leaves it blank but the
-               position is already open in the same poll's snapshot.
-            3. ``row.extras['confirm_level']`` — the price the confirm
+               the OPEN price when the activity row leaves it blank
+               but the position is already open in the same poll's
+               snapshot. **Gated to non-closing activities**: the
+               snapshot's ``level`` is the position's *open* price, so
+               using it for a close would emit a close event at the
+               entry price and silently corrupt P&L.
+            3. Bracket TP/SL leg fallback (closing legs only): the
+               leg row's persisted ``tp_level`` / ``sl_level``.
+            4. ``row.extras['confirm_level']`` — the price the confirm
                step reported at :meth:`execute_entry` time, persisted
                specifically for the race where the fill lands
                *between* the poll's ``/positions`` and
                ``/history/activity`` fetches, so neither carries it.
+               Gated to non-closing activities (the entry's
+               confirm_level is the open price, not a close price).
+            5. None of the above resolved a price for a closing leg →
+               :meth:`_process_activity`'s defer guard skips the
+               yield and the dedup commit so the next poll re-tries.
         """
         activity_type = (activity.get('type') or '').upper()
         status = (activity.get('status') or '').upper()
@@ -2867,20 +4726,116 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         # is the *open* price — wrong for the close fallback. The
         # corresponding bracket row's ``tp_level`` / ``sl_level`` is
         # the right source instead.
-        row_leg_kind = (row.extras or {}).get('leg_kind')
+        #
+        # Manual close (``DELETE /positions/{dealId}`` from the web UI
+        # / mobile app / dealer intervention) lands on the entry row
+        # with the same ``dealId`` as the entry fill — Capital.com nets
+        # per dealId. Distinguishing entry-fill from manual-close
+        # requires per-row state: the first POSITION/EXECUTED activity
+        # routed for the row stamps ``extras['entry_filled_at']``
+        # (done by :meth:`_process_activity` after the event yields);
+        # subsequent activities for the same row are necessarily
+        # closes. Without this disambiguation, ``USER`` / ``DEALER``
+        # close activities would route as :class:`LegType.ENTRY` and
+        # ``BrokerPosition.record_fill`` would ADD to the existing
+        # position instead of reducing it.
+        row_extras = row.extras or {}
+        row_leg_kind = row_extras.get('leg_kind')
+        row_kind = row_extras.get('kind', 'position')
+        entry_already_filled = bool(row_extras.get('entry_filled_at'))
+        # Defensive fallback for the "activity rolled out before stamp"
+        # race. ``entry_filled_at`` is stamped just-in-time by
+        # :meth:`_process_activity` right before yielding the entry-fill
+        # event; the ``activity_processed`` log + cursor advance
+        # committed earlier in that block are durable, so a crash
+        # between :meth:`execute_entry`'s confirm and the next poll's
+        # stamp leaves the row at ``state='confirmed'`` /
+        # ``filled_qty > 0`` / ``kind='position'`` with no breadcrumb.
+        # If Capital.com's 60s activity window rolls past the entry
+        # before the process restarts and resumes polling, the
+        # entry-fill activity simply never replays — the breadcrumb
+        # stays absent forever. Without this fallback a subsequent
+        # ``USER`` / ``DEALER`` manual close on the same dealId would
+        # fall through as :class:`LegType.ENTRY` and
+        # ``BrokerPosition.record_fill`` would ADD to the local
+        # position instead of reducing it.
+        #
+        # Resolution: a ``confirmed`` (or ``closing``) row with
+        # ``filled_qty > 0`` and ``kind == 'position'`` is by definition
+        # an already-filled entry; the only question is whether the
+        # *current* activity is the entry's first fill or a separate
+        # trade. ``row.created_ts_ms`` settles that — entry-fill
+        # activities arrive within Capital.com's 60s activity window of
+        # row creation, anything older than the window is necessarily
+        # a separate trade and therefore a close.
+        if (not entry_already_filled
+                and row_kind == 'position'
+                and row.state in ('confirmed', 'closing')
+                and row.filled_qty > 0
+                and row.created_ts_ms):
+            activity_iso = activity.get('dateUTC') or ''
+            if activity_iso:
+                activity_ts = _parse_iso_timestamp(activity_iso)
+                if (activity_ts > 0.0
+                        and activity_ts > (row.created_ts_ms / 1000.0) + 60.0):
+                    entry_already_filled = True
+        is_explicit_close_source = source in (
+            'TP', 'SL', 'CLOSE_OUT', 'CLOSE', 'MARGIN', 'STOP_OUT',
+        )
+        is_manual_close = (
+            row_kind == 'position'
+            and row_leg_kind not in ('tp', 'sl')
+            and entry_already_filled
+            and source in ('USER', 'DEALER')
+        )
         is_closing_leg = (
             activity_type == 'POSITION'
             and status in ('EXECUTED', 'ACCEPTED')
-            and (source in ('TP', 'SL') or row_leg_kind in ('tp', 'sl'))
+            and (
+                is_explicit_close_source
+                or row_leg_kind in ('tp', 'sl')
+                or is_manual_close
+            )
         )
 
-        if level <= 0.0 and position_snapshot is not None:
+        # Snapshot fallback is gated to NON-closing activities. A
+        # ``/positions`` snapshot's ``level`` field is the position's
+        # OPEN price, which is the correct fill price for a market
+        # entry whose activity row left ``level`` blank, but the WRONG
+        # price for a close — using it would emit a close event at the
+        # entry price and silently corrupt P&L. Closing legs with
+        # ``level=0`` fall through to the bracket-leg fallback below
+        # (TP/SL only) or :meth:`_process_activity`'s defer guard.
+        if (level <= 0.0
+                and position_snapshot is not None
+                and not is_closing_leg):
             pos_data = position_snapshot.get('position') or {}
             fallback_level = float(pos_data.get('level') or 0.0)
             if fallback_level > 0.0:
                 level = fallback_level
-        if level <= 0.0 and is_closing_leg:
-            # Closing-leg fallback: bracket row's tp_level / sl_level.
+        # Bracket TP/SL fill fallback: ONLY when the closing event truly
+        # comes from a bracket leg — explicit ``source in ('TP', 'SL')`` or
+        # the row itself is a stored bracket leg. Generic closes
+        # (``CLOSE``/``CLOSE_OUT``/``MARGIN``/``STOP_OUT`` and manual
+        # ``USER``/``DEALER`` closes) execute at the prevailing market
+        # price, NOT at the bracket SL level — falling back to the still-
+        # attached SL leg's stored level would misprice the fill and
+        # corrupt P&L. When the activity ``level`` is missing for those
+        # cases, leave it at 0; :meth:`_process_activity` defers the
+        # event (no yield, no dedup commit, no ``natural_close_at``
+        # stamp) so the next poll re-evaluates with a fresh
+        # ``positions_by_deal`` snapshot. If the activity rolls out of
+        # Capital.com's 60s history window before a price surfaces,
+        # :meth:`_reconcile_snapshot` still detects the vanished deal
+        # and routes through the missing-pending grace window
+        # (``UnexpectedCancelError``) — preferable to silently emitting
+        # a zero-priced close that ``BrokerPosition.record_fill`` would
+        # ignore while the row gets stamped closed.
+        is_bracket_leg_close = (
+            is_closing_leg
+            and (source in ('TP', 'SL') or row_leg_kind in ('tp', 'sl'))
+        )
+        if level <= 0.0 and is_bracket_leg_close:
             leg_kind_for_fallback = (
                 'tp' if source == 'TP' or row_leg_kind == 'tp' else 'sl'
             )
@@ -2918,7 +4873,6 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         else:
             side = row.side
         order_type = _order_type_from_row(row, activity_type)
-        kind = (row.extras or {}).get('kind', 'position')
         leg_kind = row_leg_kind
 
         leg_type: LegType | None = None
@@ -2933,8 +4887,17 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     leg_type = (LegType.TRAILING_STOP if row.trailing_stop
                                 else LegType.STOP_LOSS)
                     event_type = 'filled'
-                elif source in ('CLOSE_OUT', 'CLOSE', 'USER', 'DEALER'):
-                    leg_type = LegType.CLOSE if kind != 'position' else LegType.ENTRY
+                elif source in ('CLOSE_OUT', 'CLOSE', 'MARGIN', 'STOP_OUT'):
+                    # Unambiguous close sources — the bracket leg lookup
+                    # already ran for TP/SL above; everything else is
+                    # an exchange-side close (margin, stop-out, manual
+                    # via Close button) on the entry row.
+                    leg_type = LegType.CLOSE
+                    event_type = 'filled'
+                elif is_manual_close:
+                    # USER/DEALER on an already-filled entry row =
+                    # manual close (web UI / mobile / dealer).
+                    leg_type = LegType.CLOSE
                     event_type = 'filled'
                 else:
                     leg_type = LegType.ENTRY
@@ -3065,7 +5028,65 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         if self.store_ctx is None:
             return
         now_ts = epoch_time()
+        # Per-poll bracket aggregator: parent_coid -> all_legs_attached.
+        # Rationale: a bracket has TP + SL legs but only ONE parked
+        # dispatch entry (under the parent entry COID). Writing
+        # ``record_resolution`` separately per leg races with the engine's
+        # next ``_consume_plugin_resolutions``: if leg #1 lands as
+        # ``'attached'`` and the engine sync happens BEFORE leg #2 writes
+        # its result, the engine deletes the row and leg #2's later
+        # ``'rejected'`` UPDATE finds zero rows. The sticky-rejected SQL
+        # in :meth:`record_resolution` cannot help once the row is gone.
+        # Aggregating per parent_coid in a single pass within this poll —
+        # then writing ONE ``record_resolution`` per parent — eliminates
+        # the within-poll race entirely (both legs are visible in
+        # ``iter_live_orders`` together because :meth:`execute_exit`
+        # creates them atomically).
+        bracket_resolutions: dict[str, bool] = {}
+        # Mirror tracker for legs that ``_record_bracket_resolution`` flips
+        # to ``confirmed`` in this batch — keyed on parent COID. Used by
+        # the aggregate flush below to retire ``confirmed`` siblings when
+        # a mixed bracket lands as ``rejected`` overall (the engine then
+        # drops the parent dispatch's mapping and re-dispatches with
+        # fresh COIDs; without this retirement the confirmed siblings
+        # would survive alongside the new rows as duplicate bracket
+        # legs under the same parent_deal_id).
+        bracket_attached_coids: dict[str, list[str]] = {}
         for row in list(self.store_ctx.iter_live_orders()):
+            # --- Bracket-leg disposition recovery -------------------------
+            # Bracket TP/SL rows store ``parent_deal_id`` in extras and have
+            # NO ``exchange_order_id`` of their own (Capital.com brackets are
+            # position attributes — there is no separate order id to track).
+            # When ``execute_exit``'s PUT or confirm GET times out we flip
+            # them to ``disposition_unknown`` and raise
+            # ``OrderDispositionUnknownError``; the engine then parks the
+            # envelope. ``_verify_pending_dispatches`` only queries
+            # ``get_open_orders`` which never returns brackets, and the
+            # snapshot loop below skips rows without ``exchange_order_id``,
+            # so without this branch the leg rows would be stuck in
+            # ``disposition_unknown`` forever even when the bracket actually
+            # attached. We resolve the disposition deterministically from
+            # the parent position's ``profitLevel`` / ``stopLevel`` (or
+            # ``trailingStop`` + ``stopDistance`` for trailing legs): if it
+            # matches what we tried to set, the bracket is attached
+            # (``confirmed``); otherwise it is definitively absent
+            # (``rejected``). The aggregated resolution is also written
+            # AFTER the loop (see ``bracket_resolutions``) to the persisted
+            # park row keyed on the *parent* entry COID — the engine's
+            # :meth:`_verify_pending_dispatches` consumes it on the next
+            # sync, clearing the parked envelope and (for ``rejected``) the
+            # active ExitIntent so the next sync re-dispatches the
+            # protective order.
+            rextras = row.extras or {}
+            leg_kind = rextras.get('leg_kind')
+            if (leg_kind in ('tp', 'sl')
+                    and row.state == 'disposition_unknown'):
+                self._resolve_bracket_leg_disposition(
+                    row, leg_kind, positions_by_deal,
+                    bracket_resolutions=bracket_resolutions,
+                    bracket_attached_coids=bracket_attached_coids,
+                )
+                continue
             did = row.exchange_order_id
             if not did:
                 continue
@@ -3080,6 +5101,17 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
             work = working_by_deal.get(did)
 
             if pos is None and work is None:
+                if (row.extras or {}).get('close_event_yielded_at') is not None:
+                    # Race resolved: an earlier poll yielded a close
+                    # fill on this row while ``/positions`` still
+                    # carried the deal (so the eager teardown was
+                    # deferred). The deal has now vanished — this is
+                    # the same full-close path the immediate teardown
+                    # covers, just one poll later. Promote to teardown
+                    # here so the missing-pending grace tracker does
+                    # not raise a false ``UnexpectedCancelError``.
+                    self._close_bracket_after_natural_close(row)
+                    continue
                 extras = dict(row.extras or {})
                 if 'missing_pending_since' not in extras:
                     extras['missing_pending_since'] = now_ts
@@ -3096,6 +5128,47 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                     row.client_order_id, extras=extras,
                 )
 
+            # Clear any stale ``close_event_yielded_at`` breadcrumb on a
+            # row whose deal is still present.  The breadcrumb's purpose
+            # is the partial → full race window: a close activity yielded
+            # in the SAME poll where ``/positions`` had not yet reflected
+            # it.  If the deal is still alive on the next poll, the
+            # original close event was either a genuine partial (deal
+            # legitimately retained the remaining exposure) or a race
+            # that has now decisively NOT resolved as a full close.
+            # Either way the breadcrumb has outlived its valid window —
+            # leaving it in place causes a later disappearance of the
+            # remaining exposure (e.g. manual close whose activity rolls
+            # out of Capital.com's 60s history before the next poll) to
+            # trip the ``pos is None and work is None`` branch above and
+            # tear the bracket down silently, suppressing the
+            # missing-pending grace tracker that would otherwise raise
+            # ``UnexpectedCancelError`` and re-sync the strategy.
+            #
+            # **Same-poll guard**: when ``_process_activity`` deferred a
+            # full close in *this* cycle (``/positions`` returned the
+            # deal still open while ``/history/activity`` already showed
+            # the close), the same stale snapshot is what now hands us
+            # ``pos is not None``. Clearing here would turn next poll's
+            # legitimate disappearance into a ``missing_pending_since``
+            # stamp and eventually a false :class:`UnexpectedCancelError`.
+            # Skip the clear when the breadcrumb's poll-id matches the
+            # current cycle; a fresh snapshot in a later poll will pass
+            # the gate and clear normally.
+            if 'close_event_yielded_at' in (row.extras or {}):
+                stamp_poll_id = (row.extras or {}).get(
+                    'close_event_yielded_at_poll_id',
+                )
+                if stamp_poll_id != self._current_poll_id:
+                    extras = {k: v for k, v in (row.extras or {}).items()
+                              if k not in (
+                                  'close_event_yielded_at',
+                                  'close_event_yielded_at_poll_id',
+                              )}
+                    self.store_ctx.upsert_order(
+                        row.client_order_id, extras=extras,
+                    )
+
             # Working → position transition (entry fill)
             if (row.state == 'server_ref_seen' and pos is not None
                     and (row.extras or {}).get('kind') == 'working'):
@@ -3103,6 +5176,33 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 filled = float(pos_data.get('size') or row.qty)
                 self.store_ctx.set_order_state(row.client_order_id, 'confirmed')
                 self.store_ctx.set_filled(row.client_order_id, filled)
+                # Flip ``kind`` to ``position`` and stamp
+                # ``entry_filled_at`` so the rest of the plugin treats
+                # this row as a filled position. Several code paths
+                # gate on these fields:
+                #   * :meth:`_find_active_entry_row` requires
+                #     ``kind == 'position'`` — without it, subsequent
+                #     ``modify_exit`` lookups would skip the row.
+                #   * Partial-fill detection later in this same
+                #     reconcile loop also requires ``kind == 'position'``.
+                #   * Manual ``USER`` / ``DEALER`` close detection in
+                #     :meth:`_activity_to_event` requires
+                #     ``entry_filled_at`` truthy AND ``kind == 'position'``.
+                #     Without these, a manual close activity for a
+                #     limit-fill entry would route as
+                #     :class:`LegType.ENTRY` and add to the local
+                #     position instead of closing it.
+                # The activity-stream stamp at :meth:`_process_activity`
+                # only stamps ``entry_filled_at`` for rows that are
+                # ALREADY ``kind == 'position'`` — limit-fill entries
+                # that surface via this snapshot path are otherwise
+                # never stamped.
+                new_extras = dict(row.extras or {})
+                new_extras['kind'] = 'position'
+                new_extras['entry_filled_at'] = now_ts
+                self.store_ctx.upsert_order(
+                    row.client_order_id, extras=new_extras,
+                )
                 self.store_ctx.log_event(
                     'working_to_position',
                     client_order_id=row.client_order_id,
@@ -3165,6 +5265,111 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                         from_entry=row.from_entry,
                         leg_type=LegType.ENTRY,
                     )
+
+        # Flush aggregated bracket resolutions: one ``record_resolution``
+        # per parent COID, written AFTER every leg of that bracket has
+        # been inspected this poll. ``True`` (all legs attached) ->
+        # ``'attached'``; any leg ``False`` -> ``'rejected'`` (the engine
+        # then drops the active ExitIntent and re-dispatches on the next
+        # sync). Single write per parent eliminates the per-leg race
+        # against ``_consume_plugin_resolutions`` described above.
+        if bracket_resolutions:
+            # Index live pending-trail SL rows by ``parent_coid``. These
+            # rows are seeded as ``confirmed`` synchronously by
+            # :meth:`attach_bracket` / :meth:`modify_exit` whenever Pine
+            # combines ``trail_offset`` + ``trail_price`` (the PUT body
+            # carries the TP only — the pending-trail SL is purely
+            # local, owned by :meth:`_trailing_activation_monitor`), so
+            # they never flow through :meth:`_record_bracket_resolution`
+            # and therefore never appear in ``bracket_attached_coids``.
+            # If the parent later resolves ``rejected`` (e.g. TP attach
+            # was ambiguous and the next snapshot shows the broker did
+            # not attach it), the engine drops the parent dispatch's
+            # mapping and re-dispatches with fresh COIDs — leaving the
+            # old pending-trail SL row live with the same
+            # ``parent_deal_id``. The activation monitor would then PUT
+            # ``trailingStop=true`` against the stale row when the
+            # threshold crosses, racing the freshly seeded row.
+            pending_trail_by_parent: dict[str, list[str]] = {}
+            for live_row in self.store_ctx.iter_live_orders():
+                lextras = live_row.extras or {}
+                if lextras.get('leg_kind') != 'sl':
+                    continue
+                if lextras.get('trail_state') not in ('pending', 'activating'):
+                    continue
+                pcoid = lextras.get('parent_coid')
+                if pcoid is None:
+                    continue
+                pending_trail_by_parent.setdefault(str(pcoid), []).append(
+                    live_row.client_order_id,
+                )
+            for parent_coid, all_attached in bracket_resolutions.items():
+                if not all_attached:
+                    # Mixed bracket: any leg row that an earlier
+                    # _record_bracket_resolution call promoted to
+                    # ``confirmed`` in this same batch must be retired
+                    # before the engine sees the parent ``rejected``.
+                    # The engine's modify-rejected branch (also driving
+                    # the entry-rejected path) drops the parent
+                    # dispatch's mapping and re-dispatches the exit
+                    # with a fresh envelope (new TP/SL COIDs); leaving
+                    # the confirmed sibling alive would seed duplicate
+                    # bracket leg rows under the same parent_deal_id —
+                    # later fill / cancel lookups by parent could pick
+                    # stale rows over the new dispatch's entries.
+                    for sibling_coid in bracket_attached_coids.get(parent_coid, ()):
+                        sibling = self.store_ctx.get_order(sibling_coid)
+                        if sibling is None or sibling.closed_ts_ms is not None:
+                            continue
+                        sibling_extras = sibling.extras or {}
+                        self.store_ctx.set_order_state(
+                            sibling_coid, 'rejected',
+                        )
+                        self.store_ctx.close_order(sibling_coid)
+                        self.store_ctx.log_event(
+                            'bracket_sibling_retired_on_mixed_rejection',
+                            client_order_id=sibling_coid,
+                            exchange_order_id=sibling_extras.get('parent_deal_id'),
+                            payload={
+                                'sibling_coid': sibling_coid,
+                                'parent_coid': parent_coid,
+                                'leg_kind': sibling_extras.get('leg_kind'),
+                                'reason': 'mixed_bracket_rejected',
+                            },
+                        )
+                    # Pending-trail SL siblings: same parent rejection
+                    # consequences (engine re-dispatches with fresh
+                    # COIDs), but the row was promoted to ``confirmed``
+                    # outside _record_bracket_resolution, so it is not
+                    # in ``bracket_attached_coids``. Walk the pre-built
+                    # index and retire it through the same retirement
+                    # path so the activation monitor cannot fire against
+                    # the stale row.
+                    for sibling_coid in pending_trail_by_parent.get(parent_coid, ()):
+                        sibling = self.store_ctx.get_order(sibling_coid)
+                        if sibling is None or sibling.closed_ts_ms is not None:
+                            continue
+                        sibling_extras = sibling.extras or {}
+                        self.store_ctx.set_order_state(
+                            sibling_coid, 'rejected',
+                        )
+                        self.store_ctx.close_order(sibling_coid)
+                        self.store_ctx.log_event(
+                            'bracket_sibling_retired_on_mixed_rejection',
+                            client_order_id=sibling_coid,
+                            exchange_order_id=sibling_extras.get('parent_deal_id'),
+                            payload={
+                                'sibling_coid': sibling_coid,
+                                'parent_coid': parent_coid,
+                                'leg_kind': sibling_extras.get('leg_kind'),
+                                'reason': 'pending_trail_parent_rejected',
+                                'trail_state': sibling_extras.get('trail_state'),
+                            },
+                        )
+                self.store_ctx.record_resolution(
+                    parent_coid,
+                    'attached' if all_attached else 'rejected',
+                )
 
     async def _missing_pending_tracker(
             self,
@@ -3393,20 +5598,65 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
         event. The plugin side-steps the issue by writing the
         fingerprint to the BrokerStore on every processed row and
         reloading the last 24 h on connect.
+
+        Deferred-close clamp: the in-batch clamp in
+        :meth:`_process_activity` only protects the in-memory cursor.
+        Across restarts the rebuilt cursor must also stay below the
+        oldest *unresolved* deferred close, otherwise a later activity
+        in the same batch (logged as ``activity_processed``) would
+        rebuild ``last_date_utc`` past the deferred row's ``dateUTC``
+        and the next poll's ``date_utc < cursor.last_date_utc`` guard
+        would permanently drop the deferred close. Resolution is
+        detected by ``(dateUTC, deal_id)`` identity: a deferred close
+        is considered resolved only when an ``activity_processed`` row
+        for the **same** ``dealId`` and ``dateUTC`` exists. Matching on
+        ``dateUTC`` alone is unsafe — a sibling deal's activity at the
+        same timestamp would mask an unrelated deferred close, letting
+        the cursor advance past it and silently desync the strategy.
+        Capital re-issues the deferred row with a populated ``level``
+        (fresh fingerprint, identical ``dealId`` and ``dateUTC``), so
+        the pair is a stable identity for the resolution probe.
         """
         if self.store_ctx is None:
             return
         cutoff_ms = int((epoch_time() - 86400.0) * 1000)
         cursor = self._activity_cursor
-        for payload in self.store_ctx.iter_events_by_kind_since(
-                'activity_processed', cutoff_ms,
-        ):
+
+        processed_payloads = list(self.store_ctx.iter_events_by_kind_since(
+            'activity_processed', cutoff_ms,
+        ))
+        deferred_payloads = list(self.store_ctx.iter_events_by_kind_since(
+            'activity_close_deferred_no_price', cutoff_ms,
+        ))
+
+        processed_keys: set[tuple[str, str]] = set()
+        for payload in processed_payloads:
+            d: str | None = payload.get('dateUTC')
+            if d:
+                processed_keys.add((d, str(payload.get('deal_id') or '')))
+
+        deferred_min_unresolved: str | None = None
+        for payload in deferred_payloads:
+            d = payload.get('dateUTC')
+            if not isinstance(d, str):
+                continue
+            key = (d, str(payload.get('deal_id') or ''))
+            if key in processed_keys:
+                continue
+            if deferred_min_unresolved is None or d < deferred_min_unresolved:
+                deferred_min_unresolved = d
+
+        for payload in processed_payloads:
             fp: str | None = payload.get('fingerprint')
             if fp:
                 cursor.seen_fingerprints.add(fp)
             date_utc: str | None = payload.get('dateUTC')
-            if date_utc and (cursor.last_date_utc is None
-                             or date_utc > cursor.last_date_utc):
+            if not date_utc:
+                continue
+            if (deferred_min_unresolved is not None
+                    and date_utc >= deferred_min_unresolved):
+                continue
+            if cursor.last_date_utc is None or date_utc > cursor.last_date_utc:
                 cursor.last_date_utc = date_utc
 
     async def _recover_in_flight_submissions(self) -> None:
@@ -3617,6 +5867,13 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
           :class:`InvalidStopDistanceError` /
           :class:`InvalidTakeProfitDistanceError` carrying the dynamic
           minimum so the strategy can re-size without another round-trip.
+        * ``error.invalid.stoploss.maxvalue: X`` /
+          ``error.invalid.takeprofit.maxvalue: X`` →
+          :class:`InvalidStopMaxValueError` /
+          :class:`InvalidTakeProfitMaxValueError` carrying the boundary
+          level (price, not distance) the exchange would have accepted.
+          Triggered when a fresh fill has already moved the spread past
+          the requested SL/TP level by the time the bracket attach hits.
         * ``error.invalid.leverage.value`` → :class:`InsufficientMarginError`
           (margin/leverage are semantically the same from the script's
           viewpoint — both mean "can't afford this size").
@@ -3640,13 +5897,21 @@ class CapitalCom(BrokerPlugin[CapitalComConfig]):
                 return OrderNotFoundError(str(raw), ref_type='deal_id')
             if code == _NOT_FOUND_DEAL_REF_CODE:
                 return OrderNotFoundError(str(raw), ref_type='deal_reference')
-            if code.startswith(_INVALID_STOP_PREFIX):
+            if code.startswith(_INVALID_STOP_MIN_PREFIX):
                 return InvalidStopDistanceError(
-                    str(raw), min_distance=_extract_min_value(raw),
+                    str(raw), min_distance=_extract_numeric_value(raw),
                 )
-            if code.startswith(_INVALID_TP_PREFIX):
+            if code.startswith(_INVALID_STOP_MAX_PREFIX):
+                return InvalidStopMaxValueError(
+                    str(raw), max_value=_extract_numeric_value(raw),
+                )
+            if code.startswith(_INVALID_TP_MIN_PREFIX):
                 return InvalidTakeProfitDistanceError(
-                    str(raw), min_distance=_extract_min_value(raw),
+                    str(raw), min_distance=_extract_numeric_value(raw),
+                )
+            if code.startswith(_INVALID_TP_MAX_PREFIX):
+                return InvalidTakeProfitMaxValueError(
+                    str(raw), max_value=_extract_numeric_value(raw),
                 )
             if code == _INVALID_LEVERAGE_CODE:
                 return InsufficientMarginError(str(raw))
@@ -3699,14 +5964,20 @@ def _order_type_from_row(row: 'OrderRow', activity_type: str) -> OrderType:
     return OrderType.MARKET
 
 
-def _extract_min_value(exc: CapitalComError) -> float:
-    """Pull the ``X`` out of a Capital.com ``...minvalue: X`` error message.
+def _extract_numeric_value(exc: CapitalComError) -> float:
+    """Pull the trailing numeric ``X`` out of Capital.com's
+    ``error.invalid.<leg>.<bound>: X`` messages.
 
-    Stop-distance / take-profit-distance rejects follow the pattern
-    ``error.invalid.stoploss.minvalue: 0.00050``. The trailing numeric
-    value is the dynamic minimum the exchange currently enforces for the
-    instrument. Returns ``0.0`` on parse failure so the caller gets a
-    defined value without a raise — the typed exception is already the
+    Stop-distance / take-profit-distance rejects (``minvalue``) follow
+    the pattern ``error.invalid.stoploss.minvalue: 0.00050`` — the
+    trailing value is the dynamic *distance* minimum. Maxvalue rejects
+    (``maxvalue``) use the same shape but the trailing value is an
+    *absolute price level* the bracket level cannot cross. The parser
+    is identical for both — the *meaning* of the value differs by
+    error code, which the typed exception captures.
+
+    Returns ``0.0`` on parse failure so the caller gets a defined
+    value without a raise — the typed exception is already the
     signal; the numeric payload is advisory.
     """
     message = str(exc)

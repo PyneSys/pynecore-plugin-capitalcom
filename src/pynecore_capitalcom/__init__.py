@@ -3,7 +3,9 @@ from .plugin import (
     CapitalComConfig,
     CapitalComError,
     InvalidStopDistanceError,
+    InvalidStopMaxValueError,
     InvalidTakeProfitDistanceError,
+    InvalidTakeProfitMaxValueError,
     OrderNotFoundError,
 )
 
@@ -12,6 +14,8 @@ __all__ = [
     'CapitalComConfig',
     'CapitalComError',
     'InvalidStopDistanceError',
+    'InvalidStopMaxValueError',
     'InvalidTakeProfitDistanceError',
+    'InvalidTakeProfitMaxValueError',
     'OrderNotFoundError',
 ]
