@@ -1,0 +1,218 @@
+"""Module-level constants and stateless helpers.
+
+Bundles three loosely related concerns that share one trait — none of them
+touch class state, all are pure functions / constants:
+
+* Endpoint constants (live + demo REST hosts, WS URL, prefix).
+* Lookup tables (timeframe map, asset-type label map).
+* Error-code frozensets used by ``_RestSessionMixin._map_exception``.
+* Pure helpers: password encryption, opening-hours parser, error-code +
+  numeric-value extractors, ISO timestamp parser, order-type-from-row
+  resolver.
+
+Imported by ``_base.py`` and many mix-ins; depends only on stdlib and
+``exceptions.py``.
+"""
+from base64 import standard_b64decode, standard_b64encode
+from datetime import UTC, datetime, time
+from time import time as epoch_time
+from typing import TYPE_CHECKING
+
+from Crypto.Cipher import PKCS1_v1_5
+from Crypto.PublicKey import RSA
+
+from pynecore.core.broker.models import OrderType
+
+from .exceptions import CapitalComError
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
+
+
+URL = 'https://api-capital.backend-capital.com'
+URL_DEMO = 'https://demo-api-capital.backend-capital.com'
+
+WS_URL = 'wss://api-streaming-capital.backend-capital.com/connect'
+
+ENDPOINT_PREFIX = '/api/v1/'
+
+TIMEFRAMES = {
+    '1': 'MINUTE',
+    '5': 'MINUTE_5',
+    '15': 'MINUTE_15',
+    '30': 'MINUTE_30',
+    '60': 'HOUR',
+    '240': 'HOUR_4',
+    '1D': 'DAY',
+    '1W': 'WEEK'
+}
+
+TIMEFRAMES_INV = {v: k for k, v in TIMEFRAMES.items()}
+
+TYPES = {
+    'CURRENCIES': 'forex',
+    'CRYTOCURRENCIES': 'crypto',
+    'SHARES': 'stock',
+    'INDICES': 'index',
+}
+
+_RETRYABLE_CODES = frozenset({
+    'error.too-many.requests',
+    'error.security.client-token-missing',
+    'error.null.client.token',
+})
+
+_AUTH_ERROR_CODES = frozenset({
+    'error.null.api.key',
+    'error.invalid.details',
+    'error.invalid.accountId',
+})
+
+_NOT_FOUND_DEAL_ID_CODE = 'error.not-found.dealId'
+_NOT_FOUND_DEAL_REF_CODE = 'error.not-found.dealReference'
+_INVALID_STOP_MIN_PREFIX = 'error.invalid.stoploss.minvalue'
+_INVALID_STOP_MAX_PREFIX = 'error.invalid.stoploss.maxvalue'
+_INVALID_TP_MIN_PREFIX = 'error.invalid.takeprofit.minvalue'
+_INVALID_TP_MAX_PREFIX = 'error.invalid.takeprofit.maxvalue'
+_INVALID_LEVERAGE_CODE = 'error.invalid.leverage.value'
+
+# Valid ``on_unexpected_cancel`` policy values — keep in sync with the base
+# :class:`BrokerPlugin` docstring. Anything else is a config error raised at
+# construction so the live-trading loop never starts against a typo.
+_VALID_UNEXPECTED_CANCEL_POLICIES = frozenset({
+    'stop', 'stop_and_cancel', 're_place', 'ignore',
+})
+
+
+def encrypt_password(password: str, encryption_key: str, timestamp: int | None = None):
+    if timestamp is None:
+        timestamp = int(epoch_time())
+    payload = password + '|' + str(timestamp)
+    payload = standard_b64encode(payload.encode('ascii'))
+    public_key = RSA.importKey(standard_b64decode(encryption_key.encode('ascii')))
+    cipher = PKCS1_v1_5.new(public_key)
+    ciphertext = standard_b64encode(cipher.encrypt(payload)).decode()
+    return ciphertext
+
+
+def _parse_opening_hours_segment(oh: str) -> tuple[time, time] | None:
+    """Parse one Capital.com ``openingHours`` segment into ``(start, end)``.
+
+    Each per-day entry has the shape ``"HH:MM - HH:MM"`` where either side may
+    be ``"00:00"`` to denote midnight (open from / closed at the day boundary).
+    Whitespace around the dash and around the times is optional.
+
+    The two times are returned as :class:`datetime.time` values in the *source*
+    timezone reported by Capital — the caller is responsible for converting
+    them to ``self.timezone``. ``time(0, 0)`` represents midnight on either
+    side; the caller uses that to decide whether to emit a session_start /
+    session_end marker (midnight is the day boundary, not a real transition).
+
+    Returns ``None`` for empty input or any segment that cannot be parsed
+    (closed-day markers, multi-segment lines with stray dashes, malformed
+    time strings) — invalid segments are silently skipped by the caller.
+    """
+    parts = oh.split('-')
+    if len(parts) != 2:
+        return None
+    raw_start = parts[0].strip()
+    raw_end = parts[1].strip()
+    # A bare ``"-"`` (or any segment where one side is empty after
+    # stripping) is a closed-day marker, NOT a 24h session. Defaulting an
+    # empty side to ``time(0, 0)`` would round-trip to ``(00:00, 00:00)``,
+    # which the caller treats as a 24h shape — silently flipping the
+    # market open all day. Both sides must be explicit times; reject
+    # the segment otherwise so the caller's ``parsed is None`` skip
+    # fires.
+    if not raw_start or not raw_end:
+        return None
+    try:
+        start = time.fromisoformat(raw_start)
+        end = time.fromisoformat(raw_end)
+    except ValueError:
+        return None
+    return start, end
+
+
+def _extract_error_code(exc: CapitalComError) -> str:
+    """Pull the ``error.*`` code out of a :class:`CapitalComError` message.
+
+    The provider formats errors as ``"API error occured: <code>"`` — we
+    split on the prefix so callers get the raw code back. Returns the
+    empty string when the format does not match (defensive, since the
+    formatter could change).
+    """
+    message = str(exc)
+    prefix = "API error occured: "
+    if message.startswith(prefix):
+        return message[len(prefix):].split(':', 1)[0].strip()
+    return message.split(':', 1)[0].strip()
+
+
+def _order_type_from_row(row: 'OrderRow', activity_type: str) -> OrderType:
+    """Pick an :class:`OrderType` for an event based on row + activity context.
+
+    Bracket legs carry their intended type through ``row.extras.leg_kind``
+    (``'tp'`` → LIMIT, ``'sl'`` → STOP / TRAILING_STOP). Working-order
+    rows store the type under ``extras.order_type``. Everything else
+    falls back to MARKET — the default for a position fill.
+    """
+    extras = row.extras or {}
+    leg_kind = extras.get('leg_kind')
+    if leg_kind == 'tp':
+        return OrderType.LIMIT
+    if leg_kind == 'sl':
+        return OrderType.TRAILING_STOP if row.trailing_stop else OrderType.STOP
+    stored = extras.get('order_type')
+    if stored:
+        try:
+            return OrderType(stored)
+        except ValueError:
+            pass
+    if activity_type == 'WORKING_ORDER':
+        return OrderType.LIMIT
+    return OrderType.MARKET
+
+
+def _extract_numeric_value(exc: CapitalComError) -> float:
+    """Pull the trailing numeric ``X`` out of Capital.com's
+    ``error.invalid.<leg>.<bound>: X`` messages.
+
+    Stop-distance / take-profit-distance rejects (``minvalue``) follow
+    the pattern ``error.invalid.stoploss.minvalue: 0.00050`` — the
+    trailing value is the dynamic *distance* minimum. Maxvalue rejects
+    (``maxvalue``) use the same shape but the trailing value is an
+    *absolute price level* the bracket level cannot cross. The parser
+    is identical for both — the *meaning* of the value differs by
+    error code, which the typed exception captures.
+
+    Returns ``0.0`` on parse failure so the caller gets a defined
+    value without a raise — the typed exception is already the
+    signal; the numeric payload is advisory.
+    """
+    message = str(exc)
+    _, _, tail = message.rpartition(':')
+    try:
+        return float(tail.strip())
+    except ValueError:
+        return 0.0
+
+
+def _parse_iso_timestamp(value: str) -> float:
+    """Best-effort ISO-8601 → unix-seconds parser.
+
+    Capital.com stamps ``createdDateUTC`` as ``YYYY-MM-DDTHH:MM:SS.sss``
+    without a trailing ``Z``; :func:`datetime.fromisoformat` accepts that
+    directly on Python 3.11+. Returns ``0.0`` on parse failure so the
+    caller gets a defined value without a raise — timestamps here are
+    advisory and never load-bearing for order identity.
+    """
+    if not value:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.timestamp()
+    except ValueError:
+        return 0.0

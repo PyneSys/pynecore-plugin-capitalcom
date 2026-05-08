@@ -231,6 +231,25 @@ def __test_broker_map_exception_classifies_codes__():
     )
 
 
+# noinspection PyProtectedMember
+def __test_broker_map_exception_falls_through_to_broker_base__():
+    """Stdlib ``ConnectionError`` must be mapped by ``BrokerPlugin._map_exception``.
+
+    Capital.com's ``_map_exception`` only handles ``httpx`` transport errors
+    and ``CapitalComError`` payloads itself; everything else falls through
+    via ``super()``. The MRO from the Capital.com mix-in must reach the
+    ``BrokerPlugin`` base — any intermediate class declaring an ``...``
+    stub for ``_map_exception`` would silently break this fallthrough and
+    classify a connection drop as ``None`` (re-raise as-is) instead of
+    :class:`ExchangeConnectionError`.
+    """
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+
+    broker = _FakeBroker(config=_make_config())
+    mapped = broker._map_exception(ConnectionError("peer reset"))
+    assert isinstance(mapped, ExchangeConnectionError)
+
+
 def __test_watch_orders_is_async_iterator__():
     """watch_orders is advertised as True in capabilities, so it must exist as
     an async generator callable — not a NotImplementedError stub."""
@@ -466,7 +485,7 @@ def __test_get_instrument_rules_ttl_expiry_refetches__(tmp_path, monkeypatch):
     )
     fake_now = {'t': 1_000_000.0}
     monkeypatch.setattr(
-        'pynecore_capitalcom.plugin.epoch_time', lambda: fake_now['t'],
+        'pynecore_capitalcom.provider.epoch_time', lambda: fake_now['t'],
     )
     asyncio.run(broker._get_instrument_rules('EURUSD'))
     fetch_calls = [c for c in broker._calls if c[0] == 'markets/EURUSD']
