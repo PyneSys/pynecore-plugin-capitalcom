@@ -51,9 +51,34 @@ from .helpers import (
     _NOT_FOUND_DEAL_REF_CODE,
     _RETRYABLE_CODES,
     _extract_error_code,
+    _extract_jwt_expiry,
     _extract_numeric_value,
     encrypt_password,
 )
+
+# Capital.com session tokens expire ~1h after creation despite the
+# documented 10-min "inactivity" TTL — the cap is undocumented but
+# observed in practice. We refresh proactively before the cap so the
+# trading loop never sees ``error.invalid.session.token``.
+_SESSION_REFRESH_FALLBACK_S = 50 * 60
+_SESSION_REFRESH_SAFETY_S = 5 * 60
+# Bootstrap requests — must NOT trigger a proactive refresh (would
+# recurse into ``create_session`` itself), MUST go out without auth
+# headers, and MUST NOT trigger reactive retry on
+# ``error.invalid.session.token``. Keyed on (endpoint, method) so an
+# authenticated ``PUT session`` (account switch) is NOT mistaken for
+# the unauthenticated bootstrap login — only the encryption-key GET
+# and the login POST form the bootstrap pair.
+_SESSION_BOOTSTRAP_REQUESTS = frozenset({
+    ('session/encryptionKey', 'get'),
+    ('session', 'post'),
+})
+# Codes that mean "your session is gone" — re-create and retry.
+_SESSION_RECREATE_CODES = frozenset({
+    'error.security.client-token-missing',
+    'error.null.client.token',
+    'error.invalid.session.token',
+})
 
 
 class _RestSessionMixin(_CapitalComBase):
@@ -68,49 +93,184 @@ class _RestSessionMixin(_CapitalComBase):
         The broker side wraps every call in :meth:`_call` which offloads
         this method to a worker thread via :func:`asyncio.to_thread`.
         """
-        headers = {'X-CAP-API-KEY': self.config.api_key}
-        if self.security_token:
-            headers['X-SECURITY-TOKEN'] = self.security_token
-        if self.cst_token:
-            headers['CST'] = self.cst_token
+        method_lc = method.lower()
+        is_bootstrap = (endpoint, method_lc) in _SESSION_BOOTSTRAP_REQUESTS
+        # Proactive session refresh: Capital.com tokens have an
+        # undocumented hard cap (~1h). Refresh ahead of the deadline so
+        # ``watch_orders`` never observes ``error.invalid.session.token``.
+        # Skipped during the bootstrap calls themselves to avoid
+        # re-entering ``create_session`` from ``__call__``.
+        if (_level == 0
+                and not is_bootstrap
+                and self.config.user_email and self.config.api_password):
+            self._refresh_session_if_stale()
 
-        method = method.lower()
+        # Snapshot the tokens used for THIS request. Two purposes:
+        #   1. Bootstrap endpoints (``session/encryptionKey``/``session``)
+        #      must go out without auth headers — sending stale CST/
+        #      X-SECURITY-TOKEN there can itself trigger
+        #      ``error.invalid.session.token``. We skip auth here rather
+        #      than wiping the class state, so a concurrent WebSocket
+        #      ``_send`` does not see ``None`` mid-refresh.
+        #   2. The post-response rotation handler compares against this
+        #      snapshot, not the current attribute, so a slow response
+        #      that returns AFTER another worker has refreshed the
+        #      session does not roll the freshly-issued tokens back to
+        #      the stale pair the server echoed.
+        # Atomic snapshot: tokens AND generation must be read together
+        # under the session lock — otherwise a ``create_session`` that
+        # completes between the token reads and the generation read
+        # would tag THIS request (already pointed at the OLD session
+        # through its token snapshot) with the NEW generation, and the
+        # rotation handler would later accept the response's old-session
+        # rotation header as current. Holding the lock here also blocks
+        # against an in-progress refresh: the snapshot is consistent in
+        # both cases (pre-refresh: old tokens + old gen; post-refresh:
+        # new tokens + new gen). The lock is only held across attribute
+        # reads, so HTTP I/O is unaffected.
+        with self._session_lock:
+            req_security_token = self.security_token
+            req_cst_token = self.cst_token
+            req_generation = self._session_generation
+
+        headers = {'X-CAP-API-KEY': self.config.api_key}
+        if not is_bootstrap:
+            if req_security_token:
+                headers['X-SECURITY-TOKEN'] = req_security_token
+            if req_cst_token:
+                headers['CST'] = req_cst_token
+
         params: dict[str, dict | float | None] = dict(headers=headers, timeout=50.0)
-        if method == 'get':
+        if method_lc == 'get':
             params['params'] = data
-        elif method in ('post', 'put'):
+        elif method_lc in ('post', 'put'):
             params['json'] = data
 
         url = URL_DEMO if self.config.demo else URL
         url += ENDPOINT_PREFIX + endpoint
 
-        res: httpx.Response = getattr(httpx, method)(url, **params)
+        res: httpx.Response = getattr(httpx, method_lc)(url, **params)
         try:
             dict_res = res.json()
         except JSONDecodeError:
             raise CapitalComError(f"JSON Error: {res.text}")
 
         if res.is_error:
-            if dict_res['errorCode'] in ('error.security.client-token-missing',
-                                         'error.null.client.token') \
+            # Bootstrap endpoints must NOT trigger a re-login retry —
+            # ``create_session`` calls them with the default ``_level=0``,
+            # so a session-token error there would recurse into another
+            # ``create_session`` until ``RecursionError``. Surface the
+            # error directly; bootstrap requests already go out without
+            # stale auth headers (see snapshot above), so a real auth
+            # failure here is terminal and needs operator attention.
+            if dict_res['errorCode'] in _SESSION_RECREATE_CODES \
+                    and not is_bootstrap \
                     and self.config.user_email and self.config.api_password and _level < 3:
-                self.create_session()
+                # Serialise re-creation under the session lock — otherwise
+                # several workers seeing the same expiry would each POST
+                # ``/session`` in parallel. Double-check the generation
+                # inside the lock so workers that lost the race retry
+                # against the fresh session another worker just installed
+                # instead of issuing yet another redundant login.
+                with self._session_lock:
+                    if self._session_generation == req_generation:
+                        self.create_session()
                 return self(endpoint=endpoint, data=data, method=method, _level=_level + 1)
             raise CapitalComError(f"API error occured: {dict_res['errorCode']}")
 
-        try:
-            self.security_token = res.headers['X-SECURITY-TOKEN']
-        except KeyError:
-            pass
-        try:
-            self.cst_token = res.headers['CST']
-        except KeyError:
-            pass
+        # Apply rotation under the session lock so a concurrent refresh
+        # cannot interleave with this update. If a fresh session was
+        # installed since we snapshotted (generation advanced), the
+        # rotation header on our response belongs to the OLD session —
+        # discarding it keeps the freshly-issued tokens intact. Bootstrap
+        # responses are exempt: they ARE the new session being installed,
+        # so they always apply and bump the generation. Concurrent
+        # *non-bootstrap* responses with the same generation are allowed
+        # to apply (last-writer-wins) — the snapshot tokens are NOT
+        # compared because two normal requests both rotating from the
+        # same starting tokens are equally valid signals to update.
+        new_security = res.headers.get('X-SECURITY-TOKEN', req_security_token)
+        new_cst = res.headers.get('CST', req_cst_token)
+        if new_security == req_security_token and new_cst == req_cst_token:
+            return dict_res
+        with self._session_lock:
+            if not is_bootstrap and self._session_generation != req_generation:
+                return dict_res
+            now = epoch_time()
+            if new_security != req_security_token:
+                self.security_token = new_security
+                self._security_token_deadline = self._token_deadline(
+                    new_security, now,
+                )
+            if new_cst != req_cst_token:
+                self.cst_token = new_cst
+                self._cst_token_deadline = self._token_deadline(
+                    new_cst, now,
+                )
+            self._session_token_expiry_ts = self._compute_token_expiry()
+            if is_bootstrap:
+                self._session_generation += 1
 
         return dict_res
 
+    @staticmethod
+    def _token_deadline(tok: str | None, now: float) -> float:
+        """Per-token expiry: JWT ``exp`` if present, else ``now + fallback``.
+
+        Returns ``0.0`` for an empty token so :meth:`_compute_token_expiry`
+        can ignore it. Called at issue time so opaque tokens get their
+        hard cap anchored to the actual issue moment, not a later recompute.
+        """
+        if not tok:
+            return 0.0
+        exp = _extract_jwt_expiry(tok)
+        return exp if exp is not None else now + _SESSION_REFRESH_FALLBACK_S
+
+    def _compute_token_expiry(self) -> float:
+        """Return the earliest deadline across the two session tokens.
+
+        Reads the per-token deadlines maintained by :meth:`__call__`; the
+        session is only as fresh as the earlier-expiring half. Falls back
+        to ``epoch_time() + _SESSION_REFRESH_FALLBACK_S`` only when no
+        deadline has been registered yet (e.g. tests bypassing the
+        rotation handler).
+        """
+        deadlines = [
+            d for d in (self._security_token_deadline, self._cst_token_deadline)
+            if d > 0.0
+        ]
+        if deadlines:
+            return min(deadlines)
+        return epoch_time() + _SESSION_REFRESH_FALLBACK_S
+
+    def _refresh_session_if_stale(self) -> None:
+        """Re-create the session when the current one is within the safety window.
+
+        Double-checked locking so several worker threads tripping the
+        check at once don't all queue behind a single refresh — the
+        first thread re-creates, subsequent ones see the fresh expiry
+        on the second check inside the lock and return immediately.
+        """
+        if self._session_token_expiry_ts == 0.0:
+            return
+        deadline = self._session_token_expiry_ts - _SESSION_REFRESH_SAFETY_S
+        if epoch_time() < deadline:
+            return
+        with self._session_lock:
+            if epoch_time() < self._session_token_expiry_ts - _SESSION_REFRESH_SAFETY_S:
+                return
+            self.create_session()
+
     def create_session(self):
-        """Create a session with the Capital.com API (login)."""
+        """Create a session with the Capital.com API (login).
+
+        Leaves the existing CST / X-SECURITY-TOKEN attributes intact.
+        :meth:`__call__` skips auth headers on the bootstrap endpoints,
+        so they never see stale CST/X-SECURITY-TOKEN values, and a
+        concurrent WebSocket ``_send`` keeps observing valid tokens
+        until the response of the ``session`` POST is applied through
+        the rotation handler (which atomically swaps both halves).
+        """
         res: dict = self('session/encryptionKey', method='get')
         encryption_key = res['encryptionKey']
         timestamp = res['timeStamp']
@@ -266,10 +426,14 @@ class _RestSessionMixin(_CapitalComBase):
                 )
             if code == _INVALID_LEVERAGE_CODE:
                 return InsufficientMarginError(str(raw))
+            # Must precede the generic ``error.invalid.`` branch so
+            # ``error.invalid.session.token`` (a session-expiry signal,
+            # not an order-rejection) routes here instead of falling
+            # through to ``ExchangeOrderRejectedError``.
+            if code in _RETRYABLE_CODES:
+                return ExchangeConnectionError(str(raw))
             if code and code.startswith('error.invalid.') and 'margin' in code:
                 return InsufficientMarginError(str(raw))
             if code and code.startswith('error.invalid.'):
                 return ExchangeOrderRejectedError(str(raw))
-            if code in _RETRYABLE_CODES:
-                return ExchangeConnectionError(str(raw))
         return super()._map_exception(raw)

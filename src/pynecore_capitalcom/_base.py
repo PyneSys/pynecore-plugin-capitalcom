@@ -26,6 +26,7 @@ Final MRO:
 LiveProviderPlugin → ProviderPlugin → Plugin → object``.
 """
 import asyncio
+import threading
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from pynecore.core.broker.models import (
@@ -62,6 +63,27 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     security_token: str | None
     cst_token: str | None
     session_data: dict
+    # Wall-clock when the current session tokens are estimated to expire
+    # (unix seconds; 0.0 = no session yet). Set from the JWT ``exp`` claim
+    # if the tokens parse as JWTs, else from a hardcoded fallback interval.
+    _session_token_expiry_ts: float
+    # Per-token deadlines. Recorded at the moment a token is issued so an
+    # opaque token's hard cap survives partial rotations of the other
+    # header — recomputing on every response would slide an unchanged
+    # opaque deadline forward and let proactive refresh wait past expiry.
+    _security_token_deadline: float
+    _cst_token_deadline: float
+    # Guards re-entrant ``create_session()`` calls when several worker
+    # threads (``asyncio.to_thread`` callers) trip the proactive refresh
+    # at the same time. Also serialises the rotation handler in
+    # ``__call__`` so a slow response cannot roll back tokens issued by
+    # a concurrent refresh. ``RLock`` because ``_refresh_session_if_stale``
+    # holds the lock while ``create_session`` calls back into ``__call__``
+    # which re-enters the lock for its own rotation step.
+    _session_lock: threading.RLock
+    # Monotonic counter incremented by each successful bootstrap login —
+    # see the long ``__init__`` comment in ``plugin.py``.
+    _session_generation: int
     on_unexpected_cancel: str
 
     # --- WebSocket state ---

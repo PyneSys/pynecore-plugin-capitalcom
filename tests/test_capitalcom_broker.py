@@ -232,6 +232,29 @@ def __test_broker_map_exception_classifies_codes__():
 
 
 # noinspection PyProtectedMember
+def __test_map_exception_session_token_routes_to_connection_error__():
+    """``error.invalid.session.token`` must NOT surface as an order rejection.
+
+    The reactive retry in ``__call__`` recreates the session and retries,
+    but if retries are exhausted (or the failure was on a bootstrap
+    endpoint the retry path skips), the error reaches ``_map_exception``.
+    The code starts with ``error.invalid.``, so the generic prefix branch
+    would historically classify it as :class:`ExchangeOrderRejectedError`
+    — falsely reporting a dead REST session as a rejected trade. The fix
+    is to route session-recreate codes through the retryable branch
+    (``ExchangeConnectionError``) before the prefix fallthrough.
+    """
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+
+    broker = _FakeBroker(config=_make_config())
+    mapped = broker._map_exception(
+        CapitalComError("API error occured: error.invalid.session.token"),
+    )
+    assert isinstance(mapped, ExchangeConnectionError)
+    assert not isinstance(mapped, ExchangeOrderRejectedError)
+
+
+# noinspection PyProtectedMember
 def __test_broker_map_exception_falls_through_to_broker_base__():
     """Stdlib ``ConnectionError`` must be mapped by ``BrokerPlugin._map_exception``.
 
@@ -7435,3 +7458,527 @@ def __test_process_activity_natural_close_stamp_persists_before_yield__(tmp_path
         "eventually raise a false UnexpectedCancelError"
     )
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Session refresh — proactive + reactive coverage of the ~1h Capital.com
+# session cap (undocumented hard expiry; the 10-min "inactivity TTL" docs
+# don't surface it. Observed in live trading after the bot ran ~1h05m and
+# every subsequent reconnect failed with error.invalid.session.token).
+# ---------------------------------------------------------------------------
+
+
+class _MockHttpResponse:
+    """Minimal stand-in for ``httpx.Response`` for ``__call__`` unit tests."""
+
+    def __init__(self, status_code: int, json_body: dict,
+                 headers: dict | None = None):
+        self.status_code = status_code
+        self._json = json_body
+        self.headers = headers or {}
+        self.text = json.dumps(json_body)
+
+    @property
+    def is_error(self) -> bool:
+        return self.status_code >= 400
+
+    def json(self) -> dict:
+        return self._json
+
+
+def _make_jwt(payload: dict) -> str:
+    """Build an unsigned JWT-shaped string for testing the JWT parser."""
+    from base64 import urlsafe_b64encode
+    header = urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b'=').decode()
+    body = urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+    return f"{header}.{body}.signature"
+
+
+def __test_extract_jwt_expiry_returns_exp_claim__():
+    from pynecore_capitalcom.helpers import _extract_jwt_expiry
+    token = _make_jwt({'exp': 1234567890, 'sub': 'user'})
+    assert _extract_jwt_expiry(token) == 1234567890.0
+
+
+def __test_extract_jwt_expiry_returns_none_for_non_jwt__():
+    from pynecore_capitalcom.helpers import _extract_jwt_expiry
+    assert _extract_jwt_expiry('opaque-session-id-12345') is None
+    assert _extract_jwt_expiry('') is None
+    assert _extract_jwt_expiry(None) is None
+    assert _extract_jwt_expiry('not.valid.jwt') is None
+    token_no_exp = _make_jwt({'sub': 'user'})
+    assert _extract_jwt_expiry(token_no_exp) is None
+
+
+# noinspection PyProtectedMember
+def __test_compute_token_expiry_falls_back_to_hardcoded_when_opaque__():
+    from time import time as epoch_time
+
+    from pynecore_capitalcom.rest import _SESSION_REFRESH_FALLBACK_S
+    broker = _FakeBroker(config=_make_config())
+    now = epoch_time()
+    broker._security_token_deadline = broker._token_deadline(
+        'opaque-x-security-token', now,
+    )
+    broker._cst_token_deadline = broker._token_deadline(
+        'opaque-cst-token', now,
+    )
+    expiry = broker._compute_token_expiry()
+    assert expiry == now + _SESSION_REFRESH_FALLBACK_S
+
+
+# noinspection PyProtectedMember
+def __test_compute_token_expiry_uses_min_jwt_exp__():
+    """The session is only as fresh as the earlier-expiring token."""
+    broker = _FakeBroker(config=_make_config())
+    broker._security_token_deadline = broker._token_deadline(
+        _make_jwt({'exp': 2000000000}), 0.0,
+    )
+    broker._cst_token_deadline = broker._token_deadline(
+        _make_jwt({'exp': 1900000000}), 0.0,
+    )
+    assert broker._compute_token_expiry() == 1900000000.0
+
+
+# noinspection PyProtectedMember
+def __test_compute_token_expiry_mixed_jwt_and_opaque_uses_opaque_cap__():
+    """A far-future JWT must not mask an opaque token's hard cap."""
+    from time import time as epoch_time
+
+    from pynecore_capitalcom.rest import _SESSION_REFRESH_FALLBACK_S
+    broker = _FakeBroker(config=_make_config())
+    now = epoch_time()
+    broker._security_token_deadline = broker._token_deadline(
+        _make_jwt({'exp': 2000000000}), now,
+    )
+    broker._cst_token_deadline = broker._token_deadline(
+        'opaque-cst-token', now,
+    )
+    expiry = broker._compute_token_expiry()
+    assert expiry == now + _SESSION_REFRESH_FALLBACK_S
+
+
+# noinspection PyProtectedMember
+def __test_partial_opaque_rotation_preserves_unchanged_deadline__(monkeypatch):
+    """Rotating only X-SECURITY-TOKEN must not slide the unchanged opaque CST forward.
+
+    Regression: ``_compute_token_expiry`` used to recompute both opaque
+    deadlines from ``epoch_time()`` on every rotation, so a partial
+    header rotation at t=30min would push the unchanged CST's deadline
+    from t=50min to t=80min, defeating proactive refresh.
+    """
+    import httpx as _httpx
+
+    broker = _FakeBroker(config=_make_config())
+
+    class _StubResponse:
+        is_error = False
+
+        def __init__(self, headers: dict):
+            self.headers = headers
+
+        def json(self):
+            return {'ok': True}
+
+    # Establish initial session at t=t0: both opaque tokens issued together.
+    t0 = 1_000_000.0
+    monkeypatch.setattr('pynecore_capitalcom.rest.epoch_time', lambda: t0)
+    monkeypatch.setattr(_httpx, 'get', lambda url, **_kw: _StubResponse(
+        {'X-SECURITY-TOKEN': 'sec-A', 'CST': 'cst-B'},
+    ))
+    broker('any/endpoint', method='get')
+    cst_deadline_after_login = broker._cst_token_deadline
+
+    # At t=t0+30min, only X-SECURITY-TOKEN rotates. CST is the same.
+    monkeypatch.setattr('pynecore_capitalcom.rest.epoch_time',
+                        lambda: t0 + 30 * 60)
+    monkeypatch.setattr(_httpx, 'get', lambda url, **_kw: _StubResponse(
+        {'X-SECURITY-TOKEN': 'sec-A-prime', 'CST': 'cst-B'},
+    ))
+    broker('any/endpoint', method='get')
+
+    assert broker._cst_token_deadline == cst_deadline_after_login
+    # And the session expiry reflects the earlier (unchanged CST) deadline.
+    assert broker._session_token_expiry_ts == cst_deadline_after_login
+
+
+def __test_concurrent_refresh_response_does_not_roll_back_fresh_tokens__(monkeypatch):
+    """A slow response that returns AFTER another worker has refreshed
+    the session must not overwrite the freshly issued tokens, even when
+    the response carries server-rotated headers of its own.
+
+    Regression: the rotation handler used to compare against the live
+    attribute (always "current") instead of the request-time snapshot
+    and apply rotation unconditionally — so a stale response could
+    silently roll the session back to expiring tokens.
+    """
+    import httpx as _httpx
+    from time import time as _time
+
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'sec-old'
+    broker.cst_token = 'cst-old'
+    fresh = _time() + 3600
+    broker._security_token_deadline = fresh
+    broker._cst_token_deadline = fresh
+    broker._session_token_expiry_ts = fresh
+
+    class _StubResponse:
+        is_error = False
+        headers = {
+            'X-SECURITY-TOKEN': 'sec-server-rotated',
+            'CST': 'cst-server-rotated',
+        }
+
+        def json(self):
+            return {'ok': True}
+
+    advanced = fresh + 7200
+
+    def _stub(url, **_kw):
+        # Concurrent refresh advances the session while this request is
+        # in flight: another worker called create_session and installed
+        # fresh tokens before our response arrives. ``create_session``
+        # increments ``_session_generation`` as part of its bootstrap
+        # rotation handler, so the simulation must mirror that — without
+        # the bump the discard would (correctly, in the new generation
+        # model) treat the response as a peer rotation and apply it.
+        broker.security_token = 'sec-NEW'
+        broker.cst_token = 'cst-NEW'
+        broker._security_token_deadline = advanced
+        broker._cst_token_deadline = advanced
+        broker._session_token_expiry_ts = advanced
+        broker._session_generation += 1
+        return _StubResponse()
+
+    monkeypatch.setattr(_httpx, 'get', _stub)
+    broker('any/endpoint', method='get')
+
+    assert broker.security_token == 'sec-NEW'
+    assert broker.cst_token == 'cst-NEW'
+    assert broker._security_token_deadline == advanced
+    assert broker._cst_token_deadline == advanced
+
+
+def __test_concurrent_normal_request_rotation_is_not_discarded__(monkeypatch):
+    """Two concurrent normal requests both rotating tokens must NOT lose
+    the second response's rotation — they share a session generation,
+    so last-writer-wins is the correct rule.
+
+    Regression: an earlier fix used a snapshot-token guard
+    (``self.security_token != req_security_token`` → discard) which
+    couldn't tell apart "another worker created a fresh session" (drop
+    the late response) from "another worker rotated via a peer normal
+    response" (keep both rotations) — and dropped the second rotation,
+    silently keeping the broker on a stale-but-newer token.
+    """
+    import httpx as _httpx
+    from time import time as _time
+
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'sec-X'
+    broker.cst_token = 'cst-X'
+    fresh = _time() + 3600
+    broker._security_token_deadline = fresh
+    broker._cst_token_deadline = fresh
+    broker._session_token_expiry_ts = fresh
+
+    class _StubResponse:
+        is_error = False
+        headers = {
+            'X-SECURITY-TOKEN': 'sec-Z',
+            'CST': 'cst-Z',
+        }
+
+        def json(self):
+            return {'ok': True}
+
+    def _stub(url, **_kw):
+        # Simulate a peer normal request that already rotated the
+        # session before our response arrives. Crucially this is NOT a
+        # bootstrap login, so ``_session_generation`` stays put.
+        broker.security_token = 'sec-Y'
+        broker.cst_token = 'cst-Y'
+        return _StubResponse()
+
+    monkeypatch.setattr(_httpx, 'get', _stub)
+    broker('any/endpoint', method='get')
+
+    # Our own rotation header (Z) is the latest valid one — the snapshot
+    # guard used to throw it away on a token-mismatch, leaving the
+    # broker on Y.
+    assert broker.security_token == 'sec-Z'
+    assert broker.cst_token == 'cst-Z'
+
+
+def __test_create_session_keeps_old_tokens_visible_during_login__(monkeypatch):
+    """While ``create_session`` runs, the existing CST / X-SECURITY-TOKEN
+    must remain readable by concurrent observers (e.g. the WebSocket
+    ping loop in ``streaming._send``). Bootstrap requests skip auth
+    headers in ``__call__``, so the class state must not be wiped.
+
+    Regression: an earlier fix nulled the tokens at the top of
+    ``create_session``, opening a window where ``_send`` would push
+    pings with ``cst=None`` / ``securityToken=None`` and get the live
+    stream rejected.
+    """
+    import httpx as _httpx
+    from time import time as _time
+
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'sec-old'
+    broker.cst_token = 'cst-old'
+    fresh = _time() + 3600
+    broker._security_token_deadline = fresh
+    broker._cst_token_deadline = fresh
+    broker._session_token_expiry_ts = fresh
+
+    observed: list[tuple] = []
+
+    class _EncryptionKeyResponse:
+        is_error = False
+        headers: dict = {}
+
+        def json(self):
+            return {'encryptionKey': 'fake-key', 'timeStamp': 12345}
+
+    class _SessionResponse:
+        is_error = False
+        headers = {'X-SECURITY-TOKEN': 'sec-NEW', 'CST': 'cst-NEW'}
+
+        def json(self):
+            return {}
+
+    def _stub_get(url, **_kw):
+        observed.append(('get', broker.security_token, broker.cst_token))
+        return _EncryptionKeyResponse()
+
+    def _stub_post(url, **_kw):
+        observed.append(('post', broker.security_token, broker.cst_token))
+        return _SessionResponse()
+
+    monkeypatch.setattr(_httpx, 'get', _stub_get)
+    monkeypatch.setattr(_httpx, 'post', _stub_post)
+    monkeypatch.setattr('pynecore_capitalcom.rest.encrypt_password',
+                        lambda *_a, **_kw: 'fake-encrypted')
+
+    broker.create_session()
+
+    assert observed == [
+        ('get', 'sec-old', 'cst-old'),
+        ('post', 'sec-old', 'cst-old'),
+    ]
+    assert broker.security_token == 'sec-NEW'
+    assert broker.cst_token == 'cst-NEW'
+
+
+def __test_call_does_not_recurse_when_bootstrap_returns_session_token_error__(monkeypatch):
+    """A bootstrap endpoint returning ``error.invalid.session.token`` must
+    surface the error directly, never recurse via ``create_session``.
+
+    Regression: the recovery branch used to retry every endpoint, including
+    ``session/encryptionKey`` and ``session``, which ``create_session``
+    itself calls with ``_level=0`` — so a stale-token failure on bootstrap
+    triggered ``create_session`` → bootstrap → recovery → ``create_session``
+    until ``RecursionError``.
+    """
+    import httpx as _httpx
+
+    broker = _FakeBroker(config=_make_config())
+
+    class _StubResponse:
+        is_error = True
+        headers: dict = {}
+
+        def json(self):
+            return {'errorCode': 'error.invalid.session.token'}
+
+    call_count = [0]
+
+    def _stub(url, **_kw):
+        call_count[0] += 1
+        return _StubResponse()
+
+    monkeypatch.setattr(_httpx, 'get', _stub)
+    monkeypatch.setattr(_httpx, 'post', _stub)
+
+    with pytest.raises(CapitalComError):
+        broker.create_session()
+    # First bootstrap call fails → CapitalComError. No retry, no recursion.
+    assert call_count[0] == 1
+
+
+# noinspection PyProtectedMember
+def __test_refresh_session_if_stale_skips_when_fresh__(monkeypatch):
+    from time import time as epoch_time
+    broker = _FakeBroker(config=_make_config())
+    broker._session_token_expiry_ts = epoch_time() + 3600
+    refresh_called: list = []
+    monkeypatch.setattr(broker, 'create_session',
+                        lambda: refresh_called.append(True))
+    broker._refresh_session_if_stale()
+    assert refresh_called == []
+
+
+# noinspection PyProtectedMember
+def __test_refresh_session_if_stale_triggers_inside_safety_window__(monkeypatch):
+    """Within 5 min of expiry the refresh fires."""
+    from time import time as epoch_time
+    broker = _FakeBroker(config=_make_config())
+    broker._session_token_expiry_ts = epoch_time() + 60
+    refresh_called: list = []
+    monkeypatch.setattr(broker, 'create_session',
+                        lambda: refresh_called.append(True))
+    broker._refresh_session_if_stale()
+    assert refresh_called == [True]
+
+
+# noinspection PyProtectedMember
+def __test_refresh_session_if_stale_skips_when_no_session__(monkeypatch):
+    """expiry==0.0 means no session yet — caller will create it on demand."""
+    broker = _FakeBroker(config=_make_config())
+    broker._session_token_expiry_ts = 0.0
+    refresh_called: list = []
+    monkeypatch.setattr(broker, 'create_session',
+                        lambda: refresh_called.append(True))
+    broker._refresh_session_if_stale()
+    assert refresh_called == []
+
+
+# noinspection PyProtectedMember
+def __test_call_reactive_retry_on_invalid_session_token__(monkeypatch):
+    """error.invalid.session.token triggers create_session + retry with fresh tokens."""
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'old-x-sec'
+    broker.cst_token = 'old-cst'
+    broker._session_token_expiry_ts = 0.0  # no proactive refresh path
+
+    def fake_create_session():
+        broker.security_token = 'new-x-sec'
+        broker.cst_token = 'new-cst'
+    monkeypatch.setattr(broker, 'create_session', fake_create_session)
+
+    responses = [
+        _MockHttpResponse(401, {'errorCode': 'error.invalid.session.token'}),
+        _MockHttpResponse(200, {'positions': []}, {}),
+    ]
+    captured_csts: list[str] = []
+
+    def fake_get(url, **kwargs):
+        captured_csts.append(kwargs['headers'].get('CST', ''))
+        return responses.pop(0)
+    monkeypatch.setattr(httpx, 'get', fake_get)
+
+    result = broker('positions', method='get')
+    assert result == {'positions': []}
+    assert captured_csts == ['old-cst', 'new-cst']
+
+
+# noinspection PyProtectedMember
+def __test_call_proactive_refresh_runs_before_request__(monkeypatch):
+    """Proactive refresh fires when token is inside the safety window."""
+    from time import time as epoch_time
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'tok-v1'
+    broker.cst_token = 'cst-v1'
+    broker._session_token_expiry_ts = epoch_time() + 60
+
+    def fake_create_session():
+        broker.security_token = 'tok-v2'
+        broker.cst_token = 'cst-v2'
+        broker._session_token_expiry_ts = epoch_time() + 3600
+    monkeypatch.setattr(broker, 'create_session', fake_create_session)
+
+    captured_csts: list[str] = []
+
+    def fake_get(url, **kwargs):
+        captured_csts.append(kwargs['headers'].get('CST', ''))
+        return _MockHttpResponse(200, {'positions': []}, {})
+    monkeypatch.setattr(httpx, 'get', fake_get)
+
+    broker('positions', method='get')
+    assert captured_csts == ['cst-v2'], (
+        "proactive refresh must run BEFORE the HTTP request — the call "
+        "should land at Capital.com with the freshly minted token"
+    )
+
+
+# noinspection PyProtectedMember
+def __test_call_proactive_refresh_skipped_for_bootstrap_endpoints__(monkeypatch):
+    """create_session() reentry guard: session/* endpoints don't re-refresh."""
+    from time import time as epoch_time
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'tok'
+    broker.cst_token = 'cst'
+    broker._session_token_expiry_ts = epoch_time() + 60  # stale
+    refresh_called: list = []
+    monkeypatch.setattr(broker, 'create_session',
+                        lambda: refresh_called.append(True))
+    monkeypatch.setattr(
+        httpx, 'get',
+        lambda url, **kwargs: _MockHttpResponse(200, {'k': 'v'}, {}),
+    )
+    monkeypatch.setattr(
+        httpx, 'post',
+        lambda url, **kwargs: _MockHttpResponse(200, {'k': 'v'}, {}),
+    )
+    broker('session/encryptionKey', method='get')
+    broker('session', data={'identifier': 'x'}, method='post')
+    assert refresh_called == []
+
+
+# noinspection PyProtectedMember
+def __test_call_authenticated_session_method_is_not_treated_as_bootstrap__(monkeypatch):
+    """``PUT session`` (Capital.com account-switch) must keep the auth
+    headers and the reactive retry path — only the unauthenticated
+    bootstrap pair (``GET session/encryptionKey`` + ``POST session``) is
+    exempt.
+
+    Regression: the bootstrap check used to key on endpoint alone, so
+    any future ``PUT session`` caller would silently lose
+    ``CST``/``X-SECURITY-TOKEN`` on the wire and fail as anonymous.
+    """
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'sec-tok'
+    broker.cst_token = 'cst-tok'
+    broker._session_token_expiry_ts = 0.0  # skip proactive refresh
+    captured_headers: list[dict] = []
+
+    def fake_put(url, **kwargs):
+        captured_headers.append(dict(kwargs['headers']))
+        return _MockHttpResponse(200, {'ok': True}, {})
+
+    monkeypatch.setattr(httpx, 'put', fake_put)
+    broker('session', data={'accountId': 'X'}, method='put')
+
+    assert captured_headers == [{
+        'X-CAP-API-KEY': 'test-key',
+        'X-SECURITY-TOKEN': 'sec-tok',
+        'CST': 'cst-tok',
+    }]
+
+
+# noinspection PyProtectedMember
+def __test_call_token_rotation_recomputes_expiry_from_jwt__(monkeypatch):
+    """A header-rotated CST that is a JWT updates _session_token_expiry_ts."""
+    from time import time as epoch_time
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'old-opaque-x-sec'
+    broker.cst_token = 'old-opaque-cst'
+    broker._session_token_expiry_ts = epoch_time() + 7200  # well clear of safety
+
+    new_exp = float(int(epoch_time()) + 1800)  # 30 min from now
+    new_cst_jwt = _make_jwt({'exp': new_exp})
+
+    monkeypatch.setattr(
+        httpx, 'get',
+        lambda url, **kwargs: _MockHttpResponse(
+            200, {'positions': []},
+            {'CST': new_cst_jwt, 'X-SECURITY-TOKEN': 'new-opaque-x-sec'},
+        ),
+    )
+
+    broker('positions', method='get')
+    # X-SECURITY-TOKEN remains opaque → fallback (now+50min); CST is a
+    # JWT exp=now+30min. min() of the two pins to the JWT's exp.
+    assert broker._session_token_expiry_ts == new_exp

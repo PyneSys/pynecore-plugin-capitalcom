@@ -13,7 +13,8 @@ touch class state, all are pure functions / constants:
 Imported by ``_base.py`` and many mix-ins; depends only on stdlib and
 ``exceptions.py``.
 """
-from base64 import standard_b64decode, standard_b64encode
+import json
+from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
 from datetime import UTC, datetime, time
 from time import time as epoch_time
 from typing import TYPE_CHECKING
@@ -60,6 +61,7 @@ _RETRYABLE_CODES = frozenset({
     'error.too-many.requests',
     'error.security.client-token-missing',
     'error.null.client.token',
+    'error.invalid.session.token',
 })
 
 _AUTH_ERROR_CODES = frozenset({
@@ -196,6 +198,37 @@ def _extract_numeric_value(exc: CapitalComError) -> float:
         return float(tail.strip())
     except ValueError:
         return 0.0
+
+
+def _extract_jwt_expiry(token: str | None) -> float | None:
+    """Extract the ``exp`` claim from a JWT, or ``None`` if not parseable.
+
+    Capital.com session tokens (``CST`` / ``X-SECURITY-TOKEN``) MAY be
+    JWTs carrying their lifetime in the payload; the format is
+    ``header.payload.signature`` where each segment is URL-safe base64
+    without padding, and the ``exp`` claim is unix seconds.
+
+    Returns ``None`` when the token is empty, not three dot-separated
+    segments, the payload is not valid base64+JSON, or no numeric
+    ``exp`` claim is present — the caller then falls back to a
+    hardcoded refresh interval.
+    """
+    if not token:
+        return None
+    parts = token.split('.')
+    if len(parts) != 3:
+        return None
+    payload_b64 = parts[1]
+    payload_b64 += '=' * (-len(payload_b64) % 4)
+    try:
+        payload_bytes = urlsafe_b64decode(payload_b64)
+        payload = json.loads(payload_bytes)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    exp = payload.get('exp') if isinstance(payload, dict) else None
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+        return float(exp)
+    return None
 
 
 def _parse_iso_timestamp(value: str) -> float:

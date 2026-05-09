@@ -17,6 +17,7 @@ that declares the cross-mix-in surface for static analysers. The
 *all* the instance state.
 """
 import asyncio
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -124,6 +125,18 @@ class CapitalCom(
         self.security_token: str | None = None
         self.cst_token: str | None = None
         self.session_data: dict = {}
+        self._session_token_expiry_ts: float = 0.0
+        self._security_token_deadline: float = 0.0
+        self._cst_token_deadline: float = 0.0
+        self._session_lock = threading.RLock()
+        # Bumped by every successful bootstrap login. The rotation handler
+        # uses it to tell apart "another worker rotated tokens via a normal
+        # response" (same generation — keep both rotations, last writer
+        # wins) from "another worker created a fresh session" (generation
+        # advanced — discard our late response, its rotation header
+        # belongs to a now-dead session). A snapshot-token comparison
+        # cannot distinguish those two cases.
+        self._session_generation: int = 0
 
         # Live WebSocket streaming state
         self._ws = None
