@@ -9,13 +9,17 @@ non-terminal row:
 * ``_load_activity_cursor_from_events`` — replays the
   ``activity_processed`` events from the last 24h to rebuild
   ``_activity_cursor.seen_fingerprints`` + watermark.
-* ``_recover_in_flight_submissions`` — outer loop: walks
-  ``submitted`` / ``server_ref_seen`` / ``disposition_unknown`` rows
-  and dispatches each to the appropriate single-row recoverer.
-* ``_recover_submitted_row`` — multi-factor confidence match against
-  ``GET /positions`` + ``GET /workingorders`` snapshots.
-* ``_recover_server_ref_seen_row`` — calls ``GET /confirms/{ref}``
-  directly first; falls back to snapshot match on TTL expiry.
+* ``_recover_in_flight_submissions`` — orchestration: batch-fetches the
+  three REST snapshots, then hands ``submitted`` /
+  ``disposition_unknown`` / ``server_ref_seen`` rows to the journal's
+  :meth:`pynecore.core.broker.journal.DispatchJournal.recover_pending`
+  via :class:`_CapitalComResumeHooks`. The journal owns the persist-
+  first ``confirmed`` / ``rejected`` / ``still_unknown`` state writes
+  and the canonical ``recovered_*`` audit events.
+* ``_CapitalComResumeHooks`` — recovery-time hook implementation.
+  Routes by ``row.state`` to two verdict-builders that read the
+  snapshots and return a :class:`ResumeOutcome` carrying the resolution
+  route in ``recovery_path``.
 
 Bracket leg ``disposition_unknown`` rows are NOT handled here — they
 are owned by ``_reconcile_snapshot``'s ``_resolve_bracket_leg_disposition``
@@ -24,15 +28,25 @@ since the resolution depends on the parent position's live state.
 State touched: BrokerStore through ``self.store_ctx``,
 ``_activity_cursor`` (rebuilt).
 """
+from collections.abc import Mapping
+from dataclasses import dataclass
 from time import time as epoch_time
+from typing import TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
-from pynecore.core.broker.store_helpers import mark_confirmed_with_fill
+from pynecore.core.broker.journal import (
+    DispatchJournal,
+    ResumeOutcome,
+)
 from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
 from .exceptions import OrderNotFoundError
 from .helpers import _parse_iso_timestamp
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.models import EntryIntent
+    from pynecore.core.broker.storage import OrderRow
 
 
 class _RecoveryMixin(_CapitalComBase):
@@ -112,18 +126,19 @@ class _RecoveryMixin(_CapitalComBase):
     async def _recover_in_flight_submissions(self) -> None:
         """Replay §5.1 crash-matrix recovery on connect.
 
-        Batch-fetches the three REST snapshots once, then walks every
-        live order row whose state is ``submitted`` or ``server_ref_seen``
-        and resolves it against the batch. Three outcomes per row:
+        Batch-fetches the three REST snapshots once, then routes every
+        ``submitted`` / ``disposition_unknown`` / ``server_ref_seen``
+        entry row through
+        :meth:`DispatchJournal.recover_pending`. The journal calls the
+        plugin's :class:`_CapitalComResumeHooks` once per row; the hook
+        returns a :class:`ResumeOutcome` and the journal does the
+        persist-first state advance and writes the canonical
+        ``recovered_*`` / ``recovery_pending`` audit event with the
+        plugin's ``recovery_path`` annotation.
 
-        - Stored ``deal_reference`` matches a position/working row →
-          promote to ``confirmed`` with the exchange's ``dealId``.
-        - ``submitted`` row with no stored ref → confidence-ranked match
-          against recent activity (single match → promote; multiple →
-          :class:`BrokerManualInterventionError`; none → leave
-          submitted, sync engine re-dispatches with same CO-ID).
-        - ``server_ref_seen`` row → call ``/confirms/{ref}`` directly;
-          on TTL expiry fall back to the snapshot match.
+        Bracket leg rows (``extras['kind']`` not in
+        ``{'position', 'working'}``) skip the journal — their disposition
+        is handled by ``_resolve_bracket_leg_disposition`` later.
         """
         if self.store_ctx is None:
             return
@@ -157,30 +172,38 @@ class _RecoveryMixin(_CapitalComBase):
                 wo_by_deal_id[str(did)] = wo
         activities = activity_resp.get('activities') or []
 
-        # Track CO-IDs promoted by this recovery pass. The
-        # ``pos_by_deal_id`` / ``wo_by_deal_id`` maps are snapshots from
-        # *before* the promotions; rows resolved via ``activities`` or
-        # the direct ``/confirms/{ref}`` call land a ``deal_id`` that is
-        # not yet in those maps, so the subsequent orphan retirement
-        # would otherwise close a freshly recovered live order.
-        promoted_coids: set[str] = set()
+        resume_hooks = _CapitalComResumeHooks(
+            plugin=self,
+            activities=activities,
+            pos_by_ref=pos_by_ref,
+            wo_by_ref=wo_by_ref,
+        )
 
-        for row in list(self.store_ctx.iter_live_orders()):
-            # ``disposition_unknown`` rows are a superset of ``submitted``
-            # for recovery purposes — the POST either never went out or
-            # went out without a response. Same resolution strategy: try
-            # a stored ref first, then fall back to a confidence-ranked
-            # activity match.
-            if row.state in ('submitted', 'disposition_unknown'):
-                await self._recover_submitted_row(
-                    row, activities, pos_by_ref, wo_by_ref,
-                    promoted_coids,
-                )
-            elif row.state == 'server_ref_seen':
-                await self._recover_server_ref_seen_row(
-                    row, pos_by_ref, wo_by_ref,
-                    promoted_coids,
-                )
+        def hooks_for(row: 'OrderRow') -> '_CapitalComResumeHooks | None':
+            # Bracket legs (``leg_kind in {'tp','sl'}``) are owned by
+            # ``_resolve_bracket_leg_disposition``; everything else is
+            # an entry row and goes through the journal. Filtering on
+            # ``leg_kind`` (negative) rather than ``kind`` (positive)
+            # matches the pre-M3 outer-loop behaviour: every non-bracket
+            # row is recovered regardless of whether ``extras['kind']``
+            # was explicitly stamped (older rows / test fixtures may
+            # omit it).
+            leg_kind = (row.extras or {}).get('leg_kind')
+            if leg_kind in ('tp', 'sl'):
+                return None  # bracket legs — own resolution path
+            return resume_hooks
+
+        journal = DispatchJournal(self.store_ctx)
+        resolutions = await journal.recover_pending(hooks_for)
+
+        # The ``pos_by_deal_id`` / ``wo_by_deal_id`` maps are snapshots
+        # from *before* promotions; rows resolved via activity-heuristic
+        # or the direct ``/confirms/{ref}`` call land a ``deal_id`` that
+        # is not yet in those maps, so the subsequent orphan retirement
+        # would otherwise close a freshly recovered live order.
+        promoted_coids: set[str] = {
+            r.coid for r in resolutions if r.status == 'confirmed'
+        }
 
         # After the in-flight recovery has had its chance to resolve
         # every ``submitted`` / ``server_ref_seen`` row, retire whatever
@@ -194,148 +217,6 @@ class _RecoveryMixin(_CapitalComBase):
         self._retire_startup_orphans(
             pos_by_deal_id, wo_by_deal_id, promoted_coids,
         )
-
-    async def _recover_submitted_row(
-            self, row: 'OrderRow',
-            activities: list[dict],
-            pos_by_ref: dict[str, dict],
-            wo_by_ref: dict[str, dict],
-            promoted_coids: set[str],
-    ) -> None:
-        """Resolve a ``submitted`` row with multi-factor confidence."""
-        assert self.store_ctx is not None
-        stored_ref: str | None = (row.extras or {}).get('deal_reference')
-        if stored_ref:
-            hit = pos_by_ref.get(stored_ref) or wo_by_ref.get(stored_ref)
-            if hit is not None:
-                data = hit.get('position') or hit.get('workingOrderData') or {}
-                deal_id = data.get('dealId')
-                mark_confirmed_with_fill(
-                    self.store_ctx,
-                    coid=row.client_order_id,
-                    exchange_id=str(deal_id) if deal_id else None,
-                    is_filled=False,
-                    filled_qty=0.0,
-                    fill_price=0.0,
-                )
-                self.store_ctx.log_event(
-                    'recovery_promoted_stored_ref',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=deal_id,
-                )
-                promoted_coids.add(row.client_order_id)
-                return
-
-        # Activity heuristic: epic + direction + size + ±3 s createdDateUTC.
-        row_side = 'BUY' if row.side == 'buy' else 'SELL'
-        row_created = row.created_ts_ms / 1000.0 if row.created_ts_ms else 0.0
-        candidates: list[dict] = []
-        for a in activities:
-            if (a.get('epic') or '') != row.symbol:
-                continue
-            if (a.get('direction') or '').upper() != row_side:
-                continue
-            if abs(float(a.get('size') or 0.0) - row.qty) > 1e-9:
-                continue
-            when = _parse_iso_timestamp(a.get('dateUTC') or '')
-            if row_created and abs(when - row_created) > 3.0:
-                continue
-            candidates.append(a)
-
-        if not candidates:
-            self.store_ctx.log_event(
-                'recovery_no_match',
-                client_order_id=row.client_order_id,
-            )
-            return
-        if len(candidates) == 1:
-            deal_id = candidates[0].get('dealId')
-            mark_confirmed_with_fill(
-                self.store_ctx,
-                coid=row.client_order_id,
-                exchange_id=str(deal_id) if deal_id else None,
-                is_filled=False,
-                filled_qty=0.0,
-                fill_price=0.0,
-            )
-            self.store_ctx.log_event(
-                'recovery_promoted_single_match',
-                client_order_id=row.client_order_id,
-                exchange_order_id=deal_id,
-            )
-            promoted_coids.add(row.client_order_id)
-            return
-
-        # Multiple matches — cannot auto-resolve.
-        self.store_ctx.set_order_state(
-            row.client_order_id, 'submission_ambiguous',
-        )
-        raise BrokerManualInterventionError(
-            f"Recovery ambiguous: {len(candidates)} activity matches for "
-            f"coid={row.client_order_id!r}",
-            intent_key=row.intent_key,
-            context={'symbol': row.symbol, 'qty': row.qty, 'side': row.side,
-                     'candidate_deal_ids': [c.get('dealId') for c in candidates]},
-        )
-
-    async def _recover_server_ref_seen_row(
-            self, row: 'OrderRow',
-            pos_by_ref: dict[str, dict],
-            wo_by_ref: dict[str, dict],
-            promoted_coids: set[str],
-    ) -> None:
-        """Resolve a ``server_ref_seen`` row — confirm first, snapshot fallback."""
-        assert self.store_ctx is not None
-        ref: str | None = (row.extras or {}).get('deal_reference')
-        if not ref:
-            return
-        try:
-            confirm = await self._call(f'confirms/{ref}', method='get')
-        except OrderNotFoundError:
-            # TTL expired — fall back to snapshot match on the ref.
-            hit = pos_by_ref.get(ref) or wo_by_ref.get(ref)
-            if hit is None:
-                return
-            data = hit.get('position') or hit.get('workingOrderData') or {}
-            deal_id = data.get('dealId')
-            if deal_id:
-                mark_confirmed_with_fill(
-                    self.store_ctx,
-                    coid=row.client_order_id,
-                    exchange_id=str(deal_id),
-                    is_filled=False,
-                    filled_qty=0.0,
-                    fill_price=0.0,
-                )
-                self.store_ctx.log_event(
-                    'recovery_snapshot_fallback',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=deal_id,
-                )
-                promoted_coids.add(row.client_order_id)
-            return
-
-        deal_id = None
-        affected = confirm.get('affectedDeals') or []
-        if affected:
-            deal_id = affected[0].get('dealId')
-        if not deal_id:
-            deal_id = confirm.get('dealId')
-        if deal_id:
-            mark_confirmed_with_fill(
-                self.store_ctx,
-                coid=row.client_order_id,
-                exchange_id=str(deal_id),
-                is_filled=False,
-                filled_qty=0.0,
-                fill_price=0.0,
-            )
-            self.store_ctx.log_event(
-                'recovery_confirm_resolved',
-                client_order_id=row.client_order_id,
-                exchange_order_id=deal_id,
-            )
-            promoted_coids.add(row.client_order_id)
 
     def _retire_startup_orphans(
             self,
@@ -445,3 +326,294 @@ class _RecoveryMixin(_CapitalComBase):
                 retired_count,
             )
 
+
+# === Recovery hook =========================================================
+
+@dataclass
+class _CapitalComResumeHooks:
+    """Recovery-time hook implementation for the entry journal.
+
+    Constructed once per ``_recover_in_flight_submissions`` pass; the
+    three REST snapshots are captured as attributes so each verdict
+    call resolves locally without re-fetching. The journal's
+    :meth:`pynecore.core.broker.journal.DispatchJournal.recover_pending`
+    calls :meth:`resume_pending_dispatch` once per pending row; the
+    other :class:`pynecore.core.broker.journal.EntryDispatchHooks`
+    Protocol methods (``submit``, ``confirm_submission``,
+    ``exchange_order_from_state``) defensively raise — they exist only
+    to satisfy the Protocol and are never invoked on the recovery
+    code path.
+
+    The ``submission_ambiguous`` branch is a deliberate side-channel:
+    when the activity heuristic returns multiple candidates the hook
+    writes ``state='submission_ambiguous'`` directly and raises
+    :class:`BrokerManualInterventionError`. The journal does not catch
+    the exception (intentional — operator intervention is required),
+    so the propagation matches the legacy recovery semantics. A
+    follow-up Core change is planned to canonicalise this status; M3
+    keeps the current behaviour.
+    """
+    plugin: _RecoveryMixin
+    activities: list[dict]
+    pos_by_ref: dict[str, dict]
+    wo_by_ref: dict[str, dict]
+
+    async def submit(
+            self, *, coid: str, intent: 'EntryIntent', qty: float,
+    ):  # pragma: no cover — Protocol-only
+        raise RuntimeError(
+            "_CapitalComResumeHooks.submit is not callable: recovery does "
+            "not dispatch fresh submissions"
+        )
+
+    async def confirm_submission(
+            self, *, coid: str, intent: 'EntryIntent', server_ref: str,
+    ):  # pragma: no cover — Protocol-only
+        raise RuntimeError(
+            "_CapitalComResumeHooks.confirm_submission is not callable: "
+            "recovery resolves via snapshots / /confirms GET inside "
+            "_verdict_server_ref_seen, not the dispatch confirm path"
+        )
+
+    def exchange_order_from_state(
+            self, *, row: 'OrderRow', intent: 'EntryIntent',
+    ):  # pragma: no cover — Protocol-only
+        raise RuntimeError(
+            "_CapitalComResumeHooks.exchange_order_from_state is not "
+            "callable: recovery does not synthesise ExchangeOrders"
+        )
+
+    async def resume_pending_dispatch(
+            self, *, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Route by ``row.state`` to the matching verdict-builder.
+
+        ``server_ref_seen`` means the POST landed and the plugin
+        recorded a ``deal_reference``; the verdict-builder tries the
+        direct ``/confirms/{ref}`` GET first and falls back to the
+        snapshot on TTL expiry.
+
+        ``submitted`` always lacks a ``deal_reference`` — the POST
+        either never went out or returned no usable reference — so the
+        activity-heuristic verdict is the only option.
+
+        ``disposition_unknown`` is the journal's terminal-pending state
+        for both phases:
+
+        - Confirm-phase timeout: ``record_server_ref`` already persisted
+          a ``deal_reference`` before ``confirm_submission`` raised, so
+          a row in this state can carry a ref. Route those through the
+          ``server_ref_seen`` verdict-builder so ``/confirms/{ref}``
+          (or, on TTL expiry, the snapshot match on the ref) is tried
+          before activity matching — otherwise an accepted POST whose
+          snapshot has not yet caught up would be left without a
+          ``deal_id`` and the open-order / reconcile paths could not
+          map it back. If that verdict comes back ``still_unknown``
+          (confirm-GET TTL expired and the snapshot has no ref hit,
+          or the GET returned no ``dealId``), fall back to the
+          activity heuristic — the order may still have landed and
+          a same-bar epic / direction / size / ±3 s activity row is
+          enough to recover the ``deal_id``.
+        - Submit-phase timeout: no ``deal_reference`` was ever recorded
+          and only the activity heuristic can resolve the row.
+
+        ``refs`` carries the durable ``order_refs`` alias map for the
+        row. ``deal_reference`` is committed to ``order_refs`` *before*
+        it is mirrored into ``orders.extras`` (see
+        :func:`pynecore.core.broker.store_helpers.record_server_ref`),
+        so during the narrow crash window between those two writes the
+        ref is reachable only via ``refs``. The verdict-builders prefer
+        ``refs`` over ``extras`` for exactly that reason.
+        """
+        if row.state == 'server_ref_seen':
+            return await self._verdict_server_ref_seen(row, refs)
+        if row.state == 'disposition_unknown':
+            has_ref = bool(
+                refs.get('deal_reference')
+                or (row.extras or {}).get('deal_reference')
+            )
+            if has_ref:
+                outcome = await self._verdict_server_ref_seen(row, refs)
+                if outcome.status != 'still_unknown':
+                    return outcome
+                # Confirm-GET / snapshot path could not resolve the ref
+                # (TTL expired with no snapshot hit, or no dealId on the
+                # GET). The POST may still have landed — fall back to
+                # activity matching the same way a submit-phase timeout
+                # is handled.
+                return self._verdict_submitted(row, refs)
+            return self._verdict_submitted(row, refs)
+        if row.state == 'submitted':
+            return self._verdict_submitted(row, refs)
+        return ResumeOutcome(status='still_unknown')
+
+    def _verdict_submitted(
+            self, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Verdict for a ``submitted`` / ``disposition_unknown`` row.
+
+        Multi-factor confidence:
+
+        1. Stored ``deal_reference`` (preferred from ``refs``, falling
+           back to ``extras``) matches a positions / working snapshot →
+           ``recovery_path='stored_ref'``, confirmed.
+        2. Activity heuristic (epic + direction + size + ±3 s) →
+           single match → ``recovery_path='activity_single_match'``;
+           multiple matches → ambiguous side-channel (see class
+           docstring); zero matches → ``still_unknown`` with
+           ``recovery_path='no_match'``.
+        """
+        stored_ref: str | None = (
+            refs.get('deal_reference') or (row.extras or {}).get('deal_reference')
+        )
+        if stored_ref:
+            hit = self.pos_by_ref.get(stored_ref) or self.wo_by_ref.get(stored_ref)
+            if hit is not None:
+                data = hit.get('position') or hit.get('workingOrderData') or {}
+                deal_id = data.get('dealId')
+                matched_snapshot = (
+                    'position' if hit is self.pos_by_ref.get(stored_ref)
+                    else 'working'
+                )
+                return ResumeOutcome(
+                    status='confirmed',
+                    exchange_id=str(deal_id) if deal_id else None,
+                    is_filled=False,
+                    filled_qty=0.0,
+                    fill_price=0.0,
+                    recovery_path='stored_ref',
+                    recovery_context={
+                        'deal_reference': stored_ref,
+                        'matched_snapshot': matched_snapshot,
+                    },
+                )
+
+        # Activity heuristic: epic + direction + size + ±3 s createdDateUTC.
+        row_side = 'BUY' if row.side == 'buy' else 'SELL'
+        row_created = row.created_ts_ms / 1000.0 if row.created_ts_ms else 0.0
+        candidates: list[dict] = []
+        for a in self.activities:
+            if (a.get('epic') or '') != row.symbol:
+                continue
+            if (a.get('direction') or '').upper() != row_side:
+                continue
+            if abs(float(a.get('size') or 0.0) - row.qty) > 1e-9:
+                continue
+            when = _parse_iso_timestamp(a.get('dateUTC') or '')
+            if row_created and abs(when - row_created) > 3.0:
+                continue
+            candidates.append(a)
+
+        if not candidates:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='no_match',
+            )
+        if len(candidates) == 1:
+            deal_id = candidates[0].get('dealId')
+            return ResumeOutcome(
+                status='confirmed',
+                exchange_id=str(deal_id) if deal_id else None,
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
+                recovery_path='activity_single_match',
+                recovery_context={'activity_count': 1},
+            )
+
+        # Multiple matches — cannot auto-resolve. Side-channel: write
+        # the ambiguous state directly and raise. The journal does not
+        # catch BrokerManualInterventionError, so the halt propagates
+        # to the connect-flow caller — matching the legacy behaviour.
+        assert self.plugin.store_ctx is not None
+        self.plugin.store_ctx.set_order_state(
+            row.client_order_id, 'submission_ambiguous',
+        )
+        raise BrokerManualInterventionError(
+            f"Recovery ambiguous: {len(candidates)} activity matches for "
+            f"coid={row.client_order_id!r}",
+            intent_key=row.intent_key,
+            context={'symbol': row.symbol, 'qty': row.qty, 'side': row.side,
+                     'candidate_deal_ids': [c.get('dealId') for c in candidates]},
+        )
+
+    async def _verdict_server_ref_seen(
+            self, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Verdict for a ``server_ref_seen`` row.
+
+        Direct ``/confirms/{ref}`` GET first
+        (``recovery_path='confirm_get_direct'``); on
+        :class:`OrderNotFoundError` (TTL expiry) the verdict falls back
+        to the snapshot map (``recovery_path='ttl_fallback_snapshot'``).
+        Without a usable ``deal_id`` the verdict is ``still_unknown``.
+
+        The ``deal_reference`` is sourced from ``refs`` first and from
+        ``extras`` only as a fallback: the alias is committed to
+        ``order_refs`` ahead of the ``extras`` mirror, so ``refs`` is
+        the durable view even mid-crash-window.
+        """
+        ref: str | None = (
+            refs.get('deal_reference') or (row.extras or {}).get('deal_reference')
+        )
+        if not ref:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='missing_deal_reference',
+            )
+        try:
+            confirm = await self.plugin._call(
+                f'confirms/{ref}', method='get',
+            )
+        except OrderNotFoundError:
+            # TTL expired — fall back to snapshot match on the ref.
+            hit = self.pos_by_ref.get(ref) or self.wo_by_ref.get(ref)
+            if hit is None:
+                return ResumeOutcome(
+                    status='still_unknown',
+                    recovery_path='ttl_fallback_no_match',
+                )
+            data = hit.get('position') or hit.get('workingOrderData') or {}
+            deal_id = data.get('dealId')
+            if not deal_id:
+                return ResumeOutcome(
+                    status='still_unknown',
+                    recovery_path='ttl_fallback_no_deal_id',
+                )
+            matched_snapshot = (
+                'position' if hit is self.pos_by_ref.get(ref)
+                else 'working'
+            )
+            return ResumeOutcome(
+                status='confirmed',
+                exchange_id=str(deal_id),
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
+                recovery_path='ttl_fallback_snapshot',
+                recovery_context={
+                    'deal_reference': ref,
+                    'matched_snapshot': matched_snapshot,
+                },
+            )
+
+        deal_id = None
+        affected = confirm.get('affectedDeals') or []
+        if affected:
+            deal_id = affected[0].get('dealId')
+        if not deal_id:
+            deal_id = confirm.get('dealId')
+        if not deal_id:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='confirm_get_no_deal_id',
+            )
+        return ResumeOutcome(
+            status='confirmed',
+            exchange_id=str(deal_id),
+            is_filled=False,
+            filled_qty=0.0,
+            fill_price=0.0,
+            recovery_path='confirm_get_direct',
+            recovery_context={'deal_reference': ref},
+        )

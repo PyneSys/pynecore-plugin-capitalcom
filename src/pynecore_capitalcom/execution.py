@@ -315,22 +315,31 @@ class _ExecutionMixin(_CapitalComBase):
     ) -> list[ExchangeOrder]:
         """Open a position (MARKET) or place a working order (LIMIT/STOP).
 
+        Default path delegates to :meth:`execute_entry_via_journal`
+        — the Core
+        :class:`~pynecore.core.broker.journal.DispatchJournal` owns the
+        persist-first state machine.
+
+        ``PYNECORE_BROKER_JOURNAL_ENTRY=0`` falls back to the legacy
+        body below as a one-release escape-hatch; the legacy code path
+        is retired after M4 (close/cancel/modify cutover). Tracking:
+        ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-review.md``
+        step 4-7.
+
+        When ``self.store_ctx`` is ``None`` (no-persistence runs and test
+        paths — see :class:`BrokerPlugin.store_ctx` contract) the journal
+        path is skipped automatically and the legacy body is used, since
+        the journal cannot operate without a store.
+
         The flow follows the defensive-reconcile contract — every state
         transition is **PERSIST-FIRST** so a crash between the REST round
         trips leaves enough audit trail for
         :meth:`_recover_in_flight_submissions` to resolve the ambiguity on
         restart. The six-point crash matrix from the research dossier
         §5.1 is the truth table this method implements.
-
-        M1: when ``PYNECORE_BROKER_JOURNAL_ENTRY=1`` is set, dispatch
-        delegates to :meth:`execute_entry_via_journal` — the Core
-        :class:`~pynecore.core.broker.journal.DispatchJournal` owns
-        the persist-first state machine and this method's body only
-        runs in legacy mode. The two paths write the same orders /
-        order_refs schema (verified by the parity test); audit-event
-        payloads are diagnostic and may diverge.
         """
-        if os.environ.get('PYNECORE_BROKER_JOURNAL_ENTRY') == '1':
+        if (self.store_ctx is not None
+                and os.environ.get('PYNECORE_BROKER_JOURNAL_ENTRY', '1') != '0'):
             return await self.execute_entry_via_journal(envelope)
 
         intent = envelope.intent
@@ -2754,17 +2763,21 @@ class _CapitalComEntryHooks:
     async def resume_pending_dispatch(
             self, *, row: 'OrderRow', refs,
     ) -> 'ResumeOutcome':
-        """M1 placeholder — delegates resume to the existing recovery layer.
+        """Defensive raise — Capital.com recovery uses ``_CapitalComResumeHooks``.
 
-        The Capital.com plugin's
-        :meth:`_recover_in_flight_submissions` still owns crash
-        recovery in M1. This hook is part of the
-        :class:`EntryDispatchHooks` shape (so the unit-test surface
-        is complete) but the production wiring does not call
-        :meth:`DispatchJournal.recover_pending` yet — that
-        integration lands in M3 alongside the legacy-path retirement.
+        The journal's :meth:`DispatchJournal.recover_pending` is called
+        from :meth:`_recover_in_flight_submissions` with a separate
+        ``hooks_for()`` provider that returns
+        :class:`_CapitalComResumeHooks` instances. This method exists
+        only to satisfy the :class:`EntryDispatchHooks` Protocol; it is
+        never invoked on the production code path. A reachable call
+        here means the recovery wiring was bypassed and must be
+        debugged before live trading resumes.
         """
-        from pynecore.core.broker.journal import ResumeOutcome
-
-        del row, refs  # noqa - placeholder stub
-        return ResumeOutcome(status='still_unknown')
+        del row, refs
+        raise RuntimeError(
+            "_CapitalComEntryHooks.resume_pending_dispatch should not be "
+            "called: Capital.com recovery is routed through "
+            "_CapitalComResumeHooks. Check the hooks_for() provider in "
+            "_recover_in_flight_submissions."
+        )

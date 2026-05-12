@@ -187,7 +187,11 @@ def _run_dispatch(
     if flag:
         monkeypatch.setenv('PYNECORE_BROKER_JOURNAL_ENTRY', '1')
     else:
-        monkeypatch.delenv('PYNECORE_BROKER_JOURNAL_ENTRY', raising=False)
+        # Default is '1' (journal) from M3 onwards, so the legacy path
+        # must be requested explicitly. ``delenv`` would put both halves
+        # on the journal path and the parity assertion would compare
+        # the same path to itself.
+        monkeypatch.setenv('PYNECORE_BROKER_JOURNAL_ENTRY', '0')
     envelope = _make_envelope(intent, run_tag)
     return asyncio.run(broker.execute_entry(envelope))
 
@@ -471,3 +475,43 @@ def __test_parity_submit_no_deal_reference__(tmp_path, monkeypatch):
     assert isinstance(out['legacy_error'], OrderDispositionUnknownError)
     assert isinstance(out['journal_error'], OrderDispositionUnknownError)
     _assert_order_parity(out['legacy_orders'], out['journal_orders'])
+
+
+def __test_parity_market_confirm_accepted_status__(tmp_path, monkeypatch):
+    """MARKET entry + confirm ``status='ACCEPTED'`` (not ``'OPEN'``).
+
+    Pins the heuristic boundary in
+    :meth:`_CapitalComEntryHooks.confirm_submission`:
+    ``is_filled = (intent.order_type == MARKET and confirm_status == 'OPEN')``.
+    A MARKET POST whose confirm comes back with a non-``OPEN`` status
+    (the broker booked the order but has not yet matched it) must
+    persist as ``is_filled=False, filled_qty=0.0`` on both paths.
+    The legacy path applies the same MARKET-AND-OPEN filter, so the
+    parity assertion stays meaningful as long as both branches agree
+    on the boundary.
+    """
+    responses = {
+        ('positions', 'post'): {'dealReference': 'ref-mkt-accepted'},
+        ('confirms/ref-mkt-accepted', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'status': 'ACCEPTED',  # not OPEN — fill deferred
+            'dealId': 'deal-mkt-accepted',
+            'level': 0.0,
+            'size': 1.0,
+            'affectedDeals': [{'dealId': 'deal-mkt-accepted'}],
+        },
+    }
+    out = _run_parity(
+        tmp_path, responses=responses,
+        intent_factory=lambda: _make_intent(order_type=OrderType.MARKET),
+        monkeypatch=monkeypatch,
+    )
+    legacy_eo = out['legacy_result'][0]
+    journal_eo = out['journal_result'][0]
+    assert legacy_eo.status == journal_eo.status == OrderStatus.OPEN
+    assert legacy_eo.filled_qty == journal_eo.filled_qty == 0.0
+    assert legacy_eo.id == journal_eo.id == 'deal-mkt-accepted'
+
+    _assert_order_parity(out['legacy_orders'], out['journal_orders'])
+    _assert_refs_parity(out['legacy_refs'], out['journal_refs'])
+    _assert_event_kinds_subset(out['legacy_events'], out['journal_events'])

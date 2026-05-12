@@ -242,6 +242,192 @@ def __test_recovery_contract_confirm_get_direct__(tmp_path):
     store.close()
 
 
+def __test_recovery_contract_journal_resolutions__(tmp_path):
+    """All four recovery paths route through the journal and tag the
+    canonical ``recovered_confirmed`` event with the right ``recovery_path``.
+
+    One pass over four pending rows — each row designed to hit exactly
+    one of the resolution branches. Asserts:
+
+    * the row's end-state contract (state, exchange_order_id, deal_id ref),
+    * the ``recovered_confirmed`` audit event carries the matching
+      ``recovery_path`` payload key,
+    * the plugin-specific event kinds removed in M3
+      (``recovery_promoted_stored_ref`` etc.) are *absent*.
+    """
+    import datetime as _dt
+    ts_ms = int(_dt.datetime(2026, 4, 21, 10, 0, 0,
+                             tzinfo=_dt.UTC).timestamp() * 1000)
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            # row 1 stored-ref hit
+            {'position': {'dealReference': 'REF-A', 'dealId': 'DEAL-A'}},
+            # row 3 ttl-fallback hit
+            {'position': {'dealReference': 'REF-C', 'dealId': 'DEAL-C'}},
+        ]},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': [
+            # row 2 activity-single-match candidate
+            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+             'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'DEAL-B',
+             'type': 'POSITION', 'status': 'EXECUTED'},
+        ]},
+        # row 3 — TTL expired on direct confirm
+        ('error', 'confirms/REF-C', 'get'): OrderNotFoundError(
+            "Capital confirm REF-C not found (TTL expired)",
+            ref_type='deal_reference',
+        ),
+        # row 4 — confirm GET resolves directly
+        ('confirms/REF-D', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'OPEN',
+            'dealId': 'DEAL-D', 'level': 1.1, 'size': 1.0,
+        },
+    })
+
+    # row 1 — stored deal_reference matches positions snapshot.
+    ctx.upsert_order(
+        'coid-A', symbol='EURUSD', side='buy', qty=1.0,
+        state='submitted', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'position', 'order_type': 'market',
+                'deal_reference': 'REF-A'},
+    )
+    ctx.add_ref('coid-A', 'deal_reference', 'REF-A')
+
+    # row 2 — no stored ref, activity heuristic single match.
+    ctx.upsert_order(
+        'coid-B', symbol='EURUSD', side='buy', qty=1.0,
+        state='submitted', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'position', 'order_type': 'market'},
+    )
+    ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+        (ts_ms, 'coid-B'),
+    )
+
+    # row 3 — server_ref_seen, /confirms TTL-expired, snapshot fallback.
+    ctx.upsert_order(
+        'coid-C', symbol='EURUSD', side='buy', qty=1.0,
+        state='server_ref_seen', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'position', 'order_type': 'market',
+                'deal_reference': 'REF-C'},
+    )
+    ctx.add_ref('coid-C', 'deal_reference', 'REF-C')
+
+    # row 4 — server_ref_seen, /confirms GET resolves with dealId.
+    ctx.upsert_order(
+        'coid-D', symbol='EURUSD', side='buy', qty=1.0,
+        state='server_ref_seen', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'position', 'order_type': 'market',
+                'deal_reference': 'REF-D'},
+    )
+    ctx.add_ref('coid-D', 'deal_reference', 'REF-D')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    # Each row landed in the right end-state.
+    _assert_confirmed_contract(ctx, coid='coid-A', deal_id='DEAL-A')
+    _assert_confirmed_contract(ctx, coid='coid-B', deal_id='DEAL-B')
+    _assert_confirmed_contract(ctx, coid='coid-C', deal_id='DEAL-C')
+    _assert_confirmed_contract(ctx, coid='coid-D', deal_id='DEAL-D')
+
+    # The canonical ``recovered_confirmed`` event carries the plugin's
+    # ``recovery_path`` annotation — that is the load-bearing forensic
+    # signal in M3 (the legacy plugin-specific event kinds are gone).
+    expected_paths = {
+        'coid-A': 'stored_ref',
+        'coid-B': 'activity_single_match',
+        'coid-C': 'ttl_fallback_snapshot',
+        'coid-D': 'confirm_get_direct',
+    }
+    observed_paths: dict[str, str] = {}
+    for payload in ctx.iter_events_by_kind_since('recovered_confirmed', 0):
+        coid = payload.get('client_order_id')
+        path = payload.get('recovery_path')
+        if isinstance(coid, str) and isinstance(path, str):
+            observed_paths[coid] = path
+    # iter_events_by_kind_since may not include client_order_id in payload
+    # for older event writers; fall back to SQL when needed.
+    if not observed_paths:
+        cur = ctx._store._conn.execute(
+            "SELECT client_order_id, payload FROM events "
+            "WHERE kind = 'recovered_confirmed'",
+        )
+        import json as _json
+        for coid_val, payload_blob in cur.fetchall():
+            data = _json.loads(payload_blob) if payload_blob else {}
+            path = data.get('recovery_path')
+            if isinstance(path, str):
+                observed_paths[coid_val] = path
+    assert observed_paths == expected_paths, (
+        f"recovery_path mismatch:\nexpected={expected_paths}\n"
+        f"observed={observed_paths}"
+    )
+
+    # Plugin-specific event kinds retired in M3 must not appear.
+    cur = ctx._store._conn.execute(
+        "SELECT DISTINCT kind FROM events WHERE kind LIKE 'recovery_%'"
+    )
+    retired_kinds = {row[0] for row in cur.fetchall()}
+    assert retired_kinds == set(), (
+        f"Legacy plugin recovery event kinds resurfaced: {retired_kinds}"
+    )
+
+    store.close()
+
+
+def __test_recovery_contract_working_order_stored_ref__(tmp_path):
+    """LIMIT entry (working order) recovery via stored ``deal_reference``.
+
+    Pins that ``extras['kind'] = 'working'`` rows route through the
+    journal just like ``'position'`` rows, and that ``recovery_path``
+    is ``'stored_ref'`` with ``matched_snapshot='working'`` in the
+    context payload.
+    """
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': [
+            {'workingOrderData': {
+                'dealReference': 'REF-WO',
+                'dealId': 'DEAL-WO',
+            }},
+        ]},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    ctx.upsert_order(
+        'coid-wo', symbol='EURUSD', side='buy', qty=1.0,
+        state='submitted', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'working', 'order_type': 'limit',
+                'deal_reference': 'REF-WO'},
+    )
+    ctx.add_ref('coid-wo', 'deal_reference', 'REF-WO')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    _assert_confirmed_contract(ctx, coid='coid-wo', deal_id='DEAL-WO')
+
+    # Inspect the recovered_confirmed event payload directly.
+    import json as _json
+    cur = ctx._store._conn.execute(
+        "SELECT payload FROM events "
+        "WHERE kind = 'recovered_confirmed' AND client_order_id = ?",
+        ('coid-wo',),
+    )
+    rows = cur.fetchall()
+    assert len(rows) == 1, (
+        f"Expected exactly one recovered_confirmed event for coid-wo, "
+        f"got {len(rows)}"
+    )
+    payload = _json.loads(rows[0][0]) if rows[0][0] else {}
+    assert payload.get('recovery_path') == 'stored_ref'
+    ctx_payload = payload.get('recovery_context') or {}
+    assert ctx_payload.get('matched_snapshot') == 'working', (
+        f"Expected matched_snapshot='working' in recovery_context, "
+        f"got {ctx_payload!r}"
+    )
+
+    store.close()
+
+
 def __test_recovery_contract_idempotency__(tmp_path):
     """Running recovery twice must not duplicate ``order_refs`` or
     mutate an already-confirmed row.
