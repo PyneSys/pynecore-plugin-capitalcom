@@ -7982,3 +7982,132 @@ def __test_call_token_rotation_recomputes_expiry_from_jwt__(monkeypatch):
     # X-SECURITY-TOKEN remains opaque → fallback (now+50min); CST is a
     # JWT exp=now+30min. min() of the two pins to the JWT's exp.
     assert broker._session_token_expiry_ts == new_exp
+
+
+# === Startup orphan retire =================================================
+
+def __test_recover_retires_confirmed_row_with_no_exchange_counterpart__(
+        tmp_path, caplog,
+):
+    """A ``confirmed`` row whose ``dealId`` is gone gets retired silently.
+
+    Reproduces the user-reported case: the bot was stopped, the
+    operator closed the position manually on the exchange UI, then
+    started the bot again. The BrokerStore still carries the entry row
+    plus its TP/SL bracket legs, but ``/positions`` and
+    ``/workingorders`` return empty. Without the retire pass the runtime
+    reconcile would later raise ``UnexpectedCancelError`` and halt.
+    """
+    import logging as _logging
+
+    broker = _FakeBroker(config=_make_config(), responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order(
+            'entry-coid', symbol='EURUSD', side='buy', qty=1.0,
+            state='confirmed',
+            intent_key='Long', pine_entry_id='Long',
+            extras={'kind': 'position', 'order_type': 'market',
+                    'entry_filled_at': 1.0},
+        )
+        ctx.set_exchange_id('entry-coid', 'deal-gone-1')
+        ctx.add_ref('entry-coid', 'deal_id', 'deal-gone-1')
+
+        ctx.upsert_order(
+            'tp-coid', symbol='EURUSD', side='sell', qty=1.0,
+            state='confirmed',
+            intent_key='Long-TP', pine_entry_id='Long',
+            extras={'leg_kind': 'tp', 'parent_coid': 'entry-coid',
+                    'parent_deal_id': 'deal-gone-1'},
+        )
+        ctx.upsert_order(
+            'sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+            state='confirmed',
+            intent_key='Long-SL', pine_entry_id='Long',
+            extras={'leg_kind': 'sl', 'parent_coid': 'entry-coid',
+                    'parent_deal_id': 'deal-gone-1'},
+        )
+
+        caplog.set_level(_logging.INFO, logger='pynecore')
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        # All three rows have been closed.
+        assert ctx.get_order('entry-coid').closed_ts_ms is not None
+        assert ctx.get_order('tp-coid').closed_ts_ms is not None
+        assert ctx.get_order('sl-coid').closed_ts_ms is not None
+
+        # Audit events: one per retired row.
+        retired = store._conn.execute(
+            "SELECT client_order_id FROM events "
+            "WHERE kind = 'startup_orphan_retired' "
+            "ORDER BY client_order_id",
+        ).fetchall()
+        assert {r['client_order_id'] for r in retired} == {
+            'entry-coid', 'tp-coid', 'sl-coid',
+        }
+
+        # One [BROKER] INFO summary line.
+        summary = [
+            rec for rec in caplog.records
+            if rec.levelno == _logging.INFO
+            and 'retired' in rec.getMessage()
+            and 'orphan' in rec.getMessage()
+        ]
+        assert len(summary) == 1
+        assert '3 orphan order row(s)' in summary[0].getMessage()
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_recover_does_not_retire_when_position_still_present__(tmp_path):
+    """A ``confirmed`` row whose ``dealId`` IS in /positions stays live.
+
+    Counter-test for the retire pass — guards against accidentally
+    retiring rows the bot legitimately needs to re-adopt across a
+    restart.
+    """
+    broker = _FakeBroker(config=_make_config(), responses={
+        ('positions', 'get'): {
+            'positions': [{
+                'position': {
+                    'dealId': 'deal-still-here',
+                    'dealReference': 'ref-still-here',
+                    'size': 1.0,
+                },
+            }],
+        },
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order(
+            'entry-coid', symbol='EURUSD', side='buy', qty=1.0,
+            state='confirmed',
+            intent_key='Long', pine_entry_id='Long',
+            extras={'kind': 'position', 'order_type': 'market',
+                    'entry_filled_at': 1.0},
+        )
+        ctx.set_exchange_id('entry-coid', 'deal-still-here')
+        ctx.add_ref('entry-coid', 'deal_id', 'deal-still-here')
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        row = ctx.get_order('entry-coid')
+        assert row is not None
+        assert row.closed_ts_ms is None  # still live
+
+        n_retired = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM events "
+            "WHERE kind = 'startup_orphan_retired'",
+        ).fetchone()['n']
+        assert n_retired == 0
+    finally:
+        ctx.close()
+        store.close()

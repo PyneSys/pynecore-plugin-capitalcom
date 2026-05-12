@@ -27,6 +27,7 @@ State touched: BrokerStore through ``self.store_ctx``,
 from time import time as epoch_time
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
 from .exceptions import OrderNotFoundError
@@ -134,18 +135,34 @@ class _RecoveryMixin(_CapitalComBase):
         )
 
         pos_by_ref: dict[str, dict] = {}
+        pos_by_deal_id: dict[str, dict] = {}
         for row in positions_resp.get('positions') or []:
             pos_data = row.get('position') or {}
             ref = pos_data.get('dealReference')
             if ref:
                 pos_by_ref[str(ref)] = row
+            did = pos_data.get('dealId')
+            if did:
+                pos_by_deal_id[str(did)] = row
         wo_by_ref: dict[str, dict] = {}
+        wo_by_deal_id: dict[str, dict] = {}
         for wo in working_resp.get('workingOrders') or []:
             data = wo.get('workingOrderData') or {}
             ref = data.get('dealReference')
             if ref:
                 wo_by_ref[str(ref)] = wo
+            did = data.get('dealId')
+            if did:
+                wo_by_deal_id[str(did)] = wo
         activities = activity_resp.get('activities') or []
+
+        # Track CO-IDs promoted by this recovery pass. The
+        # ``pos_by_deal_id`` / ``wo_by_deal_id`` maps are snapshots from
+        # *before* the promotions; rows resolved via ``activities`` or
+        # the direct ``/confirms/{ref}`` call land a ``deal_id`` that is
+        # not yet in those maps, so the subsequent orphan retirement
+        # would otherwise close a freshly recovered live order.
+        promoted_coids: set[str] = set()
 
         for row in list(self.store_ctx.iter_live_orders()):
             # ``disposition_unknown`` rows are a superset of ``submitted``
@@ -156,17 +173,33 @@ class _RecoveryMixin(_CapitalComBase):
             if row.state in ('submitted', 'disposition_unknown'):
                 await self._recover_submitted_row(
                     row, activities, pos_by_ref, wo_by_ref,
+                    promoted_coids,
                 )
             elif row.state == 'server_ref_seen':
                 await self._recover_server_ref_seen_row(
                     row, pos_by_ref, wo_by_ref,
+                    promoted_coids,
                 )
+
+        # After the in-flight recovery has had its chance to resolve
+        # every ``submitted`` / ``server_ref_seen`` row, retire whatever
+        # ``confirmed`` rows the BrokerStore still holds whose exchange
+        # counterpart is absent — typical when the operator stopped the
+        # bot and then closed the position manually outside it. Without
+        # this pass the runtime ``_reconcile_snapshot`` would later
+        # stamp ``missing_pending_since`` on those rows and the grace
+        # tracker would raise ``UnexpectedCancelError`` → halt the bot
+        # on a clean restart, even though there is nothing to recover.
+        self._retire_startup_orphans(
+            pos_by_deal_id, wo_by_deal_id, promoted_coids,
+        )
 
     async def _recover_submitted_row(
             self, row: 'OrderRow',
             activities: list[dict],
             pos_by_ref: dict[str, dict],
             wo_by_ref: dict[str, dict],
+            promoted_coids: set[str],
     ) -> None:
         """Resolve a ``submitted`` row with multi-factor confidence."""
         assert self.store_ctx is not None
@@ -191,6 +224,7 @@ class _RecoveryMixin(_CapitalComBase):
                     client_order_id=row.client_order_id,
                     exchange_order_id=deal_id,
                 )
+                promoted_coids.add(row.client_order_id)
                 return
 
         # Activity heuristic: epic + direction + size + ±3 s createdDateUTC.
@@ -230,6 +264,7 @@ class _RecoveryMixin(_CapitalComBase):
                 client_order_id=row.client_order_id,
                 exchange_order_id=deal_id,
             )
+            promoted_coids.add(row.client_order_id)
             return
 
         # Multiple matches — cannot auto-resolve.
@@ -248,6 +283,7 @@ class _RecoveryMixin(_CapitalComBase):
             self, row: 'OrderRow',
             pos_by_ref: dict[str, dict],
             wo_by_ref: dict[str, dict],
+            promoted_coids: set[str],
     ) -> None:
         """Resolve a ``server_ref_seen`` row — confirm first, snapshot fallback."""
         assert self.store_ctx is not None
@@ -278,6 +314,7 @@ class _RecoveryMixin(_CapitalComBase):
                     client_order_id=row.client_order_id,
                     exchange_order_id=deal_id,
                 )
+                promoted_coids.add(row.client_order_id)
             return
 
         deal_id = None
@@ -298,5 +335,114 @@ class _RecoveryMixin(_CapitalComBase):
                 'recovery_confirm_resolved',
                 client_order_id=row.client_order_id,
                 exchange_order_id=deal_id,
+            )
+            promoted_coids.add(row.client_order_id)
+
+    def _retire_startup_orphans(
+            self,
+            pos_by_deal_id: dict[str, dict],
+            wo_by_deal_id: dict[str, dict],
+            promoted_coids: set[str] | None = None,
+    ) -> None:
+        """Retire live rows whose exchange counterpart is gone.
+
+        Two passes over :meth:`iter_live_orders`:
+
+        1. Non-bracket rows (``leg_kind`` not in ``{'tp','sl'}``) whose
+           state is ``confirmed`` / ``closing`` / ``rejected``: if the
+           row's ``exchange_order_id`` is absent from both the positions
+           and workingorders snapshots, the order is definitively gone
+           from the exchange side. Close the row silently — without
+           this, the runtime ``_reconcile_snapshot`` would later flag
+           it via ``missing_pending_since`` and the grace tracker would
+           raise :class:`UnexpectedCancelError`, halting a bot that has
+           nothing left to recover.
+        2. Bracket leg rows (``leg_kind in {'tp','sl'}``): Capital.com
+           brackets are position attributes with no own ``dealId``,
+           so the parent's state is the only handle. Retire the leg
+           if its parent ``client_order_id`` was retired in pass 1, OR
+           if ``parent_deal_id`` is set and missing from the positions
+           snapshot.
+
+        ``promoted_coids`` lists rows resolved by the immediately preceding
+        in-flight recovery pass. Their fresh ``deal_id`` came from
+        ``activities`` or ``/confirms/{ref}`` and is therefore absent from
+        the pre-recovery ``pos_by_deal_id`` / ``wo_by_deal_id`` snapshots,
+        so the orphan check must skip them to avoid closing live broker
+        orders that were just recovered.
+
+        A single ``[BROKER]`` INFO line is emitted at the end when
+        anything was retired, so the operator sees what happened
+        without per-row noise.
+        """
+        if self.store_ctx is None:
+            return
+
+        promoted = promoted_coids or set()
+        retired_parent_coids: set[str] = set()
+        retired_count = 0
+
+        for row in list(self.store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            if extras.get('leg_kind') in ('tp', 'sl'):
+                continue
+            if row.client_order_id in promoted:
+                continue
+            did = row.exchange_order_id
+            if not did:
+                continue
+            if row.state not in ('confirmed', 'closing', 'rejected'):
+                continue
+            if did in pos_by_deal_id or did in wo_by_deal_id:
+                continue
+            self.store_ctx.log_event(
+                'startup_orphan_retired',
+                client_order_id=row.client_order_id,
+                exchange_order_id=did,
+                payload={'state': row.state, 'leg_kind': None},
+            )
+            self.store_ctx.close_order(row.client_order_id)
+            retired_parent_coids.add(row.client_order_id)
+            retired_count += 1
+
+        for row in list(self.store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            leg_kind = extras.get('leg_kind')
+            if leg_kind not in ('tp', 'sl'):
+                continue
+            parent_coid = extras.get('parent_coid')
+            parent_deal_id = extras.get('parent_deal_id')
+            # If the parent was just promoted by recovery, its new
+            # ``deal_id`` (and therefore ``parent_deal_id`` stamped on
+            # this leg) may legitimately be absent from the stale
+            # pre-recovery ``pos_by_deal_id`` snapshot — don't retire.
+            if parent_coid is not None and str(parent_coid) in promoted:
+                continue
+            orphan = False
+            if parent_coid is not None and str(parent_coid) in retired_parent_coids:
+                orphan = True
+            elif parent_deal_id and str(parent_deal_id) not in pos_by_deal_id:
+                orphan = True
+            if not orphan:
+                continue
+            self.store_ctx.log_event(
+                'startup_orphan_retired',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload={
+                    'state': row.state,
+                    'leg_kind': leg_kind,
+                    'parent_coid': parent_coid,
+                    'parent_deal_id': parent_deal_id,
+                },
+            )
+            self.store_ctx.close_order(row.client_order_id)
+            retired_count += 1
+
+        if retired_count:
+            broker_info(
+                "startup: retired %d orphan order row(s) — no matching "
+                "position/working order on exchange",
+                retired_count,
             )
 
