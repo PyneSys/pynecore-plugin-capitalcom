@@ -40,6 +40,13 @@ from pynecore.core.broker.idempotency import (
     KIND_EXIT_SL,
     KIND_EXIT_TP,
 )
+from pynecore.core.broker.store_helpers import (
+    create_entry_order_row,
+    mark_confirmed_with_fill,
+    mark_disposition_unknown,
+    mark_rejected,
+    record_server_ref,
+)
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
@@ -386,15 +393,16 @@ class _ExecutionMixin(_CapitalComBase):
 
         # === (1) PERSIST-FIRST ===
         if self.store_ctx is not None:
-            self.store_ctx.upsert_order(
-                coid,
+            create_entry_order_row(
+                self.store_ctx,
+                coid=coid,
                 symbol=intent.symbol,
                 side=intent.side,
                 qty=quantized_qty,
-                state='submitted',
                 intent_key=intent.intent_key,
                 pine_entry_id=intent.pine_id,
-                extras={'kind': kind, 'order_type': intent.order_type.value},
+                kind=kind,
+                order_type=intent.order_type.value,
             )
             self.store_ctx.log_event(
                 'dispatch_submitted',
@@ -409,7 +417,7 @@ class _ExecutionMixin(_CapitalComBase):
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
             if self.store_ctx is not None:
-                self.store_ctx.set_order_state(coid, 'disposition_unknown')
+                mark_disposition_unknown(self.store_ctx, coid=coid)
                 self.store_ctx.log_event(
                     'disposition_unknown', client_order_id=coid,
                     intent_key=intent.intent_key,
@@ -424,7 +432,7 @@ class _ExecutionMixin(_CapitalComBase):
         deal_ref: str | None = resp.get('dealReference')
         if not deal_ref:
             if self.store_ctx is not None:
-                self.store_ctx.set_order_state(coid, 'disposition_unknown')
+                mark_disposition_unknown(self.store_ctx, coid=coid)
                 self.store_ctx.log_event(
                     'disposition_unknown', client_order_id=coid,
                     intent_key=intent.intent_key,
@@ -437,18 +445,13 @@ class _ExecutionMixin(_CapitalComBase):
 
         # === (3) PERSIST dealReference ===
         if self.store_ctx is not None:
-            self.store_ctx.add_ref(coid, 'deal_reference', deal_ref)
-            # Mirror into extras so recovery can cross-check without a join
-            # when the order is still in ``submitted`` state (pre-ref add).
-            self.store_ctx.upsert_order(
-                coid,
-                extras={
-                    'kind': kind,
-                    'order_type': intent.order_type.value,
-                    'deal_reference': deal_ref,
-                },
+            record_server_ref(
+                self.store_ctx,
+                coid=coid,
+                deal_reference=deal_ref,
+                kind=kind,
+                order_type=intent.order_type.value,
             )
-            self.store_ctx.set_order_state(coid, 'server_ref_seen')
             self.store_ctx.log_event(
                 'deal_reference_seen', client_order_id=coid,
                 payload={'deal_reference': deal_ref},
@@ -461,7 +464,7 @@ class _ExecutionMixin(_CapitalComBase):
         if deal_status == 'REJECTED':
             reason = confirm.get('reason') or 'unknown'
             if self.store_ctx is not None:
-                self.store_ctx.set_order_state(coid, 'rejected')
+                mark_rejected(self.store_ctx, coid=coid)
                 self.store_ctx.log_event(
                     'rejected', client_order_id=coid,
                     intent_key=intent.intent_key,
@@ -488,24 +491,19 @@ class _ExecutionMixin(_CapitalComBase):
         )
 
         if self.store_ctx is not None:
-            if deal_id:
-                self.store_ctx.add_ref(coid, 'deal_id', deal_id)
-                self.store_ctx.set_exchange_id(coid, deal_id)
-            self.store_ctx.set_order_state(coid, 'confirmed')
-            if is_filled_market:
-                self.store_ctx.set_filled(coid, filled_size)
-                # Persist the confirm-side fill price so the activity
-                # poll can recover it when the row arrives with
-                # ``level=0`` AND the same poll's ``/positions``
-                # snapshot is also empty for this dealId — happens when
-                # the fill lands *between* the snapshot and activity
-                # fetches in one poll cycle.
-                if level_confirmed > 0.0:
-                    existing = self.store_ctx.get_order(coid)
-                    if existing is not None:
-                        merged_extras = dict(existing.extras or {})
-                        merged_extras['confirm_level'] = level_confirmed
-                        self.store_ctx.upsert_order(coid, extras=merged_extras)
+            # ``mark_confirmed_with_fill`` persists the deal_id ref,
+            # ``exchange_order_id``, ``state='confirmed'``, ``filled_qty``,
+            # and ``extras['confirm_level']`` (the latter only when the
+            # fill is positive — a no-quote artefact would corrupt the
+            # activity-poll recovery fallback).
+            mark_confirmed_with_fill(
+                self.store_ctx,
+                coid=coid,
+                exchange_id=deal_id or None,
+                is_filled=is_filled_market,
+                filled_qty=filled_size if is_filled_market else 0.0,
+                fill_price=level_confirmed if is_filled_market else 0.0,
+            )
             self.store_ctx.log_event(
                 'confirmed', client_order_id=coid,
                 exchange_order_id=deal_id, intent_key=intent.intent_key,

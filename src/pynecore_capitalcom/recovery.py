@@ -27,6 +27,7 @@ State touched: BrokerStore through ``self.store_ctx``,
 from time import time as epoch_time
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.core.broker.store_helpers import mark_confirmed_with_fill
 from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
@@ -209,15 +210,13 @@ class _RecoveryMixin(_CapitalComBase):
             if hit is not None:
                 data = hit.get('position') or hit.get('workingOrderData') or {}
                 deal_id = data.get('dealId')
-                if deal_id:
-                    self.store_ctx.add_ref(
-                        row.client_order_id, 'deal_id', str(deal_id),
-                    )
-                    self.store_ctx.set_exchange_id(
-                        row.client_order_id, str(deal_id),
-                    )
-                self.store_ctx.set_order_state(
-                    row.client_order_id, 'confirmed',
+                mark_confirmed_with_fill(
+                    self.store_ctx,
+                    coid=row.client_order_id,
+                    exchange_id=str(deal_id) if deal_id else None,
+                    is_filled=False,
+                    filled_qty=0.0,
+                    fill_price=0.0,
                 )
                 self.store_ctx.log_event(
                     'recovery_promoted_stored_ref',
@@ -251,14 +250,14 @@ class _RecoveryMixin(_CapitalComBase):
             return
         if len(candidates) == 1:
             deal_id = candidates[0].get('dealId')
-            if deal_id:
-                self.store_ctx.add_ref(
-                    row.client_order_id, 'deal_id', str(deal_id),
-                )
-                self.store_ctx.set_exchange_id(
-                    row.client_order_id, str(deal_id),
-                )
-            self.store_ctx.set_order_state(row.client_order_id, 'confirmed')
+            mark_confirmed_with_fill(
+                self.store_ctx,
+                coid=row.client_order_id,
+                exchange_id=str(deal_id) if deal_id else None,
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
+            )
             self.store_ctx.log_event(
                 'recovery_promoted_single_match',
                 client_order_id=row.client_order_id,
@@ -300,14 +299,13 @@ class _RecoveryMixin(_CapitalComBase):
             data = hit.get('position') or hit.get('workingOrderData') or {}
             deal_id = data.get('dealId')
             if deal_id:
-                self.store_ctx.add_ref(
-                    row.client_order_id, 'deal_id', str(deal_id),
-                )
-                self.store_ctx.set_exchange_id(
-                    row.client_order_id, str(deal_id),
-                )
-                self.store_ctx.set_order_state(
-                    row.client_order_id, 'confirmed',
+                mark_confirmed_with_fill(
+                    self.store_ctx,
+                    coid=row.client_order_id,
+                    exchange_id=str(deal_id),
+                    is_filled=False,
+                    filled_qty=0.0,
+                    fill_price=0.0,
                 )
                 self.store_ctx.log_event(
                     'recovery_snapshot_fallback',
@@ -324,13 +322,14 @@ class _RecoveryMixin(_CapitalComBase):
         if not deal_id:
             deal_id = confirm.get('dealId')
         if deal_id:
-            self.store_ctx.add_ref(
-                row.client_order_id, 'deal_id', str(deal_id),
+            mark_confirmed_with_fill(
+                self.store_ctx,
+                coid=row.client_order_id,
+                exchange_id=str(deal_id),
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
             )
-            self.store_ctx.set_exchange_id(
-                row.client_order_id, str(deal_id),
-            )
-            self.store_ctx.set_order_state(row.client_order_id, 'confirmed')
             self.store_ctx.log_event(
                 'recovery_confirm_resolved',
                 client_order_id=row.client_order_id,
