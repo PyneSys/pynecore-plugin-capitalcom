@@ -1402,6 +1402,22 @@ def __test_map_exception_httpx_timeout_becomes_connection_error__():
     assert isinstance(mapped, ExchangeConnectionError)
 
 
+def __test_call_maps_httpx_connect_error_to_exchange_connection_error__(monkeypatch):
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+
+    broker = CapitalCom(config=_make_config())
+
+    def fake_get(_url, **_kwargs):
+        raise httpx.ConnectError(
+            "[Errno 8] nodename nor servname provided, or not known",
+        )
+
+    monkeypatch.setattr(httpx, 'get', fake_get)
+
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker._call('positions', method='get'))
+
+
 # =======================================================================
 # Natural-close regression tests — TP/SL fill on a bracket-attached entry.
 # Three structural bugs are covered:

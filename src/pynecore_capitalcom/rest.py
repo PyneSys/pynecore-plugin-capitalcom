@@ -298,7 +298,7 @@ class _RestSessionMixin(_CapitalComBase):
             return await asyncio.to_thread(
                 self, endpoint, data=data, method=method,
             )
-        except CapitalComError as e:
+        except Exception as e:
             mapped = self._map_exception(e)
             if mapped is not None:
                 raise mapped from e
