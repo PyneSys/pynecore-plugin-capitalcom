@@ -14,7 +14,6 @@ leaves an auditable row that ``_recover_in_flight_submissions`` can
 replay on restart).
 """
 import asyncio
-import os
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
@@ -42,12 +41,10 @@ from pynecore.core.broker.idempotency import (
     KIND_MODIFY_ENTRY,
     KIND_MODIFY_EXIT,
 )
+from pynecore.core.broker.journal import DispatchJournal
 from pynecore.core.broker.store_helpers import (
-    create_entry_order_row,
-    mark_confirmed_with_fill,
-    mark_disposition_unknown,
-    mark_rejected,
-    record_server_ref,
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
 )
 from pynecore.core.broker.models import (
     CancelIntent,
@@ -76,14 +73,6 @@ from .helpers import _parse_iso_timestamp
 from .models import _InstrumentRules, _bracket_leg_id
 
 if TYPE_CHECKING:
-    # The journal / store_helpers modules are an M1 opt-in surface
-    # selected by ``PYNECORE_BROKER_JOURNAL_ENTRY=1`` (see
-    # :meth:`_ExecutionMixin.execute_entry_via_journal`). They are
-    # imported lazily at the dispatch site so a PyneCore build that
-    # predates these modules can still install and import this plugin
-    # — the journal path simply remains unreachable for it. When the
-    # journal becomes the default in M3, this falls back to a regular
-    # top-level import and the PyneCore minimum is bumped accordingly.
     from pynecore.core.broker.journal import (
         ConfirmOutcome,
         ResumeOutcome,
@@ -316,262 +305,22 @@ class _ExecutionMixin(_CapitalComBase):
     ) -> list[ExchangeOrder]:
         """Open a position (MARKET) or place a working order (LIMIT/STOP).
 
-        Default path delegates to :meth:`execute_entry_via_journal`
-        — the Core
-        :class:`~pynecore.core.broker.journal.DispatchJournal` owns the
-        persist-first state machine.
+        Routed through the Core
+        :class:`~pynecore.core.broker.journal.DispatchJournal` — the
+        journal owns every ``upsert_order`` / ``add_ref`` /
+        ``log_event`` / state transition along the lifecycle. The plugin
+        contributes the pre-dispatch prep (capability gate, instrument
+        rules, ``OrderSkippedByPlugin`` floor, qty quantize, endpoint /
+        body construction) and a typed :class:`_CapitalComEntryHooks`
+        instance that the journal calls back into for the REST round
+        trips and reject classification.
 
-        ``PYNECORE_BROKER_JOURNAL_ENTRY=0`` falls back to the legacy
-        body below as a one-release escape-hatch; the legacy code path
-        is retired after M4 (close/cancel/modify cutover). Tracking:
-        ``docs/pynecore/plugin-system/broker/broker-plugin-responsibility-review.md``
-        step 4-7.
-
-        When ``self.store_ctx`` is ``None`` (no-persistence runs and test
-        paths — see :class:`BrokerPlugin.store_ctx` contract) the journal
-        path is skipped automatically and the legacy body is used, since
-        the journal cannot operate without a store.
-
-        The flow follows the defensive-reconcile contract — every state
-        transition is **PERSIST-FIRST** so a crash between the REST round
-        trips leaves enough audit trail for
-        :meth:`_recover_in_flight_submissions` to resolve the ambiguity on
-        restart. The six-point crash matrix from the research dossier
-        §5.1 is the truth table this method implements.
+        Every state transition is **PERSIST-FIRST** so a crash between
+        the REST round trips leaves enough audit trail for
+        :meth:`_recover_in_flight_submissions` to resolve the ambiguity
+        on restart. The six-point crash matrix from the research dossier
+        §5.1 is the truth table the journal implements.
         """
-        if (self.store_ctx is not None
-                and os.environ.get('PYNECORE_BROKER_JOURNAL_ENTRY', '1') != '0'):
-            return await self.execute_entry_via_journal(envelope)
-
-        intent = envelope.intent
-        assert isinstance(intent, EntryIntent)
-        coid = envelope.client_order_id(KIND_ENTRY)
-
-        if intent.order_type == OrderType.STOP_LIMIT:
-            raise ExchangeCapabilityError(
-                "Capital.com does not support STOP_LIMIT orders — core "
-                "validation should have caught this at startup.",
-            )
-
-        rules = await self._get_instrument_rules(intent.symbol)
-        if rules.min_size > 0 and intent.qty < rules.min_size:
-            raise OrderSkippedByPlugin(
-                f"Skipping {intent.symbol} {intent.side.upper()} entry "
-                f"id={intent.pine_id!r}: qty={intent.qty} below Capital.com "
-                f"minimum size {rules.min_size}. No order sent.",
-                intent_key=intent.intent_key,
-                reason="below_min_size",
-                context={
-                    'symbol': intent.symbol,
-                    'side': intent.side,
-                    'qty': intent.qty,
-                    'min_size': rules.min_size,
-                },
-            )
-        quantized_qty = self._quantize_size(intent.qty, rules)
-        direction = "BUY" if intent.side == 'buy' else "SELL"
-
-        if intent.order_type == OrderType.MARKET:
-            endpoint = 'positions'
-            body: dict = {
-                'epic': intent.symbol,
-                'direction': direction,
-                'size': quantized_qty,
-            }
-            kind = 'position'
-        else:
-            endpoint = 'workingorders'
-            if intent.order_type == OrderType.LIMIT:
-                level = intent.limit
-                wo_type = 'LIMIT'
-            else:  # STOP
-                level = intent.stop
-                wo_type = 'STOP'
-            if level is None:
-                raise ExchangeOrderRejectedError(
-                    f"Capital execute_entry: {wo_type} order requires a level, "
-                    f"got None (pine_id={intent.pine_id!r})",
-                )
-            body = {
-                'epic': intent.symbol,
-                'direction': direction,
-                'size': quantized_qty,
-                'level': float(level),
-                'type': wo_type,
-            }
-            kind = 'working'
-
-        # === (1) PERSIST-FIRST ===
-        if self.store_ctx is not None:
-            create_entry_order_row(
-                self.store_ctx,
-                coid=coid,
-                symbol=intent.symbol,
-                side=intent.side,
-                qty=quantized_qty,
-                intent_key=intent.intent_key,
-                pine_entry_id=intent.pine_id,
-                kind=kind,
-                order_type=intent.order_type.value,
-            )
-            self.store_ctx.log_event(
-                'dispatch_submitted',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'endpoint': endpoint, 'body': body},
-            )
-
-        # === (2) POST — network timeout = ambiguous disposition ===
-        try:
-            resp = await self._call(endpoint, data=body, method='post')
-        except (httpx.TimeoutException, httpx.RequestError,
-                ConnectionError, ExchangeConnectionError) as net:
-            if self.store_ctx is not None:
-                mark_disposition_unknown(self.store_ctx, coid=coid)
-                self.store_ctx.log_event(
-                    'disposition_unknown', client_order_id=coid,
-                    intent_key=intent.intent_key,
-                    payload={'error': str(net), 'endpoint': endpoint},
-                )
-            raise OrderDispositionUnknownError(
-                f"Capital POST {endpoint} ambiguous: {net}",
-                client_order_id=coid,
-                cause=net if isinstance(net, Exception) else None,
-            ) from net
-
-        deal_ref: str | None = resp.get('dealReference')
-        if not deal_ref:
-            if self.store_ctx is not None:
-                mark_disposition_unknown(self.store_ctx, coid=coid)
-                self.store_ctx.log_event(
-                    'disposition_unknown', client_order_id=coid,
-                    intent_key=intent.intent_key,
-                    payload={'reason': 'no_deal_reference', 'response': resp},
-                )
-            raise OrderDispositionUnknownError(
-                f"Capital POST {endpoint}: no dealReference in response",
-                client_order_id=coid,
-            )
-
-        # === (3) PERSIST dealReference ===
-        if self.store_ctx is not None:
-            record_server_ref(
-                self.store_ctx,
-                coid=coid,
-                deal_reference=deal_ref,
-                kind=kind,
-                order_type=intent.order_type.value,
-            )
-            self.store_ctx.log_event(
-                'deal_reference_seen', client_order_id=coid,
-                payload={'deal_reference': deal_ref},
-            )
-
-        # === (4) CONFIRM ===
-        confirm = await self._call(f'confirms/{deal_ref}', method='get')
-        deal_status = (confirm.get('dealStatus') or '').upper()
-
-        if deal_status == 'REJECTED':
-            reason = confirm.get('reason') or 'unknown'
-            if self.store_ctx is not None:
-                mark_rejected(self.store_ctx, coid=coid)
-                self.store_ctx.log_event(
-                    'rejected', client_order_id=coid,
-                    intent_key=intent.intent_key,
-                    payload={'confirm': confirm},
-                )
-            reason_lc = reason.lower()
-            if 'margin' in reason_lc or 'leverage' in reason_lc:
-                raise InsufficientMarginError(f"Capital reject: {reason}")
-            raise ExchangeOrderRejectedError(f"Capital confirm REJECTED: {reason}")
-
-        # === (5) PERSIST dealId ===
-        deal_id: str | None = None
-        affected = confirm.get('affectedDeals') or []
-        if affected:
-            deal_id = affected[0].get('dealId')
-        if not deal_id:
-            deal_id = confirm.get('dealId')
-
-        level_confirmed = float(confirm.get('level') or 0.0)
-        filled_size = float(confirm.get('size') or quantized_qty)
-        confirm_status = (confirm.get('status') or '').upper()
-        is_filled_market = (
-            intent.order_type == OrderType.MARKET and confirm_status == 'OPEN'
-        )
-
-        if self.store_ctx is not None:
-            # ``mark_confirmed_with_fill`` persists the deal_id ref,
-            # ``exchange_order_id``, ``state='confirmed'``, ``filled_qty``,
-            # and ``extras['confirm_level']`` (the latter only when the
-            # fill is positive — a no-quote artefact would corrupt the
-            # activity-poll recovery fallback).
-            mark_confirmed_with_fill(
-                self.store_ctx,
-                coid=coid,
-                exchange_id=deal_id or None,
-                is_filled=is_filled_market,
-                filled_qty=filled_size if is_filled_market else 0.0,
-                fill_price=level_confirmed if is_filled_market else 0.0,
-            )
-            self.store_ctx.log_event(
-                'confirmed', client_order_id=coid,
-                exchange_order_id=deal_id, intent_key=intent.intent_key,
-                payload={'confirm': confirm},
-            )
-
-        return [ExchangeOrder(
-            id=deal_id or '',
-            symbol=intent.symbol,
-            side=intent.side,
-            order_type=intent.order_type,
-            qty=quantized_qty,
-            filled_qty=filled_size if is_filled_market else 0.0,
-            remaining_qty=(
-                max(0.0, quantized_qty - filled_size)
-                if is_filled_market else quantized_qty
-            ),
-            price=intent.limit,
-            stop_price=intent.stop,
-            average_fill_price=level_confirmed if is_filled_market else None,
-            status=OrderStatus.FILLED if is_filled_market else OrderStatus.OPEN,
-            timestamp=epoch_time(),
-            fee=0.0,
-            fee_currency='',
-            reduce_only=False,
-            client_order_id=coid,
-        )]
-
-    async def execute_entry_via_journal(
-            self, envelope: DispatchEnvelope,
-    ) -> list[ExchangeOrder]:
-        """Entry dispatch routed through the Core :class:`DispatchJournal`.
-
-        M1 proof-of-shape implementation. The body up to the first
-        broker write is identical to :meth:`execute_entry`'s
-        pre-dispatch prep (capability gate, instrument rules,
-        ``OrderSkippedByPlugin`` floor, qty quantize, endpoint /
-        body construction). From there a typed
-        :class:`_CapitalComEntryHooks` instance hands the persist-
-        first state machine to the journal — the journal owns every
-        ``upsert_order`` / ``add_ref`` / ``log_event`` / state
-        transition along the lifecycle.
-
-        Selected by the ``PYNECORE_BROKER_JOURNAL_ENTRY=1`` env var
-        from :meth:`execute_entry`; not part of the public
-        ``BrokerPlugin`` contract.
-
-        Lazy import: the journal / store_helpers modules are only
-        referenced inside this opt-in path so the plugin keeps loading
-        even on PyneCore builds that predate them (see the
-        ``TYPE_CHECKING`` block at module top).
-        """
-        from pynecore.core.broker.journal import DispatchJournal
-        from pynecore.core.broker.store_helpers import (
-            ENTRY_KIND_POSITION,
-            ENTRY_KIND_WORKING,
-        )
-
         intent = envelope.intent
         assert isinstance(intent, EntryIntent)
         coid = envelope.client_order_id(KIND_ENTRY)
@@ -632,7 +381,7 @@ class _ExecutionMixin(_CapitalComBase):
 
         if self.store_ctx is None:
             raise RuntimeError(
-                "execute_entry_via_journal requires an active store_ctx; "
+                "execute_entry requires an active store_ctx; "
                 "the journal owns persistence and cannot operate without it.",
             )
 
@@ -1671,7 +1420,7 @@ class _ExecutionMixin(_CapitalComBase):
 class _CapitalComEntryHooks:
     """Capital.com-specific hook set for the Core :class:`DispatchJournal`.
 
-    Constructed per dispatch by :meth:`_ExecutionMixin.execute_entry_via_journal`.
+    Constructed per dispatch by :meth:`_ExecutionMixin.execute_entry`.
     Holds the request shape decided by the plugin (endpoint, body,
     quantized qty) and a back-reference to the plugin instance for the
     REST call helper.
@@ -1700,10 +1449,10 @@ class _CapitalComEntryHooks:
     ) -> 'SubmitOutcome':
         """POST the entry to ``positions`` / ``workingorders``.
 
-        Mirrors the legacy ``execute_entry`` step §2: a network timeout
-        is converted to :class:`OrderDispositionUnknownError`, and a
-        successful POST without ``dealReference`` is treated the same
-        way — there is no exchange-side anchor to confirm against.
+        A network timeout is converted to
+        :class:`OrderDispositionUnknownError`, and a successful POST
+        without ``dealReference`` is treated the same way — there is no
+        exchange-side anchor to confirm against.
         """
         from pynecore.core.broker.journal import SubmitOutcome
 
@@ -1733,8 +1482,7 @@ class _CapitalComEntryHooks:
     ) -> 'ConfirmOutcome':
         """GET ``/confirms/{server_ref}`` and classify the outcome.
 
-        Mirrors the legacy ``execute_entry`` step §4 + §5: ``REJECTED``
-        maps to :class:`InsufficientMarginError` /
+        ``REJECTED`` maps to :class:`InsufficientMarginError` /
         :class:`ExchangeOrderRejectedError`, otherwise extract
         ``dealId`` and the confirm-time fill data. Transport-level
         failures on the confirms GET are converted to
