@@ -70,7 +70,6 @@ from .exceptions import (
     InvalidStopMaxValueError,
     InvalidTakeProfitDistanceError,
     InvalidTakeProfitMaxValueError,
-    OrderNotFoundError,
 )
 from .helpers import _parse_iso_timestamp
 from .models import _InstrumentRules, _bracket_leg_id
@@ -1337,7 +1336,18 @@ class _ExecutionMixin(_CapitalComBase):
         ``error.not-found.dealId`` / ``.dealReference`` on the DELETE,
         the plugin treats it as already-gone (benign race), logs a
         ``cancel_already_gone`` event, and continues.
+
+        The per-target sweep runs through the Core
+        :class:`~pynecore.core.broker.journal.DispatchJournal` so a
+        mid-loop crash is recoverable: the cancel command row is
+        persisted *before* the wire calls, and recovery on next start
+        compares the target rows against the broker's authoritative
+        snapshots to decide whether the cancel landed.
         """
+        from pynecore.core.broker.journal import DispatchJournal
+
+        from .dispatch_hooks import _CapitalComCancelHooks
+
         intent = envelope.intent
         assert isinstance(intent, CancelIntent)
         coid = envelope.client_order_id(KIND_CANCEL)
@@ -1372,137 +1382,26 @@ class _ExecutionMixin(_CapitalComBase):
                 )
             return True
 
-        for row in targets:
-            if row.state not in ('submitted', 'server_ref_seen', 'confirmed'):
-                continue
+        if self.store_ctx is None:
+            # Journal needs a store; without one we cannot orchestrate
+            # the persist-first state machine. No live target was found
+            # above either when ``store_ctx is None``, so this branch
+            # is effectively unreachable in production — the engine
+            # never dispatches against a plugin with no run context.
+            return True
 
-            extras = row.extras or {}
-            leg_kind = extras.get('leg_kind')
-
-            # Bracket leg: ``execute_exit`` stamps ``leg_kind`` ('tp'/'sl')
-            # plus ``parent_deal_id`` and stores no ``exchange_order_id``
-            # because the level is a position attribute, not an order. The
-            # cancel must clear that one level on the parent position via
-            # PUT — DELETE on the bracket row id is not a thing.
-            #
-            # Gate on ``intent.from_entry is not None``: bracket rows store
-            # ``pine_entry_id = intent.from_entry`` (the entry id), so an
-            # entry-side ``CancelIntent(pine_id='Long', from_entry=None)``
-            # would otherwise match the bracket and clear protective exits
-            # from a still-open position. Only ``strategy.cancel(exit_id)``
-            # carries a non-None ``from_entry`` and should remove brackets.
-            if leg_kind in ('tp', 'sl') and intent.from_entry is not None:
-                parent_deal_id = extras.get('parent_deal_id')
-                if not parent_deal_id:
-                    if self.store_ctx is not None:
-                        self.store_ctx.set_order_state(
-                            row.client_order_id, 'cancel_pending',
-                        )
-                    continue
-                # ``stopLevel: null`` / ``profitLevel: null`` — Capital.com
-                # treats null as an explicit clear, leaving the unspecified
-                # leg untouched so the sister bracket survives. A trailing
-                # SL needs the ``trailingStop: False`` flag too: clearing
-                # ``stopLevel`` alone does not disable the native trailing
-                # mechanism, so without this the broker would keep the
-                # trailing stop active even after the local row is closed.
-                body: dict
-                if leg_kind == 'tp':
-                    body = {'profitLevel': None}
-                else:
-                    body = {'stopLevel': None}
-                    if row.trailing_distance or extras.get('trail_offset'):
-                        body['trailingStop'] = False
-                try:
-                    resp = await self._call(
-                        f'positions/{parent_deal_id}',
-                        data=body, method='put',
-                    )
-                    # Mirror the confirm round-trip ``execute_exit`` /
-                    # ``modify_exit`` already perform after every bracket
-                    # PUT — Capital.com's confirms endpoint is TTL-bounded
-                    # and the activity stream uses it as the truth source.
-                    new_ref = (resp or {}).get('dealReference') if isinstance(resp, dict) else None
-                    if new_ref:
-                        await self._call(f'confirms/{new_ref}', method='get')
-                except OrderNotFoundError:
-                    # Position already gone — bracket is gone with it.
-                    if self.store_ctx is not None:
-                        self.store_ctx.log_event(
-                            'cancel_already_gone',
-                            client_order_id=row.client_order_id,
-                            exchange_order_id=str(parent_deal_id),
-                            intent_key=intent.intent_key,
-                        )
-                if self.store_ctx is not None:
-                    self.store_ctx.close_order(row.client_order_id)
-                    self.store_ctx.log_event(
-                        'cancelled',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=str(parent_deal_id),
-                        intent_key=intent.intent_key,
-                        payload={'leg_kind': leg_kind, 'cleared_via': 'put_position'},
-                    )
-                continue
-            if leg_kind in ('tp', 'sl'):
-                # Bracket row picked up by an entry cancel (pine_entry_id
-                # match). TV semantics: cancel(entry_id) is a no-op — the
-                # protective exit must survive. Skip without touching the
-                # broker or the local state.
-                continue
-
-            if not row.exchange_order_id:
-                # No exchange id yet — recovery will clear this on the next
-                # reconcile; marking ``cancel_pending`` prevents a duplicate
-                # DELETE once the id finally lands.
-                if self.store_ctx is not None:
-                    self.store_ctx.set_order_state(
-                        row.client_order_id, 'cancel_pending',
-                    )
-                continue
-
-            kind = extras.get('kind', 'working')
-
-            # Filled position: TV-verified semantics for ``strategy.cancel``
-            # after the entry has filled is a no-op — never close the
-            # position from a cancel intent. (Same rule as
-            # ``Position._remove_order_by_id`` upstream; this is the
-            # broker-side guard against a stale/ambiguous cancel intent
-            # still reaching the plugin.)
-            if kind == 'position':
-                if self.store_ctx is not None:
-                    self.store_ctx.log_event(
-                        'cancel_noop',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=row.exchange_order_id,
-                        intent_key=intent.intent_key,
-                        payload={'reason': 'already_filled',
-                                 'pine_id': intent.pine_id,
-                                 'from_entry': intent.from_entry},
-                    )
-                continue
-
-            # Working order: real DELETE.
-            try:
-                await self._call(
-                    f'workingorders/{row.exchange_order_id}', method='delete',
-                )
-            except OrderNotFoundError:
-                if self.store_ctx is not None:
-                    self.store_ctx.log_event(
-                        'cancel_already_gone',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=row.exchange_order_id,
-                        intent_key=intent.intent_key,
-                    )
-            if self.store_ctx is not None:
-                self.store_ctx.close_order(row.client_order_id)
-                self.store_ctx.log_event(
-                    'cancelled',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                    intent_key=intent.intent_key,
-                )
+        hooks = _CapitalComCancelHooks(plugin=self)
+        journal = DispatchJournal(self.store_ctx)
+        await journal.run_cancel(
+            coid=coid,
+            intent=intent,
+            targets=targets,
+            hooks=hooks,
+            audit_payload={
+                'pine_id': intent.pine_id,
+                'from_entry': intent.from_entry,
+            },
+        )
         return True
 
     # --- BrokerPlugin: modify overrides -----------------------------------

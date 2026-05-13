@@ -38,7 +38,7 @@ from pynecore.core.broker.journal import (
     DispatchJournal,
     ResumeOutcome,
 )
-from pynecore.core.broker.store_helpers import KIND_MODIFY_ENTRY
+from pynecore.core.broker.store_helpers import KIND_CANCEL, KIND_MODIFY_ENTRY
 from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
@@ -179,6 +179,7 @@ class _RecoveryMixin(_CapitalComBase):
             pos_by_ref=pos_by_ref,
             wo_by_ref=wo_by_ref,
             wo_by_deal_id=wo_by_deal_id,
+            pos_by_deal_id=pos_by_deal_id,
         )
 
         def hooks_for(row: 'OrderRow') -> '_CapitalComResumeHooks | None':
@@ -360,6 +361,7 @@ class _CapitalComResumeHooks:
     pos_by_ref: dict[str, dict]
     wo_by_ref: dict[str, dict]
     wo_by_deal_id: dict[str, dict]
+    pos_by_deal_id: dict[str, dict]
 
     async def submit(
             self, *, coid: str, intent: 'EntryIntent', qty: float,
@@ -438,6 +440,8 @@ class _CapitalComResumeHooks:
         kind = (row.extras or {}).get('kind')
         if kind == KIND_MODIFY_ENTRY:
             return await self._verdict_modify_entry(row, refs)
+        if kind == KIND_CANCEL:
+            return self._verdict_cancel(row, refs)
         if row.state == 'server_ref_seen':
             return await self._verdict_server_ref_seen(row, refs)
         if row.state == 'disposition_unknown':
@@ -757,4 +761,102 @@ class _CapitalComResumeHooks:
                 'wo_level': wo_level,
                 'expected_level': new_level,
             },
+        )
+
+    def _verdict_cancel(
+            self, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Verdict for a ``cancel`` command row.
+
+        The cancel command row carries ``extras['target_coids']`` (the
+        plugin-side COIDs the per-target loop intended to sweep). For
+        each target the verdict checks the broker's snapshots:
+
+        * Target row gone (closed by the hook before crash, or removed
+          from the store) → target is considered swept.
+        * Target row alive with an ``exchange_order_id`` absent from
+          both the working-orders and positions snapshots → broker side
+          confirms it vanished; counted as swept.
+        * Target row alive with an ``exchange_order_id`` still present
+          in either snapshot → still alive; the cancel did NOT land
+          for that target → the dispatch verdict is ``still_unknown``
+          so the engine reconciler re-issues the cancel on next sync.
+        * Bracket-leg targets: lookup is by ``parent_deal_id`` in the
+          positions snapshot. Parent gone → bracket gone (swept).
+
+        All targets vanished → ``confirmed`` (the cancel landed even
+        though the local persistence was interrupted mid-loop). Any
+        target still alive → ``still_unknown``.
+        """
+        del refs  # cancel rows do not carry deal_reference
+        extras = row.extras or {}
+        target_coids = list(extras.get('target_coids') or ())
+        if self.plugin.store_ctx is None:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='cancel_no_store',
+            )
+
+        if not target_coids:
+            # An empty target list was already a ``noop`` at dispatch
+            # time (``run_cancel`` would have stamped ``reason_path``
+            # right away), so reaching the recovery loop with no
+            # targets means the row never finalised — declare it gone.
+            return ResumeOutcome(
+                status='confirmed',
+                recovery_path='cancel_no_targets',
+            )
+
+        still_alive: list[str] = []
+        swept_targets: list[str] = []
+        for target_coid in target_coids:
+            target_row = self.plugin.store_ctx.get_order(str(target_coid))
+            if target_row is None or target_row.state in (
+                    'closed', 'cancelled', 'rejected', 'filled',
+            ):
+                swept_targets.append(str(target_coid))
+                continue
+
+            target_extras = target_row.extras or {}
+            leg_kind = target_extras.get('leg_kind')
+
+            if leg_kind in ('tp', 'sl'):
+                parent_deal_id = target_extras.get('parent_deal_id')
+                if not parent_deal_id:
+                    still_alive.append(str(target_coid))
+                    continue
+                if str(parent_deal_id) in self.pos_by_deal_id:
+                    still_alive.append(str(target_coid))
+                else:
+                    swept_targets.append(str(target_coid))
+                continue
+
+            deal_id = target_row.exchange_order_id
+            if not deal_id:
+                # Target never received an exchange id; the hook would
+                # have stamped ``cancel_pending`` rather than DELETE.
+                # Without an id we cannot verify against the snapshot —
+                # treat it as still alive so the engine retries.
+                still_alive.append(str(target_coid))
+                continue
+
+            if (str(deal_id) in self.wo_by_deal_id
+                    or str(deal_id) in self.pos_by_deal_id):
+                still_alive.append(str(target_coid))
+            else:
+                swept_targets.append(str(target_coid))
+
+        if still_alive:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='cancel_targets_partial',
+                recovery_context={
+                    'still_alive_coids': still_alive,
+                    'swept_target_coids': swept_targets,
+                },
+            )
+        return ResumeOutcome(
+            status='confirmed',
+            recovery_path='cancel_targets_vanished',
+            recovery_context={'applied_target_coids': swept_targets},
         )
