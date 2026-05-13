@@ -12,11 +12,13 @@ These hooks live in their own module (rather than inside ``execution.py``)
 so the dispatch surface stays small and the ~2700-line execution mix-in
 shrinks as each path migrates.
 """
+from time import time as epoch_time
 from typing import TYPE_CHECKING
 
 import httpx
 
 from pynecore.core.broker.exceptions import (
+    BrokerManualInterventionError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     InsufficientMarginError,
@@ -25,10 +27,12 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.journal import (
     CancelOutcome,
     CancelReasonPath,
+    CloseOutcome,
     ModifyEntryOutcome,
 )
 from pynecore.core.broker.models import (
     CancelIntent,
+    CloseIntent,
     EntryIntent,
     ExchangeOrder,
     OrderStatus,
@@ -36,11 +40,13 @@ from pynecore.core.broker.models import (
 )
 
 from .exceptions import OrderNotFoundError
+from .helpers import _parse_iso_timestamp
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
     from .execution import _ExecutionMixin
+    from .models import _InstrumentRules
 
 
 class _CapitalComModifyEntryHooks:
@@ -489,5 +495,347 @@ class _CapitalComCancelHooks:
             fee=0.0,
             fee_currency='',
             reduce_only=False,
+            client_order_id=row.client_order_id,
+        )
+
+
+class _CapitalComCloseHooks:
+    """Hook set for the close dispatch.
+
+    Conforms structurally to
+    :class:`pynecore.core.broker.journal.CloseDispatchHooks`. Two wire
+    shapes:
+
+    * **Full close** — issue ``DELETE /positions/{dealId}`` for every
+      target position. The DELETE is synchronous; no confirm GET, no
+      ``dealReference``. The hook advances each target row to
+      ``closing`` and logs a per-target ``close_dispatched`` event so
+      the activity stream can later promote the row to ``closed``.
+    * **Partial close** — Capital.com has no native partial-close
+      endpoint, so the plugin emulates it by issuing an opposite-side
+      ``POST /positions``. The POST is inherently racy against any
+      unrelated opposite-side opener landing in the same instant; the
+      hook protects with a pre- + post-snapshot reconciliation and a
+      corrective ``DELETE`` only when the fresh row's ``createdDateUTC``
+      falls within a ±3 s window of our POST. If the race cannot be
+      confidently resolved the hook raises
+      :class:`BrokerManualInterventionError` — the journal does NOT
+      catch that (intentional: operator intervention required), so the
+      propagation matches the legacy execute_close semantics.
+
+    Only one of :meth:`submit_full_close` / :meth:`submit_partial_close`
+    is invoked per dispatch — the orchestrator decides between them
+    based on whether the intent's quantity matches the live position
+    total, and passes the matching ``kind`` to
+    :meth:`pynecore.core.broker.journal.DispatchJournal.run_close`.
+    """
+
+    def __init__(
+            self,
+            *,
+            plugin: '_ExecutionMixin',
+            rules: '_InstrumentRules',
+    ) -> None:
+        self._plugin = plugin
+        self._rules = rules
+
+    async def submit_full_close(
+            self, *, coid: str, intent: CloseIntent,
+            targets: list['OrderRow'],
+    ) -> CloseOutcome:
+        """DELETE every target position synchronously.
+
+        Capital.com's ``DELETE /positions/{dealId}`` returns no
+        ``dealReference`` and no confirm step is required — the broker
+        echoes a 200 with no body once the position has been queued for
+        closure. The hook mirrors each target row's state to ``closing``
+        and emits a per-target ``close_dispatched`` audit event so the
+        activity stream's subsequent ``CLOSED`` event can match the
+        local row.
+
+        Network errors raise :class:`BrokerManualInterventionError`
+        rather than :class:`OrderDispositionUnknownError`: a parked
+        close cannot be verified in-session because
+        :meth:`get_open_orders` only returns working orders, not
+        positions, so the parked intent would never resolve while a
+        position may remain open. Halting hands the ambiguity to the
+        operator; recovery on next start verifies the DELETE landed by
+        checking each target ``dealId`` against the positions snapshot.
+        """
+        store_ctx = self._plugin.store_ctx
+        applied_targets: list[str] = []
+        for row in targets:
+            try:
+                await self._plugin._call(  # type: ignore[attr-defined]
+                    f'positions/{row.exchange_order_id}', method='delete',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError) as net:
+                raise BrokerManualInterventionError(
+                    f"Capital DELETE positions/{row.exchange_order_id} "
+                    f"ambiguous during full close: {net}",
+                    intent_key=intent.intent_key,
+                    context={
+                        'coid': coid,
+                        'target_deal_id': row.exchange_order_id,
+                        'symbol': intent.symbol,
+                        'error': str(net),
+                    },
+                ) from net
+            except OrderNotFoundError:
+                # Target vanished between local snapshot and the DELETE
+                # (broker-side natural close, manual intervention, or
+                # another stale dispatch already swept it). The user's
+                # close intent is satisfied either way — count the
+                # target as swept so the journal's ``mark_closing``
+                # path records it. Letting ``OrderNotFoundError`` (a
+                # subclass of :class:`ExchangeOrderRejectedError`)
+                # escape would mark the entire close dispatch
+                # ``rejected`` — terminal, no recovery, stale position
+                # row left behind. Mirrors the cancel hook's
+                # ``already_gone`` semantics.
+                if store_ctx is not None:
+                    store_ctx.log_event(
+                        'close_already_gone',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=row.exchange_order_id,
+                        intent_key=intent.intent_key,
+                    )
+            if store_ctx is not None:
+                store_ctx.set_order_state(row.client_order_id, 'closing')
+                store_ctx.log_event(
+                    'close_dispatched',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                    intent_key=intent.intent_key,
+                )
+            applied_targets.append(row.exchange_order_id or '')
+
+        primary = targets[0]
+        return CloseOutcome(
+            mode='full',
+            applied_targets=applied_targets,
+            deal_reference=None,
+            exchange_id=primary.exchange_order_id or '',
+            filled_qty=intent.qty,
+        )
+
+    async def submit_partial_close(
+            self, *, coid: str, intent: CloseIntent,
+    ) -> CloseOutcome:
+        """Emulated partial close via opposite-direction POST.
+
+        Pre-snapshot the positions list to capture the live unit total
+        and the set of ``dealId``\\ s that existed *before* the POST;
+        these are needed both to detect a race-opened fresh leg and to
+        give recovery on next start enough context to verify the dispatch
+        even when the corrective-DELETE time window has elapsed.
+
+        On network ambiguity the hook raises
+        :class:`BrokerManualInterventionError`: the sync engine cannot
+        verify a parked emulated-partial-close in-session
+        (``get_open_orders`` does not see netted positions, and a
+        second POST could compound the exposure), so the safe contract
+        is to halt and let recovery on next start resolve the dispatch
+        via the persisted ``deal_reference`` / pre-snapshot context.
+        On an unresolvable race (post-snapshot has too many units AND
+        no fresh-leg candidate falls within ±3 s of the POST) it also
+        raises :class:`BrokerManualInterventionError`. The journal
+        does not catch either — operator intervention is required.
+        """
+        store_ctx = self._plugin.store_ctx
+        rules = self._rules
+
+        pre_snap = await self._plugin._call('positions', method='get')  # type: ignore[attr-defined]
+        pre_rows = [
+            r for r in (pre_snap.get('positions') or [])
+            if (r.get('market') or {}).get('epic') == intent.symbol
+        ]
+        pre_deal_ids = {
+            (r.get('position') or {}).get('dealId') for r in pre_rows
+        }
+        pre_total_units = sum(
+            round(float((r.get('position') or {}).get('size', 0.0))
+                  / rules.lot_step) if rules.lot_step > 0 else 0
+            for r in pre_rows
+        )
+        intent_units = (
+            round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
+        )
+
+        opposite_dir = 'SELL' if intent.side == 'sell' else 'BUY'
+        quantized_qty = self._plugin._quantize_size(intent.qty, rules)  # type: ignore[attr-defined]
+        body = {
+            'epic': intent.symbol,
+            'direction': opposite_dir,
+            'size': quantized_qty,
+        }
+
+        # Persist the pre-POST snapshot delta context into the command
+        # row so recovery on next start can verify the dispatch even
+        # though the corrective-DELETE time window will have elapsed.
+        if store_ctx is not None:
+            existing = store_ctx.get_order(coid)
+            merged_extras = dict((existing.extras or {}) if existing else {})
+            merged_extras['pre_total_units'] = pre_total_units
+            merged_extras['intent_units'] = intent_units
+            store_ctx.upsert_order(coid, extras=merged_extras)
+
+        try:
+            post_resp = await self._plugin._call(  # type: ignore[attr-defined]
+                'positions', data=body, method='post',
+            )
+        except (httpx.TimeoutException, httpx.RequestError,
+                ConnectionError, ExchangeConnectionError) as net:
+            raise BrokerManualInterventionError(
+                f"Capital POST positions ambiguous during partial close: "
+                f"{net}",
+                intent_key=intent.intent_key,
+                context={
+                    'coid': coid,
+                    'symbol': intent.symbol,
+                    'qty': intent.qty,
+                    'error': str(net),
+                },
+            ) from net
+
+        deal_ref: str | None = post_resp.get('dealReference')
+        # Mid-flow add_ref so recovery has the durable reference even if
+        # this method raises between POST and journal return. The journal
+        # will idempotently re-record the ref via ``record_close_server_ref``
+        # once :meth:`submit_partial_close` returns successfully.
+        if deal_ref and store_ctx is not None:
+            store_ctx.add_ref(coid, 'deal_reference', deal_ref)
+
+        if deal_ref:
+            try:
+                await self._plugin._call(  # type: ignore[attr-defined]
+                    f'confirms/{deal_ref}', method='get',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError) as net:
+                raise BrokerManualInterventionError(
+                    f"Capital GET confirms/{deal_ref} ambiguous after "
+                    f"partial close POST: {net}",
+                    intent_key=intent.intent_key,
+                    context={
+                        'coid': coid,
+                        'deal_reference': deal_ref,
+                        'symbol': intent.symbol,
+                        'qty': intent.qty,
+                        'error': str(net),
+                    },
+                ) from net
+            except OrderNotFoundError:
+                # Confirms TTL/lookup race: the POST landed and a
+                # ``dealReference`` was returned, but the ``confirms``
+                # endpoint cannot find it anymore (Capital.com's TTL
+                # expired between POST and our GET). The post-snapshot
+                # reconcile below still reconstructs the verdict via
+                # the unit delta. Letting ``OrderNotFoundError`` (a
+                # subclass of :class:`ExchangeOrderRejectedError`)
+                # escape would mark this row ``rejected`` — terminal,
+                # no recovery — even though the close almost certainly
+                # netted. Fall through to the post-snapshot path.
+                pass
+
+        post_snap = await self._plugin._call('positions', method='get')  # type: ignore[attr-defined]
+        post_rows = [
+            r for r in (post_snap.get('positions') or [])
+            if (r.get('market') or {}).get('epic') == intent.symbol
+        ]
+        post_total_units = sum(
+            round(float((r.get('position') or {}).get('size', 0.0))
+                  / rules.lot_step) if rules.lot_step > 0 else 0
+            for r in post_rows
+        )
+        expected_post_units = pre_total_units - intent_units
+
+        if post_total_units > expected_post_units:
+            # Race window: our opposite POST opened a fresh row instead
+            # of netting. Identify the freshly-opened leg by direction
+            # + a ±3 s ``createdDateUTC`` band around now and issue a
+            # corrective DELETE. If no candidate falls inside the band,
+            # the race cannot be confidently resolved — halt.
+            fresh_opposite: dict | None = None
+            now_ts = epoch_time()
+            for r in post_rows:
+                pos_data = r.get('position') or {}
+                if pos_data.get('dealId') in pre_deal_ids:
+                    continue
+                if (pos_data.get('direction') or '').upper() != opposite_dir:
+                    continue
+                created_at = _parse_iso_timestamp(
+                    pos_data.get('createdDateUTC') or '',
+                )
+                if created_at and abs(created_at - now_ts) <= 3.0:
+                    fresh_opposite = pos_data
+                    break
+            if fresh_opposite is not None:
+                fresh_id = fresh_opposite.get('dealId')
+                await self._plugin._call(  # type: ignore[attr-defined]
+                    f'positions/{fresh_id}', method='delete',
+                )
+                if store_ctx is not None:
+                    store_ctx.log_event(
+                        'partial_close_corrective_delete',
+                        client_order_id=coid,
+                        exchange_order_id=fresh_id,
+                        intent_key=intent.intent_key,
+                        payload={'reason': 'race_reverse_leg_corrected'},
+                    )
+            else:
+                raise BrokerManualInterventionError(
+                    f"Partial close race detected but reverse leg cannot "
+                    f"be confidently identified (expected "
+                    f"{expected_post_units} units, have "
+                    f"{post_total_units})",
+                    intent_key=intent.intent_key,
+                    context={
+                        'coid': coid,
+                        'pre_total_units': pre_total_units,
+                        'post_total_units': post_total_units,
+                        'intent_units': intent_units,
+                        'symbol': intent.symbol,
+                    },
+                )
+
+        return CloseOutcome(
+            mode='partial',
+            applied_targets=[deal_ref] if deal_ref else [],
+            deal_reference=deal_ref,
+            exchange_id=deal_ref or '',
+            filled_qty=quantized_qty,
+            raw=post_resp,
+        )
+
+    def exchange_order_from_state(
+            self, *, row: 'OrderRow', intent: CloseIntent,
+            outcome: CloseOutcome,
+    ) -> ExchangeOrder:
+        """Build the engine-facing :class:`ExchangeOrder` for the close.
+
+        Full-close: the engine sees the first target's ``dealId`` as
+        the synthetic order id. Partial-close: the ``dealReference``
+        is used. Both branches report the close as fully filled — full
+        close synchronously, partial close emulated via the opposite
+        POST.
+        """
+        return ExchangeOrder(
+            id=outcome.exchange_id or '',
+            symbol=intent.symbol,
+            side=intent.side,
+            order_type=OrderType.MARKET,
+            qty=outcome.filled_qty,
+            filled_qty=outcome.filled_qty,
+            remaining_qty=0.0,
+            price=None,
+            stop_price=None,
+            average_fill_price=outcome.fill_price,
+            status=OrderStatus.FILLED,
+            timestamp=epoch_time(),
+            fee=0.0,
+            fee_currency='',
+            reduce_only=True,
             client_order_id=row.client_order_id,
         )

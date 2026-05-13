@@ -1075,7 +1075,23 @@ class _ExecutionMixin(_CapitalComBase):
         ``createdDateUTC`` falls within a ±3 s window of our POST. If the
         race cannot be confidently resolved, the plugin raises
         :class:`BrokerManualInterventionError` — the sync engine halts.
+
+        Both branches run through the Core
+        :class:`~pynecore.core.broker.journal.DispatchJournal` so a
+        process crash between the wire calls and the persisted result is
+        recoverable: the close command row is written *before* the wire
+        calls, and recovery on next start verifies each target ``dealId``
+        against the positions snapshot (full close) or the
+        ``deal_reference`` confirm GET (partial close).
         """
+        from pynecore.core.broker.journal import DispatchJournal
+        from pynecore.core.broker.store_helpers import (
+            KIND_FULL_CLOSE,
+            KIND_PARTIAL_CLOSE,
+        )
+
+        from .dispatch_hooks import _CapitalComCloseHooks
+
         intent = envelope.intent
         assert isinstance(intent, CloseIntent)
         coid = envelope.client_order_id(KIND_CLOSE)
@@ -1094,6 +1110,12 @@ class _ExecutionMixin(_CapitalComBase):
                 f"symbol={intent.symbol!r}",
             )
 
+        if self.store_ctx is None:
+            raise RuntimeError(
+                "execute_close requires an active store_ctx; the journal "
+                "owns persistence and cannot operate without it.",
+            )
+
         total_live_units = sum(
             round(max(0.0, row.qty - row.filled_qty) / rules.lot_step)
             if rules.lot_step > 0 else 0
@@ -1103,227 +1125,20 @@ class _ExecutionMixin(_CapitalComBase):
             round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
         )
 
-        # --- Full close branch (safe: single DELETE per live row) ---
-        if intent_units == total_live_units:
-            if self.store_ctx is not None:
-                self.store_ctx.upsert_order(
-                    coid,
-                    symbol=intent.symbol,
-                    side=intent.side,
-                    qty=intent.qty,
-                    state='submitted',
-                    intent_key=intent.intent_key,
-                    extras={'kind': 'full_close'},
-                )
-                self.store_ctx.log_event(
-                    'dispatch_submitted',
-                    client_order_id=coid,
-                    intent_key=intent.intent_key,
-                    payload={'mode': 'full_close',
-                             'targets': [r.exchange_order_id for r in targets]},
-                )
-            for row in targets:
-                await self._call(
-                    f'positions/{row.exchange_order_id}', method='delete',
-                )
-                if self.store_ctx is not None:
-                    self.store_ctx.set_order_state(row.client_order_id, 'closing')
-                    self.store_ctx.log_event(
-                        'close_dispatched',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=row.exchange_order_id,
-                        intent_key=intent.intent_key,
-                    )
-            primary = targets[0]
-            return ExchangeOrder(
-                id=primary.exchange_order_id or '',
-                symbol=intent.symbol,
-                side=intent.side,
-                order_type=OrderType.MARKET,
-                qty=intent.qty,
-                filled_qty=intent.qty,
-                remaining_qty=0.0,
-                price=None,
-                stop_price=None,
-                average_fill_price=None,
-                status=OrderStatus.FILLED,
-                timestamp=epoch_time(),
-                fee=0.0,
-                fee_currency='',
-                reduce_only=True,
-                client_order_id=coid,
-            )
-
-        # --- Partial close branch (emulated opposite POST) ---
-        return await self._execute_close_partial(coid, intent, rules)
-
-    async def _execute_close_partial(
-            self,
-            coid: str,
-            intent: CloseIntent,
-            rules: _InstrumentRules,
-    ) -> ExchangeOrder:
-        """Emulated partial close — see :meth:`execute_close` docstring."""
-        # Pre-snapshot
-        pre_snap = await self._call('positions', method='get')
-        pre_rows = [
-            r for r in (pre_snap.get('positions') or [])
-            if (r.get('market') or {}).get('epic') == intent.symbol
-        ]
-        pre_deal_ids = {
-            (r.get('position') or {}).get('dealId') for r in pre_rows
-        }
-        pre_total_units = sum(
-            round(float((r.get('position') or {}).get('size', 0.0))
-                  / rules.lot_step) if rules.lot_step > 0 else 0
-            for r in pre_rows
-        )
-        intent_units = (
-            round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
+        kind = (
+            KIND_FULL_CLOSE if intent_units == total_live_units
+            else KIND_PARTIAL_CLOSE
         )
 
-        opposite_dir = 'SELL' if intent.side == 'sell' else 'BUY'
-        quantized_qty = self._quantize_size(intent.qty, rules)
-        body = {
-            'epic': intent.symbol,
-            'direction': opposite_dir,
-            'size': quantized_qty,
-        }
-
-        if self.store_ctx is not None:
-            self.store_ctx.upsert_order(
-                coid,
-                symbol=intent.symbol,
-                side=intent.side,
-                qty=quantized_qty,
-                state='submitted',
-                intent_key=intent.intent_key,
-                extras={'kind': 'partial_close_emulated',
-                        'pre_total_units': pre_total_units,
-                        'intent_units': intent_units},
-            )
-            self.store_ctx.log_event(
-                'dispatch_submitted',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'mode': 'partial_close', 'body': body},
-            )
-
-        # POST — disposition_unknown on a timeout is *not* auto-retried:
-        # a retry could open a second opposite leg and blow the hedge.
-        try:
-            post_resp = await self._call('positions', data=body, method='post')
-        except (httpx.TimeoutException, httpx.RequestError,
-                ConnectionError, ExchangeConnectionError) as net:
-            if self.store_ctx is not None:
-                self.store_ctx.set_order_state(coid, 'disposition_unknown')
-                self.store_ctx.log_event(
-                    'partial_close_disposition_unknown',
-                    client_order_id=coid,
-                    intent_key=intent.intent_key,
-                    payload={'error': str(net)},
-                )
-            raise BrokerManualInterventionError(
-                f"Partial close POST disposition unknown: {net}",
-                intent_key=intent.intent_key,
-                context={'coid': coid, 'symbol': intent.symbol,
-                         'qty': intent.qty, 'error': str(net)},
-            ) from net
-
-        deal_ref: str | None = post_resp.get('dealReference')
-        if deal_ref and self.store_ctx is not None:
-            self.store_ctx.add_ref(coid, 'deal_reference', deal_ref)
-            self.store_ctx.set_order_state(coid, 'server_ref_seen')
-        if deal_ref:
-            await self._call(f'confirms/{deal_ref}', method='get')
-
-        # Post-snapshot — detect the race
-        post_snap = await self._call('positions', method='get')
-        post_rows = [
-            r for r in (post_snap.get('positions') or [])
-            if (r.get('market') or {}).get('epic') == intent.symbol
-        ]
-        post_total_units = sum(
-            round(float((r.get('position') or {}).get('size', 0.0))
-                  / rules.lot_step) if rules.lot_step > 0 else 0
-            for r in post_rows
-        )
-        expected_post_units = pre_total_units - intent_units
-
-        if post_total_units > expected_post_units:
-            # Race: our opposite POST opened a fresh row instead of netting.
-            # Only correct when we can pin the fresh row to our POST via
-            # createdDateUTC window; otherwise halt.
-            fresh_opposite: dict | None = None
-            now_ts = epoch_time()
-            for r in post_rows:
-                pos_data = r.get('position') or {}
-                if pos_data.get('dealId') in pre_deal_ids:
-                    continue
-                if (pos_data.get('direction') or '').upper() != opposite_dir:
-                    continue
-                created_at = _parse_iso_timestamp(
-                    pos_data.get('createdDateUTC') or '',
-                )
-                if created_at and abs(created_at - now_ts) <= 3.0:
-                    fresh_opposite = pos_data
-                    break
-            if fresh_opposite is not None:
-                fresh_id = fresh_opposite.get('dealId')
-                await self._call(
-                    f'positions/{fresh_id}', method='delete',
-                )
-                if self.store_ctx is not None:
-                    self.store_ctx.log_event(
-                        'partial_close_corrective_delete',
-                        client_order_id=coid,
-                        exchange_order_id=fresh_id,
-                        intent_key=intent.intent_key,
-                        payload={'reason': 'race_reverse_leg_corrected'},
-                    )
-            else:
-                raise BrokerManualInterventionError(
-                    f"Partial close race detected but reverse leg cannot be "
-                    f"confidently identified (expected {expected_post_units} "
-                    f"units, have {post_total_units})",
-                    intent_key=intent.intent_key,
-                    context={
-                        'coid': coid,
-                        'pre_total_units': pre_total_units,
-                        'post_total_units': post_total_units,
-                        'intent_units': intent_units,
-                        'symbol': intent.symbol,
-                    },
-                )
-
-        if self.store_ctx is not None:
-            self.store_ctx.set_order_state(coid, 'confirmed')
-            self.store_ctx.log_event(
-                'partial_close_completed',
-                client_order_id=coid,
-                intent_key=intent.intent_key,
-                payload={'pre_total_units': pre_total_units,
-                         'post_total_units': post_total_units,
-                         'intent_units': intent_units},
-            )
-
-        return ExchangeOrder(
-            id=deal_ref or '',
-            symbol=intent.symbol,
-            side=intent.side,
-            order_type=OrderType.MARKET,
-            qty=quantized_qty,
-            filled_qty=quantized_qty,
-            remaining_qty=0.0,
-            price=None,
-            stop_price=None,
-            average_fill_price=None,
-            status=OrderStatus.FILLED,
-            timestamp=epoch_time(),
-            fee=0.0,
-            fee_currency='',
-            reduce_only=True,
-            client_order_id=coid,
+        hooks = _CapitalComCloseHooks(plugin=self, rules=rules)
+        journal = DispatchJournal(self.store_ctx)
+        return await journal.run_close(
+            coid=coid,
+            intent=intent,
+            kind=kind,
+            targets=targets,
+            hooks=hooks,
+            audit_payload={'pine_id': intent.pine_id},
         )
 
     async def execute_cancel(

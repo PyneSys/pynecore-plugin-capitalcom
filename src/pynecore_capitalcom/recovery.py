@@ -38,7 +38,12 @@ from pynecore.core.broker.journal import (
     DispatchJournal,
     ResumeOutcome,
 )
-from pynecore.core.broker.store_helpers import KIND_CANCEL, KIND_MODIFY_ENTRY
+from pynecore.core.broker.store_helpers import (
+    KIND_CANCEL,
+    KIND_FULL_CLOSE,
+    KIND_MODIFY_ENTRY,
+    KIND_PARTIAL_CLOSE,
+)
 from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
@@ -442,6 +447,10 @@ class _CapitalComResumeHooks:
             return await self._verdict_modify_entry(row, refs)
         if kind == KIND_CANCEL:
             return self._verdict_cancel(row, refs)
+        if kind == KIND_FULL_CLOSE:
+            return self._verdict_full_close(row, refs)
+        if kind == KIND_PARTIAL_CLOSE:
+            return await self._verdict_partial_close(row, refs)
         if row.state == 'server_ref_seen':
             return await self._verdict_server_ref_seen(row, refs)
         if row.state == 'disposition_unknown':
@@ -859,4 +868,264 @@ class _CapitalComResumeHooks:
             status='confirmed',
             recovery_path='cancel_targets_vanished',
             recovery_context={'applied_target_coids': swept_targets},
+        )
+
+    def _verdict_full_close(
+            self, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Verdict for a ``full_close`` command row.
+
+        The command row carries ``extras['targets']`` (the exchange
+        ``dealId`` list the DELETE chain was meant to sweep). For each
+        target the verdict consults the live ``positions`` snapshot:
+
+        * Target present in the snapshot → the DELETE never landed for
+          that target → ``still_unknown``; the engine reconciler will
+          re-issue the close on the next sync.
+        * Target absent from the snapshot → swept; the DELETE landed
+          even though local persistence was interrupted.
+
+        All targets absent → ``confirmed``; the journal then promotes
+        the command row to ``closing`` (matching the live dispatch end
+        state) and the activity stream takes over from there. Any target
+        still alive → ``still_unknown``. ``extras['targets']`` empty
+        → also ``confirmed`` because the dispatch had nothing to do.
+
+        The hook also mirrors each newly-confirmed target row to
+        ``closing`` so the activity stream's subsequent ``CLOSED`` event
+        matches a row in the same state the live dispatch would have
+        left behind.
+        """
+        del refs  # full_close has no deal_reference
+        extras = row.extras or {}
+        target_deal_ids = list(extras.get('targets') or ())
+        if self.plugin.store_ctx is None:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='full_close_no_store',
+            )
+
+        if not target_deal_ids:
+            return ResumeOutcome(
+                status='confirmed',
+                recovery_path='full_close_no_targets',
+                recovery_context={'applied_targets': []},
+            )
+
+        still_alive: list[str] = []
+        swept: list[str] = []
+        for did in target_deal_ids:
+            if str(did) in self.pos_by_deal_id:
+                still_alive.append(str(did))
+            else:
+                swept.append(str(did))
+
+        if still_alive:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='full_close_targets_partial',
+                recovery_context={
+                    'still_alive_targets': still_alive,
+                    'swept_targets': swept,
+                },
+            )
+
+        # All targets vanished — mirror each parent row to ``closing``
+        # so the activity stream's CLOSED event can promote it cleanly.
+        store_ctx = self.plugin.store_ctx
+        mirrored: list[str] = []
+        for r in list(store_ctx.iter_live_orders()):
+            if r.exchange_order_id and r.exchange_order_id in target_deal_ids:
+                if r.state not in ('closing', 'closed'):
+                    store_ctx.set_order_state(r.client_order_id, 'closing')
+                    store_ctx.log_event(
+                        'close_dispatched',
+                        client_order_id=r.client_order_id,
+                        exchange_order_id=r.exchange_order_id,
+                        intent_key=row.intent_key,
+                        payload={'recovery_path': 'full_close_targets_vanished'},
+                    )
+                    mirrored.append(r.client_order_id)
+        return ResumeOutcome(
+            status='confirmed',
+            recovery_path='full_close_targets_vanished',
+            recovery_context={
+                'applied_targets': swept,
+                'mirrored_target_coids': mirrored,
+            },
+        )
+
+    async def _verdict_partial_close(
+            self, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Verdict for a ``partial_close_emulated`` command row.
+
+        Partial close is the emulated opposite-direction POST. Resolution
+        paths in priority order:
+
+        1. **Stored ``deal_reference`` with live confirm** —
+           ``/confirms/{ref}`` GET. ``REJECTED`` → rejected. ``ACCEPTED``
+           — verify the POST actually netted by checking the live
+           positions delta against the persisted ``pre_total_units`` /
+           ``intent_units``: if the current symbol unit total matches the
+           expected post-POST value → confirmed; otherwise
+           ``still_unknown`` (the post-POST snapshot has not caught up or
+           a race remains unresolved — operator intervention or next
+           reconcile required). The corrective-DELETE time window (±3 s)
+           is intentionally NOT reproduced on recovery: it cannot be
+           reconstructed after the process boundary, so any race that
+           landed mid-dispatch must be resolved by the live reconciler
+           instead.
+
+        2. **Ref missing or confirm TTL expired** — fall back to the
+           persisted ``pre_total_units`` / ``intent_units`` versus the
+           live positions snapshot. If the symbol total matches the
+           expected post-POST value, the broker already netted the close
+           and a retry would over-reduce the position, so we confirm.
+           Without that delta context the verdict is ``still_unknown``
+           and the engine-side reconciler retries on next sync. We
+           deliberately do NOT re-issue an opposite POST from the
+           verdict-builder — a duplicate opposite leg would compound any
+           unresolved race.
+        """
+        extras = row.extras or {}
+        ref: str | None = (
+            refs.get('deal_reference') or extras.get('deal_reference')
+        )
+        if not ref:
+            return await self._verdict_partial_close_by_units(
+                row,
+                ref=None,
+                confirm=None,
+                fallback_path='partial_close_missing_deal_reference',
+            )
+        try:
+            confirm = await self.plugin._call(
+                f'confirms/{ref}', method='get',
+            )
+        except OrderNotFoundError:
+            return await self._verdict_partial_close_by_units(
+                row,
+                ref=ref,
+                confirm=None,
+                fallback_path='partial_close_confirm_ttl_expired',
+            )
+
+        deal_status = (confirm.get('dealStatus') or '').upper()
+        if deal_status == 'REJECTED':
+            return ResumeOutcome(
+                status='rejected',
+                reject_reason=confirm.get('reason') or 'unknown',
+                recovery_path='partial_close_confirm_rejected',
+                recovery_context={'deal_reference': ref},
+            )
+
+        return await self._verdict_partial_close_by_units(
+            row,
+            ref=ref,
+            confirm=confirm,
+            fallback_path='partial_close_units_mismatch',
+        )
+
+    async def _verdict_partial_close_by_units(
+            self,
+            row: 'OrderRow',
+            *,
+            ref: str | None,
+            confirm: dict | None,
+            fallback_path: str,
+    ) -> ResumeOutcome:
+        """Resolve a partial-close verdict from the persisted unit delta.
+
+        Used in three situations:
+
+        * Confirm GET succeeded with ``ACCEPTED`` — we treat the broker's
+          acknowledgement as truth only after the live positions snapshot
+          shows the expected net.
+        * Confirm TTL expired (``ref`` set, ``confirm`` ``None``) — the
+          broker may have already netted before the crash; the unit
+          delta is the only durable signal left.
+        * No ``deal_reference`` was ever persisted (``ref`` ``None``,
+          ``confirm`` ``None``) — same risk: a POST that landed at the
+          broker but never made it back to local persistence would
+          otherwise be retried and over-close the position.
+
+        ``fallback_path`` names the ``still_unknown`` recovery path used
+        when we lack the delta context or the units do not match.
+        """
+        extras = row.extras or {}
+        pre_total_units = extras.get('pre_total_units')
+        intent_units = extras.get('intent_units')
+        recovery_context: dict = {}
+        if ref is not None:
+            recovery_context['deal_reference'] = ref
+        if pre_total_units is None or intent_units is None:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path=(
+                    'partial_close_missing_delta_context'
+                    if confirm is not None
+                    else fallback_path
+                ),
+                recovery_context=recovery_context or None,
+            )
+
+        # Recovery runs during ``connect()`` before any execute path
+        # would populate ``_instrument_rules_cache``, so reading the
+        # cache directly leaves a fresh-restart recovery permanently
+        # ``still_unknown``. Fetch the rules instead; on failure fall
+        # back to ``still_unknown`` so the next sync / reconcile gets
+        # another chance rather than halting recovery.
+        try:
+            rules = await self.plugin._get_instrument_rules(row.symbol)
+        except Exception as fetch_err:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='partial_close_rules_fetch_failed',
+                recovery_context={
+                    **recovery_context,
+                    'error': str(fetch_err),
+                },
+            )
+        if rules.lot_step <= 0:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='partial_close_no_rules',
+                recovery_context=recovery_context or None,
+            )
+
+        current_units = sum(
+            round(float((r.get('position') or {}).get('size', 0.0))
+                  / rules.lot_step)
+            for r in self.pos_by_deal_id.values()
+            if (r.get('market') or {}).get('epic') == row.symbol
+        )
+        expected = int(pre_total_units) - int(intent_units)
+        deal_id = (confirm or {}).get('dealId')
+        match_context = {
+            **recovery_context,
+            'current_units': current_units,
+            'expected_units': expected,
+        }
+        if current_units == expected:
+            # Confirm GET succeeded → ACCEPTED + delta match.
+            # Confirm missing (TTL expired or no ref) but delta matches:
+            # the broker already netted the close, so retrying would
+            # over-reduce the position. Confirm it.
+            if confirm is not None:
+                path = 'partial_close_units_match'
+            elif ref is not None:
+                path = 'partial_close_units_match_ttl_expired'
+            else:
+                path = 'partial_close_units_match_no_ref'
+            return ResumeOutcome(
+                status='confirmed',
+                exchange_id=str(deal_id) if deal_id else None,
+                recovery_path=path,
+                recovery_context=match_context,
+            )
+        return ResumeOutcome(
+            status='still_unknown',
+            recovery_path=fallback_path,
+            recovery_context=match_context,
         )
