@@ -38,6 +38,7 @@ from pynecore.core.broker.journal import (
     DispatchJournal,
     ResumeOutcome,
 )
+from pynecore.core.broker.store_helpers import KIND_MODIFY_ENTRY
 from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
@@ -177,6 +178,7 @@ class _RecoveryMixin(_CapitalComBase):
             activities=activities,
             pos_by_ref=pos_by_ref,
             wo_by_ref=wo_by_ref,
+            wo_by_deal_id=wo_by_deal_id,
         )
 
         def hooks_for(row: 'OrderRow') -> '_CapitalComResumeHooks | None':
@@ -357,6 +359,7 @@ class _CapitalComResumeHooks:
     activities: list[dict]
     pos_by_ref: dict[str, dict]
     wo_by_ref: dict[str, dict]
+    wo_by_deal_id: dict[str, dict]
 
     async def submit(
             self, *, coid: str, intent: 'EntryIntent', qty: float,
@@ -424,7 +427,17 @@ class _CapitalComResumeHooks:
         so during the narrow crash window between those two writes the
         ref is reachable only via ``refs``. The verdict-builders prefer
         ``refs`` over ``extras`` for exactly that reason.
+
+        Modify-entry command rows (``extras['kind'] == KIND_MODIFY_ENTRY``)
+        get their own verdict path: the recovery question is "did the
+        ``PUT /workingorders/{dealId}`` land?" rather than "did the
+        original POST land?". Routed before the state-based switch so a
+        ``submitted`` modify row does not fall through to the
+        entry-submission heuristic.
         """
+        kind = (row.extras or {}).get('kind')
+        if kind == KIND_MODIFY_ENTRY:
+            return await self._verdict_modify_entry(row, refs)
         if row.state == 'server_ref_seen':
             return await self._verdict_server_ref_seen(row, refs)
         if row.state == 'disposition_unknown':
@@ -616,4 +629,132 @@ class _CapitalComResumeHooks:
             fill_price=0.0,
             recovery_path='confirm_get_direct',
             recovery_context={'deal_reference': ref},
+        )
+
+    async def _verdict_modify_entry(
+            self, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Verdict for a ``modify_entry`` command row.
+
+        The command row carries ``extras['target_coid']`` (the working
+        order being amended) and ``extras['new_level']`` (the requested
+        level). Three resolution paths in priority order:
+
+        1. **Stored ``deal_reference``** (recovery extends back to a
+           confirm-phase ambiguity): ``/confirms/{ref}`` GET first;
+           ``REJECTED`` → rejected. ``ACCEPTED`` with an echoed level
+           that matches ``new_level`` → confirmed pointing at the
+           target's exchange id. TTL miss falls through to
+           snapshot-based verification (path 2).
+
+        2. **Working-order snapshot at target's exchange id**: the
+           target row's ``exchange_order_id`` is looked up in
+           ``wo_by_deal_id``. If the live order's ``orderLevel``
+           matches ``new_level`` → confirmed, the PUT landed even
+           though the local persistence was interrupted. If it differs
+           → ``still_unknown`` (the engine reconciler will reattempt
+           the amend on the next sync rather than declaring rejection
+           — the broker's view is authoritative but a delayed PUT
+           cannot be ruled out without a confirm).
+
+        3. **No usable signal** (ref TTL expired with no snapshot match,
+           target row missing, etc.) → ``still_unknown``. The
+           engine-side reconciler retries on next sync.
+        """
+        extras = row.extras or {}
+        new_level_raw = extras.get('new_level')
+        target_coid = extras.get('target_coid')
+        try:
+            new_level = float(new_level_raw) if new_level_raw is not None else None
+        except (TypeError, ValueError):
+            new_level = None
+
+        ref: str | None = (
+            refs.get('deal_reference') or extras.get('deal_reference')
+        )
+        if ref:
+            try:
+                confirm = await self.plugin._call(
+                    f'confirms/{ref}', method='get',
+                )
+            except OrderNotFoundError:
+                confirm = None
+            if confirm is not None:
+                deal_status = (confirm.get('dealStatus') or '').upper()
+                if deal_status == 'REJECTED':
+                    return ResumeOutcome(
+                        status='rejected',
+                        reject_reason=confirm.get('reason') or 'unknown',
+                        recovery_path='modify_entry_confirm_rejected',
+                        recovery_context={'deal_reference': ref},
+                    )
+                echoed_level_raw = confirm.get('level')
+                echoed_level = (
+                    float(echoed_level_raw)
+                    if echoed_level_raw is not None else None
+                )
+                deal_id = confirm.get('dealId')
+                if (
+                    new_level is not None
+                    and echoed_level is not None
+                    and abs(echoed_level - new_level) < 1e-9
+                ):
+                    return ResumeOutcome(
+                        status='confirmed',
+                        exchange_id=str(deal_id) if deal_id else None,
+                        is_filled=False,
+                        filled_qty=0.0,
+                        fill_price=0.0,
+                        recovery_path='modify_entry_confirm_get',
+                        recovery_context={'deal_reference': ref,
+                                          'echoed_level': echoed_level},
+                    )
+
+        target_deal_id: str | None = None
+        if target_coid and self.plugin.store_ctx is not None:
+            target_row = self.plugin.store_ctx.get_order(str(target_coid))
+            if target_row is not None and target_row.exchange_order_id:
+                target_deal_id = str(target_row.exchange_order_id)
+
+        if target_deal_id is None:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='modify_entry_no_target',
+            )
+
+        wo = self.wo_by_deal_id.get(target_deal_id)
+        if wo is None:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='modify_entry_target_vanished',
+            )
+        wo_data = wo.get('workingOrderData') or {}
+        wo_level_raw = wo_data.get('orderLevel')
+        try:
+            wo_level = float(wo_level_raw) if wo_level_raw is not None else None
+        except (TypeError, ValueError):
+            wo_level = None
+
+        if (
+            new_level is not None
+            and wo_level is not None
+            and abs(wo_level - new_level) < 1e-9
+        ):
+            return ResumeOutcome(
+                status='confirmed',
+                exchange_id=target_deal_id,
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
+                recovery_path='modify_entry_snapshot_match',
+                recovery_context={'echoed_level': wo_level},
+            )
+
+        return ResumeOutcome(
+            status='still_unknown',
+            recovery_path='modify_entry_snapshot_level_mismatch',
+            recovery_context={
+                'wo_level': wo_level,
+                'expected_level': new_level,
+            },
         )

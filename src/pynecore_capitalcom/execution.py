@@ -39,6 +39,7 @@ from pynecore.core.broker.idempotency import (
     KIND_ENTRY,
     KIND_EXIT_SL,
     KIND_EXIT_TP,
+    KIND_MODIFY_ENTRY,
 )
 from pynecore.core.broker.store_helpers import (
     create_entry_order_row,
@@ -1518,7 +1519,18 @@ class _ExecutionMixin(_CapitalComBase):
         STOP is not either. Both of those fall through to the base
         class's cancel+execute path so the canonical CO-ID formula (same
         bar, same pine_id → same id) keeps idempotency intact.
+
+        The PUT/confirm/persist lifecycle runs through the Core
+        :class:`~pynecore.core.broker.journal.DispatchJournal` so a
+        crash between the wire call and the persisted result is
+        recoverable: the amend command row is written *before* the
+        REST call, and recovery on next start verifies the broker's
+        view via the same ``deal_reference`` confirm GET path.
         """
+        from pynecore.core.broker.journal import DispatchJournal
+
+        from .dispatch_hooks import _CapitalComModifyEntryHooks
+
         old_i = old.intent
         new_i = new.intent
         assert isinstance(old_i, EntryIntent)
@@ -1534,39 +1546,50 @@ class _ExecutionMixin(_CapitalComBase):
         if old_units != new_units or old_i.order_type != new_i.order_type:
             return await super().modify_entry(old, new)
 
-        old_coid = old.client_order_id(KIND_ENTRY)
-        row: 'OrderRow | None' = (
-            self.store_ctx.get_order(old_coid) if self.store_ctx is not None else None
+        target_coid = old.client_order_id(KIND_ENTRY)
+        target_row: 'OrderRow | None' = (
+            self.store_ctx.get_order(target_coid)
+            if self.store_ctx is not None else None
         )
-        if row is None or not row.exchange_order_id:
+        if target_row is None or not target_row.exchange_order_id:
             return await super().modify_entry(old, new)
 
-        body: dict = {}
+        new_level: float | None = None
         if new_i.order_type == OrderType.LIMIT and new_i.limit is not None:
-            body['level'] = float(new_i.limit)
+            new_level = float(new_i.limit)
         elif new_i.order_type == OrderType.STOP and new_i.stop is not None:
-            body['level'] = float(new_i.stop)
-        if not body:
+            new_level = float(new_i.stop)
+        if new_level is None:
             # Nothing to amend (both levels None) — tell the sync engine
             # nothing changed by returning the existing row as-is.
-            return [self._row_to_exchange_order(row, new_i)]
+            return [self._row_to_exchange_order(target_row, new_i)]
 
-        resp = await self._call(
-            f'workingorders/{row.exchange_order_id}', data=body, method='put',
-        )
-        new_ref = resp.get('dealReference')
-        if new_ref:
-            await self._call(f'confirms/{new_ref}', method='get')
-        if self.store_ctx is not None:
-            self.store_ctx.log_event(
-                'modify_entry',
-                client_order_id=old_coid,
-                exchange_order_id=row.exchange_order_id,
-                intent_key=new_i.intent_key,
-                payload={'new_level': body['level'],
-                         'order_type': new_i.order_type.value},
+        if self.store_ctx is None:
+            raise RuntimeError(
+                "modify_entry requires an active store_ctx; the journal "
+                "owns persistence and cannot operate without it.",
             )
-        return [self._row_to_exchange_order(row, new_i)]
+
+        coid = new.client_order_id(KIND_MODIFY_ENTRY)
+        hooks = _CapitalComModifyEntryHooks(
+            plugin=self,
+            target_row=target_row,
+            new_level=new_level,
+            order_type=new_i.order_type,
+        )
+        journal = DispatchJournal(self.store_ctx)
+        return await journal.run_modify_entry(
+            coid=coid,
+            target_coid=target_coid,
+            old_intent=old_i,
+            new_intent=new_i,
+            qty=new_i.qty,
+            hooks=hooks,
+            audit_payload={
+                'order_type': new_i.order_type.value,
+                'target_exchange_id': target_row.exchange_order_id,
+            },
+        )
 
     @override
     async def modify_exit(
