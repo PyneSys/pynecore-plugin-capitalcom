@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from pynecore.core.broker.exceptions import (
+    BrokerError,
     BrokerManualInterventionError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
@@ -29,18 +30,21 @@ from pynecore.core.broker.journal import (
     CancelReasonPath,
     CloseOutcome,
     ModifyEntryOutcome,
+    ModifyExitOutcome,
 )
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
     EntryIntent,
     ExchangeOrder,
+    ExitIntent,
     OrderStatus,
     OrderType,
 )
 
-from .exceptions import OrderNotFoundError
+from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import _parse_iso_timestamp
+from .models import _bracket_leg_id
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -839,3 +843,782 @@ class _CapitalComCloseHooks:
             reduce_only=True,
             client_order_id=row.client_order_id,
         )
+
+
+class _CapitalComModifyExitHooks:
+    """Hook set for the position bracket amend dispatch.
+
+    Conforms structurally to
+    :class:`pynecore.core.broker.journal.ModifyExitDispatchHooks`. The
+    journal owns the entry-side command row's state machine
+    (``submitted`` → ``server_ref_seen`` → ``confirmed`` /
+    ``disposition_unknown`` / ``rejected``); this hook owns:
+
+    * The PUT ``/positions/{dealId}`` body and the confirm GET wire
+      format.
+    * The disposition-unknown seeding for newly-added bracket leg rows
+      on the ambiguous PUT/confirm path (the journal does not write leg
+      rows — it does not know about them).
+    * The post-success mirror that materialises the synthetic TP / SL
+      leg rows under the parent dealId.
+
+    The orchestrator (``execution.modify_exit``) performs the pre-flight
+    (target row lookup, distance validation, PUT body construction,
+    derivation of ``effective_*_coid`` / ``ambiguous_*_coid`` etc.) and
+    passes the resulting derivations into this hook's constructor. That
+    keeps the journal's contract pure (one ``submit_amend`` call, one
+    ``mirror_bracket_legs`` call) while the plugin retains responsibility
+    for every Capital.com-specific decision.
+
+    When the PUT body is empty (a pure pending-trail seed amend), the
+    orchestrator bypasses the journal entirely and calls
+    :meth:`_apply_mirror` directly — there is no broker round-trip to
+    journal in that case.
+    """
+
+    def __init__(
+            self,
+            *,
+            plugin: '_ExecutionMixin',
+            target_row: 'OrderRow',
+            body: dict,
+            existing_tp: 'OrderRow | None',
+            existing_sl: 'OrderRow | None',
+            tp_coid: str,
+            sl_coid: str,
+            effective_tp_coid: str,
+            effective_sl_coid: str,
+            trail_pending: bool,
+            ambiguous_tp_coid: str | None,
+            ambiguous_sl_coid: str | None,
+            sl_in_body: bool,
+            sl_clears_broker_active: bool,
+            clears_broker_tp: bool,
+    ) -> None:
+        self._plugin = plugin
+        self._target_row = target_row
+        self._body = body
+        self._existing_tp = existing_tp
+        self._existing_sl = existing_sl
+        self._tp_coid = tp_coid
+        self._sl_coid = sl_coid
+        self._effective_tp_coid = effective_tp_coid
+        self._effective_sl_coid = effective_sl_coid
+        self._trail_pending = trail_pending
+        self._ambiguous_tp_coid = ambiguous_tp_coid
+        self._ambiguous_sl_coid = ambiguous_sl_coid
+        self._sl_in_body = sl_in_body
+        self._sl_clears_broker_active = sl_clears_broker_active
+        self._clears_broker_tp = clears_broker_tp
+
+    async def submit_amend(
+            self, *, coid: str, target_coid: str,
+            old_intent: ExitIntent, new_intent: ExitIntent,
+    ) -> ModifyExitOutcome:
+        """PUT ``/positions/{dealId}`` with the new bracket and confirm.
+
+        ``PUT /positions/{dealId}`` atomically rewrites ``profitLevel`` /
+        ``stopLevel`` / ``trailingStop`` without a cancel window. Three
+        outcome categories:
+
+        * **Happy path:** PUT 200 → confirm GET 200 with
+          ``dealStatus == 'ACCEPTED'``. Returns
+          :class:`ModifyExitOutcome` carrying the broker-echoed levels in
+          ``post_put_state``.
+        * **Synchronous reject:** confirm GET returns
+          ``dealStatus == 'REJECTED'``. The hook logs the rejection event
+          and raises :class:`ExchangeOrderRejectedError`.
+        * **Ambiguous (PUT timeout / confirm timeout / mapped broker
+          error on confirm):** the broker may already have applied the
+          amend while we cannot read back. The hook seeds any newly-added
+          leg rows in ``disposition_unknown``, stamps
+          ``force_disposition_rejected`` on the existing SL row for the
+          pending-trail transition, refreshes existing leg rows to the
+          attempted target levels, and finally raises
+          :class:`OrderDispositionUnknownError`. The next reconcile
+          snapshot promotes the legs against the broker's authoritative
+          state.
+
+        ``target_coid`` is identical to the constructor's
+        ``target_row.client_order_id``; the argument is part of the
+        Protocol contract.
+        """
+        del target_coid
+
+        deal_id = self._target_row.exchange_order_id
+        if deal_id is None:
+            raise RuntimeError(
+                f"_CapitalComModifyExitHooks.submit_amend: target row has "
+                f"no exchange_order_id (coid={coid!r})"
+            )
+
+        try:
+            resp = await self._plugin._call(  # type: ignore[attr-defined]
+                f'positions/{deal_id}', data=self._body, method='put',
+            )
+        except (httpx.TimeoutException, httpx.RequestError,
+                ConnectionError, ExchangeConnectionError) as net:
+            # PUT outcome ambiguous: the broker may already have applied
+            # the amend while local state still reflects the pre-amend
+            # bracket. Seed/refresh the leg rows so the next reconcile
+            # snapshot resolves them against authoritative broker state.
+            self._seed_added_legs_disposition_unknown(new_intent)
+            self._mark_existing_sl_force_rejected_on_pending_trail()
+            self._persist_existing_legs_attempted_target(new_intent)
+            self._plugin._mark_bracket_legs_disposition_unknown(  # type: ignore[attr-defined]
+                intent=new_intent,
+                parent_coid=self._target_row.client_order_id,
+                deal_id=deal_id,
+                tp_coid=self._ambiguous_tp_coid,
+                sl_coid=self._ambiguous_sl_coid,
+                reason=str(net), stage='put',
+            )
+            raise OrderDispositionUnknownError(
+                f"Capital modify_exit PUT positions/{deal_id} "
+                f"ambiguous: {net}",
+                client_order_id=self._target_row.client_order_id,
+                cause=net if isinstance(net, Exception) else None,
+            ) from net
+
+        new_ref = resp.get('dealReference')
+        post_put_state: dict = {}
+        if new_ref:
+            try:
+                modify_confirm = await self._plugin._call(  # type: ignore[attr-defined]
+                    f'confirms/{new_ref}', method='get',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError,
+                    CapitalComError, BrokerError) as net:
+                # PUT landed (got a dealReference) but the confirm read
+                # failed. Same ambiguity as PUT-timeout: the broker may
+                # already have applied the amend. Mapped broker errors
+                # (404 OrderNotFoundError, 429 ExchangeRateLimitError,
+                # etc.) on the confirm GET are treated identically to
+                # network failures here.
+                # Persist the server-allocated deal_reference on the
+                # modify command row before raising so restart recovery
+                # (_verdict_modify_exit) can resolve via confirms/{ref}
+                # without falling back to snapshot matching.
+                if self._plugin.store_ctx is not None:
+                    self._plugin.store_ctx.add_ref(
+                        coid, 'deal_reference', new_ref,
+                    )
+                self._seed_added_legs_disposition_unknown(new_intent)
+                self._mark_existing_sl_force_rejected_on_pending_trail()
+                self._persist_existing_legs_attempted_target(new_intent)
+                self._plugin._mark_bracket_legs_disposition_unknown(  # type: ignore[attr-defined]
+                    intent=new_intent,
+                    parent_coid=self._target_row.client_order_id,
+                    deal_id=deal_id,
+                    tp_coid=self._ambiguous_tp_coid,
+                    sl_coid=self._ambiguous_sl_coid,
+                    reason=str(net), stage='confirm',
+                    deal_reference=new_ref,
+                )
+                raise OrderDispositionUnknownError(
+                    f"Capital modify_exit confirm {new_ref} "
+                    f"ambiguous: {net}",
+                    client_order_id=self._target_row.client_order_id,
+                    cause=net if isinstance(net, Exception) else None,
+                ) from net
+
+            deal_status = (modify_confirm.get('dealStatus') or '').upper()
+            if deal_status == 'REJECTED':
+                reason = modify_confirm.get('reason') or 'unknown'
+                if self._plugin.store_ctx is not None:
+                    self._plugin.store_ctx.log_event(
+                        'modify_exit_rejected',
+                        client_order_id=self._target_row.client_order_id,
+                        exchange_order_id=self._target_row.exchange_order_id,
+                        intent_key=new_intent.intent_key,
+                        payload={'reason': reason,
+                                 'tp': new_intent.tp_price,
+                                 'sl': new_intent.sl_price,
+                                 'trail_offset': new_intent.trail_offset},
+                    )
+                raise ExchangeOrderRejectedError(
+                    f"Capital position amend REJECTED: {reason}",
+                )
+
+            post_put_state = {
+                'profit_level': modify_confirm.get('profitLevel'),
+                'stop_level': modify_confirm.get('stopLevel'),
+                'trailing_stop': modify_confirm.get('trailingStop'),
+                'stop_distance': modify_confirm.get('stopDistance'),
+            }
+            raw_confirm = modify_confirm
+        else:
+            raw_confirm = None
+
+        return ModifyExitOutcome(
+            server_ref=str(new_ref) if new_ref else '',
+            deal_status='ACCEPTED',
+            rejected_reason=None,
+            post_put_state=post_put_state,
+            raw=raw_confirm,
+        )
+
+    def mirror_bracket_legs(
+            self, *, target_row: 'OrderRow', new_intent: ExitIntent,
+            outcome: ModifyExitOutcome,
+    ) -> None:
+        """Mirror the new TP / SL onto the parent entry row + leg rows.
+
+        Invoked by the journal only on the happy path (after the
+        command row has been ``confirmed`` + ``close_order``). Writes:
+
+        * The parent entry row's risk snapshot
+          (``set_risk`` + risk-clear ``upsert_order``).
+        * Each TP / SL leg row: INSERT if absent, UPDATE if present,
+          retire (close) if removed. Pending-trail extras are written /
+          dropped symmetrically with the new intent's trail shape.
+        * A ``modify_exit`` audit event tying the wire result back to
+          the leg COIDs the engine sees.
+        """
+        del outcome
+        self._apply_mirror(target_row=target_row, new_intent=new_intent)
+
+    def _apply_mirror(
+            self, *, target_row: 'OrderRow', new_intent: ExitIntent,
+    ) -> None:
+        """Body of :meth:`mirror_bracket_legs` minus the outcome arg.
+
+        Called directly by the orchestrator on the body-less path
+        (pending-trail seed amend with no broker round-trip), and by
+        :meth:`mirror_bracket_legs` on the journal-happy-path.
+        """
+        if self._plugin.store_ctx is None:
+            return
+
+        new_i = new_intent
+        old_target_row = self._target_row
+        existing_tp = self._existing_tp
+        existing_sl = self._existing_sl
+        effective_tp_coid = self._effective_tp_coid
+        effective_sl_coid = self._effective_sl_coid
+        trail_pending = self._trail_pending
+        deal_id = old_target_row.exchange_order_id or ''
+        store_ctx = self._plugin.store_ctx
+        # We need ``old_i`` for the retire branches; the constructor
+        # captured the existing rows but not the prior intent. The
+        # journal hands ``new_intent`` only; ``old_intent`` was passed to
+        # ``submit_amend`` but not stored. Reconstruct the "had a TP
+        # before" / "had an SL before" predicates from ``existing_*``:
+        # those rows are the authoritative record of what the broker
+        # currently has live, which is exactly what the retire branches
+        # need.
+        had_tp_before = (
+            existing_tp is not None and existing_tp.closed_ts_ms is None
+        )
+        had_sl_before = (
+            existing_sl is not None and existing_sl.closed_ts_ms is None
+        )
+
+        # ``trailing_stop`` MUST be passed even when False — ``set_risk``
+        # treats ``None`` as "no change", so a prior ``True`` survives
+        # an amend back to a fixed SL and ``_activity_to_event`` would
+        # misclassify the fill on the next stop hit.
+        store_ctx.set_risk(
+            old_target_row.client_order_id,
+            sl=new_i.sl_price, tp=new_i.tp_price,
+            trailing_distance=new_i.trail_offset,
+            trailing_stop=(
+                new_i.trail_offset is not None and not trail_pending
+            ),
+        )
+        # Removal-amend clears: ``set_risk`` filters ``None`` as "leave
+        # unchanged", so an amend that REMOVES a protective leg leaves
+        # the parent entry row's stale risk fields in BrokerStore.
+        risk_clears: dict[str, float | None] = {}
+        if had_tp_before and new_i.tp_price is None:
+            risk_clears['tp_level'] = None
+        if (existing_sl is not None
+                and existing_sl.closed_ts_ms is None
+                and existing_sl.sl_level is not None
+                and new_i.sl_price is None):
+            risk_clears['sl_level'] = None
+        if (existing_sl is not None
+                and existing_sl.closed_ts_ms is None
+                and existing_sl.trailing_distance is not None
+                and new_i.trail_offset is None):
+            risk_clears['trailing_distance'] = None
+        if risk_clears:
+            store_ctx.upsert_order(
+                old_target_row.client_order_id, **risk_clears,
+            )
+
+        # === TP leg mirror =================================================
+        if new_i.tp_price is None and had_tp_before:
+            # TP removal: retire the previously confirmed TP leg row.
+            tp_existing = store_ctx.get_order(effective_tp_coid)
+            if (tp_existing is not None
+                    and tp_existing.closed_ts_ms is None):
+                store_ctx.set_order_state(
+                    effective_tp_coid, 'rejected',
+                )
+                store_ctx.close_order(effective_tp_coid)
+                store_ctx.log_event(
+                    'bracket_leg_retired_on_modify',
+                    client_order_id=effective_tp_coid,
+                    exchange_order_id=deal_id,
+                    intent_key=new_i.intent_key,
+                    payload={
+                        'leg_kind': 'tp',
+                        'reason': 'tp_removed',
+                        'old_tp_price': (existing_tp.tp_level
+                                         if existing_tp is not None else None),
+                    },
+                )
+        if new_i.tp_price is not None:
+            tp_existing = store_ctx.get_order(effective_tp_coid)
+            if tp_existing is None or tp_existing.closed_ts_ms is not None:
+                if tp_existing is not None:
+                    store_ctx.reopen_order(effective_tp_coid)
+                store_ctx.upsert_order(
+                    effective_tp_coid,
+                    symbol=new_i.symbol,
+                    side=new_i.side,
+                    qty=old_target_row.qty,
+                    state='confirmed',
+                    intent_key=new_i.intent_key + '\0TP',
+                    from_entry=new_i.from_entry,
+                    pine_entry_id=new_i.from_entry,
+                    tp_level=float(new_i.tp_price),
+                    extras={
+                        'leg_kind': 'tp',
+                        'parent_deal_id': deal_id,
+                        'parent_coid': old_target_row.client_order_id,
+                    },
+                )
+                store_ctx.add_ref(
+                    effective_tp_coid, 'bracket_deal_id', deal_id,
+                )
+            else:
+                # Live row exists — UPDATE under its own COID. ``state``
+                # is forced back to ``confirmed`` because an earlier
+                # ambiguous PUT/confirm could have flipped the row to
+                # ``disposition_unknown``; this amend just succeeded, so
+                # the leg is unambiguously attached.
+                store_ctx.upsert_order(
+                    effective_tp_coid,
+                    state='confirmed',
+                    tp_level=float(new_i.tp_price),
+                )
+
+        # === SL leg mirror =================================================
+        if new_i.sl_price is not None or new_i.trail_offset is not None:
+            sl_existing = store_ctx.get_order(effective_sl_coid)
+            if sl_existing is None or sl_existing.closed_ts_ms is not None:
+                if sl_existing is not None:
+                    store_ctx.reopen_order(effective_sl_coid)
+                sl_extras: dict = {
+                    'leg_kind': 'sl',
+                    'parent_deal_id': deal_id,
+                    'parent_coid': old_target_row.client_order_id,
+                }
+                # Pending-trail leg: stash the activation threshold and
+                # offset under the same keys
+                # :meth:`_trailing_activation_monitor` reads. Without
+                # ``trail_state='pending'`` the monitor would skip this
+                # row and the protective trailing stop would never
+                # attach.
+                if trail_pending:
+                    sl_extras['trail_activation_price'] = new_i.trail_price
+                    sl_extras['trail_offset'] = new_i.trail_offset
+                    sl_extras['trail_state'] = 'pending'
+                store_ctx.upsert_order(
+                    effective_sl_coid,
+                    symbol=new_i.symbol,
+                    side=new_i.side,
+                    qty=old_target_row.qty,
+                    state='confirmed',
+                    intent_key=new_i.intent_key + '\0SL',
+                    from_entry=new_i.from_entry,
+                    pine_entry_id=new_i.from_entry,
+                    sl_level=(float(new_i.sl_price)
+                              if new_i.sl_price is not None else None),
+                    trailing_distance=(float(new_i.trail_offset)
+                                       if new_i.trail_offset is not None
+                                       else None),
+                    trailing_stop=(
+                        new_i.trail_offset is not None and not trail_pending
+                    ),
+                    extras=sl_extras,
+                )
+                store_ctx.add_ref(
+                    effective_sl_coid, 'bracket_deal_id', deal_id,
+                )
+            else:
+                # ``trailing_stop`` MUST be re-stamped — amending a fixed
+                # SL to native trailing (or vice versa) changes the leg's
+                # classification, and :meth:`_activity_to_event` reads
+                # ``row.trailing_stop`` off this stored row to decide
+                # between ``LegType.STOP_LOSS`` and
+                # ``LegType.TRAILING_STOP`` on the eventual fill.
+                #
+                # The pending-trail trio (``trail_state`` /
+                # ``trail_activation_price`` / ``trail_offset`` extras)
+                # must be kept in sync with ``trail_pending``.
+                new_sl_extras = dict(sl_existing.extras or {})
+                if trail_pending:
+                    new_sl_extras['trail_activation_price'] = new_i.trail_price
+                    new_sl_extras['trail_offset'] = new_i.trail_offset
+                    new_sl_extras['trail_state'] = 'pending'
+                else:
+                    # Leaving pending trailing: drop ALL three trail
+                    # extras — ``trail_offset`` MUST go too, otherwise
+                    # :meth:`_resolve_bracket_leg_disposition` keeps
+                    # treating this row as a trailing leg and the next
+                    # ambiguous amend recovery would resolve a fixed
+                    # stop against the parent's ``trailingStop`` /
+                    # ``stopDistance`` instead of ``stopLevel``.
+                    new_sl_extras.pop('trail_state', None)
+                    new_sl_extras.pop('trail_activation_price', None)
+                    new_sl_extras.pop('trail_offset', None)
+                store_ctx.upsert_order(
+                    effective_sl_coid,
+                    state='confirmed',
+                    sl_level=(float(new_i.sl_price)
+                              if new_i.sl_price is not None else None),
+                    trailing_distance=(float(new_i.trail_offset)
+                                       if new_i.trail_offset is not None
+                                       else None),
+                    trailing_stop=(
+                        new_i.trail_offset is not None and not trail_pending
+                    ),
+                    extras=new_sl_extras,
+                )
+        elif had_sl_before:
+            # The amend removed the protective stop entirely (no fixed
+            # SL, no trail in the new intent). All three prior shapes
+            # need the SL leg row retired here — see the inline notes
+            # in the original ``modify_exit`` for the rationale of each
+            # reason code.
+            if existing_sl is not None and existing_sl.sl_level is not None:
+                reason = 'fixed_sl_removed_no_replacement'
+            elif (existing_sl is not None
+                    and existing_sl.extras is not None
+                    and 'trail_activation_price' in (existing_sl.extras or {})):
+                reason = 'pending_trail_removed_no_replacement'
+            else:
+                reason = 'native_trail_removed_no_replacement'
+            sl_existing = store_ctx.get_order(effective_sl_coid)
+            if (sl_existing is not None
+                    and sl_existing.closed_ts_ms is None):
+                store_ctx.set_order_state(
+                    effective_sl_coid, 'rejected',
+                )
+                store_ctx.close_order(effective_sl_coid)
+                store_ctx.log_event(
+                    'bracket_leg_retired_on_modify',
+                    client_order_id=effective_sl_coid,
+                    exchange_order_id=deal_id,
+                    intent_key=new_i.intent_key,
+                    payload={
+                        'leg_kind': 'sl',
+                        'reason': reason,
+                        'old_sl_price': (
+                            existing_sl.sl_level
+                            if existing_sl is not None else None
+                        ),
+                        'old_trail_offset': (
+                            existing_sl.trailing_distance
+                            if existing_sl is not None else None
+                        ),
+                        'old_trail_price': (
+                            (existing_sl.extras or {}).get(
+                                'trail_activation_price'
+                            )
+                            if existing_sl is not None else None
+                        ),
+                    },
+                )
+
+        store_ctx.log_event(
+            'modify_exit',
+            client_order_id=old_target_row.client_order_id,
+            exchange_order_id=old_target_row.exchange_order_id,
+            intent_key=new_i.intent_key,
+            payload={'tp': new_i.tp_price, 'sl': new_i.sl_price,
+                     'trail_offset': new_i.trail_offset,
+                     'tp_coid': effective_tp_coid,
+                     'sl_coid': effective_sl_coid,
+                     'envelope_tp_coid': self._tp_coid,
+                     'envelope_sl_coid': self._sl_coid},
+        )
+
+    def exchange_order_from_state(
+            self, *, row: 'OrderRow', new_intent: ExitIntent,
+            outcome: ModifyExitOutcome,
+    ) -> list[ExchangeOrder]:
+        """Build the synthetic TP / SL leg list the engine expects."""
+        del row, outcome
+        new_i = new_intent
+        target_row = self._target_row
+        deal_id = target_row.exchange_order_id or ''
+        legs: list[ExchangeOrder] = []
+        now_ts = epoch_time()
+        if new_i.tp_price is not None:
+            legs.append(ExchangeOrder(
+                id=_bracket_leg_id(deal_id, 'tp'),
+                symbol=new_i.symbol, side=new_i.side,
+                order_type=OrderType.LIMIT,
+                qty=target_row.qty, filled_qty=0.0,
+                remaining_qty=target_row.qty,
+                price=new_i.tp_price, stop_price=None,
+                average_fill_price=None, status=OrderStatus.OPEN,
+                timestamp=now_ts, fee=0.0, fee_currency='',
+                reduce_only=True, client_order_id=self._effective_tp_coid,
+            ))
+        if new_i.sl_price is not None or new_i.trail_offset is not None:
+            legs.append(ExchangeOrder(
+                id=_bracket_leg_id(deal_id, 'sl'),
+                symbol=new_i.symbol, side=new_i.side,
+                order_type=(
+                    OrderType.TRAILING_STOP
+                    if new_i.trail_offset is not None else OrderType.STOP
+                ),
+                qty=target_row.qty, filled_qty=0.0,
+                remaining_qty=target_row.qty,
+                price=None, stop_price=new_i.sl_price,
+                average_fill_price=None, status=OrderStatus.OPEN,
+                timestamp=now_ts, fee=0.0, fee_currency='',
+                reduce_only=True, client_order_id=self._effective_sl_coid,
+            ))
+        return legs
+
+    # === Disposition-unknown seeding helpers ==============================
+    #
+    # These three helpers run on the ambiguous PUT/confirm path inside
+    # :meth:`submit_amend` *before* the journal raises. They mutate the
+    # leg rows and the existing SL row so the next reconcile snapshot
+    # resolves them correctly against the broker's authoritative state.
+    # The journal does not orchestrate these — bracket leg rows live
+    # outside the entry-row scope for M4.
+
+    def _seed_added_legs_disposition_unknown(
+            self, new_intent: ExitIntent,
+    ) -> None:
+        """Seed leg rows for newly-added (not pre-existing) legs.
+
+        ``modify_exit`` mirrors leg state AFTER the PUT, unlike
+        ``execute_exit`` which persist-firsts. When the amend ADDs a leg
+        that had no prior row, the ambiguous-PUT/confirm path has
+        nothing to flip — the next snapshot reconcile would have no row
+        to compare against the parent ``profitLevel`` / ``stopLevel``
+        and the broker-attached new leg would stay invisible to
+        BrokerStore. Pre-seed those rows here in ``disposition_unknown``
+        so the reconcile snapshot owns promotion or rejection.
+
+        Closed-row case: a previous attach for the same envelope could
+        have closed the row. Treat closed rows as absent: reopen first,
+        then upsert. Mirrors the post-PUT mirror's closed-row guard.
+        """
+        store_ctx = self._plugin.store_ctx
+        if store_ctx is None:
+            return
+        new_i = new_intent
+        target_row = self._target_row
+        existing_tp = self._existing_tp
+        existing_sl = self._existing_sl
+        tp_coid = self._tp_coid
+        sl_coid = self._sl_coid
+        deal_id = target_row.exchange_order_id or ''
+        sl_in_body = self._sl_in_body
+        trail_pending = self._trail_pending
+
+        if new_i.tp_price is not None and existing_tp is None:
+            tp_existing = store_ctx.get_order(tp_coid)
+            if (tp_existing is not None
+                    and tp_existing.closed_ts_ms is not None):
+                store_ctx.reopen_order(tp_coid)
+            store_ctx.upsert_order(
+                tp_coid,
+                symbol=new_i.symbol,
+                side=new_i.side,
+                qty=target_row.qty,
+                state='disposition_unknown',
+                intent_key=new_i.intent_key + '\0TP',
+                from_entry=new_i.from_entry,
+                pine_entry_id=new_i.from_entry,
+                tp_level=float(new_i.tp_price),
+                extras={
+                    'leg_kind': 'tp',
+                    'parent_deal_id': deal_id,
+                    'parent_coid': target_row.client_order_id,
+                },
+            )
+            store_ctx.add_ref(tp_coid, 'bracket_deal_id', deal_id)
+        if sl_in_body and existing_sl is None:
+            sl_existing = store_ctx.get_order(sl_coid)
+            if (sl_existing is not None
+                    and sl_existing.closed_ts_ms is not None):
+                store_ctx.reopen_order(sl_coid)
+            store_ctx.upsert_order(
+                sl_coid,
+                symbol=new_i.symbol,
+                side=new_i.side,
+                qty=target_row.qty,
+                state='disposition_unknown',
+                intent_key=new_i.intent_key + '\0SL',
+                from_entry=new_i.from_entry,
+                pine_entry_id=new_i.from_entry,
+                sl_level=(float(new_i.sl_price)
+                          if new_i.sl_price is not None else None),
+                trailing_distance=(float(new_i.trail_offset)
+                                   if new_i.trail_offset is not None else None),
+                trailing_stop=(
+                    new_i.trail_offset is not None and not trail_pending
+                ),
+                extras={
+                    'leg_kind': 'sl',
+                    'parent_deal_id': deal_id,
+                    'parent_coid': target_row.client_order_id,
+                },
+            )
+            store_ctx.add_ref(sl_coid, 'bracket_deal_id', deal_id)
+        elif (
+            trail_pending
+            and existing_sl is None
+            and new_i.trail_offset is not None
+            and new_i.trail_price is not None
+        ):
+            # Pending-trail SL is purely local — the activation monitor
+            # PUTs it later when the threshold is crossed — so it never
+            # appears in the PUT body and ``sl_in_body`` is False. On
+            # an ambiguous PUT/confirm path the exception unwinds before
+            # the post-PUT mirror inserts this row; without persisting
+            # it here :meth:`_trailing_activation_monitor` has nothing
+            # to activate.
+            #
+            # Persist with ``state='confirmed'`` (NOT
+            # ``disposition_unknown``): the broker has no leg to resolve
+            # here — the pending-trail row is a local bookkeeping anchor
+            # — and :meth:`_resolve_bracket_leg_disposition` would see
+            # ``trailingStop=False`` on the parent and wrongly mark this
+            # row rejected.
+            pending_extras: dict = {
+                'leg_kind': 'sl',
+                'parent_deal_id': deal_id,
+                'parent_coid': target_row.client_order_id,
+                'trail_activation_price': new_i.trail_price,
+                'trail_offset': new_i.trail_offset,
+                'trail_state': 'pending',
+            }
+            pending_existing = store_ctx.get_order(sl_coid)
+            if (pending_existing is not None
+                    and pending_existing.closed_ts_ms is not None):
+                store_ctx.reopen_order(sl_coid)
+            store_ctx.upsert_order(
+                sl_coid,
+                symbol=new_i.symbol,
+                side=new_i.side,
+                qty=target_row.qty,
+                state='confirmed',
+                intent_key=new_i.intent_key + '\0SL',
+                from_entry=new_i.from_entry,
+                pine_entry_id=new_i.from_entry,
+                sl_level=None,
+                trailing_distance=float(new_i.trail_offset),
+                trailing_stop=False,
+                extras=pending_extras,
+            )
+            store_ctx.add_ref(sl_coid, 'bracket_deal_id', deal_id)
+
+    def _mark_existing_sl_force_rejected_on_pending_trail(self) -> None:
+        """Stamp ``force_disposition_rejected`` on the existing SL row.
+
+        When the amend transitions an existing broker-active SL (fixed
+        or immediate native trail) into a pending-trail, the PUT body
+        actively clears the broker-side stop. Marking the existing SL
+        row as ``disposition_unknown`` alone is NOT enough — the next
+        :meth:`_resolve_bracket_leg_disposition` compares the row's OLD
+        ``sl_level`` / ``trailing_distance`` against the parent's actual
+        ``stopLevel`` / ``trailingStop``, which only tells us whether
+        the broker applied the clear. It does NOT tell us whether the
+        new pending-trail intent was satisfied (the pending-trail leg
+        is purely local — the activation monitor PUTs it later).
+
+        Setting ``force_disposition_rejected`` makes the resolver record
+        ``'rejected'`` for this transition regardless of broker
+        comparison. The engine then restores ``_active_intents`` from
+        the pre-modify snapshot and re-dispatches.
+        """
+        store_ctx = self._plugin.store_ctx
+        if (store_ctx is None
+                or not self._sl_clears_broker_active
+                or self._existing_sl is None):
+            return
+        existing_extras = dict(self._existing_sl.extras or {})
+        existing_extras['force_disposition_rejected'] = True
+        store_ctx.upsert_order(
+            self._existing_sl.client_order_id,
+            extras=existing_extras,
+        )
+
+    def _persist_existing_legs_attempted_target(
+            self, new_intent: ExitIntent,
+    ) -> None:
+        """Refresh existing leg rows to the attempted new target.
+
+        :meth:`_mark_bracket_legs_disposition_unknown` only flips
+        ``state='disposition_unknown'``; it does NOT update
+        ``tp_level`` / ``sl_level`` / ``trailing_distance`` /
+        ``trailing_stop``. The next
+        :meth:`_resolve_bracket_leg_disposition` then compares the row's
+        stale OLD level against the broker's actual levels, so a PUT
+        that never reached Capital.com (broker still has the old level)
+        looks like ``attached`` because old == old.
+
+        Fix: write the new intent's target onto the existing leg row
+        BEFORE flipping it to ``disposition_unknown``. The resolver then
+        compares the attempted target against broker — broker applied
+        → ``'attached'``; broker NOT applied → mismatch → ``'rejected'``
+        → engine retries.
+        """
+        store_ctx = self._plugin.store_ctx
+        if store_ctx is None:
+            return
+        new_i = new_intent
+        existing_tp = self._existing_tp
+        existing_sl = self._existing_sl
+        trail_pending = self._trail_pending
+
+        if existing_tp is not None:
+            store_ctx.upsert_order(
+                existing_tp.client_order_id,
+                tp_level=(float(new_i.tp_price)
+                          if new_i.tp_price is not None else None),
+            )
+        if existing_sl is not None:
+            # Read the row DB-fresh: an earlier helper
+            # (:meth:`_mark_existing_sl_force_rejected_on_pending_trail`)
+            # may have just stamped ``force_disposition_rejected`` into
+            # extras; the in-memory ``existing_sl`` snapshot was captured
+            # before that write and would clobber the marker if used as
+            # the merge base.
+            cur = store_ctx.get_order(existing_sl.client_order_id)
+            cur_extras = dict((cur.extras if cur is not None else None) or {})
+            new_is_pending_trail = (
+                new_i.trail_offset is not None
+                and new_i.trail_price is not None
+            )
+            if not new_is_pending_trail:
+                for key in (
+                        'trail_state',
+                        'trail_activation_price',
+                        'trail_offset',
+                ):
+                    cur_extras.pop(key, None)
+            store_ctx.upsert_order(
+                existing_sl.client_order_id,
+                sl_level=(float(new_i.sl_price)
+                          if new_i.sl_price is not None else None),
+                trailing_distance=(float(new_i.trail_offset)
+                                   if new_i.trail_offset is not None else None),
+                trailing_stop=(
+                    new_i.trail_offset is not None and not trail_pending
+                ),
+                extras=cur_extras,
+            )

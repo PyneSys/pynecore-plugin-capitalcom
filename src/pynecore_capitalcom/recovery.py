@@ -42,6 +42,7 @@ from pynecore.core.broker.store_helpers import (
     KIND_CANCEL,
     KIND_FULL_CLOSE,
     KIND_MODIFY_ENTRY,
+    KIND_MODIFY_EXIT,
     KIND_PARTIAL_CLOSE,
 )
 from pynecore.lib.log import broker_info
@@ -445,6 +446,8 @@ class _CapitalComResumeHooks:
         kind = (row.extras or {}).get('kind')
         if kind == KIND_MODIFY_ENTRY:
             return await self._verdict_modify_entry(row, refs)
+        if kind == KIND_MODIFY_EXIT:
+            return await self._verdict_modify_exit(row, refs)
         if kind == KIND_CANCEL:
             return self._verdict_cancel(row, refs)
         if kind == KIND_FULL_CLOSE:
@@ -769,6 +772,172 @@ class _CapitalComResumeHooks:
             recovery_context={
                 'wo_level': wo_level,
                 'expected_level': new_level,
+            },
+        )
+
+    async def _verdict_modify_exit(
+            self, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
+        """Verdict for a ``modify_exit`` command row.
+
+        The command row carries ``extras['target_coid']`` (the entry
+        whose bracket was being amended). Recovery question: did the
+        ``PUT /positions/{dealId}`` land? Three resolution paths:
+
+        1. **Stored ``deal_reference`` + confirm GET**: ``REJECTED`` →
+           ``rejected``. ``ACCEPTED`` → ``confirmed`` (the leg rows
+           seeded by the hook into ``disposition_unknown`` are reconciled
+           separately by :meth:`_resolve_bracket_leg_disposition` on the
+           next /positions snapshot — recovery does NOT re-run the
+           mirror).
+        2. **Position snapshot matches attempted target**: if the parent
+           position's live ``profitLevel`` / ``stopLevel`` /
+           ``trailingStop`` / ``stopDistance`` match the persisted
+           ``new_tp`` / ``new_sl`` / ``new_trail`` the PUT landed even
+           though local persistence was interrupted → ``confirmed``.
+           Pending trailing (``new_trail_price`` + ``new_trail``) is
+           treated as a local-only bracket: the snapshot must show
+           ``trailingStop=False`` and a cleared ``stopLevel`` to
+           match, because the broker carries no native trailing stop
+           until the local activation monitor PUTs one.
+        3. **No usable signal** (ref TTL expired with no snapshot match,
+           target row missing, etc.) → ``still_unknown`` so the engine
+           reconciler retries on next sync.
+
+        The journal's command row carries no lifecycle for the leg rows
+        themselves — those live outside the entry-row scope for M4 and
+        keep their own ``disposition_unknown`` → ``attached`` /
+        ``rejected`` path via the snapshot reconciler.
+        """
+        extras = row.extras or {}
+        target_coid = extras.get('target_coid')
+
+        def _as_float(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        new_tp = _as_float(extras.get('new_tp'))
+        new_sl = _as_float(extras.get('new_sl'))
+        new_trail = _as_float(extras.get('new_trail'))
+        new_trail_price = _as_float(extras.get('new_trail_price'))
+        # Pine pending trailing (``trail_price`` + ``trail_offset``) leaves
+        # broker ``trailingStop`` off — the local activation monitor PUTs the
+        # native stop only after price crosses ``new_trail_price``. Recovery
+        # therefore expects the broker snapshot to show ``trailingStop=False``
+        # and the existing fixed/native stop cleared.
+        pending_trail = new_trail is not None and new_trail_price is not None
+
+        ref: str | None = (
+            refs.get('deal_reference') or extras.get('deal_reference')
+        )
+        if ref:
+            try:
+                confirm = await self.plugin._call(
+                    f'confirms/{ref}', method='get',
+                )
+            except OrderNotFoundError:
+                confirm = None
+            if confirm is not None:
+                deal_status = (confirm.get('dealStatus') or '').upper()
+                if deal_status == 'REJECTED':
+                    return ResumeOutcome(
+                        status='rejected',
+                        reject_reason=confirm.get('reason') or 'unknown',
+                        recovery_path='modify_exit_confirm_rejected',
+                        recovery_context={'deal_reference': ref},
+                    )
+                if deal_status == 'ACCEPTED':
+                    return ResumeOutcome(
+                        status='confirmed',
+                        is_filled=False,
+                        filled_qty=0.0,
+                        fill_price=0.0,
+                        recovery_path='modify_exit_confirm_get',
+                        recovery_context={'deal_reference': ref},
+                    )
+
+        target_deal_id: str | None = None
+        if target_coid and self.plugin.store_ctx is not None:
+            target_row = self.plugin.store_ctx.get_order(str(target_coid))
+            if target_row is not None and target_row.exchange_order_id:
+                target_deal_id = str(target_row.exchange_order_id)
+
+        if target_deal_id is None:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='modify_exit_no_target',
+            )
+
+        pos = self.pos_by_deal_id.get(target_deal_id)
+        if pos is None:
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='modify_exit_target_vanished',
+            )
+        pos_data = pos.get('position') or {}
+        pos_profit_level: float | None = _as_float(pos_data.get('profitLevel'))
+        pos_stop_level: float | None = _as_float(pos_data.get('stopLevel'))
+        pos_stop_distance: float | None = _as_float(pos_data.get('stopDistance'))
+        pos_trailing_stop = bool(pos_data.get('trailingStop'))
+
+        def _matches_tp() -> bool:
+            if new_tp is None:
+                return pos_profit_level is None
+            if pos_profit_level is None:
+                return False
+            return abs(pos_profit_level - new_tp) < 1e-9
+
+        def _matches_sl() -> bool:
+            if new_sl is None and new_trail is None:
+                return pos_stop_level is None and not pos_trailing_stop
+            if new_trail is not None:
+                # Pending trailing: the new bracket is purely local until the
+                # activation monitor PUTs it. The broker side has no SL leg —
+                # ``trailingStop`` must be off, ``stopLevel`` cleared.
+                if pending_trail:
+                    return pos_stop_level is None and not pos_trailing_stop
+                if not pos_trailing_stop:
+                    return False
+                if pos_stop_distance is None:
+                    return False
+                return abs(pos_stop_distance - new_trail) < 1e-9
+            if new_sl is None or pos_stop_level is None:
+                return False
+            return abs(pos_stop_level - new_sl) < 1e-9
+
+        if _matches_tp() and _matches_sl():
+            return ResumeOutcome(
+                status='confirmed',
+                exchange_id=target_deal_id,
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
+                recovery_path='modify_exit_snapshot_match',
+                recovery_context={
+                    'profit_level': pos_profit_level,
+                    'stop_level': pos_stop_level,
+                    'stop_distance': pos_stop_distance,
+                    'trailing_stop': pos_trailing_stop,
+                },
+            )
+
+        return ResumeOutcome(
+            status='still_unknown',
+            recovery_path='modify_exit_snapshot_mismatch',
+            recovery_context={
+                'profit_level': pos_profit_level,
+                'stop_level': pos_stop_level,
+                'stop_distance': pos_stop_distance,
+                'trailing_stop': pos_trailing_stop,
+                'expected_tp': new_tp,
+                'expected_sl': new_sl,
+                'expected_trail': new_trail,
+                'expected_trail_price': new_trail_price,
+                'pending_trail': pending_trail,
             },
         )
 
