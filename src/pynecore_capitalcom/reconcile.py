@@ -30,6 +30,10 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     UnexpectedCancelError,
 )
+from pynecore.core.broker.journal import (
+    DispatchJournal,
+    ReconcileOutcome,
+)
 from pynecore.core.broker.models import (
     ExchangeOrder,
     ExitIntent,
@@ -210,12 +214,12 @@ class _ReconcileMixin(_CapitalComBase):
                     and (row.extras or {}).get('kind') == 'working'):
                 pos_data = pos.get('position') or {}
                 filled = float(pos_data.get('size') or row.qty)
-                self.store_ctx.set_order_state(row.client_order_id, 'confirmed')
-                self.store_ctx.set_filled(row.client_order_id, filled)
-                # Flip ``kind`` to ``position`` and stamp
-                # ``entry_filled_at`` so the rest of the plugin treats
-                # this row as a filled position. Several code paths
-                # gate on these fields:
+                # Promote the working row via the journal. The Core
+                # helper owns state + filled_qty + extras merge + audit
+                # event in a single transaction. The extras_patch flips
+                # ``kind`` to ``position`` and stamps ``entry_filled_at``
+                # so the rest of the plugin treats this row as a filled
+                # position. Several code paths gate on these fields:
                 #   * :meth:`_find_active_entry_row` requires
                 #     ``kind == 'position'`` — without it, subsequent
                 #     ``modify_exit`` lookups would skip the row.
@@ -233,17 +237,21 @@ class _ReconcileMixin(_CapitalComBase):
                 # ALREADY ``kind == 'position'`` — limit-fill entries
                 # that surface via this snapshot path are otherwise
                 # never stamped.
-                new_extras = dict(row.extras or {})
-                new_extras['kind'] = 'position'
-                new_extras['entry_filled_at'] = now_ts
-                self.store_ctx.upsert_order(
-                    row.client_order_id, extras=new_extras,
-                )
-                self.store_ctx.log_event(
-                    'working_to_position',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=did,
-                    payload={'filled': filled},
+                DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+                    row.client_order_id,
+                    ReconcileOutcome(
+                        kind='filled',
+                        reason='working_promoted_position',
+                        new_state='confirmed',
+                        audit_event='working_to_position',
+                        filled_qty=filled,
+                        extras_patch={
+                            'kind': 'position',
+                            'entry_filled_at': now_ts,
+                        },
+                        audit_payload={'filled': filled},
+                        exchange_order_id=did,
+                    ),
                 )
                 yield OrderEvent(
                     order=ExchangeOrder(
@@ -267,18 +275,30 @@ class _ReconcileMixin(_CapitalComBase):
                 )
 
             # Partial fill detection: position size < row.qty - row.filled_qty.
-            if pos is not None and (row.extras or {}).get('kind') == 'position':
+            # Restricted to rows already in ``confirmed`` — any other live
+            # state (``closing``, ``cancel_pending``) is owned by a
+            # different lifecycle path, and the journal helper would
+            # otherwise overwrite that state back to ``confirmed`` and
+            # resurrect a row that is on its way out.
+            if (pos is not None
+                    and (row.extras or {}).get('kind') == 'position'
+                    and row.state == 'confirmed'):
                 pos_data = pos.get('position') or {}
                 current_size = float(pos_data.get('size') or 0.0)
                 cumulative = _compute_cumulative_fill(row.qty, current_size)
                 if row.filled_qty + 1e-9 < cumulative < row.qty:
-                    self.store_ctx.set_filled(row.client_order_id, cumulative)
-                    self.store_ctx.log_event(
-                        'partial_fill_detected',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=did,
-                        payload={'cumulative': cumulative,
-                                 'previous': row.filled_qty},
+                    DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+                        row.client_order_id,
+                        ReconcileOutcome(
+                            kind='filled',
+                            reason='partial_fill_progress',
+                            new_state='confirmed',
+                            audit_event='partial_fill_detected',
+                            filled_qty=cumulative,
+                            audit_payload={'cumulative': cumulative,
+                                           'previous': row.filled_qty},
+                            exchange_order_id=did,
+                        ),
                     )
                     yield OrderEvent(
                         order=ExchangeOrder(
@@ -341,6 +361,7 @@ class _ReconcileMixin(_CapitalComBase):
                 )
             for parent_coid, all_attached in bracket_resolutions.items():
                 if not all_attached:
+                    journal = DispatchJournal(self.store_ctx)
                     # Mixed bracket: any leg row that an earlier
                     # _record_bracket_resolution call promoted to
                     # ``confirmed`` in this same batch must be retired
@@ -358,20 +379,24 @@ class _ReconcileMixin(_CapitalComBase):
                         if sibling is None or sibling.closed_ts_ms is not None:
                             continue
                         sibling_extras = sibling.extras or {}
-                        self.store_ctx.set_order_state(
-                            sibling_coid, 'rejected',
-                        )
-                        self.store_ctx.close_order(sibling_coid)
-                        self.store_ctx.log_event(
-                            'bracket_sibling_retired_on_mixed_rejection',
-                            client_order_id=sibling_coid,
-                            exchange_order_id=sibling_extras.get('parent_deal_id'),
-                            payload={
-                                'sibling_coid': sibling_coid,
-                                'parent_coid': parent_coid,
-                                'leg_kind': sibling_extras.get('leg_kind'),
-                                'reason': 'mixed_bracket_rejected',
-                            },
+                        journal.apply_reconcile_outcome(
+                            sibling_coid,
+                            ReconcileOutcome(
+                                kind='terminal_close',
+                                reason='bracket_sibling_retired_on_mixed_rejection',
+                                new_state='rejected',
+                                audit_event='bracket_sibling_retired_on_mixed_rejection',
+                                close_row=True,
+                                audit_payload={
+                                    'sibling_coid': sibling_coid,
+                                    'parent_coid': parent_coid,
+                                    'leg_kind': sibling_extras.get('leg_kind'),
+                                    'reason': 'mixed_bracket_rejected',
+                                },
+                                exchange_order_id=sibling_extras.get(
+                                    'parent_deal_id'
+                                ),
+                            ),
                         )
                     # Pending-trail SL siblings: same parent rejection
                     # consequences (engine re-dispatches with fresh
@@ -386,21 +411,27 @@ class _ReconcileMixin(_CapitalComBase):
                         if sibling is None or sibling.closed_ts_ms is not None:
                             continue
                         sibling_extras = sibling.extras or {}
-                        self.store_ctx.set_order_state(
-                            sibling_coid, 'rejected',
-                        )
-                        self.store_ctx.close_order(sibling_coid)
-                        self.store_ctx.log_event(
-                            'bracket_sibling_retired_on_mixed_rejection',
-                            client_order_id=sibling_coid,
-                            exchange_order_id=sibling_extras.get('parent_deal_id'),
-                            payload={
-                                'sibling_coid': sibling_coid,
-                                'parent_coid': parent_coid,
-                                'leg_kind': sibling_extras.get('leg_kind'),
-                                'reason': 'pending_trail_parent_rejected',
-                                'trail_state': sibling_extras.get('trail_state'),
-                            },
+                        journal.apply_reconcile_outcome(
+                            sibling_coid,
+                            ReconcileOutcome(
+                                kind='terminal_close',
+                                reason='pending_trail_parent_rejected',
+                                new_state='rejected',
+                                audit_event='bracket_sibling_retired_on_mixed_rejection',
+                                close_row=True,
+                                audit_payload={
+                                    'sibling_coid': sibling_coid,
+                                    'parent_coid': parent_coid,
+                                    'leg_kind': sibling_extras.get('leg_kind'),
+                                    'reason': 'pending_trail_parent_rejected',
+                                    'trail_state': sibling_extras.get(
+                                        'trail_state'
+                                    ),
+                                },
+                                exchange_order_id=sibling_extras.get(
+                                    'parent_deal_id'
+                                ),
+                            ),
                         )
                 self.store_ctx.record_resolution(
                     parent_coid,
@@ -441,12 +472,17 @@ class _ReconcileMixin(_CapitalComBase):
             if did and (did in working_by_deal or did in positions_by_deal):
                 # Came back — already cleared in reconcile, skip.
                 continue
-            self.store_ctx.close_order(row.client_order_id)
-            self.store_ctx.log_event(
-                'unexpected_cancel',
-                client_order_id=row.client_order_id,
-                exchange_order_id=did,
-                payload={'missing_since': since, 'grace': grace},
+            DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+                row.client_order_id,
+                ReconcileOutcome(
+                    kind='terminal_close',
+                    reason='missing_pending_grace_expired',
+                    new_state='rejected',
+                    audit_event='unexpected_cancel',
+                    close_row=True,
+                    audit_payload={'missing_since': since, 'grace': grace},
+                    exchange_order_id=did,
+                ),
             )
             yield OrderEvent(
                 order=ExchangeOrder(
@@ -496,6 +532,7 @@ class _ReconcileMixin(_CapitalComBase):
                 )
             return
         if policy == 'stop_and_cancel' and self.store_ctx is not None:
+            cascade_journal = DispatchJournal(self.store_ctx)
             for other in list(self.store_ctx.iter_live_orders(symbol=row.symbol)):
                 if (other.client_order_id == row.client_order_id
                         or not other.exchange_order_id):
@@ -508,7 +545,21 @@ class _ReconcileMixin(_CapitalComBase):
                     await self._call(endpoint, method='delete')
                 except (OrderNotFoundError, BrokerError):
                     pass
-                self.store_ctx.close_order(other.client_order_id)
+                cascade_journal.apply_reconcile_outcome(
+                    other.client_order_id,
+                    ReconcileOutcome(
+                        kind='terminal_close',
+                        reason='unexpected_cancel_cascade',
+                        new_state='rejected',
+                        audit_event='unexpected_cancel_cascade',
+                        close_row=True,
+                        audit_payload={
+                            'origin_coid': row.client_order_id,
+                            'origin_deal_id': row.exchange_order_id,
+                        },
+                        exchange_order_id=other.exchange_order_id,
+                    ),
+                )
         raise UnexpectedCancelError(
             f"Bot-owned order disappeared unexpectedly: "
             f"coid={row.client_order_id!r} deal_id={row.exchange_order_id!r}",
