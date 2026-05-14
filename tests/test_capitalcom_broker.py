@@ -1296,11 +1296,10 @@ def __test_trailing_monitor_activating_to_active_on_snapshot__(tmp_path):
 
 
 def __test_missing_pending_tracker_fires_unexpected_cancel__(tmp_path):
-    # stop policy → UnexpectedCancelError bubbles up.
+    # stop policy (BrokerPlugin default) → UnexpectedCancelError bubbles up.
     broker, store, ctx = _make_broker(
         tmp_path,
         config=_make_config(
-            on_unexpected_cancel='stop',
             poll_interval_seconds=0.1,  # grace = max(5s, 0.5s) = 5s
         ),
     )
@@ -1323,10 +1322,10 @@ def __test_missing_pending_tracker_fires_unexpected_cancel__(tmp_path):
 
 
 def __test_missing_pending_tracker_ignore_policy_suppresses__(tmp_path):
-    broker, store, ctx = _make_broker(
-        tmp_path,
-        config=_make_config(on_unexpected_cancel='ignore'),
-    )
+    broker, store, ctx = _make_broker(tmp_path)
+    # The CLI normally injects the runtime policy from brokers.toml; in tests
+    # we set it directly on the plugin instance, which is what reconcile reads.
+    broker.on_unexpected_cancel = 'ignore'
     old_ts = __import__('time').time() - 120.0
     ctx.upsert_order('lost', symbol='EURUSD', side='buy', qty=1.0,
                      state='confirmed', pine_entry_id='Long',
@@ -1739,7 +1738,6 @@ def __test_natural_close_does_not_stamp_missing_pending__(tmp_path):
     broker, store, ctx = _make_broker(
         tmp_path,
         config=_make_config(
-            on_unexpected_cancel='stop',
             poll_interval_seconds=0.1,
         ),
     )

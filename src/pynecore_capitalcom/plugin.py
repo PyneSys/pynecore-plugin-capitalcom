@@ -36,7 +36,7 @@ from .exceptions import (
     OrderNotFoundError,
 )
 from .execution import _ExecutionMixin
-from .helpers import _VALID_UNEXPECTED_CANCEL_POLICIES, _parse_opening_hours_segment
+from .helpers import _parse_opening_hours_segment
 from .models import _ActivityCursor, _InstrumentRules, _activity_fingerprint
 from .provider import _ProviderMixin
 from .reconcile import _ReconcileMixin
@@ -110,16 +110,6 @@ class CapitalCom(
         super().__init__(symbol=symbol, timeframe=timeframe,
                          ohlcv_dir=ohlcv_dir, config=config)
         assert isinstance(self.config, CapitalComConfig), "CapitalComConfig is required"
-
-        if self.config.on_unexpected_cancel not in _VALID_UNEXPECTED_CANCEL_POLICIES:
-            raise ValueError(
-                f"CapitalComConfig.on_unexpected_cancel must be one of "
-                f"{sorted(_VALID_UNEXPECTED_CANCEL_POLICIES)}, got "
-                f"{self.config.on_unexpected_cancel!r}",
-            )
-        # Promote to instance attribute so the base-class handler sees the
-        # user-selected policy. The class-level default is ``"stop"``.
-        self.on_unexpected_cancel = self.config.on_unexpected_cancel
 
         # REST session state
         self.security_token: str | None = None

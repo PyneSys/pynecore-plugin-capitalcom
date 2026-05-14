@@ -78,13 +78,6 @@ _INVALID_TP_MIN_PREFIX = 'error.invalid.takeprofit.minvalue'
 _INVALID_TP_MAX_PREFIX = 'error.invalid.takeprofit.maxvalue'
 _INVALID_LEVERAGE_CODE = 'error.invalid.leverage.value'
 
-# Valid ``on_unexpected_cancel`` policy values — keep in sync with the base
-# :class:`BrokerPlugin` docstring. Anything else is a config error raised at
-# construction so the live-trading loop never starts against a typo.
-_VALID_UNEXPECTED_CANCEL_POLICIES = frozenset({
-    'stop', 'stop_and_cancel', 're_place', 'ignore',
-})
-
 
 def encrypt_password(password: str, encryption_key: str, timestamp: int | None = None):
     if timestamp is None:

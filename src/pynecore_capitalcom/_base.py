@@ -84,7 +84,6 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     # Monotonic counter incremented by each successful bootstrap login —
     # see the long ``__init__`` comment in ``plugin.py``.
     _session_generation: int
-    on_unexpected_cancel: str
 
     # --- WebSocket state ---
     # ``_ws`` holds the active ``websockets`` client connection. The

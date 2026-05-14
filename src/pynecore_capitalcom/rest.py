@@ -349,9 +349,10 @@ class _RestSessionMixin(_CapitalComBase):
         """Fail-closed if the active account is in hedging mode.
 
         :raises ExchangeCapabilityError: The account has hedging enabled
-            and the plugin was instantiated with ``require_one_way_mode``.
+            and :attr:`require_one_way_mode` is True (the default,
+            sourced from the cross-broker ``brokers.toml``).
         """
-        if not self.config.require_one_way_mode:
+        if not self.require_one_way_mode:
             return
         prefs = await self.get_preferences()
         if prefs.get('hedgingMode'):
