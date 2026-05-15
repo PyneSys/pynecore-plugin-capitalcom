@@ -233,7 +233,7 @@ class _ProviderMixin(_CapitalComBase):
             avg_spred_summ += spread
         avg_spred = avg_spred_summ / len(res['prices'])
 
-        return SymInfo(
+        sym_info = SymInfo(
             prefix='CAPITALCOM',
             description=instrument['name'],
             ticker=instrument['epic'],
@@ -251,6 +251,28 @@ class _ProviderMixin(_CapitalComBase):
             session_ends=session_ends,
             avg_spread=avg_spred,
         )
+        # Cache for the streaming watchdogs to consult: they suppress
+        # REST recovery and ohlc-stale WS reconnect calls while the
+        # market is in a known-closed window.
+        self._sym_info = sym_info
+        return sym_info
+
+    @override
+    def get_symbol_info(self, force_update=False) -> SymInfo:
+        """Wrap the base implementation so the streaming watchdogs always
+        see a populated ``_sym_info``.
+
+        The base ``get_symbol_info`` short-circuits to ``SymInfo.load_toml``
+        when the cached TOML exists, bypassing ``update_symbol_info`` and
+        therefore the ``self._sym_info = sym_info`` write above. On any
+        subsequent run with a cached symbol file ``_market_open_now``
+        would then see ``_sym_info is None`` and treat every period as
+        open, disabling the session gates on the OHLC watchdog and the
+        live-runner reconnect loop.
+        """
+        sym_info = super().get_symbol_info(force_update=force_update)
+        self._sym_info = sym_info
+        return sym_info
 
     @override
     def download_ohlcv(self, time_from: datetime, time_to: datetime,

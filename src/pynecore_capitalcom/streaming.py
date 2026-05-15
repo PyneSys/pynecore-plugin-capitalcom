@@ -24,11 +24,13 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from time import time as epoch_time
+from zoneinfo import ZoneInfo
 
 from websockets.exceptions import WebSocketException
 
 from pynecore.core.plugin import override
 from pynecore.lib.log import broker_info, broker_warning
+from pynecore.lib.session import _is_in_session, _is_point_in_session
 from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
@@ -38,6 +40,59 @@ from .helpers import WS_URL
 
 class _StreamingMixin(_CapitalComBase):
     """WebSocket streaming mix-in: connect / listen / ping / watchdog / synth."""
+
+    # --- Session-calendar helper -----------------------------------------
+
+    def _market_open_now(self) -> bool:
+        """True iff ``self._sym_info`` says the market is currently open.
+
+        Returns True when ``_sym_info`` is unset or its ``opening_hours``
+        is empty — preserves legacy behaviour for 24/7 instruments and
+        for the early-init window before ``update_symbol_info`` lands a
+        ``SymInfo``. The streaming watchdogs consult this to suppress
+        active WS-close calls (REST recovery + ohlc-stale reconnect)
+        during known-closed windows; if the WS dies on its own anyway
+        (e.g. Capital.com's 10-minute inactivity timeout over a
+        weekend) the framework reconnect loop is itself gated on the
+        same calendar.
+
+        Point-in-time semantics: does **not** extend wall-clock by one
+        timeframe, so a higher TF (1h, 1D) cannot report the market as
+        already open one TF before its real session start. The slot-
+        aware variant for bar decisions is :meth:`_market_open_at`.
+        """
+        sym_info = self._sym_info
+        if sym_info is None or not sym_info.opening_hours:
+            return True
+        try:
+            tz = ZoneInfo(sym_info.timezone)
+        except Exception:  # noqa: BLE001
+            return True
+        local_dt = datetime.fromtimestamp(epoch_time(), tz=tz)
+        return _is_point_in_session(sym_info.opening_hours, local_dt)
+
+    def _market_open_at(self, epoch_ts: float) -> bool:
+        """True iff the symbol's opening_hours mark ``epoch_ts`` as open.
+
+        Returns True for the 24/7 fallback (no calendar) so callers can
+        delegate the open/closed decision unconditionally. The slot-
+        aware variant of :meth:`_market_open_now`; the OHLC watchdog
+        consults it for the *missing slot's* calendar state rather than
+        wall-clock now, so a bar dropped just before the session edge
+        still gets REST recovery instead of being treated as
+        out-of-session.
+        """
+        sym_info = self._sym_info
+        if sym_info is None or not sym_info.opening_hours:
+            return True
+        try:
+            tz = ZoneInfo(sym_info.timezone)
+        except Exception:  # noqa: BLE001
+            return True
+        assert self.timeframe is not None
+        tf_seconds = max(1, int(in_seconds(self.timeframe)))
+        local_dt = datetime.fromtimestamp(epoch_ts, tz=tz)
+        return _is_in_session(sym_info.opening_hours, local_dt, tf_seconds)
 
     # --- LiveProviderPlugin (WebSocket) ------------------------------------
 
@@ -229,6 +284,12 @@ class _StreamingMixin(_CapitalComBase):
                     continue
                 if self._ws is None or self._ws.close_code is not None:
                     continue
+                # Session-gate: market in a known-closed window, the
+                # silence is expected. Do not close the socket — the
+                # framework reconnect loop is itself gated and would
+                # just bounce here indefinitely otherwise.
+                if not self._market_open_now():
+                    continue
                 # Reset the stamp BEFORE awaiting the close so a
                 # second pass through the loop doesn't double-fire
                 # while the close is still in flight; the listener's
@@ -283,6 +344,10 @@ class _StreamingMixin(_CapitalComBase):
            elapsed for the same slot do we escalate to ``ws.close``
            and force a reconnect (publish lag alone must not trigger
            a reconnect storm).
+        5. If multiple consecutive bars are recovered from REST, the
+           OHLC subscription itself is stale even though REST can hide
+           the gap. Emit the recovered bar first, then close the WS so
+           the live runner reconnects with a fresh subscription.
         """
         assert self.timeframe is not None
         tf_seconds = float(in_seconds(self.timeframe))
@@ -293,6 +358,7 @@ class _StreamingMixin(_CapitalComBase):
         # timeout; without this cap a single stalled fetch would block
         # the watchdog past the synth deadline, defeating its purpose.
         rest_fetch_timeout_s = 5.0
+        rest_recovery_reconnect_threshold = 2
         broker_info(
             "ohlc watchdog started: tf=%.0fs publish_lag=%.0fs max_wait=%.0fs",
             tf_seconds, rest_publish_lag_s, max_rest_wait_s,
@@ -302,13 +368,59 @@ class _StreamingMixin(_CapitalComBase):
         # the slot. Prevents an indefinite retry loop on publish lag.
         missing_slot_ts: int | None = None
         missing_slot_first_seen_at: float = 0.0
+        consecutive_rest_recoveries = 0
+        last_real_ohlc_event_ts = self._last_ohlc_event_ts
         try:
             while True:
                 try:
                     await asyncio.sleep(1.0)
                     if self._ws is None or self._ws.close_code is not None:
                         continue
+                    # Session-gate: gated on the *missing slot's*
+                    # calendar state, not wall-clock now. The slot in
+                    # question is the one immediately after the last
+                    # known bar open (``_last_bar_open_ts + tf_seconds``).
+                    # Using wall-clock would drop REST recovery for a
+                    # valid closing-session bar whose ohlc.event was
+                    # missed: the watchdog deadline lands a moment past
+                    # session close, ``_market_open_now()`` returns
+                    # false, the slot never gets fetched, and
+                    # ``live_runner`` then synthesises a zero-volume bar
+                    # for that still-in-session slot.
+                    #
+                    # Also disarm the anchor here: if we leave
+                    # ``_last_bar_open_ts`` pointing at the pre-close
+                    # bar, on session reopen the quote stream lights up
+                    # before the first ``ohlc.event`` and the watchdog
+                    # probes REST for stale weekend slots, potentially
+                    # forcing a reconnect on an otherwise healthy
+                    # subscription. The next real ``ohlc.event`` after
+                    # reopen re-arms the watchdog via ``_listen_loop``.
+                    #
+                    # No-baseline case (``_last_bar_open_ts == 0.0``)
+                    # falls through to wall-clock: there is no slot to
+                    # gate on, so we use ``_market_open_now`` to keep
+                    # the pre-baseline branch out of REST until quotes
+                    # arrive in-session.
+                    if self._last_bar_open_ts > 0.0:
+                        candidate_missing_ts = (
+                            self._last_bar_open_ts + tf_seconds
+                        )
+                        slot_in_session = self._market_open_at(
+                            candidate_missing_ts
+                        )
+                    else:
+                        slot_in_session = self._market_open_now()
+                    if not slot_in_session:
+                        missing_slot_ts = None
+                        missing_slot_first_seen_at = 0.0
+                        consecutive_rest_recoveries = 0
+                        self._last_bar_open_ts = 0.0
+                        continue
                     now = epoch_time()
+                    if self._last_ohlc_event_ts > last_real_ohlc_event_ts:
+                        last_real_ohlc_event_ts = self._last_ohlc_event_ts
+                        consecutive_rest_recoveries = 0
                     if self._last_bar_open_ts == 0.0:
                         # Watchdog is disarmed — either we just connected
                         # without a baseline, or the session-gap branch
@@ -332,6 +444,8 @@ class _StreamingMixin(_CapitalComBase):
                                 current_bar_open - tf_seconds
                             )
                             self._last_ohlc_event_ts = now
+                            last_real_ohlc_event_ts = now
+                            consecutive_rest_recoveries = 0
                             missing_slot_ts = None
                             missing_slot_first_seen_at = 0.0
                         continue
@@ -382,7 +496,6 @@ class _StreamingMixin(_CapitalComBase):
                         # on the same slot while the injected bar is
                         # still in the queue.
                         self._last_bar_open_ts = float(missing_ts)
-                        self._last_ohlc_event_ts = now
                         # Reset the tick-volume accumulator at the
                         # recovered bar boundary. ``_listen_loop``
                         # normally snapshots-and-resets ``_tick_volume``
@@ -398,10 +511,35 @@ class _StreamingMixin(_CapitalComBase):
                         # ``lastTradedVolume`` is the authoritative volume
                         # for the recovered bar.
                         self._tick_volume = 0
+                        consecutive_rest_recoveries += 1
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
                         assert self._update_queue is not None
                         await self._update_queue.put(("ohlc", payload))
+                        if (consecutive_rest_recoveries
+                                >= rest_recovery_reconnect_threshold):
+                            quote_silent_for = (
+                                now - self._last_quote_event_ts
+                                if self._last_quote_event_ts > 0.0 else 0.0
+                            )
+                            broker_warning(
+                                "ohlc.event recovered via REST for %d "
+                                "consecutive slots (last ts=%d, "
+                                "silent %.1fs, quotes silent %.1fs) - "
+                                "forcing WS reconnect to refresh "
+                                "OHLC subscription",
+                                consecutive_rest_recoveries, missing_ts,
+                                ohlc_silent_for, quote_silent_for,
+                            )
+                            self._last_bar_open_ts = 0.0
+                            consecutive_rest_recoveries = 0
+                            try:
+                                await self._ws.close(
+                                    code=4001,
+                                    reason="ohlc-rest-recovered-stale",
+                                )
+                            except (WebSocketException, OSError):
+                                pass
                         continue
 
                     slot_wait = now - missing_slot_first_seen_at

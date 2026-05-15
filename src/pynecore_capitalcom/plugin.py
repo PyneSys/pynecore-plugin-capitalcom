@@ -181,6 +181,12 @@ class CapitalCom(
         # the framework synth would.
         self._last_bar_open_ts: float = 0.0
 
+        # Session calendar cache (populated by ``update_symbol_info``).
+        # Until the first call lands a ``SymInfo``, watchdogs treat
+        # ``None`` as 24/7 fallback so legacy behaviour is preserved
+        # during early init.
+        self._sym_info = None
+
         # Broker state
         self._account_preferences: dict | None = None
         self._activity_cursor = _ActivityCursor()

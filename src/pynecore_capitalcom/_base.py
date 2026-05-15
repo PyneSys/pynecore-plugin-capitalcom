@@ -34,6 +34,7 @@ from pynecore.core.broker.models import (
     OrderEvent,
 )
 from pynecore.core.plugin.broker import BrokerPlugin
+from pynecore.core.syminfo import SymInfo
 from pynecore.types.ohlcv import OHLCV
 
 from .config import CapitalComConfig
@@ -114,6 +115,15 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     _last_auth_probe_ts: float
     _instrument_rules_cache: dict[str, _InstrumentRules]
     _current_poll_id: int
+
+    # --- Session calendar cache ---
+    # Latest ``SymInfo`` returned by ``update_symbol_info``. Used by the
+    # streaming watchdogs to suppress active WS-close calls (REST recovery
+    # + ohlc-stale reconnect) while the market is in a known-closed
+    # window. ``None`` until ``update_symbol_info`` has run at least once
+    # — watchdogs treat that as 24/7 fallback to preserve legacy
+    # behaviour during early init or for plugins that never call it.
+    _sym_info: SymInfo | None
 
     # ------------------------------------------------------------------
     # Capital.com–private cross-mix-in method surface.

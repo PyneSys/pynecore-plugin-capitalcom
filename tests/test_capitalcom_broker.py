@@ -3919,6 +3919,99 @@ def __test_listen_loop_sentinel_targets_local_queue_not_successor__(tmp_path):
     assert payload is None
 
 
+def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypatch):
+    """Repeated REST recovery means the OHLC subscription is stale, not healthy.
+
+    A single dropped ``ohlc.event`` is worth patching from REST. Multiple
+    consecutive REST-recovered bars mean the WebSocket can be alive while the
+    OHLC subscription is dead; the watchdog must emit the recovered bars and
+    then force a reconnect instead of resetting the real-event silence timer.
+    """
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    broker._update_queue = asyncio.Queue()
+    broker._raw_ohlc_queue = asyncio.Queue()
+    broker._last_bar_open_ts = 1_000.0
+    broker._last_ohlc_event_ts = 1_000.0
+
+    class _DummyWS:
+        close_code = None
+
+        def __init__(self):
+            self.close_calls: list[tuple[int | None, str | None]] = []
+
+        async def close(self, code=None, reason=None):
+            self.close_calls.append((code, reason))
+            self.close_code = code
+
+    ws = _DummyWS()
+    broker._ws = ws  # type: ignore[assignment]
+
+    wake_times = iter([1_131.0, 1_191.0, 1_252.0])
+    now = {"t": 1_000.0}
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(_delay):
+        now["t"] = next(wake_times)
+        broker._last_quote_event_ts = now["t"]
+        await original_sleep(0)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    fetches: list[int] = []
+
+    def fake_fetch_bar_payload(timestamp: int) -> dict:
+        fetches.append(timestamp)
+        return {
+            "priceType": "bid",
+            "t": timestamp * 1000,
+            "o": 1.0,
+            "h": 1.1,
+            "l": 0.9,
+            "c": 1.05,
+            "_volume": 123.0,
+        }
+
+    monkeypatch.setattr('pynecore_capitalcom.streaming.epoch_time',
+                        lambda: now["t"])
+    monkeypatch.setattr('pynecore_capitalcom.streaming.asyncio.sleep',
+                        fake_sleep)
+    monkeypatch.setattr('pynecore_capitalcom.streaming.asyncio.to_thread',
+                        fake_to_thread)
+    monkeypatch.setattr(broker, '_fetch_bar_payload',
+                        fake_fetch_bar_payload)
+
+    async def runner():
+        task = asyncio.create_task(broker._ohlc_watchdog_loop())
+        try:
+            for _ in range(10):
+                await original_sleep(0)
+                if ws.close_calls:
+                    break
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(runner())
+
+    assert fetches == [1_060, 1_120]
+    assert ws.close_calls == [(4001, "ohlc-rest-recovered-stale")]
+    assert broker._last_ohlc_event_ts == 1_000.0
+
+    recovered = []
+    while not broker._update_queue.empty():
+        event_type, payload = broker._update_queue.get_nowait()
+        recovered.append((event_type, payload["t"]))
+    assert recovered == [("ohlc", 1_060_000), ("ohlc", 1_120_000)]
+
+
 def __test_resolve_bracket_leg_disposition_force_rejected_marker_overrides_native_trail_match__(tmp_path):
     """The force-rejected marker must override the native-trailing
     branch too: existing native-trail SL → pending-trail transition
@@ -8213,3 +8306,105 @@ def __test_orphan_retire_also_deletes_envelope_anchor__(tmp_path):
     finally:
         ctx.close()
         store.close()
+
+
+# --- Session-calendar gate ---
+
+def _make_syminfo_closed_now():
+    """Build a SymInfo whose ``opening_hours`` virtually never cover wall-clock.
+
+    A 5-minute window 00:00-00:05 UTC for every weekday — the test
+    treats the rest of the day as closed.
+    """
+    from datetime import time as dtime
+    from pynecore.core.syminfo import SymInfo, SymInfoInterval
+
+    closed_calendar = [
+        SymInfoInterval(day=d, start=dtime(0, 0, 0), end=dtime(0, 5, 0))
+        for d in range(7)
+    ]
+    return SymInfo(
+        prefix="CAPITALCOM",
+        description="closed",
+        ticker="EURUSD",
+        currency="USD",
+        period="1",
+        type="forex",
+        mintick=0.0001,
+        pricescale=10000,
+        minmove=1,
+        pointvalue=1.0,
+        opening_hours=closed_calendar,
+        session_starts=[],
+        session_ends=[],
+        timezone="UTC",
+    )
+
+
+def __test_market_open_now_returns_true_without_calendar__():
+    """When ``_sym_info`` is unset, watchdog gates fall back to 'open'."""
+    broker = _FakeBroker(
+        symbol="EURUSD", timeframe="1", config=_make_config(),
+    )
+    assert broker._sym_info is None
+    assert broker._market_open_now() is True
+
+
+def __test_market_open_now_false_in_closed_window__():
+    """Calendar with a 5-minute weekday window outside wall-clock returns False.
+
+    Verifies the helper that gates ``_feed_watchdog_loop`` and
+    ``_ohlc_watchdog_loop``. Without this gate both would actively close
+    the WS during a known-closed market window (FX weekend) and trigger
+    a reconnect storm via the framework's ``live_runner``.
+    """
+    broker = _FakeBroker(
+        symbol="EURUSD", timeframe="1", config=_make_config(),
+    )
+    broker._sym_info = _make_syminfo_closed_now()
+    # Cannot assert False unconditionally because the test could
+    # theoretically run inside the 00:00-00:05 UTC window — skip in that
+    # rare case rather than flake.
+    from datetime import datetime, timezone as _tz
+    now_utc = datetime.now(tz=_tz.utc)
+    if now_utc.hour == 0 and now_utc.minute < 5:
+        pytest.skip("wall-clock inside synthetic open window; rerun later")
+    assert broker._market_open_now() is False
+
+
+def __test_market_open_now_true_inside_calendar_window__():
+    """Calendar that covers the current UTC hour returns True.
+
+    Exercises the positive branch of the gate so a future regression
+    that always-returns-False (silent freeze of live runs) fails fast.
+    """
+    from datetime import datetime, time as dtime, timezone as _tz
+    from pynecore.core.syminfo import SymInfo, SymInfoInterval
+
+    now_utc = datetime.now(tz=_tz.utc)
+    today_only = [SymInfoInterval(
+        day=now_utc.weekday(),
+        start=dtime(0, 0, 0),
+        end=dtime(23, 59, 59),
+    )]
+    sym_info = SymInfo(
+        prefix="CAPITALCOM",
+        description="open",
+        ticker="EURUSD",
+        currency="USD",
+        period="1",
+        type="forex",
+        mintick=0.0001,
+        pricescale=10000,
+        minmove=1,
+        pointvalue=1.0,
+        opening_hours=today_only,
+        session_starts=[],
+        session_ends=[],
+        timezone="UTC",
+    )
+    broker = _FakeBroker(
+        symbol="EURUSD", timeframe="1", config=_make_config(),
+    )
+    broker._sym_info = sym_info
+    assert broker._market_open_now() is True
