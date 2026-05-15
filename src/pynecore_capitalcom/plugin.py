@@ -136,6 +136,21 @@ class CapitalCom(
         self._listen_task: asyncio.Task | None = None
         self._ping_task: asyncio.Task | None = None
         self._feed_watchdog_task: asyncio.Task | None = None
+        # Watchdog for the OHLC subscription specifically — quotes can keep
+        # flowing while ``OHLCMarketData.subscribe`` silently dies (e.g.
+        # token-bound subscription invalidated by session refresh). The
+        # generic feed watchdog only sees ``_last_payload_ts`` and would
+        # remain quiet, so a dedicated task tracks OHLC liveness.
+        self._ohlc_watchdog_task: asyncio.Task | None = None
+        # Worker that resolves authoritative REST volume off the
+        # listener path and enqueues bars in FIFO order on
+        # ``_update_queue``. See :meth:`_volume_backfill_worker_loop`.
+        self._volume_backfill_task: asyncio.Task | None = None
+        # Internal queue between ``_listen_loop`` (producer of raw
+        # bid-side ``ohlc.event`` payloads) and the backfill worker
+        # (consumer that adds REST volume and forwards to
+        # ``_update_queue``).
+        self._raw_ohlc_queue: asyncio.Queue | None = None
         self._tick_volume: int = 0
         # Latest tick quote snapshot, updated by each ``quote`` event and
         # attached to every OHLCV emitted by ``watch_ohlcv`` so the spinner
@@ -147,6 +162,24 @@ class CapitalCom(
         # watchdog: when the connection is TCP-alive but the server stops
         # streaming market data, this stamp is the only signal we have.
         self._last_payload_ts: float = 0.0
+        # Wall-clock of the last ``ohlc.event`` received. Distinct from
+        # ``_last_payload_ts`` so the OHLC watchdog can detect the
+        # "quotes alive, bars dead" failure mode where the OHLC
+        # subscription died but ``marketData`` is still flowing.
+        self._last_ohlc_event_ts: float = 0.0
+        # Wall-clock of the last ``quote`` event received. Lets the OHLC
+        # watchdog distinguish the "OHLC dead, quotes alive" token-bound
+        # failure (must reconnect) from an expected session/market-closed
+        # gap (no reconnect — REST simply has no bar to inject and the
+        # quote stream is also idle).
+        self._last_quote_event_ts: float = 0.0
+        # Bar OPEN epoch seconds of the most recent OHLC event the
+        # listener forwarded (independent of consumer progress). Used
+        # by the OHLC watchdog to anchor its deadline on the same axis
+        # as ``live_runner``'s synth deadline (bar-open time, not
+        # event-arrival wallclock), so the watchdog can fire BEFORE
+        # the framework synth would.
+        self._last_bar_open_ts: float = 0.0
 
         # Broker state
         self._account_preferences: dict | None = None

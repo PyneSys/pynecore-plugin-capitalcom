@@ -269,6 +269,7 @@ class _RecoveryMixin(_CapitalComBase):
 
         promoted = promoted_coids or set()
         retired_parent_coids: set[str] = set()
+        retired_intent_keys: set[str] = set()
         retired_count = 0
 
         for row in list(self.store_ctx.iter_live_orders()):
@@ -292,6 +293,18 @@ class _RecoveryMixin(_CapitalComBase):
             )
             self.store_ctx.close_order(row.client_order_id)
             retired_parent_coids.add(row.client_order_id)
+            # The envelope anchor in the ``envelopes`` table survives
+            # ``close_order``; without this delete the next dispatch of
+            # the same Pine intent reuses the stale ``bar_ts_ms`` and
+            # regenerates the SAME client_order_id, hitting the
+            # ``upsert_order`` UPDATE path on the just-closed row — and
+            # since UPDATE does not touch ``closed_ts_ms``, the freshly
+            # confirmed entry is invisible to ``iter_live_orders``,
+            # which makes the immediately-following ``execute_exit``
+            # raise ``no confirmed entry row``.
+            if row.intent_key:
+                self.store_ctx.record_complete(row.intent_key)
+                retired_intent_keys.add(row.intent_key)
             retired_count += 1
 
         for row in list(self.store_ctx.iter_live_orders()):
@@ -326,6 +339,17 @@ class _RecoveryMixin(_CapitalComBase):
                 },
             )
             self.store_ctx.close_order(row.client_order_id)
+            # Leg rows persist ``intent_key`` as ``<exit_pine>\0<from_entry>\0TP/SL``;
+            # strip the leg suffix to get the exit envelope key that
+            # ``OrderSyncEngine._build_envelope`` looks up. TP and SL
+            # legs share one exit envelope — ``record_complete`` is a
+            # plain DELETE so the second call is a harmless no-op.
+            leg_intent_key = row.intent_key
+            if leg_intent_key and leg_intent_key.endswith(('\0TP', '\0SL')):
+                exit_intent_key = leg_intent_key[:-3]
+                if exit_intent_key not in retired_intent_keys:
+                    self.store_ctx.record_complete(exit_intent_key)
+                    retired_intent_keys.add(exit_intent_key)
             retired_count += 1
 
         if retired_count:

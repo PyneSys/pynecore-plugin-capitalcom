@@ -3834,25 +3834,33 @@ def __test_seed_added_legs_pending_trail_reopens_closed_row__(tmp_path):
 
 
 def __test_listen_loop_sentinel_targets_local_queue_not_successor__(tmp_path):
-    """Listener's exit sentinel must land on the queue THIS listener
-    was started with, not on a successor connection's queue established
-    by a fast disconnect/reconnect cycle.
+    """Listener's disconnect signal must land on the raw queue THIS
+    listener was started with, not on a successor connection's queue
+    established by a fast disconnect/reconnect cycle.
 
     Failure mode without local-queue capture: ``disconnect()`` cancels
-    the listener and clears ``self._update_queue``; a fresh
+    the listener and clears ``self._raw_ohlc_queue``; a fresh
     ``connect()`` then creates a NEW queue. If the cancelled listener
     task hasn't reached its ``finally`` yet (cancellation is not
-    synchronous), reading ``self._update_queue`` in ``finally`` picks
-    up the NEW connection's queue and the sentinel ``None`` lands
-    there — ``watch_ohlcv`` would raise ``ConnectionError`` on an
-    otherwise healthy reconnect.
+    synchronous), reading ``self._raw_ohlc_queue`` in ``finally``
+    picks up the NEW connection's queue and a stale disconnect signal
+    lands there — the new worker would forward a spurious ``None`` to
+    ``_update_queue`` and ``watch_ohlcv`` would raise
+    ``ConnectionError`` on an otherwise healthy reconnect.
     """
     broker = _FakeBroker(config=_make_config())
 
     async def runner():
-        # Stage one listener with its own queue, then start the task.
-        old_queue: asyncio.Queue = asyncio.Queue()
-        broker._update_queue = old_queue
+        # Stage one listener with its own queues, then start the task.
+        # The disconnect signal flows through ``_raw_ohlc_queue`` so
+        # that any in-flight bid bar drains BEFORE the sentinel reaches
+        # ``_update_queue`` (the volume backfill worker forwards both
+        # in FIFO order). The local-queue invariant therefore applies
+        # to the raw queue.
+        old_update_queue: asyncio.Queue = asyncio.Queue()
+        old_raw_queue: asyncio.Queue = asyncio.Queue()
+        broker._update_queue = old_update_queue
+        broker._raw_ohlc_queue = old_raw_queue
 
         class _DummyWS:
             close_code = None
@@ -3871,34 +3879,44 @@ def __test_listen_loop_sentinel_targets_local_queue_not_successor__(tmp_path):
         await asyncio.sleep(0)  # let the listener reach the await
 
         # Simulate the disconnect/reconnect race: replace the broker's
-        # queue with a NEW one BEFORE the cancelled listener gets to run
-        # its finally. With local-queue capture, the listener still
-        # writes to ``old_queue``; without it, the sentinel lands on
-        # ``new_queue`` and breaks the next consumer.
-        new_queue: asyncio.Queue = asyncio.Queue()
-        broker._update_queue = new_queue
+        # queues with NEW ones BEFORE the cancelled listener gets to
+        # run its finally. With local-queue capture, the listener
+        # still writes to ``old_raw_queue``; without it, the
+        # disconnect signal lands on ``new_raw_queue`` and breaks the
+        # next consumer.
+        new_update_queue: asyncio.Queue = asyncio.Queue()
+        new_raw_queue: asyncio.Queue = asyncio.Queue()
+        broker._update_queue = new_update_queue
+        broker._raw_ohlc_queue = new_raw_queue
         listener.cancel()
         try:
             await listener
         except asyncio.CancelledError:
             pass
-        return old_queue, new_queue
+        return old_raw_queue, new_raw_queue, old_update_queue, new_update_queue
 
-    old_queue, new_queue = asyncio.run(runner())
-    assert old_queue.qsize() == 1, (
-        f"listener's exit sentinel must land on the OLD queue (the "
-        f"one this listener was started with), not on the successor "
-        f"queue established mid-cancellation; got "
-        f"old_queue.qsize()={old_queue.qsize()}, "
-        f"new_queue.qsize()={new_queue.qsize()}"
+    old_raw, new_raw, old_update, new_update = asyncio.run(runner())
+    assert old_raw.qsize() == 1, (
+        f"listener's disconnect signal must land on the OLD raw queue "
+        f"(the one this listener was started with), not on the "
+        f"successor queue established mid-cancellation; got "
+        f"old_raw.qsize()={old_raw.qsize()}, "
+        f"new_raw.qsize()={new_raw.qsize()}"
     )
-    assert new_queue.qsize() == 0, (
-        f"successor queue must NOT receive a stale None — that would "
-        f"make watch_ohlcv raise ConnectionError on a healthy "
-        f"reconnect; got new_queue.qsize()={new_queue.qsize()}"
+    assert new_raw.qsize() == 0, (
+        f"successor raw queue must NOT receive a stale disconnect "
+        f"signal — that would make the new worker emit a spurious "
+        f"None and watch_ohlcv raise ConnectionError on a healthy "
+        f"reconnect; got new_raw.qsize()={new_raw.qsize()}"
     )
-    sentinel = old_queue.get_nowait()
-    assert sentinel is None
+    # No worker ran in this test, so the consumer queues stay empty
+    # on both sides; the disconnect signal sits on the raw queue
+    # waiting for the worker (which a real connection would have).
+    assert old_update.qsize() == 0
+    assert new_update.qsize() == 0
+    event_type, payload = old_raw.get_nowait()
+    assert event_type == "disconnect"
+    assert payload is None
 
 
 def __test_resolve_bracket_leg_disposition_force_rejected_marker_overrides_native_trail_match__(tmp_path):
@@ -8122,6 +8140,76 @@ def __test_recover_does_not_retire_when_position_still_present__(tmp_path):
             "WHERE kind = 'startup_orphan_retired'",
         ).fetchone()['n']
         assert n_retired == 0
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_orphan_retire_also_deletes_envelope_anchor__(tmp_path):
+    """Orphan retire must wipe the ``envelopes`` row too.
+
+    Without this, the next dispatch of the same Pine intent inherits
+    the stale ``bar_ts_ms`` from the persisted anchor and regenerates
+    the SAME ``client_order_id``. ``upsert_order`` then takes the
+    UPDATE path on the just-closed row, ``state`` is reset to
+    ``confirmed`` but ``closed_ts_ms`` survives — the freshly
+    confirmed entry becomes invisible to ``iter_live_orders`` and
+    ``execute_exit`` raises ``no confirmed entry row``.
+    """
+    broker = _FakeBroker(config=_make_config(), responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order(
+            'entry-coid', symbol='EURUSD', side='buy', qty=1.0,
+            state='confirmed',
+            intent_key='Long', pine_entry_id='Long',
+            extras={'kind': 'position', 'order_type': 'market',
+                    'entry_filled_at': 1.0},
+        )
+        ctx.set_exchange_id('entry-coid', 'deal-gone-1')
+        ctx.add_ref('entry-coid', 'deal_id', 'deal-gone-1')
+
+        # Bracket leg intent_key uses the production format
+        # ``<exit_pine>\0<from_entry>\0TP/SL`` so the suffix-strip in
+        # ``_retire_startup_orphans`` produces the exit envelope key
+        # ``Bracket\0Long``.
+        ctx.upsert_order(
+            'tp-coid', symbol='EURUSD', side='sell', qty=1.0,
+            state='confirmed',
+            intent_key='Bracket\0Long\0TP', pine_entry_id='Long',
+            extras={'leg_kind': 'tp', 'parent_coid': 'entry-coid',
+                    'parent_deal_id': 'deal-gone-1'},
+        )
+        ctx.upsert_order(
+            'sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+            state='confirmed',
+            intent_key='Bracket\0Long\0SL', pine_entry_id='Long',
+            extras={'leg_kind': 'sl', 'parent_coid': 'entry-coid',
+                    'parent_deal_id': 'deal-gone-1'},
+        )
+
+        # Persist envelope anchors that a prior session would have
+        # written for these intents.
+        ctx.record_envelope('Long', bar_ts_ms=1_700_000_000_000, retry_seq=0)
+        ctx.record_envelope(
+            'Bracket\0Long', bar_ts_ms=1_700_000_000_000, retry_seq=0,
+        )
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        # Both anchors are gone.
+        envelopes_after = store._conn.execute(
+            "SELECT intent_key FROM envelopes WHERE run_id = ?",
+            (ctx.run_id,),
+        ).fetchall()
+        assert envelopes_after == [], (
+            f"orphan retire must delete persisted envelope anchors, "
+            f"still present: {[r['intent_key'] for r in envelopes_after]!r}"
+        )
     finally:
         ctx.close()
         store.close()

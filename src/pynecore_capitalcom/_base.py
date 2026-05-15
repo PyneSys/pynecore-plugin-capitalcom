@@ -97,10 +97,16 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     _listen_task: asyncio.Task | None
     _ping_task: asyncio.Task | None
     _feed_watchdog_task: asyncio.Task | None
+    _ohlc_watchdog_task: asyncio.Task | None
+    _volume_backfill_task: asyncio.Task | None
+    _raw_ohlc_queue: asyncio.Queue | None
     _tick_volume: int
     _last_bid: float | None
     _last_ask: float | None
     _last_payload_ts: float
+    _last_ohlc_event_ts: float
+    _last_quote_event_ts: float
+    _last_bar_open_ts: float
 
     # --- Caches & cursors ---
     _account_preferences: dict | None
