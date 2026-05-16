@@ -24,6 +24,7 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
+from .exceptions import CapitalComError
 from .helpers import (
     TIMEFRAMES,
     TIMEFRAMES_INV,
@@ -309,7 +310,20 @@ class _ProviderMixin(_CapitalComBase):
                     break
                 previous_tf = tf
 
-                res: dict = self.get_historical_prices(time_from=tf, limit=limit or 1000)
+                try:
+                    res: dict = self.get_historical_prices(time_from=tf, limit=limit or 1000)
+                except CapitalComError as exc:
+                    # Capital.com returns HTTP 404 with
+                    # ``error.prices.not-found`` (rather than an empty
+                    # ``prices`` list) when the requested window has no
+                    # bars at all — typically when ``tf`` has advanced
+                    # past the Friday close on a weekend or into any
+                    # other market-closed gap. Treat it identically to
+                    # an empty response: stop downloading, keep what we
+                    # already wrote. All other error codes propagate.
+                    if 'error.prices.not-found' in str(exc):
+                        break
+                    raise
                 if not res or not res['prices']:
                     break
                 ps = res['prices']
