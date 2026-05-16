@@ -10,7 +10,6 @@ pipeline at the end of warm-up so the very first quote can produce an
 intra-bar update).
 """
 from datetime import UTC, datetime, time, timedelta
-from functools import lru_cache
 from time import time as epoch_time
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -69,7 +68,6 @@ class _ProviderMixin(_CapitalComBase):
         res: dict = self('markets', data=data, method='get')
         return res
 
-    @lru_cache(maxsize=1)
     def get_single_market_details(self) -> dict:
         """Get market details of the plugin's current symbol."""
         assert self.symbol is not None
