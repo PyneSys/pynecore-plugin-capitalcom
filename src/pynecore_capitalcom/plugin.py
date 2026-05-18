@@ -100,7 +100,7 @@ class CapitalCom(
     """
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
-                 ohlcv_dir: Path | None = None, config: object | None = None):
+                 ohlcv_dir: Path | None = None, config: CapitalComConfig | None = None):
         """
         :param symbol: The symbol to get data for.
         :param timeframe: The timeframe in TradingView format.

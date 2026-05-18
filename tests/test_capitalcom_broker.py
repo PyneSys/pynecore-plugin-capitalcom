@@ -1615,6 +1615,80 @@ def __test_execute_exit_rejects_when_only_flagged_entry_exists__(tmp_path):
     store.close()
 
 
+def __test_execute_exit_no_entry_row_but_open_position_raises_bracket_attach__(
+        tmp_path,
+):
+    """Defense-in-depth path for the startup-orphan-race crash.
+
+    Reproduces the live scenario where, on a fresh bar after the
+    plugin retired stale orphan rows, ``_find_active_entry_row``
+    returns ``None`` (no live entry row remains) but the exchange
+    still reports an OPEN position. Without this fix the bot raised
+    a plain :class:`ExchangeOrderRejectedError` and halted, leaving
+    the unprotected position exposed indefinitely.
+
+    The fix probes ``get_position`` and, when a position is open,
+    raises :class:`BracketAttachAfterFillRejectedError` so the sync
+    engine's defensive-close path fires and flattens the position.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {
+            'positions': [{
+                'market': {'epic': 'EURUSD'},
+                'position': {
+                    'direction': 'BUY', 'size': 1.0,
+                    'level': 1.17600, 'upl': 0.0,
+                },
+            }],
+        },
+    })
+    # NB: deliberately seed NO entry row in BrokerStore — that is the
+    # whole point of the race we are testing.
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.18000, sl_price=1.17000,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(broker.execute_exit(env))
+    err = exc.value
+    assert err.symbol == 'EURUSD'
+    assert err.position_side == 'buy'
+    assert err.qty == 1.0
+    assert err.from_entry == 'Long'
+    # Surrogate ids must be deterministic across retries so a follow-up
+    # cycle converges on the same defensive CloseIntent envelope.
+    assert err.position_coid == '__pyne_orphan__EURUSD__Long'
+    assert err.position_deal_id == '__pyne_orphan__EURUSD__Long'
+    store.close()
+
+
+def __test_execute_exit_no_entry_row_no_open_position_raises_plain_reject__(
+        tmp_path,
+):
+    """Symmetric guard: with NO entry row AND NO open position, the
+    plugin must keep raising :class:`ExchangeOrderRejectedError`
+    (not the bracket-attach variant). Nothing is exposed on the
+    exchange, so the defensive-close path would only do harm.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+    })
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.18000, sl_price=1.17000,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(ExchangeOrderRejectedError) as exc:
+        asyncio.run(broker.execute_exit(env))
+    assert not isinstance(exc.value, BracketAttachAfterFillRejectedError)
+    store.close()
+
+
 def __test_process_activity_closing_leg_side_is_opposite_of_entry__(tmp_path):
     """Bug B (corrected): Capital.com's ``direction`` field on a TP/SL
     close activity reports the POSITION direction (``'BUY'`` for a long
