@@ -26,6 +26,7 @@ Final MRO:
 LiveProviderPlugin → ProviderPlugin → Plugin → object``.
 """
 import asyncio
+import collections
 import threading
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
@@ -108,6 +109,29 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     _last_ohlc_event_ts: float
     _last_quote_event_ts: float
     _last_bar_open_ts: float
+
+    # --- WS-primary volume state ---
+    # Per-bar quote tick buckets keyed by bar OPEN time (seconds, UTC).
+    # The listener increments a bucket on every ``quote`` event using the
+    # event's own ``timestamp`` (ms) so reconnects do not contaminate
+    # already-closed bars.
+    _ws_quote_buckets: dict[int, int]
+    # Wallclock (epoch seconds) at the most recent successful WS handshake.
+    # Bars whose OPEN predates this stamp are partial-coverage and MUST
+    # fall back to REST instead of contributing to the rolling baseline.
+    _ws_coverage_started_at: float
+    # Rolling history of the last N "good" full-coverage WS quote counts.
+    # Used to compute a median for the low-ratio fallback trigger AND for
+    # the REST-failed estimate. REST-substituted bars are NOT appended.
+    _ws_volume_baseline: collections.deque[int]
+    # Consecutive count of full-coverage bars where REST confirmed the WS
+    # value was bogus (zero or <low_ratio * median). At the configured
+    # threshold the worker closes the WS so live_runner reconnects.
+    _ws_bad_bar_streak: int
+    # One-shot flag for the missing-``timestamp``-on-quote warning so the
+    # log is not flooded if Capital.com regresses the payload shape.
+    # Reset on every successful ``connect()``.
+    _ws_quote_timestamp_warned: bool
 
     # --- Caches & cursors ---
     _account_preferences: dict | None

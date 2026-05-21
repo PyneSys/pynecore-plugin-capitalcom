@@ -17,6 +17,7 @@ that declares the cross-mix-in surface for static analysers. The
 *all* the instance state.
 """
 import asyncio
+import collections
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -180,6 +181,20 @@ class CapitalCom(
         # event-arrival wallclock), so the watchdog can fire BEFORE
         # the framework synth would.
         self._last_bar_open_ts: float = 0.0
+
+        # WS-primary volume state. The listener buckets every ``quote``
+        # event into ``_ws_quote_buckets`` keyed by the quote's own bar
+        # OPEN (derived from its ``timestamp``). The backfill worker
+        # consumes the bucket at bar close; REST is only consulted for
+        # partial coverage, zero quotes, or values far below the
+        # rolling baseline. See :meth:`_volume_backfill_worker_loop`.
+        self._ws_quote_buckets: dict[int, int] = {}
+        self._ws_coverage_started_at: float = 0.0
+        self._ws_volume_baseline: collections.deque[int] = collections.deque(
+            maxlen=self.config.ws_volume_baseline_bars,
+        )
+        self._ws_bad_bar_streak: int = 0
+        self._ws_quote_timestamp_warned: bool = False
 
         # Session calendar cache (populated by ``update_symbol_info``).
         # Until the first call lands a ``SymInfo``, watchdogs treat

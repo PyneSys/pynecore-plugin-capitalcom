@@ -18,10 +18,13 @@ updates) over a single WS endpoint. This mix-in owns:
 State touched: ``_ws``, ``_update_queue``, ``_listen_task``,
 ``_ping_task``, ``_feed_watchdog_task``, ``_last_payload_ts``,
 ``_last_bar_timestamp``, ``_last_bar_ohlcv``, ``_last_bid``,
-``_last_ask``, ``_tick_volume``.
+``_last_ask``, ``_tick_volume``, ``_ws_quote_buckets``,
+``_ws_coverage_started_at``, ``_ws_volume_baseline``, ``_ws_bad_bar_streak``.
 """
 import asyncio
+import collections
 import json
+import statistics
 from datetime import datetime, timezone
 from time import time as epoch_time
 from zoneinfo import ZoneInfo
@@ -145,70 +148,141 @@ class _StreamingMixin(_CapitalComBase):
         # loop so the watchdog does not fire while we are still in the
         # subscribe handshake (no market payloads yet by definition).
         self._last_payload_ts = epoch_time()
-        # noinspection PyBroadException
         try:
             async for raw in self._ws:
                 self._last_payload_ts = epoch_time()
-                data = json.loads(raw)
-                dest = data.get("destination", "")
-                if dest == "ohlc.event":
-                    payload_dict = data.get("payload") or {}
-                    price_type = str(
-                        payload_dict.get("priceType", "bid")
-                    ).lower()
-                    if price_type != "bid":
-                        # Ask-side duplicate (Pine OHLC is bid-side);
-                        # drop entirely instead of routing through the
-                        # backfill worker just to be filtered later.
-                        # Do NOT advance liveness markers from an ask
-                        # payload: if the bid candle was dropped
-                        # server-side but the ask duplicate still
-                        # arrived, advancing here would mask the missing
-                        # bid bar from the OHLC watchdog.
-                        continue
-                    self._last_ohlc_event_ts = epoch_time()
-                    t_ms = payload_dict.get("t")
-                    if t_ms is not None:
-                        # Stamp the bar OPEN of the latest forwarded event
-                        # so the OHLC watchdog can anchor on the same axis
-                        # as live_runner's synth deadline (bar-time, not
-                        # arrival-wallclock).
-                        self._last_bar_open_ts = float(t_ms) / 1000.0
-                    # Snapshot the per-bar tick count synchronously with
-                    # the bar boundary and reset to 0 for the next bar.
-                    # Attach the snapshot to the payload so the backfill
-                    # worker can fall back to it if REST has not yet
-                    # published the bar's ``lastTradedVolume``.
-                    payload_dict["_tick_volume_snapshot"] = self._tick_volume
-                    self._tick_volume = 0
-                    await raw_q.put(("ohlc", payload_dict))
-                elif dest == "quote":
-                    payload = data.get("payload") or {}
-                    bid: float | str | None = payload.get("bid")
-                    ofr: float | str | None = payload.get("ofr")
-                    if bid is not None:
-                        self._last_bid = float(bid)
-                    if ofr is not None:
-                        self._last_ask = float(ofr)
-                    self._tick_volume += 1
-                    # Stamp the quote-liveness anchor so the OHLC watchdog
-                    # can tell "quotes still flowing => token-bound OHLC
-                    # failure, must reconnect" from "quotes also idle =>
-                    # expected market-closed gap, do not reconnect".
-                    self._last_quote_event_ts = epoch_time()
-                    # Route quotes through the same FIFO queue as bid
-                    # bars so the volume backfill worker preserves
-                    # stream order: a quote that arrives after a closed
-                    # bar must not reach ``_update_queue`` ahead of
-                    # that bar while REST volume resolution is in
-                    # flight. Otherwise ``_synth_from_quote`` would
-                    # mutate/emit the previous bar with next-bar prices
-                    # before the closed bar lands.
-                    await raw_q.put(("quote", None))
+                try:
+                    data = json.loads(raw)
+                    dest = data.get("destination", "")
+                    if dest == "ohlc.event":
+                        payload_dict = data.get("payload") or {}
+                        price_type = str(
+                            payload_dict.get("priceType", "bid")
+                        ).lower()
+                        if price_type != "bid":
+                            # Ask-side duplicate (Pine OHLC is bid-side);
+                            # drop entirely instead of routing through
+                            # the backfill worker just to be filtered
+                            # later. Do NOT advance liveness markers
+                            # from an ask payload: if the bid candle
+                            # was dropped server-side but the ask
+                            # duplicate still arrived, advancing here
+                            # would mask the missing bid bar from the
+                            # OHLC watchdog.
+                            continue
+                        self._last_ohlc_event_ts = epoch_time()
+                        t_ms = payload_dict.get("t")
+                        if t_ms is not None:
+                            # Stamp the bar OPEN of the latest forwarded
+                            # event so the OHLC watchdog can anchor on
+                            # the same axis as live_runner's synth
+                            # deadline (bar-time, not arrival-wallclock).
+                            self._last_bar_open_ts = float(t_ms) / 1000.0
+                        # The worker owns volume resolution end-to-end:
+                        # it reads ``_ws_quote_buckets[bar_open_s]``
+                        # (filled by the quote branch using per-quote
+                        # ``timestamp``), decides REST vs. WS, and
+                        # resets ``_tick_volume`` for the synth
+                        # spinner. Doing the reset here would race a
+                        # late quote whose bucket the worker has not
+                        # yet pulled.
+                        await raw_q.put(("ohlc", payload_dict))
+                    elif dest == "quote":
+                        payload = data.get("payload") or {}
+                        bid: float | str | None = payload.get("bid")
+                        ofr: float | str | None = payload.get("ofr")
+                        if bid is not None:
+                            self._last_bid = float(bid)
+                        if ofr is not None:
+                            self._last_ask = float(ofr)
+                        # Bucket the tick into the bar the quote
+                        # actually belongs to (via its own
+                        # ``timestamp``), NOT into whichever bar
+                        # happens to be open when ``ohlc.event``
+                        # arrives. A reconnect mid-bar would otherwise
+                        # stamp ``_tick_volume`` against the new
+                        # connection's current bar, then close it as
+                        # if it were the full count -> deterministic
+                        # V=1 contamination. With bucketing, a partial
+                        # bar (started before WS came up) gets routed
+                        # through the REST fallback path by the worker
+                        # because the bar's open predates
+                        # ``_ws_coverage_started_at``.
+                        ts_ms = payload.get("timestamp")
+                        if ts_ms is None:
+                            # Defensive: docs guarantee ``timestamp``;
+                            # if a server build ever omits it, fall
+                            # back to wallclock and warn once per
+                            # connection so we notice the regression.
+                            if not self._ws_quote_timestamp_warned:
+                                broker_warning(
+                                    "Capital.com quote payload missing "
+                                    "'timestamp'; falling back to "
+                                    "wallclock for bar bucketing "
+                                    "(payload keys=%s)",
+                                    sorted(payload.keys()),
+                                )
+                                self._ws_quote_timestamp_warned = True
+                            ts_ms = int(epoch_time() * 1000)
+                        tf_seconds = (int(in_seconds(self.timeframe))
+                                      if self.timeframe is not None
+                                      else 0)
+                        if tf_seconds > 0:
+                            ts_s = int(ts_ms) // 1000
+                            bar_open_s = ts_s - (ts_s % tf_seconds)
+                            self._ws_quote_buckets[bar_open_s] = (
+                                self._ws_quote_buckets.get(bar_open_s, 0)
+                                + 1
+                            )
+                        # Global counter remains the source for the
+                        # intra-bar synth spinner
+                        # (``_synth_from_quote``). The worker resets it
+                        # when the bid bar closes so the next bar's
+                        # spinner starts from 0, matching the legacy
+                        # behaviour.
+                        self._tick_volume += 1
+                        # Stamp the quote-liveness anchor so the OHLC
+                        # watchdog can tell "quotes still flowing =>
+                        # token-bound OHLC failure, must reconnect"
+                        # from "quotes also idle => expected
+                        # market-closed gap, do not reconnect".
+                        self._last_quote_event_ts = epoch_time()
+                        # Route quotes through the same FIFO queue as
+                        # bid bars so the volume backfill worker
+                        # preserves stream order: a quote that arrives
+                        # after a closed bar must not reach
+                        # ``_update_queue`` ahead of that bar while
+                        # REST volume resolution is in flight.
+                        # Otherwise ``_synth_from_quote`` would
+                        # mutate/emit the previous bar with next-bar
+                        # prices before the closed bar lands.
+                        await raw_q.put(("quote", None))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # A single malformed frame must not bring the WS
+                    # loop down. Until this hardening landed every
+                    # exception in the per-frame body silently exited
+                    # the listener, posted the disconnect sentinel,
+                    # and forced a full reconnect cycle. Log the
+                    # offender and keep reading: the next frame may be
+                    # perfectly fine.
+                    broker_warning(
+                        "Capital.com WS frame handler raised %s: %s; "
+                        "continuing",
+                        type(exc).__name__, exc,
+                    )
+                    continue
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            # Loop-level failure (likely from ``async for raw in self._ws``
+            # itself: socket reset, decode error past json.loads, etc.).
+            # Surface it so the next reconnect is not a complete mystery.
+            broker_warning(
+                "Capital.com WS listener loop ended with %s: %s",
+                type(exc).__name__, exc,
+            )
         finally:
             # Live runner reconnect is gated on a ``None`` sentinel in
             # the consumer queue. Route the disconnect signal through
@@ -609,85 +683,75 @@ class _StreamingMixin(_CapitalComBase):
             pass
 
     async def _volume_backfill_worker_loop(self) -> None:
-        """Resolve REST volume for each bid bar in FIFO order, then enqueue.
+        """Resolve volume for each bid bar — WS-primary, REST fallback.
 
-        Capital.com's WS ``ohlc.event`` carries no volume field, and
-        the local tick counter is roughly an order of magnitude below
-        the real per-bar ``lastTradedVolume`` because the ``quote``
-        stream is throttled to snapshot-rate, not every underlying
-        tick. The authoritative source is REST ``lastTradedVolume``.
+        Capital.com's WS ``ohlc.event`` carries no volume field. The
+        per-quote ``timestamp`` is bucketed into
+        :attr:`_ws_quote_buckets` by the listener (one bucket per
+        bar OPEN), giving an authoritative tick-volume proxy *for full-
+        coverage bars*. REST ``lastTradedVolume`` is the safety net
+        for three suspect cases: partial coverage (bar started before
+        the WS came up), zero quotes (the quote feed dropped silently),
+        or a value far below the rolling baseline (silent throttling).
 
-        Resolving REST volume inside ``watch_ohlcv`` is fatal: the
-        roundtrip can take ~1s, and on publish-lag spikes the
-        framework's ``wait_for(timeout=2.0)`` in ``live_runner``
-        trips and emits a V=0 synth bar - exactly the failure mode
-        the OHLC watchdog tries to prevent. Solution: move REST
-        volume resolution off the consumer path entirely. The
-        listener parks raw bid payloads on :attr:`_raw_ohlc_queue`
-        (snapshot-and-resetting :attr:`_tick_volume` synchronously
-        with the bar boundary). This worker drains that queue in
-        FIFO order, performs the REST call via
-        :func:`asyncio.to_thread` (the underlying HTTP call is sync
-        and would otherwise block the event loop), writes the
-        resolved volume into the payload, and forwards it to
-        :attr:`_update_queue`. ``watch_ohlcv`` then receives
-        ready-to-emit payloads and never blocks on REST.
+        Why WS-primary, not REST-primary as before: a REST roundtrip
+        per closed bar burns the rate-limit budget and adds ~1s of
+        publish-lag risk. The quote-bucket count is already a sound
+        live-volume proxy; REST only earns its keep when the WS value
+        is structurally suspect.
 
-        Quote frames are routed through this same FIFO queue (tagged
-        ``"quote"``) so a quote that arrives after a closed bar cannot
-        overtake the bar while its REST volume is being resolved.
-        Quotes carry no payload and need no REST lookup; the worker
-        simply forwards them to :attr:`_update_queue` in arrival
-        order. Without this routing the previous design pushed quotes
-        directly to :attr:`_update_queue` while the closed bar was
-        still parked in :attr:`_raw_ohlc_queue`, and
-        :meth:`_synth_from_quote` would mutate/emit the previous bar
-        with next-bar prices before the closed bar landed.
+        Why per-bar buckets, not a global counter as before: a
+        reconnect partway through a bar would otherwise stamp the new
+        connection's tick count against the current bar at bar close,
+        producing a deterministic V=1 contamination. With timestamp
+        bucketing, the worker recognises the bar as partial (open
+        predates :attr:`_ws_coverage_started_at`) and falls through to
+        REST.
 
-        Per-bar ordering is preserved because the worker is the
-        single consumer of :attr:`_raw_ohlc_queue` and serialises its
-        REST calls; bars cannot reorder by completing REST out of
-        order, and quotes interleaved with bars retain their relative
-        position.
+        Fallback decision matrix (full chain):
 
-        Publish-lag handling: if REST returns 0 (the bar's
-        ``lastTradedVolume`` is not yet published), fall back to the
-        per-bar tick snapshot attached by the listener. The volume
-        scale is then briefly low for that one bar instead of stalling
-        the strategy on a sleep-based retry.
+        =====================================  =============================
+        Case                                   Emitted volume
+        =====================================  =============================
+        ws_vol > 0 AND full coverage AND       ws_vol (also appended to
+        (no baseline OR ws_vol >= median*r)    rolling baseline)
+        partial coverage OR ws_vol == 0 OR     REST if > 0; else median
+        (baseline ready AND ws < median*r)     estimate if baseline ready;
+                                               else raw ws_vol + warning
+        =====================================  =============================
+
+        REST-confirmed-bad streak: when REST fires for a full-coverage
+        bar and returns a real number, the worker increments
+        :attr:`_ws_bad_bar_streak`. At
+        :attr:`CapitalComConfig.ws_volume_bad_bar_reconnect_threshold`
+        consecutive hits the WS is closed (``code=4001``,
+        ``reason="quote-volume-stale"``) so the live_runner reconnects
+        — mirrors the OHLC watchdog's stale-subscription recovery.
+        Partial-coverage bars NEVER count toward this streak.
+
+        Quote frames are forwarded verbatim and preserve their order
+        relative to in-flight bid bars (single-consumer FIFO).
 
         REST stall bound: the underlying ``httpx`` client uses a 50s
-        request timeout, but every frame queued behind a stalled REST
-        call - including subsequent quotes - is delayed by the full
-        timeout. On the live_runner side that can both delay closed
-        bars past ``2*tf + bar_grace`` (triggering a V=0 synth that
-        then dedups the real bar away once it finally lands) and
-        freeze intra-bar synth between quote ticks. Cap the REST
-        volume lookup at ``BACKFILL_VOLUME_TIMEOUT_S`` so a slow REST
-        roundtrip degrades to the tick snapshot rather than holding
-        the OHLC pipeline. Normal latency is ~1s; the cap is well
-        below the framework's 15s grace floor so a single bar's
-        volume miss never cascades into framework-synth territory.
+        request timeout. Cap each REST lookup at
+        ``backfill_volume_timeout_s`` (5s), further shrunk against the
+        live_runner's per-bar synth deadline, so a slow roundtrip
+        degrades to the median estimate (or raw WS) instead of holding
+        the OHLC pipeline.
         """
         assert (self._raw_ohlc_queue is not None
                 and self._update_queue is not None)
         raw_q = self._raw_ohlc_queue
         out_q = self._update_queue
         backfill_volume_timeout_s = 5.0
-        # Safety margin so the bar reaches ``_update_queue`` AND is
-        # consumed by ``live_runner``'s ``wait_for`` before its
-        # synth-deadline check fires. Covers asyncio loop scheduling
-        # plus the consumer thread's pickup latency.
         synth_deadline_margin_s = 1.0
         tf_seconds = (float(in_seconds(self.timeframe))
                       if self.timeframe is not None else 0.0)
         # Mirror ``live_runner.py``'s ``bar_grace`` formula EXACTLY so the
         # deadline budget matches the framework's synth deadline for THIS
-        # TF. For tf>=60s the actual grace is 30s (not 15s), so hardcoding
-        # the 15s floor would shrink ``rest_timeout_s`` to zero for bars
-        # that arrive 15-30s past close even though there is still safe
-        # time to fetch authoritative REST volume.
+        # TF. For tf>=60s the actual grace is 30s (not 15s).
         framework_grace_s = max(15.0, min(tf_seconds * 0.5, 30.0))
+        cfg = self.config
         try:
             while True:
                 event_type, payload = await raw_q.get()
@@ -705,100 +769,238 @@ class _StreamingMixin(_CapitalComBase):
                     # relative to any in-flight bid bar.
                     await out_q.put((event_type, payload))
                     continue
-                assert payload is not None
-                timestamp = int(payload["t"] / 1000)
-                tick_vol = int(payload.pop("_tick_volume_snapshot", 0))
-                # Cap the REST volume timeout against the framework's
-                # synth deadline for THIS bar. ``live_runner`` synths
-                # the missing slot at ``bar_open + tf + bar_grace``;
-                # subtracting a small margin gives the worst-case budget
-                # for this bar to reach the consumer. If a late bid bar
-                # (e.g. close+28s on a 1m TF) leaves less than the
-                # configured ``backfill_volume_timeout_s``, shrink the
-                # REST wait to the remaining budget — never hold the
-                # already-received closed bar long enough that the
-                # framework emits a V=0 synth and then dedups the real
-                # bar away.
-                bar_open_s = float(payload["t"]) / 1000.0
-                budget_s = (
-                    bar_open_s + tf_seconds + framework_grace_s
-                    - epoch_time() - synth_deadline_margin_s
-                )
-                rest_timeout_s = min(
-                    backfill_volume_timeout_s, max(0.0, budget_s),
-                )
-                # WS is already going down (or gone): skip REST and ship
-                # with the tick snapshot immediately. Otherwise this
-                # worker can block up to ``backfill_volume_timeout_s``
-                # while ``live_runner`` races through its 2s
-                # ``wait_for`` timeout, sees ``is_connected=False``,
-                # raises ``ConnectionError`` and tears the consumer
-                # queue down. The bar then lands on a queue nobody is
-                # reading anymore and is lost on reconnect. Draining the
-                # worker fast lets the bar reach ``_update_queue``
-                # before ``live_runner`` gives up.
-                ws = self._ws
-                ws_down = ws is None or ws.close_code is not None
-                if ws_down:
-                    broker_warning(
-                        "REST volume lookup skipped for ts=%d "
-                        "(WS disconnecting) - falling back to tick snapshot",
-                        timestamp,
+                try:
+                    await self._process_ohlc_payload(
+                        payload,
+                        out_q=out_q,
+                        cfg=cfg,
+                        tf_seconds=tf_seconds,
+                        framework_grace_s=framework_grace_s,
+                        synth_deadline_margin_s=synth_deadline_margin_s,
+                        backfill_volume_timeout_s=backfill_volume_timeout_s,
                     )
-                    rest_vol = 0.0
-                elif rest_timeout_s <= 0.0:
-                    # No headroom left; ship with the tick snapshot
-                    # instead of risking a synth/dedup loss.
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
                     broker_warning(
-                        "REST volume lookup skipped for ts=%d "
-                        "(bar age %.1fs, no budget vs framework synth) "
-                        "- falling back to tick snapshot",
-                        timestamp, epoch_time() - bar_open_s - tf_seconds,
+                        "Volume backfill worker dropped bar payload "
+                        "(t=%s) due to %s: %s",
+                        payload.get("t") if payload else None,
+                        type(exc).__name__, exc,
                     )
-                    rest_vol = 0.0
-                else:
-                    try:
-                        rest_vol = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self._fetch_bar_volume, timestamp,
-                            ),
-                            timeout=rest_timeout_s,
-                        )
-                    except asyncio.TimeoutError:
-                        # REST stalled past our budget; fall back to
-                        # the tick snapshot so the closed bar (and every
-                        # frame queued behind it) is not held hostage by
-                        # a slow ``lastTradedVolume`` lookup. The
-                        # orphaned ``to_thread`` blocks one worker
-                        # thread until the underlying httpx request
-                        # times out at 50s, but the OHLC pipeline is no
-                        # longer blocked.
-                        broker_warning(
-                            "REST volume lookup timed out for ts=%d "
-                            "after %.1fs - falling back to tick snapshot",
-                            timestamp, rest_timeout_s,
-                        )
-                        rest_vol = 0.0
-                    except Exception:
-                        rest_vol = 0.0
-                payload["_volume"] = (
-                    rest_vol if rest_vol > 0.0 else float(tick_vol)
-                )
-                await out_q.put(("ohlc", payload))
         except asyncio.CancelledError:
-            # Wake any consumer parked on ``watch_ohlcv`` so a
-            # ``disconnect()`` that cancels us mid-flight (e.g. when
-            # ``wait_for(worker, timeout=6.0)`` fires because REST or
-            # the raw queue is wedged) still releases the consumer
-            # queue with a single sentinel. Without this, ``wait_for``
-            # would return normally (CancelledError absorbed here),
-            # the caller would mark us as "drained", and the
-            # safety-net ``None`` would be skipped — parking any
-            # ``watch_ohlcv()`` consumer on the old queue indefinitely.
             try:
                 out_q.put_nowait(None)
             except asyncio.QueueFull:
                 pass
+            return
+        except Exception as exc:
+            # Unhandled exception in the outer loop: surface the WS
+            # disconnect sentinel so the consumer wakes up and the
+            # live_runner reconnects instead of waiting forever on the
+            # dead worker.
+            broker_warning(
+                "Volume backfill worker died: %s: %s",
+                type(exc).__name__, exc,
+            )
+            try:
+                out_q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+            return
+
+    async def _process_ohlc_payload(
+        self,
+        payload: dict,
+        *,
+        out_q: asyncio.Queue,
+        cfg,
+        tf_seconds: float,
+        framework_grace_s: float,
+        synth_deadline_margin_s: float,
+        backfill_volume_timeout_s: float,
+    ) -> None:
+        """Body of :meth:`_volume_backfill_worker_loop` for a single bar.
+
+        Extracted so the worker loop can catch per-bar exceptions and
+        drop just the offending bar instead of tearing down the whole
+        pipeline.
+        """
+        assert payload is not None
+        bar_open_s_int = int(payload["t"]) // 1000
+        bar_open_s = float(payload["t"]) / 1000.0
+        # Pull this bar's quote bucket and drop any older orphans
+        # (late quotes that never made it before the bar closed are
+        # unrecoverable; Capital.com's throttled feed makes the
+        # window vanishingly small).
+        ws_vol = self._ws_quote_buckets.pop(bar_open_s_int, 0)
+        for stale_ts in [k for k in self._ws_quote_buckets
+                         if k < bar_open_s_int]:
+            self._ws_quote_buckets.pop(stale_ts, None)
+
+        is_partial = bar_open_s_int < self._ws_coverage_started_at
+        baseline = self._ws_volume_baseline
+        baseline_ready = (
+            len(baseline) >= cfg.ws_volume_min_baseline_bars
+        )
+        rolling_median: float = (
+            float(statistics.median(baseline))
+            if baseline_ready else 0.0
+        )
+        low_ratio = (
+            baseline_ready
+            and ws_vol < rolling_median * cfg.ws_volume_low_ratio
+        )
+        need_rest = is_partial or ws_vol == 0 or low_ratio
+
+        rest_vol: float = 0.0
+        rest_attempted = False
+        if need_rest:
+            rest_vol = await self._fetch_bar_volume_with_budget(
+                bar_open_s_int,
+                bar_open_s=bar_open_s,
+                tf_seconds=tf_seconds,
+                framework_grace_s=framework_grace_s,
+                synth_deadline_margin_s=synth_deadline_margin_s,
+                backfill_volume_timeout_s=backfill_volume_timeout_s,
+            )
+            rest_attempted = True
+
+        chosen: float
+        reason: str
+        if not need_rest:
+            chosen = float(ws_vol)
+            reason = "ws_primary"
+            baseline.append(ws_vol)
+        elif rest_vol > 0.0:
+            chosen = rest_vol
+            reason = (
+                "partial" if is_partial
+                else ("zero" if ws_vol == 0 else "low_ratio")
+            )
+        elif baseline_ready:
+            chosen = rolling_median
+            reason = "rest_failed_median_estimate"
+        else:
+            chosen = float(ws_vol)
+            reason = "rest_failed_no_baseline"
+            broker_warning(
+                "WS volume fallback chain exhausted for ts=%d "
+                "(ws=%d, no baseline); emitting raw count",
+                bar_open_s_int, ws_vol,
+            )
+
+        if reason != "ws_primary":
+            broker_warning(
+                "WS volume fallback (ts=%d, reason=%s, "
+                "ws=%d, rest=%.1f, median=%.1f)",
+                bar_open_s_int, reason, ws_vol,
+                rest_vol, rolling_median,
+            )
+
+        # REST-confirmed bad streak: bump only when the WS value
+        # was demonstrably wrong on a *full-coverage* bar (REST
+        # returned a real number and we trusted it over WS).
+        # Partial bars never count — those are expected after
+        # every reconnect.
+        if (rest_attempted and not is_partial
+                and rest_vol > 0.0):
+            self._ws_bad_bar_streak += 1
+        elif not need_rest:
+            self._ws_bad_bar_streak = 0
+        # `rest_failed_*` paths leave the streak unchanged: we
+        # could not confirm whether the WS was wrong or REST was
+        # simply unavailable.
+
+        payload["_volume"] = chosen
+        await out_q.put(("ohlc", payload))
+
+        # Reset the global tick counter at bar close so
+        # ``_synth_from_quote`` starts the next bar's intra-bar
+        # spinner from 0 (matches legacy spinner behaviour). Doing
+        # this here, not in the listener, avoids a race against a
+        # late quote whose bucket the worker has yet to consume.
+        self._tick_volume = 0
+
+        if (self._ws_bad_bar_streak
+                >= cfg.ws_volume_bad_bar_reconnect_threshold):
+            streak = self._ws_bad_bar_streak
+            self._ws_bad_bar_streak = 0
+            ws = self._ws
+            if ws is not None and ws.close_code is None:
+                broker_warning(
+                    "WS quote-volume stale "
+                    "(consecutive bad bars=%d), forcing reconnect",
+                    streak,
+                )
+                try:
+                    await ws.close(
+                        code=4001,
+                        reason="quote-volume-stale",
+                    )
+                except (WebSocketException, OSError):
+                    # Already-broken socket: the listener's finally
+                    # clause delivers the sentinel anyway, so
+                    # swallow and let the loop drain.
+                    pass
+
+    async def _fetch_bar_volume_with_budget(
+        self,
+        timestamp: int,
+        *,
+        bar_open_s: float,
+        tf_seconds: float,
+        framework_grace_s: float,
+        synth_deadline_margin_s: float,
+        backfill_volume_timeout_s: float,
+    ) -> float:
+        """REST lastTradedVolume with synth-deadline-aware timeout cap.
+
+        Returns ``0.0`` on every kind of miss (WS down, no budget left,
+        timeout, exception, or REST returns 0). Callers must treat 0
+        as "REST did not deliver a usable value" — they may then fall
+        through to a rolling-median estimate or raw WS count.
+
+        Budget logic mirrors ``live_runner.py``'s synth deadline so a
+        slow REST roundtrip degrades to the fallback path instead of
+        holding the bar past the framework's V=0 synth window.
+        """
+        budget_s = (
+            bar_open_s + tf_seconds + framework_grace_s
+            - epoch_time() - synth_deadline_margin_s
+        )
+        rest_timeout_s = min(
+            backfill_volume_timeout_s, max(0.0, budget_s),
+        )
+        ws = self._ws
+        ws_down = ws is None or ws.close_code is not None
+        if ws_down:
+            broker_warning(
+                "REST volume lookup skipped for ts=%d "
+                "(WS disconnecting)",
+                timestamp,
+            )
+            return 0.0
+        if rest_timeout_s <= 0.0:
+            broker_warning(
+                "REST volume lookup skipped for ts=%d "
+                "(bar age %.1fs, no budget vs framework synth)",
+                timestamp, epoch_time() - bar_open_s - tf_seconds,
+            )
+            return 0.0
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_bar_volume, timestamp),
+                timeout=rest_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            broker_warning(
+                "REST volume lookup timed out for ts=%d after %.1fs",
+                timestamp, rest_timeout_s,
+            )
+            return 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     def _fetch_bar_payload(self, timestamp: int) -> dict | None:
         """Fetch a single closed bar from REST as an ohlc.event payload.
@@ -888,6 +1090,19 @@ class _StreamingMixin(_CapitalComBase):
         self._update_queue = asyncio.Queue()
         self._raw_ohlc_queue = asyncio.Queue()
         self._tick_volume = 0
+        # WS-primary volume state. Buckets restart per-connect because
+        # they key on the THIS connection's quote stream; baseline is
+        # also fresh — the rolling median is only useful between bars
+        # from the same WS coverage window, so a quick reconnect would
+        # otherwise mix pre- and post-reconnect counts that came from
+        # different feed-health epochs.
+        self._ws_quote_buckets = {}
+        self._ws_coverage_started_at = epoch_time()
+        self._ws_volume_baseline = collections.deque(
+            maxlen=self.config.ws_volume_baseline_bars,
+        )
+        self._ws_bad_bar_streak = 0
+        self._ws_quote_timestamp_warned = False
         # Seed the bar-time anchor from the warmup baseline if the
         # provider already loaded one. Without this, the OHLC
         # watchdog stays disarmed (``_last_bar_open_ts == 0.0`` short-
@@ -1051,6 +1266,10 @@ class _StreamingMixin(_CapitalComBase):
         self._tick_volume = 0
         self._last_bid = None
         self._last_ask = None
+        # Quote buckets are per-connection only — they cannot survive
+        # because the next ``connect()`` resets ``_ws_coverage_started_at``
+        # and any retained bucket would be misclassified as full-coverage.
+        self._ws_quote_buckets.clear()
 
     @property
     @override

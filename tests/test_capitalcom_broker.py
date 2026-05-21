@@ -8482,3 +8482,437 @@ def __test_market_open_now_true_inside_calendar_window__():
     )
     broker._sym_info = sym_info
     assert broker._market_open_now() is True
+
+
+# ---------------------------------------------------------------------------
+# WS-primary volume path (per-bar quote bucketing + REST fallback)
+# ---------------------------------------------------------------------------
+
+
+def _drive_listener_with_frames(broker, frames):
+    """Run ``_listen_loop`` against a fake WS yielding ``frames`` then EOF.
+
+    Helper for the WS-primary volume tests. Sets up ``_raw_ohlc_queue``
+    and ``_update_queue`` if absent, drives the listener until the fake
+    iterator is exhausted (which exits ``async for`` naturally), and
+    returns control to the caller. The listener's ``finally`` clause
+    puts the disconnect sentinel onto ``_raw_ohlc_queue`` afterwards.
+    """
+    if broker._raw_ohlc_queue is None:
+        broker._raw_ohlc_queue = asyncio.Queue()
+    if broker._update_queue is None:
+        broker._update_queue = asyncio.Queue()
+
+    class _ScriptedWS:
+        close_code = None
+
+        def __aiter__(self):
+            self._iter = iter(frames)
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def close(self, code=None, reason=None):
+            self.close_code = code
+
+    broker._ws = _ScriptedWS()
+    asyncio.run(broker._listen_loop())
+
+
+async def _run_worker_until_drained(broker, frames_into_raw_queue,
+                                    *, fake_fetch_bar_volume,
+                                    now_ts: float | None = None):
+    """Push frames into the raw queue, run the worker until drained.
+
+    ``frames_into_raw_queue`` is a list of ``(event_type, payload)``
+    tuples to put on ``_raw_ohlc_queue`` before starting the worker.
+    The function appends a final ``("disconnect", None)`` sentinel so
+    the worker exits cleanly after processing.
+
+    ``fake_fetch_bar_volume(timestamp) -> float`` replaces the
+    blocking REST call; it runs in the worker thread via the real
+    ``asyncio.to_thread`` indirection, so make it side-effect-only.
+
+    ``now_ts`` overrides ``streaming.epoch_time`` for the run so the
+    worker's synth-deadline budget math sees the OHLC bars as fresh
+    (otherwise a fixed historical ``payload["t"]`` would make
+    ``rest_timeout_s <= 0`` and skip REST). When provided, it is
+    derived from the first OHLC payload's ``t``: ``payload["t"] // 1000
+    + tf_seconds + 5`` (i.e. 5s past close).
+    """
+    import pynecore_capitalcom.streaming as streaming_mod
+
+    original_to_thread = streaming_mod.asyncio.to_thread
+    original_epoch = streaming_mod.epoch_time
+    original_fetch = broker._fetch_bar_volume
+
+    async def _direct_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    streaming_mod.asyncio.to_thread = _direct_to_thread  # type: ignore[assignment]
+    if now_ts is not None:
+        streaming_mod.epoch_time = lambda: now_ts  # type: ignore[assignment]
+    broker._fetch_bar_volume = fake_fetch_bar_volume  # type: ignore[assignment]
+    try:
+        for frame in frames_into_raw_queue:
+            broker._raw_ohlc_queue.put_nowait(frame)
+        broker._raw_ohlc_queue.put_nowait(("disconnect", None))
+        await broker._volume_backfill_worker_loop()
+    finally:
+        streaming_mod.asyncio.to_thread = original_to_thread  # type: ignore[assignment]
+        streaming_mod.epoch_time = original_epoch  # type: ignore[assignment]
+        broker._fetch_bar_volume = original_fetch  # type: ignore[assignment]
+
+
+def _make_volume_broker(tf="1"):
+    """Build a broker pre-configured for WS-primary volume tests.
+
+    Sets up the per-connect WS state directly so tests do not need a
+    full ``connect()`` (which would touch the real WS lib).
+    """
+    import collections as _collections
+
+    broker = _FakeBroker(
+        symbol="EURUSD", timeframe=tf, config=_make_config(),
+    )
+    broker._raw_ohlc_queue = asyncio.Queue()
+    broker._update_queue = asyncio.Queue()
+    broker._ws_quote_buckets = {}
+    broker._ws_volume_baseline = _collections.deque(
+        maxlen=broker.config.ws_volume_baseline_bars,
+    )
+    broker._ws_bad_bar_streak = 0
+    broker._ws_coverage_started_at = 0.0  # tests override per-case
+
+    class _AliveWS:
+        close_code = None
+        close_calls: list[tuple[int | None, str | None]] = []
+
+        async def close(self, code=None, reason=None):
+            self.close_calls.append((code, reason))
+            self.close_code = code
+
+    broker._ws = _AliveWS()
+    return broker
+
+
+def _drain_update_queue(broker):
+    out = []
+    while not broker._update_queue.empty():
+        item = broker._update_queue.get_nowait()
+        out.append(item)
+    return out
+
+
+def __test_ws_volume_normal_path_no_rest__():
+    """Full-coverage bar with N quotes emits ws_vol, never calls REST.
+
+    The bar opens AFTER ``_ws_coverage_started_at`` (so is_partial=False),
+    ``ws_vol > 0`` (no zero trigger), and there is no baseline yet (so
+    the low-ratio trigger cannot fire). The worker must pick the WS
+    count and NOT call REST.
+    """
+    broker = _make_volume_broker(tf="1")
+    bar_open_s = 1_700_000_000  # %60 == 0
+    bar_open_ms = bar_open_s * 1000
+    broker._ws_coverage_started_at = float(bar_open_s) - 10.0
+
+    broker._ws_quote_buckets[bar_open_s] = 10
+
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 999.0  # would be picked if REST fired
+
+    payload = {
+        "priceType": "bid", "t": bar_open_ms,
+        "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+    }
+    asyncio.run(_run_worker_until_drained(
+        broker, [("ohlc", payload)],
+        fake_fetch_bar_volume=_fake_fetch,
+    ))
+
+    items = _drain_update_queue(broker)
+    # First item is the OHLC payload; second is the None disconnect sentinel.
+    assert items[0][0] == "ohlc"
+    assert items[0][1]["_volume"] == 10.0
+    assert items[-1] is None
+    assert rest_calls == [], "REST must not fire on full-coverage ws_primary"
+    assert list(broker._ws_volume_baseline) == [10]
+    assert broker._ws_bad_bar_streak == 0
+
+
+def __test_ws_volume_partial_first_bar_uses_rest__():
+    """Bar that opened BEFORE WS coverage started is partial → REST."""
+    broker = _make_volume_broker(tf="1")
+    bar_open_s = 1_700_000_000
+    bar_open_ms = bar_open_s * 1000
+    # WS came up MID-bar (coverage_started_at > bar_open_s)
+    broker._ws_coverage_started_at = float(bar_open_s) + 30.0
+    broker._ws_quote_buckets[bar_open_s] = 1  # one quote captured mid-bar
+
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 137.0
+
+    payload = {
+        "priceType": "bid", "t": bar_open_ms,
+        "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+    }
+    asyncio.run(_run_worker_until_drained(
+        broker, [("ohlc", payload)],
+        fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(bar_open_s) + 65.0,  # 5s past 1m close
+    ))
+
+    items = _drain_update_queue(broker)
+    assert items[0][1]["_volume"] == 137.0
+    assert rest_calls == [bar_open_s]
+    assert list(broker._ws_volume_baseline) == [], (
+        "partial-coverage bars must NOT enter the baseline"
+    )
+    assert broker._ws_bad_bar_streak == 0, (
+        "partial bars never count toward the bad-bar streak"
+    )
+
+
+def __test_ws_volume_low_outlier_triggers_rest__():
+    """Baseline ready, new ws_vol way below median × ratio → REST."""
+    import collections as _collections
+
+    broker = _make_volume_broker(tf="1")
+    bar_open_s = 1_700_000_000
+    bar_open_ms = bar_open_s * 1000
+    broker._ws_coverage_started_at = float(bar_open_s) - 60.0
+    # Pre-seed baseline (≥ min) so the low-ratio branch is active.
+    broker._ws_volume_baseline = _collections.deque(
+        [100] * 6, maxlen=broker.config.ws_volume_baseline_bars,
+    )
+    broker._ws_quote_buckets[bar_open_s] = 1  # < 100 * 0.20
+
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 100.0
+
+    payload = {
+        "priceType": "bid", "t": bar_open_ms,
+        "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+    }
+    asyncio.run(_run_worker_until_drained(
+        broker, [("ohlc", payload)],
+        fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(bar_open_s) + 65.0,
+    ))
+
+    items = _drain_update_queue(broker)
+    assert items[0][1]["_volume"] == 100.0
+    assert rest_calls == [bar_open_s]
+    # REST-derived bar must NOT extend the baseline.
+    assert list(broker._ws_volume_baseline) == [100] * 6
+
+
+def __test_ws_volume_zero_triggers_rest__():
+    """Full-coverage bar with 0 quotes → REST fallback always fires."""
+    broker = _make_volume_broker(tf="1")
+    bar_open_s = 1_700_000_000
+    bar_open_ms = bar_open_s * 1000
+    broker._ws_coverage_started_at = float(bar_open_s) - 60.0
+    # No bucket entry for this bar → ws_vol == 0
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 42.0
+
+    payload = {
+        "priceType": "bid", "t": bar_open_ms,
+        "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+    }
+    asyncio.run(_run_worker_until_drained(
+        broker, [("ohlc", payload)],
+        fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(bar_open_s) + 65.0,
+    ))
+
+    items = _drain_update_queue(broker)
+    assert items[0][1]["_volume"] == 42.0
+    assert rest_calls == [bar_open_s]
+
+
+def __test_ws_volume_consecutive_bad_bars_force_reconnect__():
+    """Two REST-confirmed-bad full-coverage bars → WS close(4001)."""
+    import collections as _collections
+
+    broker = _make_volume_broker(tf="1")
+    base_open = 1_700_000_000
+    broker._ws_coverage_started_at = float(base_open) - 60.0
+    broker._ws_volume_baseline = _collections.deque(
+        [100] * 6, maxlen=broker.config.ws_volume_baseline_bars,
+    )
+    # Two consecutive bars at base+0 and base+60, both with ws=1
+    # (low_ratio), REST returns 100 each time.
+    for off in (0, 60):
+        broker._ws_quote_buckets[base_open + off] = 1
+
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 100.0
+
+    frames = []
+    for off in (0, 60):
+        frames.append(("ohlc", {
+            "priceType": "bid", "t": (base_open + off) * 1000,
+            "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+        }))
+    asyncio.run(_run_worker_until_drained(
+        broker, frames, fake_fetch_bar_volume=_fake_fetch,
+        # 5s past the FIRST bar's close — bar 2 budget then still wide
+        # open. The synth-deadline gate is per-bar; freezing wallclock
+        # at the older bar's age keeps both REST budgets positive.
+        now_ts=float(base_open) + 65.0,
+    ))
+
+    items = [item for item in _drain_update_queue(broker)
+             if item is not None]
+    # Both bars must have been delivered BEFORE the close fired.
+    assert len(items) == 2
+    assert all(it[1]["_volume"] == 100.0 for it in items)
+    assert rest_calls == [base_open, base_open + 60]
+    # WS close called exactly once with the reconnect signal.
+    assert broker._ws.close_calls == [(4001, "quote-volume-stale")]
+    # Streak counter reset after the close.
+    assert broker._ws_bad_bar_streak == 0
+
+
+def __test_ws_volume_rest_failed_emits_median__():
+    """Baseline ready, ws=0, REST returns 0 → emit rolling median."""
+    import collections as _collections
+
+    broker = _make_volume_broker(tf="1")
+    bar_open_s = 1_700_000_000
+    bar_open_ms = bar_open_s * 1000
+    broker._ws_coverage_started_at = float(bar_open_s) - 60.0
+    broker._ws_volume_baseline = _collections.deque(
+        [100] * 6, maxlen=broker.config.ws_volume_baseline_bars,
+    )
+    # ws_vol == 0 forces need_rest; fake REST also fails.
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 0.0
+
+    payload = {
+        "priceType": "bid", "t": bar_open_ms,
+        "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+    }
+    asyncio.run(_run_worker_until_drained(
+        broker, [("ohlc", payload)],
+        fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(bar_open_s) + 65.0,
+    ))
+
+    items = _drain_update_queue(broker)
+    assert items[0][1]["_volume"] == 100.0  # median of [100]*6
+    assert rest_calls == [bar_open_s]
+    assert broker._ws_bad_bar_streak == 0, (
+        "REST-failed median estimate must not bump the streak"
+    )
+
+
+def __test_ws_volume_rest_failed_no_baseline_emits_raw__():
+    """No baseline yet, ws=3, REST fails → emit raw 3 + warning."""
+    broker = _make_volume_broker(tf="1")
+    bar_open_s = 1_700_000_000
+    bar_open_ms = bar_open_s * 1000
+    broker._ws_coverage_started_at = float(bar_open_s) - 60.0
+    broker._ws_quote_buckets[bar_open_s] = 3  # triggers low_ratio? no:
+    # baseline empty → low_ratio short-circuits False. But ws>0 and
+    # !is_partial → need_rest is False. To force the REST path with no
+    # baseline, route via the zero branch instead: drop the bucket.
+    broker._ws_quote_buckets.pop(bar_open_s)
+
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 0.0
+
+    payload = {
+        "priceType": "bid", "t": bar_open_ms,
+        "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+    }
+    asyncio.run(_run_worker_until_drained(
+        broker, [("ohlc", payload)],
+        fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(bar_open_s) + 65.0,
+    ))
+
+    items = _drain_update_queue(broker)
+    # ws_vol was 0 (no bucket) and REST also failed; no baseline → raw 0.
+    assert items[0][1]["_volume"] == 0.0
+    assert rest_calls == [bar_open_s]
+    assert list(broker._ws_volume_baseline) == []
+
+
+def __test_ws_volume_listener_buckets_quotes_by_timestamp__():
+    """Listener routes per-quote ``timestamp`` into the correct bucket.
+
+    A reconnect-mid-bar quote that arrives AFTER the previous bar
+    closed must NOT pollute the previous bar's count; it must land in
+    the bucket corresponding to its own ``timestamp``.
+    """
+    broker = _make_volume_broker(tf="1")
+    # 60-aligned for tf=60: 1_700_000_040 % 60 == 0
+    bar_a_open_s = 1_700_000_040     # bar A
+    bar_b_open_s = bar_a_open_s + 60  # bar B
+    # Coverage started BEFORE bar A so both bars are full-coverage.
+    broker._ws_coverage_started_at = float(bar_a_open_s) - 5.0
+
+    # Three quotes for bar A (timestamps inside bar A), then one quote
+    # for bar B that arrives AFTER bar A's close (e.g. a late tick that
+    # in the old global-counter design would have been counted into the
+    # already-closed bar A).
+    quote_a_ts_ms = [
+        (bar_a_open_s + 10) * 1000,
+        (bar_a_open_s + 20) * 1000,
+        (bar_a_open_s + 40) * 1000,
+    ]
+    quote_b_ts_ms = (bar_b_open_s + 5) * 1000
+
+    frames = []
+    for ts in quote_a_ts_ms:
+        frames.append(json.dumps({
+            "destination": "quote",
+            "payload": {"bid": 1.0, "ofr": 1.0001, "timestamp": ts},
+        }))
+    # Bar A close arrives BEFORE bar B's quote
+    frames.append(json.dumps({
+        "destination": "ohlc.event",
+        "payload": {"priceType": "bid", "t": bar_a_open_s * 1000,
+                    "o": 1.0, "h": 1.001, "l": 0.999, "c": 1.0005},
+    }))
+    frames.append(json.dumps({
+        "destination": "quote",
+        "payload": {"bid": 1.0, "ofr": 1.0001, "timestamp": quote_b_ts_ms},
+    }))
+    _drive_listener_with_frames(broker, frames)
+
+    # Bar A's bucket should hold exactly 3; bar B's bucket should hold 1.
+    # The OHLC close did NOT consume the bucket (worker is not running
+    # in this test) — we are asserting the listener-side bucketing
+    # directly.
+    assert broker._ws_quote_buckets[bar_a_open_s] == 3
+    assert broker._ws_quote_buckets[bar_b_open_s] == 1

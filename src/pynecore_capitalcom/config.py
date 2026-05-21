@@ -46,3 +46,44 @@ class CapitalComConfig:
     pre-check. Five minutes is conservative — it bounds the staleness to
     one news-event window without flooding the rate-limited markets endpoint.
     """
+
+    ws_volume_baseline_bars: int = 20
+    """How many recent full-coverage WS quote counts to remember as the
+    rolling baseline for the volume sanity checks.
+
+    The baseline drives two decisions: the low-ratio outlier trigger
+    (``ws_volume < median * ws_volume_low_ratio`` → REST fallback) and the
+    median-estimate emitted when REST also fails. A 20-bar window keeps
+    the median responsive to session-level liquidity changes without being
+    swayed by a single quiet bar.
+    """
+
+    ws_volume_min_baseline_bars: int = 5
+    """Minimum baseline samples required before low-ratio and median-estimate
+    paths activate.
+
+    During the warmup window the worker emits raw WS counts even when they
+    look suspicious (no reliable median yet). REST still fires for the
+    ``ws_volume == 0`` and partial-coverage cases — those do not depend on
+    the baseline.
+    """
+
+    ws_volume_low_ratio: float = 0.20
+    """Multiplier applied to the rolling median when deciding whether a
+    full-coverage WS volume is low enough to warrant a REST sanity check.
+
+    With the default 0.20 a bar must come in below 20% of the median to
+    trigger REST. Tighter (smaller) values silence the trigger; looser
+    (larger) values burn REST budget on normal lulls.
+    """
+
+    ws_volume_bad_bar_reconnect_threshold: int = 2
+    """Consecutive REST-confirmed bad full-coverage bars after which the
+    worker forces a WS reconnect.
+
+    "Bad" means REST returned a real volume that disagreed materially with
+    the WS count (zero or low-ratio). Two in a row implies the quote feed
+    has gone silent while the OHLC subscription still ticks — the same
+    failure mode the OHLC watchdog handles for the other direction.
+    Partial-coverage bars never count toward this streak.
+    """
