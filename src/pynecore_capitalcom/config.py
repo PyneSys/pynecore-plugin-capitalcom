@@ -6,9 +6,11 @@ inert when the plugin is used for data ingest only.
 """
 from dataclasses import dataclass
 
+from pynecore.core.plugin import LiveProviderConfig
+
 
 @dataclass
-class CapitalComConfig:
+class CapitalComConfig(LiveProviderConfig):
     """Capital.com plugin configuration.
 
     Covers both the data-ingest and the order-execution side — one
