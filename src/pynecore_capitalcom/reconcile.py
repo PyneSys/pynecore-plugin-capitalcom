@@ -45,6 +45,7 @@ from pynecore.core.broker.models import (
 
 from ._base import _CapitalComBase
 from .exceptions import OrderNotFoundError
+from .helpers import _POLL_INTERVAL_S
 from .models import _compute_cumulative_fill
 
 
@@ -453,7 +454,7 @@ class _ReconcileMixin(_CapitalComBase):
         """
         if self.store_ctx is None:
             return
-        grace = max(5.0, self.config.poll_interval_seconds * 5.0)
+        grace = max(5.0, _POLL_INTERVAL_S * 5.0)
         now_ts = epoch_time()
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}

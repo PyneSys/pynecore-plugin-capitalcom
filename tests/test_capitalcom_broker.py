@@ -26,6 +26,7 @@ from pynecore_capitalcom import (
     CapitalComConfig,
     CapitalComError,
 )
+from pynecore_capitalcom.helpers import _WS_VOLUME_BASELINE_BARS
 from pynecore_capitalcom.plugin import _activity_fingerprint
 
 
@@ -500,11 +501,11 @@ def __test_execute_exit_trailing_with_activation_defers_put__(tmp_path):
 
 
 def __test_get_instrument_rules_ttl_expiry_refetches__(tmp_path, monkeypatch):
-    """Cache honours ``instrument_rules_ttl_seconds``: a stale entry forces
-    a re-fetch instead of indefinite reuse."""
-    broker, store, _ = _make_broker(
-        tmp_path,
-        config=_make_config(instrument_rules_ttl_seconds=30.0),
+    """Cache honours the TTL: a stale entry forces a re-fetch instead of
+    indefinite reuse."""
+    broker, store, _ = _make_broker(tmp_path)
+    monkeypatch.setattr(
+        'pynecore_capitalcom.provider._INSTRUMENT_RULES_TTL_S', 30.0,
     )
     fake_now = {'t': 1_000_000.0}
     monkeypatch.setattr(
@@ -1297,12 +1298,9 @@ def __test_trailing_monitor_activating_to_active_on_snapshot__(tmp_path):
 
 def __test_missing_pending_tracker_fires_unexpected_cancel__(tmp_path):
     # stop policy (BrokerPlugin default) → UnexpectedCancelError bubbles up.
-    broker, store, ctx = _make_broker(
-        tmp_path,
-        config=_make_config(
-            poll_interval_seconds=0.1,  # grace = max(5s, 0.5s) = 5s
-        ),
-    )
+    broker, store, ctx = _make_broker(tmp_path)
+    # 120s in the past easily exceeds the internal grace window
+    # (max(5s, _POLL_INTERVAL_S * 5) = 7.5s).
     old_ts = epoch_time_compat = __import__('time').time() - 120.0
     ctx.upsert_order('lost', symbol='EURUSD', side='buy', qty=1.0,
                      state='confirmed', pine_entry_id='Long',
@@ -1809,12 +1807,7 @@ def __test_natural_close_does_not_stamp_missing_pending__(tmp_path):
          ``missing_pending_since``.
       3. ``_missing_pending_tracker`` must not raise.
     """
-    broker, store, ctx = _make_broker(
-        tmp_path,
-        config=_make_config(
-            poll_interval_seconds=0.1,
-        ),
-    )
+    broker, store, ctx = _make_broker(tmp_path)
     e_coid, _, _ = _seed_bracket_setup(ctx)
     activity = {
         'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-L',
@@ -8583,7 +8576,7 @@ def _make_volume_broker(tf="1"):
     broker._update_queue = asyncio.Queue()
     broker._ws_quote_buckets = {}
     broker._ws_volume_baseline = _collections.deque(
-        maxlen=broker.config.ws_volume_baseline_bars,
+        maxlen=_WS_VOLUME_BASELINE_BARS,
     )
     broker._ws_bad_bar_streak = 0
     broker._ws_coverage_started_at = 0.0  # tests override per-case
@@ -8694,7 +8687,7 @@ def __test_ws_volume_low_outlier_triggers_rest__():
     broker._ws_coverage_started_at = float(bar_open_s) - 60.0
     # Pre-seed baseline (≥ min) so the low-ratio branch is active.
     broker._ws_volume_baseline = _collections.deque(
-        [100] * 6, maxlen=broker.config.ws_volume_baseline_bars,
+        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
     )
     broker._ws_quote_buckets[bar_open_s] = 1  # < 100 * 0.20
 
@@ -8757,7 +8750,7 @@ def __test_ws_volume_consecutive_bad_bars_force_reconnect__():
     base_open = 1_700_000_000
     broker._ws_coverage_started_at = float(base_open) - 60.0
     broker._ws_volume_baseline = _collections.deque(
-        [100] * 6, maxlen=broker.config.ws_volume_baseline_bars,
+        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
     )
     # Two consecutive bars at base+0 and base+60, both with ws=1
     # (low_ratio), REST returns 100 each time.
@@ -8805,7 +8798,7 @@ def __test_ws_volume_rest_failed_emits_median__():
     bar_open_ms = bar_open_s * 1000
     broker._ws_coverage_started_at = float(bar_open_s) - 60.0
     broker._ws_volume_baseline = _collections.deque(
-        [100] * 6, maxlen=broker.config.ws_volume_baseline_bars,
+        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
     )
     # ws_vol == 0 forces need_rest; fake REST also fails.
     rest_calls: list[int] = []

@@ -39,7 +39,7 @@ from pynecore.core.plugin import override
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
-from .helpers import _order_type_from_row, _parse_iso_timestamp
+from .helpers import _POLL_INTERVAL_S, _order_type_from_row, _parse_iso_timestamp
 from .models import _activity_fingerprint
 
 if TYPE_CHECKING:
@@ -69,11 +69,11 @@ class _ActivityMixin(_CapitalComBase):
            ``trail_price`` activation threshold on top of Capital's
            always-on native trailing.
 
-        Rate limits (3 GET per tick @ 1.5 s default cadence = 2 req/s)
+        Rate limits (3 GET per tick @ :data:`_POLL_INTERVAL_S` cadence)
         sit comfortably below Capital's 10 req/s account budget; 429s
         still trigger an exponential backoff.
         """
-        cadence = max(0.5, float(self.config.poll_interval_seconds))
+        cadence = _POLL_INTERVAL_S
         consecutive_429 = 0
         while True:
             try:
@@ -117,7 +117,9 @@ class _ActivityMixin(_CapitalComBase):
         self._current_poll_id += 1
         positions_resp = await self._call('positions', method='get')
         working_resp = await self._call('workingorders', method='get')
-        last_period = max(60, int(self.config.poll_interval_seconds * 10))
+        # Capital.com activity rolling window is 60s; ask for the full
+        # window each poll so a slow tick can't drop a fill.
+        last_period = 60
         activity_resp = await self._call(
             'history/activity',
             data={'lastPeriod': last_period, 'detailed': 'true'},

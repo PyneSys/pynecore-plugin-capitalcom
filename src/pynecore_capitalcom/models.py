@@ -25,7 +25,7 @@ class _InstrumentRules:
 
     ``fetched_at`` is the epoch second the entry was cached at; the lookup
     re-fetches once it ages past
-    :attr:`CapitalComConfig.instrument_rules_ttl_seconds`. Capital.com
+    :data:`pynecore_capitalcom.helpers._INSTRUMENT_RULES_TTL_S`. Capital.com
     widens the minimum during volatile sessions, so unbounded caching
     would silently drift out of date.
     """

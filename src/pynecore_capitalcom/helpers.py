@@ -79,6 +79,52 @@ _INVALID_TP_MAX_PREFIX = 'error.invalid.takeprofit.maxvalue'
 _INVALID_LEVERAGE_CODE = 'error.invalid.leverage.value'
 
 
+# --- Internal tuning constants ---------------------------------------------
+#
+# These are intentionally NOT exposed in :class:`CapitalComConfig` (and
+# therefore not in ``workdir/config/plugins/capitalcom.toml``). They are
+# rate-limit / cache / WS-feed heuristics tuned once for Capital.com's
+# specific server behaviour and are not something an end user can
+# meaningfully reason about. If real operator intent ever surfaces to
+# override one, promote it through the config writer's hidden-field
+# mechanism — not by reintroducing a docstring'd dataclass field.
+
+# Seconds between ``GET /positions`` + ``GET /workingorders`` polls.
+# Capital.com's 10 req/s budget easily accommodates 1s cadence, but 1.5s
+# leaves headroom for the snapshot + activity tail + any ad-hoc reconcile
+# calls the sync engine issues.
+_POLL_INTERVAL_S = 1.5
+
+# TTL on cached ``_InstrumentRules`` entries. Capital.com widens
+# ``minNormalStopOrLimitDistance`` during volatile sessions; unbounded
+# caching would silently disable the pre-check. Five minutes bounds the
+# staleness to one news-event window without flooding the rate-limited
+# markets endpoint.
+_INSTRUMENT_RULES_TTL_S = 300.0
+
+# Rolling window of full-coverage WS quote counts used by the volume
+# sanity checks. Drives the low-ratio outlier trigger and the
+# median-estimate emitted when REST also fails. 20 bars stays responsive
+# to session-level liquidity changes without being swayed by a single
+# quiet bar.
+_WS_VOLUME_BASELINE_BARS = 20
+
+# Minimum baseline samples required before low-ratio and median-estimate
+# paths activate. During warmup the worker emits raw WS counts; REST
+# still fires for ``ws_volume == 0`` and partial-coverage cases.
+_WS_VOLUME_MIN_BASELINE_BARS = 5
+
+# Multiplier applied to the rolling median when deciding whether a
+# full-coverage WS volume is low enough to warrant a REST sanity check.
+# 0.20 → a bar below 20% of the median triggers REST.
+_WS_VOLUME_LOW_RATIO = 0.20
+
+# Consecutive REST-confirmed bad full-coverage bars after which the
+# worker forces a WS reconnect. Two in a row implies the quote feed has
+# gone silent while the OHLC subscription still ticks.
+_WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD = 2
+
+
 def encrypt_password(password: str, encryption_key: str, timestamp: int | None = None):
     if timestamp is None:
         timestamp = int(epoch_time())

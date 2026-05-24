@@ -29,6 +29,7 @@ from .helpers import (
     TIMEFRAMES,
     TIMEFRAMES_INV,
     TYPES,
+    _INSTRUMENT_RULES_TTL_S,
     _parse_opening_hours_segment,
 )
 from .models import _InstrumentRules
@@ -509,7 +510,7 @@ class _ProviderMixin(_CapitalComBase):
         hitting the exchange: Capital.com rejects non-multiples with
         ``error.invalid.size``, and an implicit rounding at the REST
         boundary is a silent data-loss bug waiting to happen. The cache
-        honours :attr:`CapitalComConfig.instrument_rules_ttl_seconds` so
+        honours the internal :data:`_INSTRUMENT_RULES_TTL_S` so
         ``minNormalStopOrLimitDistance`` widening during volatile sessions
         does not get masked by a stale entry.
 
@@ -519,8 +520,7 @@ class _ProviderMixin(_CapitalComBase):
         """
         now = epoch_time()
         cached = self._instrument_rules_cache.get(epic)
-        ttl = self.config.instrument_rules_ttl_seconds
-        if cached is not None and (ttl <= 0.0 or now - cached.fetched_at < ttl):
+        if cached is not None and now - cached.fetched_at < _INSTRUMENT_RULES_TTL_S:
             return cached
         rules, _ = await self._fetch_market(epic)
         return rules

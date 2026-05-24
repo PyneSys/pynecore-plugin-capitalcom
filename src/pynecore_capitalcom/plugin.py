@@ -37,7 +37,7 @@ from .exceptions import (
     OrderNotFoundError,
 )
 from .execution import _ExecutionMixin
-from .helpers import _parse_opening_hours_segment
+from .helpers import _WS_VOLUME_BASELINE_BARS, _parse_opening_hours_segment
 from .models import _ActivityCursor, _InstrumentRules, _activity_fingerprint
 from .provider import _ProviderMixin
 from .reconcile import _ReconcileMixin
@@ -191,7 +191,7 @@ class CapitalCom(
         self._ws_quote_buckets: dict[int, int] = {}
         self._ws_coverage_started_at: float = 0.0
         self._ws_volume_baseline: collections.deque[int] = collections.deque(
-            maxlen=self.config.ws_volume_baseline_bars,
+            maxlen=_WS_VOLUME_BASELINE_BARS,
         )
         self._ws_bad_bar_streak: int = 0
         self._ws_quote_timestamp_warned: bool = False

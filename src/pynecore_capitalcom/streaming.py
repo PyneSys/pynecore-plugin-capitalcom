@@ -38,7 +38,13 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
-from .helpers import WS_URL
+from .helpers import (
+    WS_URL,
+    _WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD,
+    _WS_VOLUME_BASELINE_BARS,
+    _WS_VOLUME_LOW_RATIO,
+    _WS_VOLUME_MIN_BASELINE_BARS,
+)
 
 
 class _StreamingMixin(_CapitalComBase):
@@ -723,7 +729,7 @@ class _StreamingMixin(_CapitalComBase):
         REST-confirmed-bad streak: when REST fires for a full-coverage
         bar and returns a real number, the worker increments
         :attr:`_ws_bad_bar_streak`. At
-        :attr:`CapitalComConfig.ws_volume_bad_bar_reconnect_threshold`
+        :data:`_WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD`
         consecutive hits the WS is closed (``code=4001``,
         ``reason="quote-volume-stale"``) so the live_runner reconnects
         — mirrors the OHLC watchdog's stale-subscription recovery.
@@ -751,7 +757,6 @@ class _StreamingMixin(_CapitalComBase):
         # deadline budget matches the framework's synth deadline for THIS
         # TF. For tf>=60s the actual grace is 30s (not 15s).
         framework_grace_s = max(15.0, min(tf_seconds * 0.5, 30.0))
-        cfg = self.config
         try:
             while True:
                 event_type, payload = await raw_q.get()
@@ -773,7 +778,6 @@ class _StreamingMixin(_CapitalComBase):
                     await self._process_ohlc_payload(
                         payload,
                         out_q=out_q,
-                        cfg=cfg,
                         tf_seconds=tf_seconds,
                         framework_grace_s=framework_grace_s,
                         synth_deadline_margin_s=synth_deadline_margin_s,
@@ -814,7 +818,6 @@ class _StreamingMixin(_CapitalComBase):
         payload: dict,
         *,
         out_q: asyncio.Queue,
-        cfg,
         tf_seconds: float,
         framework_grace_s: float,
         synth_deadline_margin_s: float,
@@ -841,7 +844,7 @@ class _StreamingMixin(_CapitalComBase):
         is_partial = bar_open_s_int < self._ws_coverage_started_at
         baseline = self._ws_volume_baseline
         baseline_ready = (
-            len(baseline) >= cfg.ws_volume_min_baseline_bars
+            len(baseline) >= _WS_VOLUME_MIN_BASELINE_BARS
         )
         rolling_median: float = (
             float(statistics.median(baseline))
@@ -849,7 +852,7 @@ class _StreamingMixin(_CapitalComBase):
         )
         low_ratio = (
             baseline_ready
-            and ws_vol < rolling_median * cfg.ws_volume_low_ratio
+            and ws_vol < rolling_median * _WS_VOLUME_LOW_RATIO
         )
         need_rest = is_partial or ws_vol == 0 or low_ratio
 
@@ -923,7 +926,7 @@ class _StreamingMixin(_CapitalComBase):
         self._tick_volume = 0
 
         if (self._ws_bad_bar_streak
-                >= cfg.ws_volume_bad_bar_reconnect_threshold):
+                >= _WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD):
             streak = self._ws_bad_bar_streak
             self._ws_bad_bar_streak = 0
             ws = self._ws
@@ -1099,7 +1102,7 @@ class _StreamingMixin(_CapitalComBase):
         self._ws_quote_buckets = {}
         self._ws_coverage_started_at = epoch_time()
         self._ws_volume_baseline = collections.deque(
-            maxlen=self.config.ws_volume_baseline_bars,
+            maxlen=_WS_VOLUME_BASELINE_BARS,
         )
         self._ws_bad_bar_streak = 0
         self._ws_quote_timestamp_warned = False
