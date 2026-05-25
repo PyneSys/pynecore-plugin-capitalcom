@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
+    PartialQtyBracketExitMode,
 )
 from pynecore.core.plugin import override
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
@@ -440,7 +441,7 @@ class _ProviderMixin(_CapitalComBase):
             stop_limit_order=CapabilityLevel.UNSUPPORTED,
             trailing_stop=CapabilityLevel.NATIVE,
             tp_sl_bracket=CapabilityLevel.NATIVE,
-            partial_qty_bracket_exit=CapabilityLevel.UNSUPPORTED,
+            partial_qty_bracket_exit=PartialQtyBracketExitMode.UNSUPPORTED,
             oca_cancel=CapabilityLevel.SOFTWARE,
             amend_order=CapabilityLevel.PARTIAL_NATIVE,
             cancel_all=CapabilityLevel.SOFTWARE,

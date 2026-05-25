@@ -1454,29 +1454,30 @@ class _ExecutionMixin(_CapitalComBase):
         if new_i.tp_price is not None:
             body['profitLevel'] = float(new_i.tp_price)
         elif old_i.tp_price is not None:
-            # TP removal: Capital.com preserves any field NOT mentioned
-            # in the PUT, so without this explicit null the old
-            # ``profitLevel`` stays live on the position even though
-            # BrokerStore / ``_active_intents`` no longer carry the
-            # TP — the position could later close at a stale level the
-            # engine believes was removed. Mirrors the cancel-bracket-leg
-            # flow's ``profitLevel: null`` clear (see ``execute_cancel``).
+            # TP removal: Capital.com ``PUT /positions/{dealId}`` is
+            # full-replacement for bracket attributes — unmentioned
+            # ``stopLevel`` / ``profitLevel`` / ``trailingStop`` fields
+            # are CLEARED, not preserved (verified 2026-05-25, partial-
+            # qty bracket exit plan §9 #19 Exp D2). The explicit ``null``
+            # here makes the clearing intent visible in the wire payload
+            # so this branch is robust to body-construction reordering
+            # and mirrors the cancel-bracket-leg flow.
             body['profitLevel'] = None
         if new_i.sl_price is not None:
             body['stopLevel'] = float(new_i.sl_price)
         elif (old_i.sl_price is not None
                 and new_i.trail_offset is None):
-            # Fixed SL removal: Capital.com preserves any field NOT
-            # mentioned in the PUT, so without this explicit null the
-            # old ``stopLevel`` stays live on the position even though
-            # BrokerStore / ``_active_intents`` no longer carry the
-            # SL — the position could later close at a stale level the
-            # engine believes was removed. Mirrors the TP-removal
-            # explicit clear above and ``execute_cancel``'s
-            # ``stopLevel: null`` flow. The ``trail_offset is None``
-            # guard avoids a redundant clear on the fixed-SL → trailing
-            # transition: ``trailingStop=True`` + ``stopDistance``
-            # below replace the prior fixed stop atomically.
+            # Fixed SL removal: Capital.com ``PUT /positions/{dealId}``
+            # is full-replacement for bracket attributes — unmentioned
+            # ``stopLevel`` / ``profitLevel`` / ``trailingStop`` fields
+            # are CLEARED, not preserved (verified 2026-05-25, partial-
+            # qty bracket exit plan §9 #19 Exp D2). The explicit ``null``
+            # here makes the clearing intent visible in the wire payload
+            # and mirrors the TP-removal branch + the cancel-bracket-leg
+            # flow. The ``trail_offset is None`` guard avoids overwriting
+            # a fixed-SL → trailing transition: ``trailingStop=True`` +
+            # ``stopDistance`` below replace the prior fixed stop
+            # atomically.
             body['stopLevel'] = None
         if new_i.trail_offset is not None and not trail_pending:
             body['trailingStop'] = True
@@ -1484,18 +1485,21 @@ class _ExecutionMixin(_CapitalComBase):
         elif (old_i.trail_offset is not None
                 and old_i.trail_price is None
                 and new_i.trail_offset is None):
-            # Native-trailing removal: Capital.com keeps the prior
-            # ``trailingStop`` flag active unless we explicitly clear it
-            # in the PUT body. Covers both transitions:
-            #   * trail → fixed SL: without this branch the broker keeps
-            #     trailing while the leg row records a fixed stop —
-            #     :meth:`_activity_to_event` would classify the fill as
-            #     ``LegType.STOP_LOSS`` even though the exchange ran a
-            #     trailing stop, mispricing the close.
+            # Native-trailing removal: Capital.com ``PUT /positions/{dealId}``
+            # is full-replacement (§9 #19 Exp D2) — an absent
+            # ``trailingStop`` field would be cleared anyway, but we
+            # send the explicit ``False`` so the wire payload reflects
+            # intent and stays stable across body-construction
+            # reordering. Covers both transitions:
+            #   * trail → fixed SL: without this explicit clear the
+            #     leg row records a fixed stop while the broker fill
+            #     would still be classified by :meth:`_activity_to_event`
+            #     based on the actual trailing flag at fill time —
+            #     redundant ``trailingStop: False`` here keeps the wire
+            #     state aligned with the leg row.
             #   * trail → no stop at all (e.g. ``TP+trail`` → ``TP``):
-            #     the broker would silently keep trailing while local
-            #     state shows the position unprotected, leaving live
-            #     risk active that the engine no longer tracks.
+            #     local state shows the position unprotected, the wire
+            #     payload makes the trailing removal explicit.
             body['trailingStop'] = False
         if trail_pending and (
                 old_i.sl_price is not None
@@ -1503,17 +1507,17 @@ class _ExecutionMixin(_CapitalComBase):
                     and old_i.trail_price is None)):
             # Transitioning to pending trailing from a broker-side
             # active stop (fixed SL or immediate native trailing).
-            # Capital.com preserves any field NOT mentioned in the PUT,
-            # so the prior protective leg would stay live while
-            # BrokerStore is rewritten as ``trail_state='pending'`` —
-            # the position would close at the OLD stop before Pine's
-            # activation price is reached. Send an explicit clear:
-            # ``stopLevel: null`` removes the fixed stop (matches the
-            # cancel-bracket-leg flow), and ``trailingStop: false``
+            # Capital.com ``PUT /positions/{dealId}`` is full-replacement
+            # (§9 #19 Exp D2): unmentioned bracket fields are cleared, so
+            # leaving the body untouched here happens to remove the prior
+            # protective leg already — but the wire payload would not
+            # reflect the engine's clearing intent. Send an explicit
+            # clear: ``stopLevel: null`` removes the fixed stop (matches
+            # the cancel-bracket-leg flow), and ``trailingStop: false``
             # disables the native trailing flag if it was set. We only
             # null out ``stopLevel`` when the new intent did not also
-            # specify a fixed SL (defensive — Pine's pending trail and
-            # a fixed SL are mutually exclusive in practice).
+            # specify a fixed SL (Pine's pending trail and a fixed SL
+            # are mutually exclusive in practice).
             if new_i.sl_price is None:
                 body['stopLevel'] = None
             body['trailingStop'] = False
