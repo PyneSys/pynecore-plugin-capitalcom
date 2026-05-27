@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
-    PartialQtyBracketExitMode,
 )
 from pynecore.core.plugin import override
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
@@ -398,10 +397,24 @@ class _ProviderMixin(_CapitalComBase):
         - ``tp_sl_bracket = NATIVE`` — a single ``POST /positions`` call
           atomically attaches the TP/SL as *position attributes* (full-row,
           see ``partial_qty_bracket_exit``).
-        - ``partial_qty_bracket_exit = UNSUPPORTED`` — the bracket is
-          full-row only; a Pine ``strategy.exit(qty=N, from_entry=...)``
-          with ``N`` less than the total entry qty cannot be expressed and
-          the validator rejects such scripts at startup.
+        - ``partial_qty_bracket_exit = SOFTWARE`` — Capital.com has no
+          native multi-leg bracket inside a single position (empirically
+          validated, see ``partial-qty-bracket-exit-plan.md`` §9 #18:
+          opposite-direction WO trigger nets the parent but the WO's
+          TP/SL are NOT inherited onto the remainder; §9 #16/#17:
+          orphaned WO opens a fresh reverse position once the parent is
+          flat — never safe to park). The sync engine arms an in-memory
+          leg state machine per ``strategy.exit`` call and dispatches a
+          partial close through ``execute_close`` when the price crosses
+          the trigger level. The §2.6 native fail-safe stop manager
+          publishes the worst remaining SL onto the parent's position
+          attributes via ``PUT /positions/{dealId}`` so engine downtime
+          is bounded to the worst-SL drawdown.
+        - ``partial_qty_bracket_exit_supports_pyramiding = False`` — the
+          multi-row reduction-order routing (§9 #13) is empirically
+          unresolved on Capital.com; the validator rejects
+          ``pyramiding > 1`` scripts that need partial-qty bracket support
+          until that lands.
         - ``trailing_stop = NATIVE`` — server-side, points-only via
           ``trailingStop=true, stopDistance``. Mutually exclusive with
           ``guaranteedStop``.
@@ -441,7 +454,8 @@ class _ProviderMixin(_CapitalComBase):
             stop_limit_order=CapabilityLevel.UNSUPPORTED,
             trailing_stop=CapabilityLevel.NATIVE,
             tp_sl_bracket=CapabilityLevel.NATIVE,
-            partial_qty_bracket_exit=PartialQtyBracketExitMode.UNSUPPORTED,
+            partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
+            partial_qty_bracket_exit_supports_pyramiding=False,
             oca_cancel=CapabilityLevel.SOFTWARE,
             amend_order=CapabilityLevel.PARTIAL_NATIVE,
             cancel_all=CapabilityLevel.SOFTWARE,

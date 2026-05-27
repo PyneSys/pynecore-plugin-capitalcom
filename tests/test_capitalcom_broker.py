@@ -17,7 +17,6 @@ from pynecore.core.broker.exceptions import (
 )
 from pynecore.core.broker.models import (
     CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType,
-    PartialQtyBracketExitMode,
 )
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
@@ -97,7 +96,7 @@ def __test_broker_capabilities_match_dossier__():
     assert caps.stop_limit_order is CapabilityLevel.UNSUPPORTED
     assert caps.trailing_stop is CapabilityLevel.NATIVE
     assert caps.tp_sl_bracket is CapabilityLevel.NATIVE
-    assert caps.partial_qty_bracket_exit is PartialQtyBracketExitMode.UNSUPPORTED
+    assert caps.partial_qty_bracket_exit is CapabilityLevel.SOFTWARE
     assert caps.partial_qty_bracket_exit_supports_pyramiding is False
     assert caps.oca_cancel is CapabilityLevel.SOFTWARE
     assert caps.amend_order is CapabilityLevel.PARTIAL_NATIVE
