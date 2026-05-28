@@ -47,6 +47,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_WORKING,
 )
 from pynecore.core.broker.models import (
+    CancelDispositionOutcome,
     CancelIntent,
     CloseIntent,
     DispatchEnvelope,
@@ -68,6 +69,7 @@ from .exceptions import (
     InvalidStopMaxValueError,
     InvalidTakeProfitDistanceError,
     InvalidTakeProfitMaxValueError,
+    OrderNotFoundError,
 )
 from .helpers import _parse_iso_timestamp
 from .models import _InstrumentRules, _bracket_leg_id
@@ -1299,6 +1301,233 @@ class _ExecutionMixin(_CapitalComBase):
             },
         )
         return True
+
+    @override
+    async def execute_cancel_with_outcome(
+            self, envelope: DispatchEnvelope,
+    ) -> CancelDispositionOutcome:
+        """Cancel a pending working order and classify the broker disposition.
+
+        Capital.com working-order cancel is ``DELETE /workingorders/{dealId}``.
+        The sync engine's cancel-tentative reconcile loop needs a precise
+        disposition rather than the bool-only :meth:`execute_cancel`
+        contract, so this override normalizes the wire result into the five
+        :class:`CancelDispositionOutcome` categories:
+
+        * DELETE succeeds → :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED`.
+        * DELETE 404 (:class:`OrderNotFoundError`): the working order is
+          gone, but that alone does not say why. ``GET /history/activity``
+          is queried for the same ``dealId`` and the most recent terminal
+          row decides — a fill →
+          :attr:`CancelDispositionOutcome.ALREADY_FILLED` (the engine must
+          restore the bracket legs onto the freshly opened position), a
+          prior cancel → :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED`
+          (idempotent), an expiry / rejection without fill →
+          :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL` (terminal
+          non-fill). No terminal row →
+          :attr:`CancelDispositionOutcome.UNKNOWN` so the loop retries.
+        * Transient network failure →
+          :attr:`CancelDispositionOutcome.UNKNOWN` (keep cancel-tentative
+          armed).
+
+        Only pending entry working orders enter the cancel-tentative state,
+        so bracket-leg and filled-position rows are not classified here; an
+        empty working-order target set returns
+        :attr:`CancelDispositionOutcome.UNKNOWN` rather than fabricating a
+        resolution.
+
+        Aggregation across multiple working-order targets is conservative:
+        any ``ALREADY_FILLED`` wins (the engine must restore legs onto a
+        position that now exists), then any ``UNKNOWN`` keeps the loop
+        armed, then ``TOO_LATE_TO_CANCEL`` / ``CANCEL_CONFIRMED`` (both
+        resolve as a confirmed cancel engine-side).
+        """
+        intent = envelope.intent
+        assert isinstance(intent, CancelIntent)
+
+        if self.store_ctx is None:
+            return CancelDispositionOutcome.UNKNOWN
+
+        targets: list[tuple[str, str]] = []
+        for row in self.store_ctx.iter_live_orders(
+                symbol=intent.symbol,
+                from_entry=intent.from_entry,
+        ):
+            matches_pine = row.pine_entry_id == intent.pine_id or (
+                intent.from_entry is not None
+                and row.from_entry == intent.from_entry
+            )
+            if not matches_pine:
+                continue
+            extras = row.extras or {}
+            if extras.get('leg_kind') in ('tp', 'sl'):
+                continue
+            if extras.get('kind', ENTRY_KIND_POSITION) != ENTRY_KIND_WORKING:
+                continue
+            if row.exchange_order_id:
+                targets.append((row.client_order_id, row.exchange_order_id))
+
+        if not targets:
+            return CancelDispositionOutcome.UNKNOWN
+
+        outcomes: list[CancelDispositionOutcome] = []
+        for coid, deal_id in targets:
+            try:
+                await self._call(
+                    f'workingorders/{deal_id}', method='delete',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError):
+                # Transient — keep the row live so the retry loop re-runs.
+                outcomes.append(CancelDispositionOutcome.UNKNOWN)
+                continue
+            except OrderNotFoundError:
+                resolved = await self._classify_cancel_via_activity(deal_id)
+                self._finalize_cancel_outcome_row(
+                    coid, deal_id, resolved, intent=intent,
+                    already_gone=True,
+                )
+                outcomes.append(resolved)
+                continue
+            # Clean DELETE: the broker order is gone. Close and audit the
+            # live working row here — the sync engine's cancel-tentative
+            # resolution only drops in-memory mappings / leg ledger state,
+            # never the persisted ``OrderRow``. Leaving it live would make
+            # the next ``_reconcile_snapshot`` see a row whose deal is
+            # absent from both ``/positions`` and ``/workingorders``, stamp
+            # ``missing_pending_since``, and eventually raise a false
+            # :class:`UnexpectedCancelError`.
+            self._finalize_cancel_outcome_row(
+                coid, deal_id, CancelDispositionOutcome.CANCEL_CONFIRMED,
+                intent=intent, already_gone=False,
+            )
+            outcomes.append(CancelDispositionOutcome.CANCEL_CONFIRMED)
+
+        if CancelDispositionOutcome.ALREADY_FILLED in outcomes:
+            return CancelDispositionOutcome.ALREADY_FILLED
+        if CancelDispositionOutcome.UNKNOWN in outcomes:
+            return CancelDispositionOutcome.UNKNOWN
+        if CancelDispositionOutcome.TOO_LATE_TO_CANCEL in outcomes:
+            return CancelDispositionOutcome.TOO_LATE_TO_CANCEL
+        return CancelDispositionOutcome.CANCEL_CONFIRMED
+
+    def _finalize_cancel_outcome_row(
+            self, coid: str, deal_id: str,
+            outcome: CancelDispositionOutcome, *,
+            intent: CancelIntent, already_gone: bool,
+    ) -> None:
+        """Close and audit a working row whose cancel resolved terminally.
+
+        Mirrors the ``_CapitalComCancelHooks`` working-order sweep so the
+        :meth:`execute_cancel_with_outcome` retry path leaves the same
+        audit trail and never strands a live :class:`OrderRow` whose deal
+        is gone broker-side.
+
+        Only terminal-cancel outcomes close the row:
+
+        * :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED` /
+          :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL`: the working
+          order is terminally gone without a fill — close the row and log
+          ``cancel_already_gone`` (404 path) then ``cancelled``.
+        * :attr:`CancelDispositionOutcome.ALREADY_FILLED`: the order became
+          a position; the activity reconcile needs the live row to record
+          the fill, so leave it untouched (same rule as the hook never
+          closing a filled position from a cancel).
+        * :attr:`CancelDispositionOutcome.UNKNOWN`: keep the row live so
+          the cancel-tentative loop retries.
+
+        :param coid: The working row's ``client_order_id``.
+        :param deal_id: The working order's exchange ``dealId``.
+        :param outcome: The resolved cancel disposition for this row.
+        :param intent: The originating cancel intent (for ``intent_key``).
+        :param already_gone: ``True`` when the DELETE returned 404 (the
+            broker had already removed the order), driving the extra
+            ``cancel_already_gone`` audit event.
+        """
+        if self.store_ctx is None:
+            return
+        if outcome not in (
+                CancelDispositionOutcome.CANCEL_CONFIRMED,
+                CancelDispositionOutcome.TOO_LATE_TO_CANCEL,
+        ):
+            return
+        if already_gone:
+            self.store_ctx.log_event(
+                'cancel_already_gone',
+                client_order_id=coid,
+                exchange_order_id=deal_id,
+                intent_key=intent.intent_key,
+            )
+        self.store_ctx.close_order(coid)
+        self.store_ctx.log_event(
+            'cancelled',
+            client_order_id=coid,
+            exchange_order_id=deal_id,
+            intent_key=intent.intent_key,
+            payload={'via': 'cancel_with_outcome',
+                     'outcome': outcome.value},
+        )
+
+    async def _classify_cancel_via_activity(
+            self, deal_id: str,
+    ) -> CancelDispositionOutcome:
+        """Disambiguate a vanished working order via ``GET /history/activity``.
+
+        Called when ``DELETE /workingorders/{dealId}`` returns 404: the
+        order is gone, and the most recent terminal activity row for
+        ``dealId`` decides whether it filled, was already cancelled, or
+        expired / rejected without filling. Returns
+        :attr:`CancelDispositionOutcome.UNKNOWN` when no terminal row is
+        found (the reconcile loop retries) or the history fetch fails
+        transiently.
+
+        :param deal_id: The working order's exchange ``dealId``.
+        :return: Normalized cancel disposition outcome.
+        """
+        try:
+            resp = await self._call(
+                'history/activity',
+                data={'lastPeriod': 60, 'detailed': 'true'},
+                method='get',
+            )
+        except (httpx.TimeoutException, httpx.RequestError,
+                ConnectionError, ExchangeConnectionError):
+            return CancelDispositionOutcome.UNKNOWN
+
+        matching = [
+            a for a in (resp.get('activities') or [])
+            if str(a.get('dealId') or '') == str(deal_id)
+        ]
+        matching.sort(
+            key=lambda a: _parse_iso_timestamp(a.get('dateUTC') or ''),
+            reverse=True,
+        )
+        for activity in matching:
+            status = (activity.get('status') or '').upper()
+            activity_type = (activity.get('type') or '').upper()
+            # A fill requires positive evidence of an opened position or an
+            # executed working order. A bare ``ACCEPTED`` on a
+            # ``WORKING_ORDER`` row is the broker acknowledging the order's
+            # creation/amend, NOT a fill (mirrors ``activity.py``'s
+            # ``WORKING_ORDER`` + ``ACCEPTED``/``CREATED`` → ``created``
+            # routing). Treating it as ``ALREADY_FILLED`` would make the
+            # sync engine restore bracket legs onto a parent that never
+            # opened. Only ``POSITION`` activity (a position came into
+            # existence) or a ``WORKING_ORDER`` ``EXECUTED`` row counts.
+            position_fill = activity_type == 'POSITION' and status in (
+                'EXECUTED', 'ACCEPTED', 'FILLED',
+            )
+            working_fill = (
+                activity_type == 'WORKING_ORDER'
+                and status in ('EXECUTED', 'FILLED')
+            )
+            if position_fill or working_fill:
+                return CancelDispositionOutcome.ALREADY_FILLED
+            if status in ('CANCELLED', 'DELETED'):
+                return CancelDispositionOutcome.CANCEL_CONFIRMED
+            if status in ('EXPIRED', 'REJECTED'):
+                return CancelDispositionOutcome.TOO_LATE_TO_CANCEL
+        return CancelDispositionOutcome.UNKNOWN
 
     # --- BrokerPlugin: modify overrides -----------------------------------
 

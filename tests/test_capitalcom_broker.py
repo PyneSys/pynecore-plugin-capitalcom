@@ -296,6 +296,7 @@ from pynecore.core.broker.exceptions import (  # noqa: E402
     InsufficientMarginError,
 )
 from pynecore.core.broker.models import (  # noqa: E402
+    CancelDispositionOutcome,
     CancelIntent, CloseIntent, ExitIntent, LegType, OrderStatus,
 )
 from pynecore_capitalcom import (  # noqa: E402
@@ -693,6 +694,39 @@ def __test_execute_close_full_deletes_position__(tmp_path):
     store.close()
 
 
+def __test_synthetic_partial_bracket_close_routes_through_execute_close__(tmp_path):
+    """The engine's synthetic partial-bracket close key survives execute_close.
+
+    The Slice B WATCH-phase dispatch (_dispatch_partial_bracket_close in
+    the sync engine) synthesises a CloseIntent whose ``pine_id`` is
+    ``__pyne_partial_trigger__{exit_id}\\0{from_entry}\\0{leg_kind}`` — the
+    NUL delimiter makes it collision-free against the script's own keys.
+    The plugin's execute_close must handle that key transparently: the
+    target-resolve is symbol-scoped (``iter_live_orders(symbol=...)``), not
+    pine_id-scoped, and the NUL-bearing pine_id must not break COID
+    construction (``envelope.client_order_id(KIND_CLOSE)``). This pins that
+    the synthetic close reaches the broker and flattens the position.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'delete'): {},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    synthetic_pine_id = '__pyne_partial_trigger__exit_tp\x00Long\x00tp_partial'
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id=synthetic_pine_id, symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'deal-L'
+    assert any(c[0] == 'positions/deal-L' and c[1] == 'delete'
+               for c in broker._calls)
+    store.close()
+
+
 def __test_execute_close_partial_race_outside_window_halts__(tmp_path):
     # Pre-snapshot = 1 row size=2.0. POST partial close size=1.0.
     # Post-snapshot = 2 rows (original + fresh opposite) — expected 1 unit,
@@ -921,6 +955,138 @@ def __test_execute_cancel_does_not_sweep_unrelated_entries__(tmp_path):
     assert deleted == ['workingorders/w-L1'], (
         f"only Long1 should be deleted, got {deleted}"
     )
+    store.close()
+
+
+def _cancel_outcome_env(pine_id='Long', symbol='EURUSD', from_entry=None):
+    return DispatchEnvelope(
+        intent=CancelIntent(pine_id=pine_id, symbol=symbol,
+                            from_entry=from_entry),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+
+def _seed_working_order(ctx, *, coid='coid-w', pine_id='Long',
+                        exchange_order_id='w1'):
+    ctx.upsert_order(coid, symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id=pine_id,
+                     exchange_order_id=exchange_order_id,
+                     extras={'kind': 'working'})
+
+
+def __test_cancel_with_outcome_delete_success_confirms__(tmp_path):
+    """A clean DELETE resolves the cancel-tentative as CANCEL_CONFIRMED."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/w1', 'delete'): {},
+    })
+    _seed_working_order(ctx)
+    outcome = asyncio.run(
+        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.CANCEL_CONFIRMED
+    store.close()
+
+
+def __test_cancel_with_outcome_404_filled_is_already_filled__(tmp_path):
+    """A 404 whose activity shows a fill resolves as ALREADY_FILLED.
+
+    The engine must restore the bracket legs onto the freshly opened
+    position, so this branch requires positive fill evidence.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'):
+            OrderNotFoundError('gone', ref_type='deal_id'),
+        ('history/activity', 'get'): {'activities': [
+            {'epic': 'EURUSD', 'dateUTC': '2026-04-21T10:00:00.000',
+             'dealId': 'w1', 'type': 'POSITION', 'status': 'EXECUTED'},
+        ]},
+    })
+    _seed_working_order(ctx)
+    outcome = asyncio.run(
+        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.ALREADY_FILLED
+    store.close()
+
+
+def __test_cancel_with_outcome_404_cancelled_confirms__(tmp_path):
+    """A 404 whose activity shows a prior cancel is idempotent CANCEL_CONFIRMED."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'):
+            OrderNotFoundError('gone', ref_type='deal_id'),
+        ('history/activity', 'get'): {'activities': [
+            {'epic': 'EURUSD', 'dateUTC': '2026-04-21T10:00:00.000',
+             'dealId': 'w1', 'type': 'WORKING_ORDER', 'status': 'DELETED'},
+        ]},
+    })
+    _seed_working_order(ctx)
+    outcome = asyncio.run(
+        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.CANCEL_CONFIRMED
+    store.close()
+
+
+def __test_cancel_with_outcome_404_rejected_too_late__(tmp_path):
+    """A 404 whose activity shows expiry / rejection without fill is
+    TOO_LATE_TO_CANCEL (terminal non-fill — engine treats it as a
+    confirmed cancel, must NOT restore legs)."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'):
+            OrderNotFoundError('gone', ref_type='deal_id'),
+        ('history/activity', 'get'): {'activities': [
+            {'epic': 'EURUSD', 'dateUTC': '2026-04-21T10:00:00.000',
+             'dealId': 'w1', 'type': 'WORKING_ORDER', 'status': 'REJECTED'},
+        ]},
+    })
+    _seed_working_order(ctx)
+    outcome = asyncio.run(
+        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.TOO_LATE_TO_CANCEL
+    store.close()
+
+
+def __test_cancel_with_outcome_404_no_activity_unknown__(tmp_path):
+    """A 404 with no terminal activity row for the dealId stays UNKNOWN so
+    the reconcile loop retries (never fabricate a resolution)."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'):
+            OrderNotFoundError('gone', ref_type='deal_id'),
+        ('history/activity', 'get'): {'activities': [
+            {'epic': 'EURUSD', 'dateUTC': '2026-04-21T10:00:00.000',
+             'dealId': 'other-deal', 'type': 'POSITION',
+             'status': 'EXECUTED'},
+        ]},
+    })
+    _seed_working_order(ctx)
+    outcome = asyncio.run(
+        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.UNKNOWN
+    store.close()
+
+
+def __test_cancel_with_outcome_network_error_unknown__(tmp_path):
+    """A transient DELETE failure keeps the cancel-tentative armed (UNKNOWN)."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'):
+            httpx.ConnectError('boom'),
+    })
+    _seed_working_order(ctx)
+    outcome = asyncio.run(
+        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.UNKNOWN
+    store.close()
+
+
+def __test_cancel_with_outcome_no_working_target_unknown__(tmp_path):
+    """No live working-order target → UNKNOWN (a filled position is not a
+    cancel-tentative subject; the reconcile loop must not resolve it)."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    outcome = asyncio.run(
+        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.UNKNOWN
+    assert not any(c[1] == 'delete' for c in broker._calls)
     store.close()
 
 
