@@ -410,11 +410,13 @@ class _ProviderMixin(_CapitalComBase):
           publishes the worst remaining SL onto the parent's position
           attributes via ``PUT /positions/{dealId}`` so engine downtime
           is bounded to the worst-SL drawdown.
-        - ``partial_qty_bracket_exit_supports_pyramiding = False`` — the
-          multi-row reduction-order routing (§9 #13) is empirically
-          unresolved on Capital.com; the validator rejects
-          ``pyramiding > 1`` scripts that need partial-qty bracket support
-          until that lands.
+        - ``partial_qty_bracket_exit_pyramiding = SOFTWARE`` — multi-row
+          reduction routing is empirically resolved (§9 #13): an
+          opposite-direction ``POST`` nets the aggregated position and the
+          server reduces the oldest ``dealId`` first (FIFO), so the engine
+          drives a single delta close against the summed parent with no
+          client-side per-``dealId`` routing. Each pyramiding parent keeps
+          its own §2.6 fail-safe state on its own ``dealId``.
         - ``trailing_stop = NATIVE`` — server-side, points-only via
           ``trailingStop=true, stopDistance``. Mutually exclusive with
           ``guaranteedStop``.
@@ -455,7 +457,7 @@ class _ProviderMixin(_CapitalComBase):
             trailing_stop=CapabilityLevel.NATIVE,
             tp_sl_bracket=CapabilityLevel.NATIVE,
             partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,
-            partial_qty_bracket_exit_supports_pyramiding=False,
+            partial_qty_bracket_exit_pyramiding=CapabilityLevel.SOFTWARE,
             oca_cancel=CapabilityLevel.SOFTWARE,
             amend_order=CapabilityLevel.PARTIAL_NATIVE,
             cancel_all=CapabilityLevel.SOFTWARE,

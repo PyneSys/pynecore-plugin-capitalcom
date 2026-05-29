@@ -98,7 +98,7 @@ def __test_broker_capabilities_match_dossier__():
     assert caps.trailing_stop is CapabilityLevel.NATIVE
     assert caps.tp_sl_bracket is CapabilityLevel.NATIVE
     assert caps.partial_qty_bracket_exit is CapabilityLevel.SOFTWARE
-    assert caps.partial_qty_bracket_exit_supports_pyramiding is False
+    assert caps.partial_qty_bracket_exit_pyramiding is CapabilityLevel.SOFTWARE
     assert caps.oca_cancel is CapabilityLevel.SOFTWARE
     assert caps.amend_order is CapabilityLevel.PARTIAL_NATIVE
     assert caps.cancel_all is CapabilityLevel.SOFTWARE
