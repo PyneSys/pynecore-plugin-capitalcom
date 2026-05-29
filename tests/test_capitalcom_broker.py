@@ -18,6 +18,7 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.models import (
     CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType,
 )
+from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 
@@ -724,6 +725,195 @@ def __test_synthetic_partial_bracket_close_routes_through_execute_close__(tmp_pa
     assert result.id == 'deal-L'
     assert any(c[0] == 'positions/deal-L' and c[1] == 'delete'
                for c in broker._calls)
+    store.close()
+
+
+# === §2.6.7 native fail-safe dispatcher (publish_native_failsafe_sl) ===
+#
+# Capital.com PUT /positions/{dealId} is full-replacement (verified on demo
+# 2026-05-29): an omitted bracket field is cleared. The body-builder always
+# sends an explicit stopLevel (float or null) so the body is never empty.
+
+def _failsafe_snapshot(*, stop_level=1.0900, profit_level=None,
+                       trailing_stop=None, ref='coid-entry', generation=1):
+    return NativeBracketSnapshot(
+        parent_entry_dispatch_ref=ref, symbol='EURUSD', parent_side='long',
+        stop_level=stop_level, profit_level=profit_level,
+        trailing_stop=trailing_stop, generation=generation,
+    )
+
+
+def _seed_failsafe_entry(ctx, *, exchange_order_id='deal-L'):
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id=exchange_order_id,
+                     extras={'kind': 'position'})
+
+
+def __test_failsafe_sl_puts_stop_on_resolved_dealid__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'r1'},
+        ('confirms/r1', 'get'): {'dealStatus': 'ACCEPTED', 'status': 'AMENDED'},
+    })
+    _seed_failsafe_entry(ctx)
+    asyncio.run(broker.publish_native_failsafe_sl(_failsafe_snapshot(stop_level=1.09)))
+    put = next(c for c in broker._calls
+               if c[0] == 'positions/deal-L' and c[1] == 'put')
+    assert put[2] == {'stopLevel': 1.09}
+    store.close()
+
+
+def __test_failsafe_sl_clear_sends_explicit_null_not_empty_body__(tmp_path):
+    # stop_level=None means "remove the SL"; the body must still be non-empty
+    # (an empty body is a SKIP, not a clear) so stopLevel is sent as null.
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'r1'},
+        ('confirms/r1', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    _seed_failsafe_entry(ctx)
+    asyncio.run(broker.publish_native_failsafe_sl(
+        _failsafe_snapshot(stop_level=None, profit_level=1.20)))
+    put = next(c for c in broker._calls
+               if c[0] == 'positions/deal-L' and c[1] == 'put')
+    assert put[2] == {'stopLevel': None, 'profitLevel': 1.20}
+    store.close()
+
+
+def __test_failsafe_sl_full_replacement_carries_tp_and_trailing__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'r1'},
+        ('confirms/r1', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    _seed_failsafe_entry(ctx)
+    asyncio.run(broker.publish_native_failsafe_sl(
+        _failsafe_snapshot(stop_level=1.09, profit_level=1.20, trailing_stop=50.0)))
+    put = next(c for c in broker._calls
+               if c[0] == 'positions/deal-L' and c[1] == 'put')
+    assert put[2] == {'stopLevel': 1.09, 'profitLevel': 1.20,
+                      'trailingStop': True, 'stopDistance': 50.0}
+    store.close()
+
+
+def __test_failsafe_sl_unresolved_dealid_raises_without_put__(tmp_path):
+    # No entry row -> get_order returns None -> raise, and NEVER PUT against
+    # a guessed position (the engine then records a failure and degrades).
+    broker, store, ctx = _make_broker(tmp_path)
+    with pytest.raises(CapitalComError):
+        asyncio.run(broker.publish_native_failsafe_sl(_failsafe_snapshot()))
+    assert not any(c[1] == 'put' for c in broker._calls)
+    store.close()
+
+
+def __test_failsafe_sl_missing_exchange_id_raises_without_put__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_failsafe_entry(ctx, exchange_order_id=None)  # entry not confirmed yet
+    with pytest.raises(CapitalComError):
+        asyncio.run(broker.publish_native_failsafe_sl(_failsafe_snapshot()))
+    assert not any(c[1] == 'put' for c in broker._calls)
+    store.close()
+
+
+def __test_failsafe_sl_rejected_confirm_raises__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'r1'},
+        ('confirms/r1', 'get'): {'dealStatus': 'REJECTED', 'reason': 'error.x'},
+    })
+    _seed_failsafe_entry(ctx)
+    with pytest.raises(CapitalComError):
+        asyncio.run(broker.publish_native_failsafe_sl(_failsafe_snapshot()))
+    store.close()
+
+
+# === §2.6.7 native fail-safe observed recovery feed (reconcile) ===
+#
+# The reconcile pass forwards the broker-observed bracket triple per live
+# position into ``native_failsafe_observed_sink`` (installed by the runner).
+# The plugin maps Capital.com's static ``stopLevel`` vs trailing
+# ``trailingStop`` + ``stopDistance`` onto the engine's (stop_level,
+# trailing_stop) split, and feeds positions only — never working orders.
+
+async def _drain_agen(agen):
+    out = []
+    async for ev in agen:
+        out.append(ev)
+    return out
+
+
+def _capture_observed_sink(broker):
+    """Install a recording fake sink, returning its call log."""
+    calls: list = []
+
+    def _sink(ref, *, stop_level, profit_level, trailing_stop):
+        calls.append((ref, stop_level, profit_level, trailing_stop))
+
+    broker.native_failsafe_observed_sink = _sink
+    return calls
+
+
+def _live_position(deal_id='deal-L', *, size=2.0, stop_level=None,
+                   profit_level=None, trailing=False, stop_distance=None):
+    pos: dict = {'dealId': deal_id, 'direction': 'BUY', 'size': size}
+    if stop_level is not None:
+        pos['stopLevel'] = stop_level
+    if profit_level is not None:
+        pos['profitLevel'] = profit_level
+    if trailing:
+        pos['trailingStop'] = True
+        pos['stopDistance'] = stop_distance
+    return {'market': {'epic': 'EURUSD'}, 'position': pos}
+
+
+def __test_reconcile_feeds_observed_static_stop__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_failsafe_entry(ctx)  # coid-entry -> deal-L, kind=position, qty=2.0
+    calls = _capture_observed_sink(broker)
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {'deal-L': _live_position(stop_level=1.0900, profit_level=1.2000)},
+        {},
+    )))
+    # Fed once, keyed on the entry dispatch COID, with the static stop + TP.
+    assert calls == [('coid-entry', 1.0900, 1.2000, None)]
+    store.close()
+
+
+def __test_reconcile_feeds_observed_trailing_stop__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_failsafe_entry(ctx)
+    calls = _capture_observed_sink(broker)
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {'deal-L': _live_position(trailing=True, stop_distance=50.0,
+                                  stop_level=1.0900)},
+        {},
+    )))
+    # Trailing active: distance surfaces as trailing_stop; the absolute
+    # stopLevel slot is suppressed (the engine keys trailing on
+    # desired_trailing_stop, not desired_level).
+    assert calls == [('coid-entry', None, None, 50.0)]
+    store.close()
+
+
+def __test_reconcile_skips_observed_for_working_only_row__(tmp_path):
+    # A working order carries no position-level bracket yet (pos is None), so
+    # the feed must not fire — guarding the engine against a phantom confirm.
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-work', symbol='EURUSD', side='buy', qty=1.0,
+                     state='server_ref_seen', pine_entry_id='Long',
+                     exchange_order_id='deal-W', extras={'kind': 'working'})
+    calls = _capture_observed_sink(broker)
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {}, {'deal-W': {'workingOrderData': {'dealId': 'deal-W'}}},
+    )))
+    assert calls == []
+    store.close()
+
+
+def __test_feed_observed_no_sink_is_silent__(tmp_path):
+    # Runner may not have wired the sink (persistence off / state-only path):
+    # the helper must be a silent no-op, never raising.
+    broker, store, _ = _make_broker(tmp_path)
+    assert broker.native_failsafe_observed_sink is None
+    broker._feed_native_failsafe_observed('coid-entry',
+                                          _live_position(stop_level=1.09))
     store.close()
 
 

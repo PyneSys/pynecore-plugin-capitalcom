@@ -141,6 +141,18 @@ class _ReconcileMixin(_CapitalComBase):
             pos = positions_by_deal.get(did)
             work = working_by_deal.get(did)
 
+            # §2.6.7 native fail-safe recovery feed: push the broker-observed
+            # bracket triple for this live position into the engine so a parent
+            # stuck in ``DEGRADING`` flips back to ``HEALTHY`` once the broker
+            # confirms the desired worst-SL (see ``BrokerPlugin``'s
+            # ``native_failsafe_observed_sink`` + ``_feed_native_failsafe_observed``).
+            # Only positions carry brackets — a working order (``pos is None``)
+            # has none yet. The parent ref is this row's ``client_order_id``
+            # (the entry dispatch COID, which the engine keys the state on);
+            # bracket-leg rows never reach here (no ``exchange_order_id``).
+            if pos is not None:
+                self._feed_native_failsafe_observed(row.client_order_id, pos)
+
             if pos is None and work is None:
                 if (row.extras or {}).get('close_event_yielded_at') is not None:
                     # Race resolved: an earlier poll yielded a close
@@ -438,6 +450,46 @@ class _ReconcileMixin(_CapitalComBase):
                     parent_coid,
                     'attached' if all_attached else 'rejected',
                 )
+
+    def _feed_native_failsafe_observed(
+            self, parent_ref: str, pos: dict,
+    ) -> None:
+        """Forward one live position's broker-observed bracket triple to the
+        engine's §2.6.7 fail-safe recovery feed.
+
+        Maps the Capital.com ``/positions`` payload to the engine's
+        ``(stop_level, profit_level, trailing_stop)`` shape:
+
+        * a static stop is reported as ``stopLevel`` (an absolute price);
+        * a trailing stop is reported as ``trailingStop=true`` + ``stopDistance``
+          (a distance), and the absolute ``stopLevel`` slot is then irrelevant.
+
+        The two are mutually exclusive at the broker for the SL slot, so we
+        surface ``stop_level`` only when trailing is inactive and
+        ``trailing_stop`` only when it is — exactly the split the engine's
+        desired snapshot uses (``desired_level`` vs ``desired_trailing_stop``).
+        A no-op when the runner has not wired the sink (state-only paths).
+        """
+        sink = self.native_failsafe_observed_sink
+        if sink is None:
+            return
+        pos_data = pos.get('position') or {}
+        raw_stop = pos_data.get('stopLevel')
+        raw_profit = pos_data.get('profitLevel')
+        raw_distance = pos_data.get('stopDistance')
+        trailing_active = bool(pos_data.get('trailingStop'))
+        sink(
+            parent_ref,
+            stop_level=(
+                float(raw_stop)
+                if raw_stop is not None and not trailing_active else None
+            ),
+            profit_level=float(raw_profit) if raw_profit is not None else None,
+            trailing_stop=(
+                float(raw_distance)
+                if trailing_active and raw_distance is not None else None
+            ),
+        )
 
     async def _missing_pending_tracker(
             self,

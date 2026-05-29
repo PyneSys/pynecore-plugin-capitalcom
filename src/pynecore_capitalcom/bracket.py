@@ -33,8 +33,10 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.models import ExitIntent
 
 from ._base import _CapitalComBase
+from .exceptions import CapitalComError
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
     from pynecore.core.broker.storage import OrderRow
 
 
@@ -457,6 +459,89 @@ class _BracketMixin(_CapitalComBase):
                     exchange_order_id=row.exchange_order_id,
                     payload={'distance': row.trailing_distance},
                 )
+
+    async def publish_native_failsafe_sl(self, snapshot: 'NativeBracketSnapshot') -> None:
+        """§2.6.7 fail-safe actuator: PUT the worst-SL onto the parent dealId.
+
+        The :class:`~pynecore.core.broker.native_failsafe_manager.NativeFailsafeManager`
+        owns the worst-SL state; this method is the broker-side actuator the
+        sync engine drives through ``set_native_bracket_dispatcher``. It does
+        NOT touch BrokerStore leg rows — the protective stop here is the
+        engine's own backstop behind the software partial-bracket WATCH loop,
+        distinct from :meth:`execute_exit`'s bracket-leg accounting.
+
+        Capital.com ``PUT /positions/{dealId}`` is *full replacement*
+        (verified on demo 2026-05-29): a bracket field omitted from the body
+        is cleared. The body therefore always carries an explicit
+        ``stopLevel`` — a float to arm it, JSON ``null`` to remove it — never
+        relying on omission for the SL, which keeps the body non-empty (an
+        empty body is a no-op skip, not a clear). ``profitLevel`` and the
+        trailing pair are sent only when the snapshot still wants them, so
+        full replacement clears any coexisting leg the worst-SL recompute
+        dropped (the snapshot carries the whole desired triple for exactly
+        this reason).
+
+        Raises (rather than returning) on an unresolved dealId, a mapped
+        broker error, or a ``REJECTED`` confirm, so the engine records a PUT
+        failure and degrades the fail-safe instead of believing the stop
+        landed.
+
+        :param snapshot: desired bracket triple + parent COID + generation.
+        """
+        if self.store_ctx is None:
+            raise CapitalComError(
+                "native fail-safe SL PUT refused: no store_ctx to resolve the "
+                f"dealId for parent {snapshot.parent_entry_dispatch_ref!r}"
+            )
+        row = self.store_ctx.get_order(snapshot.parent_entry_dispatch_ref)
+        deal_id = row.exchange_order_id if row is not None else None
+        if not deal_id:
+            raise CapitalComError(
+                "native fail-safe SL PUT refused: unresolved dealId for parent "
+                f"{snapshot.parent_entry_dispatch_ref!r} "
+                f"({'no order row' if row is None else 'no exchange_order_id yet'})"
+                " — refusing to PUT against a guessed position."
+            )
+
+        body: dict = {
+            'stopLevel': (
+                float(snapshot.stop_level)
+                if snapshot.stop_level is not None else None
+            ),
+        }
+        if snapshot.profit_level is not None:
+            body['profitLevel'] = float(snapshot.profit_level)
+        if snapshot.trailing_stop is not None:
+            body['trailingStop'] = True
+            body['stopDistance'] = float(snapshot.trailing_stop)
+
+        resp = await self._call(f'positions/{deal_id}', data=body, method='put')
+        deal_ref = resp.get('dealReference') if isinstance(resp, dict) else None
+        self.store_ctx.log_event(
+            'native_failsafe_sl_put',
+            client_order_id=snapshot.parent_entry_dispatch_ref,
+            exchange_order_id=deal_id,
+            payload={
+                'stop_level': snapshot.stop_level,
+                'profit_level': snapshot.profit_level,
+                'trailing_stop': snapshot.trailing_stop,
+                'generation': snapshot.generation,
+                'deal_reference': deal_ref,
+            },
+        )
+        if not deal_ref:
+            # PUT returned no dealReference to confirm; treat the round-trip
+            # as success (the observed-reconcile pass verifies the actual
+            # level later). Mirrors :meth:`execute_exit`, which only confirms
+            # when a dealReference is present.
+            return
+        confirm = await self._call(f'confirms/{deal_ref}', method='get')
+        if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
+            reason = confirm.get('reason') or 'unknown'
+            raise CapitalComError(
+                f"native fail-safe SL PUT REJECTED for dealId {deal_id} "
+                f"(parent {snapshot.parent_entry_dispatch_ref!r}): {reason}"
+            )
 
     # --- Connect / recovery -----------------------------------------------
 
