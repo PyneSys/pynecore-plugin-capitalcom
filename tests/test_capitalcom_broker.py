@@ -94,7 +94,6 @@ def __test_broker_capabilities_match_dossier__():
     broker = _FakeBroker(config=_make_config())
     caps = broker.get_capabilities()
     assert caps.stop_order is CapabilityLevel.NATIVE
-    assert caps.stop_limit_order is CapabilityLevel.UNSUPPORTED
     assert caps.trailing_stop is CapabilityLevel.NATIVE
     assert caps.tp_sl_bracket is CapabilityLevel.NATIVE
     assert caps.partial_qty_bracket_exit is CapabilityLevel.SOFTWARE
@@ -381,15 +380,6 @@ def __test_execute_entry_limit_creates_working_order__(tmp_path):
     call = [c for c in broker._calls if c[0] == 'workingorders' and c[1] == 'post'][0]
     assert call[2]['level'] == 1.2000
     assert call[2]['type'] == 'LIMIT'
-    store.close()
-
-
-def __test_execute_entry_stop_limit_rejects_as_capability__(tmp_path):
-    broker, store, _ = _make_broker(tmp_path)
-    env = _entry_envelope(order_type=OrderType.STOP_LIMIT,
-                          limit=1.2, stop=1.1)
-    with pytest.raises(ExchangeCapabilityError):
-        asyncio.run(broker.execute_entry(env))
     store.close()
 
 

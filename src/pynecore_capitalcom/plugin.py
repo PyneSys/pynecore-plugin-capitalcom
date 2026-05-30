@@ -86,9 +86,12 @@ class CapitalCom(
 
     Only one-way position mode is supported; hedging-mode accounts are
     rejected at startup. Stop orders and server-side trailing stops are
-    supported; stop-limit is not. Partial closes are emulated via
-    opposite-direction posts (netting), and size changes require
-    cancel-and-recreate — order size is not amendable.
+    supported. A both-set Pine entry (``limit`` and ``stop``) is not a
+    stop-limit order: the sync engine rests the limit leg natively and
+    fires a market order on the stop side via a software price-watch, so
+    the plugin only ever sees plain market / limit / stop entries. Partial
+    closes are emulated via opposite-direction posts (netting), and size
+    changes require cancel-and-recreate — order size is not amendable.
 
     Idempotency is software-upheld via the unified
     :class:`~pynecore.core.broker.storage.BrokerStore` — the generic

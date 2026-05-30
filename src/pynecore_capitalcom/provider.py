@@ -453,7 +453,6 @@ class _ProviderMixin(_CapitalComBase):
         """
         return ExchangeCapabilities(
             stop_order=CapabilityLevel.NATIVE,
-            stop_limit_order=CapabilityLevel.UNSUPPORTED,
             trailing_stop=CapabilityLevel.NATIVE,
             tp_sl_bracket=CapabilityLevel.NATIVE,
             partial_qty_bracket_exit=CapabilityLevel.SOFTWARE,

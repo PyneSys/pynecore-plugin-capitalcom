@@ -36,6 +36,7 @@ from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
+    KIND_ENTRY_STOP,
     KIND_EXIT_SL,
     KIND_EXIT_TP,
     KIND_MODIFY_ENTRY,
@@ -325,13 +326,14 @@ class _ExecutionMixin(_CapitalComBase):
         """
         intent = envelope.intent
         assert isinstance(intent, EntryIntent)
-        coid = envelope.client_order_id(KIND_ENTRY)
-
-        if intent.order_type == OrderType.STOP_LIMIT:
-            raise ExchangeCapabilityError(
-                "Capital.com does not support STOP_LIMIT orders — core "
-                "validation should have caught this at startup.",
-            )
+        # The stop-fired MARKET of a both-set entry uses a distinct
+        # client-order-id from the native LIMIT leg (which already holds the
+        # KIND_ENTRY id for the same pine_id) — otherwise the broker's local
+        # idempotency dedup would treat the market POST as a duplicate of the
+        # just-cancelled limit and skip it.
+        coid = envelope.client_order_id(
+            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
+        )
 
         rules = await self._get_instrument_rules(intent.symbol)
         if rules.min_size > 0 and intent.qty < rules.min_size:
