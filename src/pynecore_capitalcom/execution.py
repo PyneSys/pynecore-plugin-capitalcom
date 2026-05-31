@@ -72,7 +72,7 @@ from .exceptions import (
     InvalidTakeProfitMaxValueError,
     OrderNotFoundError,
 )
-from .helpers import _parse_iso_timestamp
+from .helpers import _extract_reject_reason, _is_funds_reject, _parse_iso_timestamp
 from .models import _InstrumentRules, _bracket_leg_id
 
 if TYPE_CHECKING:
@@ -822,7 +822,7 @@ class _ExecutionMixin(_CapitalComBase):
                         cause=net if isinstance(net, Exception) else None,
                     ) from net
                 if (attach_confirm.get('dealStatus') or '').upper() == 'REJECTED':
-                    reason = attach_confirm.get('reason') or 'unknown'
+                    reason = _extract_reject_reason(attach_confirm)
                     self._rollback_bracket_legs(
                         intent=intent, parent_coid=target_row.client_order_id,
                         deal_id=deal_id,
@@ -2093,9 +2093,8 @@ class _CapitalComEntryHooks:
 
         deal_status = (confirm.get('dealStatus') or '').upper()
         if deal_status == 'REJECTED':
-            reason = confirm.get('reason') or 'unknown'
-            reason_lc = reason.lower()
-            if 'margin' in reason_lc or 'leverage' in reason_lc:
+            reason = _extract_reject_reason(confirm)
+            if _is_funds_reject(reason):
                 raise InsufficientMarginError(f"Capital reject: {reason}")
             raise ExchangeOrderRejectedError(
                 f"Capital confirm REJECTED: {reason}"

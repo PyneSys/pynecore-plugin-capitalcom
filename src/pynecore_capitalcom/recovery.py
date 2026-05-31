@@ -49,7 +49,7 @@ from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
 from .exceptions import OrderNotFoundError
-from .helpers import _parse_iso_timestamp
+from .helpers import _extract_reject_reason, _parse_iso_timestamp
 
 if TYPE_CHECKING:
     from pynecore.core.broker.models import EntryIntent
@@ -724,7 +724,7 @@ class _CapitalComResumeHooks:
                 if deal_status == 'REJECTED':
                     return ResumeOutcome(
                         status='rejected',
-                        reject_reason=confirm.get('reason') or 'unknown',
+                        reject_reason=_extract_reject_reason(confirm),
                         recovery_path='modify_entry_confirm_rejected',
                         recovery_context={'deal_reference': ref},
                     )
@@ -870,7 +870,7 @@ class _CapitalComResumeHooks:
                 if deal_status == 'REJECTED':
                     return ResumeOutcome(
                         status='rejected',
-                        reject_reason=confirm.get('reason') or 'unknown',
+                        reject_reason=_extract_reject_reason(confirm),
                         recovery_path='modify_exit_confirm_rejected',
                         recovery_context={'deal_reference': ref},
                     )
@@ -1208,7 +1208,7 @@ class _CapitalComResumeHooks:
         if deal_status == 'REJECTED':
             return ResumeOutcome(
                 status='rejected',
-                reject_reason=confirm.get('reason') or 'unknown',
+                reject_reason=_extract_reject_reason(confirm),
                 recovery_path='partial_close_confirm_rejected',
                 recovery_context={'deal_reference': ref},
             )

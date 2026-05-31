@@ -78,6 +78,13 @@ _INVALID_TP_MIN_PREFIX = 'error.invalid.takeprofit.minvalue'
 _INVALID_TP_MAX_PREFIX = 'error.invalid.takeprofit.maxvalue'
 _INVALID_LEVERAGE_CODE = 'error.invalid.leverage.value'
 
+# ``rejectReason`` tokens / substrings on a REJECTED confirm that mean the
+# account cannot fund or risk-clear the order (insufficient balance, margin,
+# leverage cap, or a generic risk-engine veto). These map to the typed
+# :class:`InsufficientMarginError` — a non-terminal reject the runner survives
+# (see its docstring) so the strategy can respond on a later bar.
+_FUNDS_REJECT_REASON_SUBSTRINGS = ('MARGIN', 'LEVERAGE', 'FUND', 'RISK', 'BALANCE')
+
 
 # --- Internal tuning constants ---------------------------------------------
 #
@@ -188,6 +195,27 @@ def _extract_error_code(exc: CapitalComError) -> str:
     if message.startswith(prefix):
         return message[len(prefix):].split(':', 1)[0].strip()
     return message.split(':', 1)[0].strip()
+
+
+def _extract_reject_reason(confirm: dict) -> str:
+    """Pull the rejection reason out of a Capital.com confirm payload.
+
+    Capital.com reports the reason under ``rejectReason`` (e.g.
+    ``"RISK_CHECK"``, ``"INSUFFICIENT_FUNDS"``). The legacy ``reason`` key is
+    kept as a fallback in case an alternate payload shape ever carries it.
+    Returns ``"unknown"`` when neither is present.
+    """
+    reason = confirm.get('rejectReason') or confirm.get('reason')
+    return str(reason) if reason else 'unknown'
+
+
+def _is_funds_reject(reason: str) -> bool:
+    """True when a Capital.com reject reason means the account cannot fund /
+    risk-clear the order (insufficient balance, margin, leverage cap or a
+    generic risk-engine veto), so the caller should raise the non-terminal
+    :class:`InsufficientMarginError` rather than a plain reject."""
+    reason_uc = reason.upper()
+    return any(token in reason_uc for token in _FUNDS_REJECT_REASON_SUBSTRINGS)
 
 
 def _order_type_from_row(row: 'OrderRow', activity_type: str) -> OrderType:

@@ -34,6 +34,7 @@ from pynecore.core.broker.models import ExitIntent
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
+from .helpers import _extract_reject_reason
 
 if TYPE_CHECKING:
     from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
@@ -537,7 +538,7 @@ class _BracketMixin(_CapitalComBase):
             return
         confirm = await self._call(f'confirms/{deal_ref}', method='get')
         if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
-            reason = confirm.get('reason') or 'unknown'
+            reason = _extract_reject_reason(confirm)
             raise CapitalComError(
                 f"native fail-safe SL PUT REJECTED for dealId {deal_id} "
                 f"(parent {snapshot.parent_entry_dispatch_ref!r}): {reason}"

@@ -43,7 +43,7 @@ from pynecore.core.broker.models import (
 )
 
 from .exceptions import CapitalComError, OrderNotFoundError
-from .helpers import _parse_iso_timestamp
+from .helpers import _extract_reject_reason, _is_funds_reject, _parse_iso_timestamp
 from .models import _bracket_leg_id
 
 if TYPE_CHECKING:
@@ -140,9 +140,8 @@ class _CapitalComModifyEntryHooks:
 
         deal_status = (confirm.get('dealStatus') or '').upper()
         if deal_status == 'REJECTED':
-            reason = confirm.get('reason') or 'unknown'
-            reason_lc = reason.lower()
-            if 'margin' in reason_lc or 'leverage' in reason_lc:
+            reason = _extract_reject_reason(confirm)
+            if _is_funds_reject(reason):
                 raise InsufficientMarginError(
                     f"Capital reject on working-order amend: {reason}",
                 )
@@ -1025,7 +1024,7 @@ class _CapitalComModifyExitHooks:
 
             deal_status = (modify_confirm.get('dealStatus') or '').upper()
             if deal_status == 'REJECTED':
-                reason = modify_confirm.get('reason') or 'unknown'
+                reason = _extract_reject_reason(modify_confirm)
                 if self._plugin.store_ctx is not None:
                     self._plugin.store_ctx.log_event(
                         'modify_exit_rejected',
