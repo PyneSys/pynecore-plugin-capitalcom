@@ -351,6 +351,27 @@ class _ExecutionMixin(_CapitalComBase):
                 },
             )
         quantized_qty = self._quantize_size(intent.qty, rules)
+        # Mirror of the min-size floor: Capital.com rejects sizes above
+        # ``maxDealSize`` with ``error.invalid.size.maxvalue``, which surfaces
+        # as a fatal ``ExchangeOrderRejectedError`` and would halt the live
+        # run. Pre-empt it here so an oversized request is declined like an
+        # undersized one — skip (no silent clamp; the size is the caller's
+        # concern) and let the engine carry on. Compare the quantized size,
+        # i.e. what actually reaches the broker.
+        if rules.max_size > 0 and quantized_qty > rules.max_size:
+            raise OrderSkippedByPlugin(
+                f"Skipping {intent.symbol} {intent.side.upper()} entry "
+                f"id={intent.pine_id!r}: qty={quantized_qty} above Capital.com "
+                f"maximum size {rules.max_size}. No order sent.",
+                intent_key=intent.intent_key,
+                reason="above_max_size",
+                context={
+                    'symbol': intent.symbol,
+                    'side': intent.side,
+                    'qty': quantized_qty,
+                    'max_size': rules.max_size,
+                },
+            )
         direction = "BUY" if intent.side == 'buy' else "SELL"
 
         if intent.order_type == OrderType.MARKET:

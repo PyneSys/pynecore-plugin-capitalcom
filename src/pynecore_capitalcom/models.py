@@ -15,13 +15,19 @@ class _InstrumentRules:
     """Cached dealing rules for a single instrument.
 
     Capital.com returns these on ``GET /markets/{epic}`` as the
-    ``dealingRules`` + ``instrument`` blocks. Three values are load-bearing
+    ``dealingRules`` + ``instrument`` blocks. Four values are load-bearing
     for order sizing: ``lot_step`` (granularity of the ``size`` param),
-    ``min_size`` (the smallest accepted ``size``), and
-    ``min_stop_or_limit_distance`` — the dynamic minimum that
-    ``minNormalStopOrLimitDistance`` carries; it applies symmetrically to
-    both stop level and limit (take-profit) level, used to pre-filter
-    obviously-rejectable bracket levels before the round-trip.
+    ``min_size`` / ``max_size`` (the smallest / largest accepted ``size``;
+    ``maxDealSize`` rejects oversized orders with
+    ``error.invalid.size.maxvalue``), and ``min_stop_or_limit_distance`` —
+    the dynamic minimum that ``minNormalStopOrLimitDistance`` carries; it
+    applies symmetrically to both stop level and limit (take-profit) level,
+    used to pre-filter obviously-rejectable bracket levels before the
+    round-trip.
+
+    ``max_size`` is ``0.0`` when the venue does not quote a ``maxDealSize``
+    (or the field is unavailable); the execute path treats ``<= 0`` as
+    "no ceiling known" and skips the pre-check.
 
     ``fetched_at`` is the epoch second the entry was cached at; the lookup
     re-fetches once it ages past
@@ -34,6 +40,7 @@ class _InstrumentRules:
     min_size: float
     min_stop_or_limit_distance: float
     fetched_at: float
+    max_size: float = 0.0
 
 
 @dataclass

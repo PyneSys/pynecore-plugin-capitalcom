@@ -499,6 +499,7 @@ class _ProviderMixin(_CapitalComBase):
             or instrument.get('lotSize', 0.01)
         )
         min_size = float((dealing.get('minDealSize') or {}).get('value', lot_step))
+        max_size = float((dealing.get('maxDealSize') or {}).get('value', 0.0))
         min_stop_or_limit_distance = float(
             (dealing.get('minNormalStopOrLimitDistance') or {}).get('value', 0.0)
             or (dealing.get('minControlledRiskStopDistance') or {}).get('value', 0.0)
@@ -507,6 +508,7 @@ class _ProviderMixin(_CapitalComBase):
             epic=epic,
             lot_step=lot_step if lot_step > 0.0 else 0.01,
             min_size=min_size,
+            max_size=max_size,
             min_stop_or_limit_distance=min_stop_or_limit_distance,
             fetched_at=now,
         )
