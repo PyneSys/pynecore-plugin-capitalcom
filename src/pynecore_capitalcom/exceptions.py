@@ -7,10 +7,17 @@ distance for ``minvalue``, an absolute price level for ``maxvalue``) so
 callers can re-size or re-place without another round-trip.
 """
 from pynecore.core.broker.exceptions import ExchangeOrderRejectedError
+from pynecore.core.plugin import ProviderError
 
 
-class CapitalComError(ValueError):
-    ...
+class CapitalComError(ProviderError):
+    """Base class for Capital.com REST / connection failures.
+
+    Subclasses :class:`~pynecore.core.plugin.ProviderError` so credential,
+    auth and connection problems surface as a clean one-line ``pyne data``
+    error rather than a traceback, while staying catchable as
+    ``CapitalComError`` on the broker and risk paths.
+    """
 
 
 class InvalidStopDistanceError(ExchangeOrderRejectedError):
