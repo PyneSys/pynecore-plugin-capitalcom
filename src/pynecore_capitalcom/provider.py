@@ -277,7 +277,7 @@ class _ProviderMixin(_CapitalComBase):
     @override
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
                        on_progress: Callable[[datetime], None] | None = None,
-                       limit: int | None = None):
+                       limit: int | None = None, with_extra: bool = False):
         """Download OHLCV data between ``time_from`` and ``time_to``.
 
         The Capital.com REST ``/prices`` endpoint includes the currently-
@@ -287,6 +287,10 @@ class _ProviderMixin(_CapitalComBase):
         same timestamp as the last warmup bar and the script_runner
         would have to treat it as an in-place refinement, which makes
         the logged bar_index appear stuck at the warmup boundary.
+
+        The response already carries bid and ask OHLC, so ``with_extra``
+        only gates whether the ask/spread fields are written to the
+        ``.extra.csv`` sidecar (no extra request either way).
         """
         tf = time_from.replace(tzinfo=None)
         tt = (time_to if time_to is not None else datetime.now(UTC)).replace(tzinfo=None)
@@ -364,7 +368,7 @@ class _ProviderMixin(_CapitalComBase):
                             'ask_low': ask_l,
                             'ask_close': ask_c,
                             'spread': abs(ask_c - bid_c),
-                        },
+                        } if with_extra else None,
                     )
 
                     self.save_ohlcv_data(ohlcv)
