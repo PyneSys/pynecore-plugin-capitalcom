@@ -226,6 +226,14 @@ class _ProviderMixin(_CapitalComBase):
             pricescale *= 10
             minmove *= 10
 
+        # minDealSize is the smallest tradable amount — TV's mincontract
+        # definition. 0.0 lets the provider chain fall back to volume
+        # analysis / heuristics when the API omits it.
+        try:
+            mincontract = float(dealing_rules['minDealSize']['value'])
+        except (KeyError, TypeError, ValueError):
+            mincontract = 0.0
+
         res = self.get_historical_prices()
         avg_spred_summ = 0.0
         for p in res['prices']:
@@ -245,6 +253,7 @@ class _ProviderMixin(_CapitalComBase):
             pricescale=pricescale,
             minmove=minmove,
             pointvalue=instrument['lotSize'],
+            mincontract=mincontract,
             timezone=self.timezone,
             opening_hours=opening_hours,
             session_starts=session_starts,
