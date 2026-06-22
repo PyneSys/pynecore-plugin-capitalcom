@@ -139,7 +139,15 @@ def _activity_fingerprint(activity: dict) -> str:
     The value is stored on :class:`_ActivityCursor.seen_fingerprints` for
     the in-session dedup set and persisted in the ``events`` table
     (``activity_processed`` kind) so the next process incarnation can
-    rebuild the set from the BrokerStore.
+    rebuild the set from the BrokerStore. It is also surfaced as the
+    ``OrderEvent.fill_id`` the sync engine's duplicate-fill gate keys on.
+
+    The field set is FROZEN: it must not change without a stored-fingerprint
+    migration. Adding or removing a field (e.g. ``epic`` / ``direction``)
+    re-hashes every row, so a fill recorded before the change would no longer
+    match its persisted fingerprint after a restart and would be applied a
+    second time. ``dealId`` plus the timestamp already discriminate rows in
+    practice; the extra fields only guard against same-instant collisions.
     """
     key = "|".join(str(activity.get(k, '')) for k in (
         'dateUTC', 'dealId', 'type', 'status', 'source', 'level', 'size',

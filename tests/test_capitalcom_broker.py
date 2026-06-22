@@ -1408,6 +1408,9 @@ def __test_process_activity_fills_zero_level_from_position_snapshot__(tmp_path):
     assert len(events) == 1
     assert events[0].event_type == 'filled'
     assert events[0].fill_price == 1.17341
+    # The content-addressed activity fingerprint is stamped as the canonical
+    # fill_id so the engine's duplicate-fill gate can drop a redelivered copy.
+    assert events[0].fill_id == _activity_fingerprint(activity)
     store.close()
 
 

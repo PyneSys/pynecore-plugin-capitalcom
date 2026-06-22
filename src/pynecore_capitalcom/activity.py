@@ -321,6 +321,8 @@ class _ActivityMixin(_CapitalComBase):
                         leg_type=event.leg_type,
                         fee=event.fee,
                         fee_currency=event.fee_currency,
+                        # Same source activity row => same canonical fingerprint.
+                        fill_id=event.fill_id,
                     )
                     if self.store_ctx is not None:
                         self.store_ctx.log_event(
@@ -740,6 +742,15 @@ class _ActivityMixin(_CapitalComBase):
             pine_id=row.pine_entry_id,
             from_entry=row.from_entry,
             leg_type=leg_type,
+            # Capital.com exposes no stable activity/execution id, so the
+            # content-addressed activity fingerprint (the same key
+            # :meth:`_process_activity` dedups on) is the canonical per-fill
+            # id. The engine's duplicate-fill gate keys on it as a backstop
+            # for a row redelivered past the local ``seen_fingerprints`` set
+            # (e.g. cross-restart before the cursor persists). Snapshot
+            # reconcile emissions carry no fingerprint and stay ``None``,
+            # relying on the ``filled_qty`` cursor watermark instead.
+            fill_id=_activity_fingerprint(activity),
         )
 
     def _find_active_entry_row(
