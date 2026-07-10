@@ -454,8 +454,9 @@ class _ProviderMixin(_CapitalComBase):
         - ``watch_orders = SOFTWARE`` — no WebSocket order channel; the
           plugin emulates one with an AsyncIterator that fuses
           ``GET /positions`` + ``GET /workingorders`` +
-          ``GET /history/activity`` snapshots. Cadence and backoff live on
-          :class:`CapitalComConfig`.
+          ``GET /history/activity`` snapshots. Cadence and backoff are
+          internal module constants in ``helpers.py`` — deliberately NOT
+          user-configurable (see the ``config.py`` module docstring).
         - ``fetch_position = NATIVE`` — ``GET /positions`` returns the
           live position(s) directly.
         - ``idempotency = SOFTWARE`` — the server generates the
