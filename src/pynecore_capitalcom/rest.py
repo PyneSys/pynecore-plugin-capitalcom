@@ -5,12 +5,13 @@ Carries authentication state (``security_token``, ``cst_token``,
 HTTP request, ``_call`` offloads it to a worker thread for async
 callers), the session creator (``create_session``), the startup auth
 probe (``get_balance``), the cached preferences fetch
-(``get_preferences``), the one-way-mode assertion, and the exception
-mapper that classifies Capital.com error codes into the broker
-taxonomy.
+(``get_preferences``), the account-mode probe
+(``_detect_account_mode``), and the exception mapper that classifies
+Capital.com error codes into the broker taxonomy.
 
 State touched: ``security_token``, ``cst_token``, ``session_data``,
-``_account_id``, ``_account_preferences``, ``_last_auth_probe_ts``.
+``_account_id``, ``_account_preferences``, ``_hedging_enabled``,
+``_last_auth_probe_ts``.
 """
 import asyncio
 from json import JSONDecodeError
@@ -21,7 +22,6 @@ import httpx
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
     BrokerError,
-    ExchangeCapabilityError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
@@ -345,22 +345,23 @@ class _RestSessionMixin(_CapitalComBase):
             self._account_preferences = prefs
         return prefs
 
-    async def assert_one_way_mode(self) -> None:
-        """Fail-closed if the active account is in hedging mode.
+    async def _detect_account_mode(self) -> None:
+        """Probe the account's position mode and wire the one-way emulation.
 
-        :raises ExchangeCapabilityError: The account has hedging enabled
-            and :attr:`require_one_way_mode` is True (the default,
-            sourced from the cross-broker ``brokers.toml``).
+        A hedging-mode account opts into core one-way emulation: the Order
+        Sync Engine reroutes close/reversal/bracket through the
+        :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator` via
+        this plugin's :class:`~pynecore.core.plugin.broker.PositionPort`
+        primitives, presenting Pine one-way semantics over the multi-row
+        book. A one-way (netting) account leaves ``position_port`` ``None``
+        and keeps the direct execute path. ``get_preferences`` is
+        instance-cached, so a reconnect re-entry is free and the
+        assignment is idempotent.
         """
-        if not self.require_one_way_mode:
-            return
         prefs = await self.get_preferences()
-        if prefs.get('hedgingMode'):
-            raise ExchangeCapabilityError(
-                "Capital.com account is in hedging mode — this plugin "
-                "only supports one-way mode. Disable hedging on the account "
-                "or await the future HedgeBrokerPlugin subclass.",
-            )
+        self._hedging_enabled = bool(prefs.get('hedgingMode'))
+        if self._hedging_enabled:
+            self.position_port = self
 
     # --- exception mapping ------------------------------------------------
 

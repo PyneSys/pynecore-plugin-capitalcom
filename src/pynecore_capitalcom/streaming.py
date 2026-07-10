@@ -1077,6 +1077,11 @@ class _StreamingMixin(_CapitalComBase):
             self.create_session()
 
         if self.store_ctx is not None:
+            # Account-mode probe BEFORE the recovery passes: a hedging-mode
+            # account opts into core one-way emulation (``position_port =
+            # self``) and the recovery + the engine's restart replay must
+            # already see the wired port. See ``_detect_account_mode``.
+            await self._detect_account_mode()
             await self._load_activity_cursor_from_events()
             await self._recover_in_flight_submissions()
 

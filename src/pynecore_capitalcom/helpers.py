@@ -16,6 +16,7 @@ Imported by ``_base.py`` and many mix-ins; depends only on stdlib and
 import json
 from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
 from datetime import UTC, datetime, time
+from decimal import Decimal
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
@@ -316,3 +317,16 @@ def _parse_iso_timestamp(value: str) -> float:
         return dt.timestamp()
     except ValueError:
         return 0.0
+
+
+def _size_from_units(units: int, lot_step: float) -> float:
+    """Convert a lot-step unit count back to a JSON-safe ``size`` value.
+
+    ``units * lot_step`` in binary floats produces artifacts
+    (``7 * 0.01 == 0.07000000000000001``) that would be serialized
+    verbatim into the request body. Rounding to the lot step's own
+    decimal precision restores the exact grid value.
+    """
+    exponent = Decimal(str(lot_step)).normalize().as_tuple().exponent
+    decimals = max(0, -int(exponent))
+    return round(units * lot_step, decimals)

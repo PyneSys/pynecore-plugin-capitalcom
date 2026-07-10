@@ -25,11 +25,7 @@ State touched: BrokerStore through ``self.store_ctx``.
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
-from pynecore.core.broker.exceptions import (
-    BrokerError,
-    OrderDispositionUnknownError,
-    UnexpectedCancelError,
-)
+from pynecore.core.broker.exceptions import BrokerError
 from pynecore.core.broker.models import ExitIntent
 
 from ._base import _CapitalComBase
@@ -494,15 +490,25 @@ class _BracketMixin(_CapitalComBase):
                 "native fail-safe SL PUT refused: no store_ctx to resolve the "
                 f"dealId for parent {snapshot.parent_entry_dispatch_ref!r}"
             )
-        row = self.store_ctx.get_order(snapshot.parent_entry_dispatch_ref)
-        deal_id = row.exchange_order_id if row is not None else None
-        if not deal_id:
-            raise CapitalComError(
-                "native fail-safe SL PUT refused: unresolved dealId for parent "
-                f"{snapshot.parent_entry_dispatch_ref!r} "
-                f"({'no order row' if row is None else 'no exchange_order_id yet'})"
-                " — refusing to PUT against a guessed position."
-            )
+        if self._hedging_enabled:
+            # A hedging-mode one-way position can span several rows
+            # (pyramided entries each open their own dealId), so the
+            # worst-case SL is replicated onto EVERY row on the position
+            # side — amending only the parent entry's own row would leave
+            # the other legs without the downtime stop while the fail-safe
+            # reports healthy.
+            deal_ids = await self._failsafe_leg_ids(snapshot)
+        else:
+            row = self.store_ctx.get_order(snapshot.parent_entry_dispatch_ref)
+            deal_id = row.exchange_order_id if row is not None else None
+            if not deal_id:
+                raise CapitalComError(
+                    "native fail-safe SL PUT refused: unresolved dealId for parent "
+                    f"{snapshot.parent_entry_dispatch_ref!r} "
+                    f"({'no order row' if row is None else 'no exchange_order_id yet'})"
+                    " — refusing to PUT against a guessed position."
+                )
+            deal_ids = [deal_id]
 
         body: dict = {
             'stopLevel': (
@@ -516,33 +522,65 @@ class _BracketMixin(_CapitalComBase):
             body['trailingStop'] = True
             body['stopDistance'] = float(snapshot.trailing_stop)
 
-        resp = await self._call(f'positions/{deal_id}', data=body, method='put')
-        deal_ref = resp.get('dealReference') if isinstance(resp, dict) else None
+        # PUT every leg BEFORE confirming any: a reject on one leg must not
+        # leave the remaining legs without the downtime stop.
+        deal_refs: list[str | None] = []
+        for deal_id in deal_ids:
+            resp = await self._call(
+                f'positions/{deal_id}', data=body, method='put',
+            )
+            deal_refs.append(
+                resp.get('dealReference') if isinstance(resp, dict) else None,
+            )
         self.store_ctx.log_event(
             'native_failsafe_sl_put',
             client_order_id=snapshot.parent_entry_dispatch_ref,
-            exchange_order_id=deal_id,
+            exchange_order_id=','.join(deal_ids),
             payload={
                 'stop_level': snapshot.stop_level,
                 'profit_level': snapshot.profit_level,
                 'trailing_stop': snapshot.trailing_stop,
                 'generation': snapshot.generation,
-                'deal_reference': deal_ref,
+                'deal_references': deal_refs,
             },
         )
-        if not deal_ref:
-            # PUT returned no dealReference to confirm; treat the round-trip
-            # as success (the observed-reconcile pass verifies the actual
-            # level later). Mirrors :meth:`execute_exit`, which only confirms
-            # when a dealReference is present.
-            return
-        confirm = await self._call(f'confirms/{deal_ref}', method='get')
-        if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
-            reason = _extract_reject_reason(confirm)
+        for deal_id, deal_ref in zip(deal_ids, deal_refs):
+            if not deal_ref:
+                # PUT returned no dealReference to confirm; treat the
+                # round-trip as success (the observed-reconcile pass
+                # verifies the actual level later). Mirrors
+                # :meth:`execute_exit`, which only confirms when a
+                # dealReference is present.
+                continue
+            confirm = await self._call(f'confirms/{deal_ref}', method='get')
+            if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
+                reason = _extract_reject_reason(confirm)
+                raise CapitalComError(
+                    f"native fail-safe SL PUT REJECTED for dealId {deal_id} "
+                    f"(parent {snapshot.parent_entry_dispatch_ref!r}): {reason}"
+                )
+
+    async def _failsafe_leg_ids(
+            self, snapshot: 'NativeBracketSnapshot',
+    ) -> list[str]:
+        """Resolve every hedging-mode row the fail-safe SL must protect.
+
+        Fans across all open rows on the parent's position side — the same
+        set the core emulator's bracket replication amends. An empty result
+        raises so the engine degrades the fail-safe rather than believing a
+        stop landed on a guessed position.
+        """
+        legs = await self.fetch_raw_positions(snapshot.symbol)
+        open_side = 'buy' if snapshot.parent_side == 'long' else 'sell'
+        leg_ids = [leg.leg_id for leg in legs if leg.side == open_side]
+        if not leg_ids:
             raise CapitalComError(
-                f"native fail-safe SL PUT REJECTED for dealId {deal_id} "
-                f"(parent {snapshot.parent_entry_dispatch_ref!r}): {reason}"
+                f"native fail-safe SL refused: no {snapshot.parent_side} rows "
+                f"for parent {snapshot.parent_entry_dispatch_ref!r} on "
+                f"{snapshot.symbol!r} — refusing to PUT against a guessed "
+                "position."
             )
+        return leg_ids
 
     # --- Connect / recovery -----------------------------------------------
 

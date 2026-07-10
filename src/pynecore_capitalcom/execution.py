@@ -13,21 +13,17 @@ state transition is PERSIST-FIRST so a process crash mid-dispatch
 leaves an auditable row that ``_recover_in_flight_submissions`` can
 replay on restart).
 """
-import asyncio
 from time import time as epoch_time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 
 from pynecore.core.broker.exceptions import (
-    AuthenticationError,
     BracketAttachAfterFillRejectedError,
     BrokerError,
-    BrokerManualInterventionError,
     ExchangeCapabilityError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
-    ExchangeRateLimitError,
     InsufficientMarginError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -42,6 +38,7 @@ from pynecore.core.broker.idempotency import (
     KIND_MODIFY_ENTRY,
     KIND_MODIFY_EXIT,
 )
+from pynecore.core.broker.emulator import aggregate_positions
 from pynecore.core.broker.journal import DispatchJournal
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
@@ -56,10 +53,9 @@ from pynecore.core.broker.models import (
     ExchangeOrder,
     ExchangePosition,
     ExitIntent,
-    LegType,
-    OrderEvent,
     OrderStatus,
     OrderType,
+    PositionLeg,
 )
 from pynecore.core.plugin import override
 
@@ -67,12 +63,15 @@ from ._base import _CapitalComBase
 from .exceptions import (
     CapitalComError,
     InvalidStopDistanceError,
-    InvalidStopMaxValueError,
     InvalidTakeProfitDistanceError,
-    InvalidTakeProfitMaxValueError,
     OrderNotFoundError,
 )
-from .helpers import _extract_reject_reason, _is_funds_reject, _parse_iso_timestamp
+from .helpers import (
+    _extract_reject_reason,
+    _is_funds_reject,
+    _parse_iso_timestamp,
+    _size_from_units,
+)
 from .models import _InstrumentRules, _bracket_leg_id
 
 if TYPE_CHECKING:
@@ -164,7 +163,7 @@ class _ExecutionMixin(_CapitalComBase):
         if rules.lot_step <= 0.0:
             return qty
         units = round(qty / rules.lot_step)
-        return units * rules.lot_step
+        return _size_from_units(units, rules.lot_step)
     async def get_position(self, symbol: str) -> ExchangePosition | None:
         """Return the aggregate position across all rows for ``symbol``.
 
@@ -172,7 +171,19 @@ class _ExecutionMixin(_CapitalComBase):
         (confirmed empirically after §9 #5 is closed) — aggregation is
         therefore mandatory for Pine's one-way model. Returns ``None``
         when no row exists for the symbol.
+
+        On a hedging-mode account the rows are netted through the core
+        :func:`~pynecore.core.broker.emulator.aggregate_positions` instead:
+        that virtual-FIFO survivor view is what the
+        :class:`~pynecore.core.broker.one_way_emulator.OneWayEmulator`'s
+        close/reversal plans assume, whereas the netting branch below
+        computes a gross same-side average (fine when opposite rows cannot
+        coexist).
         """
+        if self._hedging_enabled:
+            return aggregate_positions(
+                symbol, await self.fetch_raw_positions(symbol),
+            )
         res = await self._call('positions', method='get')
         rows = res.get('positions') or []
         long_size = 0.0
@@ -231,6 +242,281 @@ class _ExecutionMixin(_CapitalComBase):
             leverage=leverage,
             margin_mode=margin_mode,
         )
+
+    async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
+        """Return every open position row ("leg") for ``symbol``, oldest first.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` transport
+        primitive: one :class:`PositionLeg` per Capital.com position row
+        with ZERO aggregation — the core emulator nets them. Sorted by
+        ``(open_time, leg_id)`` so the FIFO close order is deterministic
+        and replay-stable across polls (``createdDateUTC`` has millisecond
+        resolution; the dealId tiebreak covers same-millisecond fills).
+        """
+        res = await self._call('positions', method='get')
+        rows = res.get('positions') or []
+        legs: list[PositionLeg] = []
+        for row in rows:
+            market = row.get('market') or {}
+            if market.get('epic') != symbol:
+                continue
+            position = row.get('position') or {}
+            direction = (position.get('direction') or '').upper()
+            if direction not in ('BUY', 'SELL'):
+                continue
+            deal_id = position.get('dealId')
+            if not deal_id:
+                continue
+            legs.append(PositionLeg(
+                leg_id=str(deal_id),
+                symbol=symbol,
+                side='buy' if direction == 'BUY' else 'sell',
+                qty=float(position.get('size', 0.0)),
+                entry_price=float(position.get('level', 0.0)),
+                open_time=_parse_iso_timestamp(
+                    position.get('createdDateUTC') or '',
+                ),
+                unrealized_pnl=float(position.get('upl', 0.0)),
+            ))
+        legs.sort(key=lambda leg: (leg.open_time, leg.leg_id))
+        return legs
+
+    async def get_volume_quantizer(self, symbol: str) -> 'Callable[[float], int]':
+        """Return a sync Pine-units -> lot-step-grid quantizer for ``symbol``.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` transport
+        primitive: a closure capturing the cached ``lot_step`` so the core
+        emulator can snap per-leg volumes in a tight loop without an await
+        per call. The grid unit is the lot-step count;
+        :func:`~pynecore_capitalcom.helpers._size_from_units` converts it
+        back to a JSON-safe ``size`` on the wire.
+        """
+        rules = await self._get_instrument_rules(symbol)
+        # ``_fetch_market`` clamps ``lot_step`` positive (0.01 floor), so
+        # the closure can divide unconditionally.
+        step = rules.lot_step
+        return lambda qty: round(qty / step)
+
+    async def reject_out_of_range(
+            self, envelope: DispatchEnvelope, qty: float,
+    ) -> None:
+        """Raise the non-halting volume-bounds skip when ``qty`` is out of range.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` transport
+        primitive: core's reversal pre-flights the residual size through
+        this before any leg close lands, so an out-of-range reversal skips
+        while that is still true (never leaving the book half-reduced).
+        """
+        intent = envelope.intent
+        assert isinstance(intent, EntryIntent)
+        rules = await self._get_instrument_rules(intent.symbol)
+        self._reject_out_of_range_entry(intent, rules, qty)
+
+    async def place_leg(
+            self, envelope: DispatchEnvelope, qty: float,
+    ) -> list[ExchangeOrder]:
+        """Open ONE order of ``qty`` (Pine units) for the envelope's entry.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` transport
+        primitive — the residual leg of a reversal, or a plain add. Same
+        persist-first journaled dispatch as :meth:`execute_entry`; only the
+        size differs from ``intent.qty``.
+        """
+        return await self._place_entry_order(envelope, qty)
+
+    #: ``DELETE /positions/{dealId}`` is full-row only — it silently ignores
+    #: any ``size`` parameter, body or query (measured on demo, 2026-07-10) —
+    #: so the core emulator must never plan a partial leg slice. A fractional
+    #: ``strategy.close(qty=...)`` on a hedging account becomes a loud
+    #: non-halting skip; partial closes need a one-way (netting) account.
+    supports_partial_leg_close = False
+
+    async def close_leg(
+            self, symbol: str, leg_id: str, volume: int, coid: str,
+    ) -> None:
+        """Close ONE broker position row (``leg_id`` is its dealId).
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` transport
+        primitive. ``volume`` always covers the whole leg (see
+        :attr:`supports_partial_leg_close`); ``coid`` never reaches the
+        wire — the DELETE carries no client reference — idempotency is
+        owned by the core persist-first close-leg ledger. The resulting
+        fill surfaces through the activity stream as an ordinary natural
+        close (``LegType.CLOSE`` on the tracked dealId).
+
+        The error taxonomy deliberately differs from the netting
+        full-close hook: an ambiguous transport fault maps to
+        :class:`OrderDispositionUnknownError`, NOT
+        :class:`BrokerManualInterventionError` — the emulator's close-leg
+        ledger + restart replay reconcile the leg against the live book
+        and re-dispatch only the residual, so the in-session
+        unverifiability that forces the netting path to halt does not
+        apply. A vanished leg is a benign no-op (the close already landed
+        or the row was swept broker-side; the replay finalises the row).
+        """
+        # ``volume`` is audit-only here: full-leg by contract, and a size is
+        # not expressible on the DELETE wire anyway.
+        store_ctx = self.store_ctx
+        entry_row = (
+            store_ctx.find_by_ref('deal_id', leg_id)
+            if store_ctx is not None else None
+        )
+        try:
+            await self._call(f'positions/{leg_id}', method='delete')
+        except OrderNotFoundError:
+            if store_ctx is not None:
+                store_ctx.log_event(
+                    'close_already_gone',
+                    client_order_id=(
+                        entry_row.client_order_id if entry_row else coid
+                    ),
+                    exchange_order_id=leg_id,
+                )
+            return
+        except ExchangeConnectionError as net:
+            # ``_call`` maps httpx transport faults to
+            # ``ExchangeConnectionError`` centrally; at THIS dispatch site a
+            # DELETE was in flight, so the leg's fate is genuinely unknown.
+            raise OrderDispositionUnknownError(
+                f"Capital DELETE positions/{leg_id} ({symbol}) ambiguous "
+                f"during one-way leg close: {net}",
+                client_order_id=coid,
+                cause=net,
+            ) from net
+        # Bookkeeping AFTER the wire call, mirroring the netting full-close
+        # hook: the core close-leg ledger row (written persist-first by the
+        # emulator before this call) owns the crash window, so the entry
+        # row's ``closing`` mirror only needs to reflect a dispatch that
+        # actually went out.
+        if store_ctx is not None and entry_row is not None:
+            store_ctx.set_order_state(entry_row.client_order_id, 'closing')
+            store_ctx.log_event(
+                'close_dispatched',
+                client_order_id=entry_row.client_order_id,
+                exchange_order_id=leg_id,
+                payload={'leg_volume': volume, 'leg_coid': coid},
+            )
+
+    async def amend_bracket(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            coid: str,
+    ) -> None:
+        """Replicate (or clear) a protective bracket on ONE position row.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` transport
+        primitive. Capital.com ``PUT /positions/{dealId}`` is *full
+        replacement* (verified on demo 2026-05-29): every bracket field is
+        sent explicitly — a float to arm, JSON ``null`` / ``false`` to
+        clear — so the all-``None`` call clears the whole bracket instead
+        of no-oping on an empty body. A ``trail_offset`` maps to the
+        native ``trailingStop`` + ``stopDistance`` pair and takes the stop
+        slot: Capital.com carries ONE stop per row, so a coexisting fixed
+        ``sl_price`` is superseded, and the netting path's deferred
+        ``trail_price`` activation is not expressible per-leg — the
+        trailing is live immediately.
+
+        Idempotent on ``coid``: an unchanged re-amend is a broker-level
+        no-op (full replacement with identical values). A vanished leg
+        (``error.not-found.dealId``) is a benign return; a definitive
+        reject raises :class:`ExchangeOrderRejectedError` (on the attach
+        path the core emulator wraps it into
+        :class:`BracketAttachAfterFillRejectedError` and flattens
+        defensively); an ambiguous PUT or confirm round-trip raises
+        :class:`OrderDispositionUnknownError` so the ownership row stays
+        replayable.
+
+        ``side`` is audit-only — Capital.com levels are absolute prices on
+        the row; no side-dependent anchor is needed (cTrader seeds its
+        trailing anchor from it).
+        """
+        rules = await self._get_instrument_rules(symbol)
+        # Same live-mid pre-check as the netting bracket paths: turns an
+        # obviously-rejectable level into the typed distance error before
+        # the round-trip. Distance violations subclass
+        # ``ExchangeOrderRejectedError``, so the attach path still ends in
+        # the defensive flatten rather than a halt.
+        mid_price = await self._get_current_mid_price(symbol)
+        if sl_price is not None:
+            self._validate_sl_distance(rules, mid_price, float(sl_price))
+        if tp_price is not None:
+            self._validate_tp_distance(rules, mid_price, float(tp_price))
+
+        body: dict = {
+            'profitLevel': float(tp_price) if tp_price is not None else None,
+        }
+        if trail_offset is not None:
+            body['trailingStop'] = True
+            body['stopDistance'] = float(trail_offset)
+        else:
+            body['trailingStop'] = False
+            body['stopLevel'] = (
+                float(sl_price) if sl_price is not None else None
+            )
+
+        try:
+            resp = await self._call(
+                f'positions/{leg_id}', data=body, method='put',
+            )
+        except OrderNotFoundError:
+            # Leg vanished between the emulator's fetch and this amend —
+            # the bracket it would carry is moot.
+            return
+        except ExchangeConnectionError as net:
+            raise OrderDispositionUnknownError(
+                f"Capital PUT positions/{leg_id} ({symbol}) ambiguous during "
+                f"one-way bracket amend: {net}",
+                client_order_id=coid,
+                cause=net,
+            ) from net
+        except CapitalComError as exc:
+            # An unmapped Capital.com API error on the PUT is a definitive
+            # refusal of THIS amend — classify it so the attach path runs
+            # the defensive flatten instead of escaping as an untyped
+            # provider error (which the engine's write-side net would
+            # escalate to a halt).
+            raise ExchangeOrderRejectedError(
+                f"Capital PUT positions/{leg_id} bracket amend refused: {exc}",
+            ) from exc
+
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                'one_way_bracket_amend',
+                client_order_id=coid,
+                exchange_order_id=leg_id,
+                payload={
+                    'side': side,
+                    'tp_price': tp_price,
+                    'sl_price': sl_price,
+                    'trail_offset': trail_offset,
+                },
+            )
+        deal_ref = resp.get('dealReference') if isinstance(resp, dict) else None
+        if not deal_ref:
+            # No dealReference to confirm — treat the round-trip as success;
+            # the reconcile pass verifies the observed levels later. Mirrors
+            # ``publish_native_failsafe_sl``.
+            return
+        try:
+            confirm = await self._call(f'confirms/{deal_ref}', method='get')
+        except (OrderNotFoundError, ExchangeConnectionError) as net:
+            # The PUT went out but its outcome cannot be verified — leave
+            # the ownership row replayable rather than guessing.
+            raise OrderDispositionUnknownError(
+                f"Capital confirms/{deal_ref} ambiguous after one-way "
+                f"bracket amend on {leg_id} ({symbol}): {net}",
+                client_order_id=coid,
+                cause=net,
+            ) from net
+        if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
+            reason = _extract_reject_reason(confirm)
+            raise ExchangeOrderRejectedError(
+                f"Capital PUT positions/{leg_id} bracket amend REJECTED "
+                f"(coid={coid}): {reason}",
+            )
 
     async def get_open_orders(
             self, symbol: str | None = None,
@@ -326,39 +612,39 @@ class _ExecutionMixin(_CapitalComBase):
         """
         intent = envelope.intent
         assert isinstance(intent, EntryIntent)
-        # The stop-fired MARKET of a both-set entry uses a distinct
-        # client-order-id from the native LIMIT leg (which already holds the
-        # KIND_ENTRY id for the same pine_id) — otherwise the broker's local
-        # idempotency dedup would treat the market POST as a duplicate of the
-        # just-cancelled limit and skip it.
-        coid = envelope.client_order_id(
-            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
-        )
+        return await self._place_entry_order(envelope, intent.qty)
 
-        rules = await self._get_instrument_rules(intent.symbol)
-        if rules.min_size > 0 and intent.qty < rules.min_size:
+    def _reject_out_of_range_entry(
+            self, intent: EntryIntent, rules: _InstrumentRules, qty: float,
+    ) -> None:
+        """Raise the non-halting :class:`OrderSkippedByPlugin` when ``qty``
+        is outside the instrument's tradable size bounds.
+
+        Preserves the historical asymmetry: the minimum gates the RAW
+        requested qty (rounding an undersized request up to the grid would
+        be silent up-inflation), the maximum gates the QUANTIZED qty —
+        i.e. what actually reaches the broker. Capital.com rejects sizes
+        above ``maxDealSize`` with ``error.invalid.size.maxvalue``, which
+        surfaces as a fatal :class:`ExchangeOrderRejectedError` and would
+        halt the live run — pre-empting both bounds here turns them into
+        logged skips (no silent clamp; the size is the caller's concern).
+        """
+        if rules.min_size > 0 and qty < rules.min_size:
             raise OrderSkippedByPlugin(
                 f"Skipping {intent.symbol} {intent.side.upper()} entry "
-                f"id={intent.pine_id!r}: qty={intent.qty} below Capital.com "
+                f"id={intent.pine_id!r}: qty={qty} below Capital.com "
                 f"minimum size {rules.min_size}. No order sent.",
                 intent_key=intent.intent_key,
                 reason="below_min_size",
                 context={
                     'symbol': intent.symbol,
                     'side': intent.side,
-                    'qty': intent.qty,
+                    'qty': qty,
                     'min_size': rules.min_size,
                 },
             )
-        quantized_qty = self._quantize_size(intent.qty, rules)
-        # Mirror of the min-size floor: Capital.com rejects sizes above
-        # ``maxDealSize`` with ``error.invalid.size.maxvalue``, which surfaces
-        # as a fatal ``ExchangeOrderRejectedError`` and would halt the live
-        # run. Pre-empt it here so an oversized request is declined like an
-        # undersized one — skip (no silent clamp; the size is the caller's
-        # concern) and let the engine carry on. Compare the quantized size,
-        # i.e. what actually reaches the broker.
-        if rules.max_size > 0 and quantized_qty > rules.max_size:
+        quantized_qty = self._quantize_size(qty, rules)
+        if 0 < rules.max_size < quantized_qty:
             raise OrderSkippedByPlugin(
                 f"Skipping {intent.symbol} {intent.side.upper()} entry "
                 f"id={intent.pine_id!r}: qty={quantized_qty} above Capital.com "
@@ -372,6 +658,32 @@ class _ExecutionMixin(_CapitalComBase):
                     'max_size': rules.max_size,
                 },
             )
+
+    async def _place_entry_order(
+            self, envelope: DispatchEnvelope, qty: float,
+    ) -> list[ExchangeOrder]:
+        """Shared journaled entry dispatch for ``execute_entry`` / ``place_leg``.
+
+        ``qty`` is the size to place — ``intent.qty`` on the plain entry
+        path, the emulator-supplied residual on the ``place_leg`` path;
+        everything else (coid derivation, bounds skip, quantize, endpoint /
+        body construction, persist-first :class:`DispatchJournal` flow) is
+        identical.
+        """
+        intent = envelope.intent
+        assert isinstance(intent, EntryIntent)
+        # The stop-fired MARKET of a both-set entry uses a distinct
+        # client-order-id from the native LIMIT leg (which already holds the
+        # KIND_ENTRY id for the same pine_id) — otherwise the broker's local
+        # idempotency dedup would treat the market POST as a duplicate of the
+        # just-cancelled limit and skip it.
+        coid = envelope.client_order_id(
+            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
+        )
+
+        rules = await self._get_instrument_rules(intent.symbol)
+        self._reject_out_of_range_entry(intent, rules, qty)
+        quantized_qty = self._quantize_size(qty, rules)
         direction = "BUY" if intent.side == 'buy' else "SELL"
 
         if intent.order_type == OrderType.MARKET:

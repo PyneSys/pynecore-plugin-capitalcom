@@ -84,14 +84,21 @@ class CapitalCom(
     trading share a single REST session, so one credential block serves
     both roles.
 
-    Only one-way position mode is supported; hedging-mode accounts are
-    rejected at startup. Stop orders and server-side trailing stops are
-    supported. A both-set Pine entry (``limit`` and ``stop``) is not a
-    stop-limit order: the sync engine rests the limit leg natively and
-    fires a market order on the stop side via a software price-watch, so
-    the plugin only ever sees plain market / limit / stop entries. Partial
-    closes are emulated via opposite-direction posts (netting), and size
-    changes require cancel-and-recreate — order size is not amendable.
+    Both account position modes are supported. A one-way (netting)
+    account uses the direct execute path; on a hedging-mode account
+    ``connect()`` opts into core one-way emulation (``position_port =
+    self``) and the Order Sync Engine drives close/reversal/bracket
+    through the :class:`~pynecore.core.plugin.broker.PositionPort`
+    primitives, presenting Pine one-way semantics over the multi-row
+    book. Stop orders and server-side trailing stops are supported. A
+    both-set Pine entry (``limit`` and ``stop``) is not a stop-limit
+    order: the sync engine rests the limit leg natively and fires a
+    market order on the stop side via a software price-watch, so the
+    plugin only ever sees plain market / limit / stop entries. Partial
+    closes are emulated via opposite-direction posts on a netting
+    account; on a hedging account a partial close is a loud non-halting
+    skip (``DELETE /positions/{dealId}`` is full-row only). Size changes
+    require cancel-and-recreate — order size is not amendable.
 
     Idempotency is software-upheld via the unified
     :class:`~pynecore.core.broker.storage.BrokerStore` — the generic
@@ -209,6 +216,10 @@ class CapitalCom(
         self._account_preferences: dict | None = None
         self._activity_cursor = _ActivityCursor()
         self._last_auth_probe_ts: float = 0.0
+        # ``True`` once ``connect()`` reads ``hedgingMode`` from the account
+        # preferences; drives the core one-way emulation path (see
+        # ``_CapitalComBase._hedging_enabled``).
+        self._hedging_enabled: bool = False
         # Per-epic dealing-rules cache.  Capital.com rules are effectively
         # static during a trading session (lot step, min size); the plugin
         # refetches on explicit cache invalidation only.

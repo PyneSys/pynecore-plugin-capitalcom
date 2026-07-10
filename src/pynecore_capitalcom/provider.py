@@ -506,11 +506,17 @@ class _ProviderMixin(_CapitalComBase):
         now = epoch_time()
         details = await self._call('markets/' + epic, method='get')
         dealing = details.get('dealingRules') or {}
-        instrument = details.get('instrument') or {}
         snapshot = details.get('snapshot') or {}
+        # The SIZE grid is ``minSizeIncrement`` — ``minStepDistance`` is the
+        # PRICE step (order-level distance) and must not be used here: on
+        # e.g. BTCUSD it is 0.05 while the real size increment is 0.0001,
+        # so quantizing a small crypto size against it collapses to 0.
+        # ``minDealSize`` doubles as the fallback grid (the increment
+        # equals the minimum on every venue-quoted instrument observed).
         lot_step = float(
-            (dealing.get('minStepDistance') or {}).get('value', 0.01)
-            or instrument.get('lotSize', 0.01)
+            (dealing.get('minSizeIncrement') or {}).get('value', 0.0)
+            or (dealing.get('minDealSize') or {}).get('value', 0.0)
+            or 0.01
         )
         min_size = float((dealing.get('minDealSize') or {}).get('value', lot_step))
         max_size = float((dealing.get('maxDealSize') or {}).get('value', 0.0))

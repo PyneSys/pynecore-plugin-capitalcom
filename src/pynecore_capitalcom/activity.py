@@ -27,7 +27,6 @@ from pynecore.core.broker.exceptions import (
     BrokerError,
     ExchangeConnectionError,
     ExchangeRateLimitError,
-    UnexpectedCancelError,
 )
 from pynecore.core.broker.models import (
     ExchangeOrder,
@@ -510,8 +509,17 @@ class _ActivityMixin(_CapitalComBase):
         activity_type = (activity.get('type') or '').upper()
         status = (activity.get('status') or '').upper()
         source = (activity.get('source') or '').upper()
-        size = float(activity.get('size') or row.qty)
-        level = float(activity.get('level') or 0.0)
+        # The real ``detailed=true`` payload carries size / level / direction
+        # inside ``details`` only (measured 2026-07-10 — there is NO top-level
+        # ``size``/``direction``); the top-level reads are kept first for
+        # backward compatibility with any legacy payload shape.
+        details = activity.get('details') or {}
+        size = float(
+            activity.get('size') or details.get('size') or row.qty,
+        )
+        level = float(
+            activity.get('level') or details.get('level') or 0.0,
+        )
 
         # A closing leg on a position-attached bracket: the activity
         # references the entry row's dealId (TP/SL share the entry's
@@ -572,13 +580,37 @@ class _ActivityMixin(_CapitalComBase):
                 if (activity_ts > 0.0
                         and activity_ts > (row.created_ts_ms / 1000.0) + 60.0):
                     entry_already_filled = True
+        # Deterministic close discriminator (primary, MEASURED 2026-07-10):
+        # ``details.direction`` is the TRADE direction — BUY on the open
+        # activity of a long, SELL on its close — and on Capital.com a
+        # same-direction add on an existing dealId is impossible (every
+        # open creates a fresh deal), so a POSITION activity carrying the
+        # row's own direction is the entry's fill and an opposite-direction
+        # one is a reduce/close. This must NOT be left to the time
+        # heuristics above: the feed stamps the entry-fill activity up to
+        # 60+ s after the deal (observed 61.4 s), which tripped the
+        # ``created_ts_ms + 60`` fallback and routed the bot's own entry
+        # fill as a manual close — a sign-flip in the engine's position
+        # accounting. Deliberately details-only: no top-level ``direction``
+        # exists in the measured payload, and inventing semantics for one
+        # would risk reading a position-direction field as a trade
+        # direction. The heuristics remain the tie-breaker when the
+        # direction is absent.
+        activity_direction = (details.get('direction') or '').upper()
+        is_same_direction: bool | None = None
+        if row_kind == 'position' and activity_direction in ('BUY', 'SELL'):
+            row_direction = 'BUY' if row.side == 'buy' else 'SELL'
+            is_same_direction = activity_direction == row_direction
         is_explicit_close_source = source in (
             'TP', 'SL', 'CLOSE_OUT', 'CLOSE', 'MARGIN', 'STOP_OUT',
         )
         is_manual_close = (
             row_kind == 'position'
             and row_leg_kind not in ('tp', 'sl')
-            and entry_already_filled
+            and (
+                is_same_direction is False
+                or (is_same_direction is None and entry_already_filled)
+            )
             and source in ('USER', 'DEALER')
         )
         is_closing_leg = (

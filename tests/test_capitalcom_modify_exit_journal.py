@@ -63,6 +63,7 @@ def main():
 _MARKETS_RESP = {
     'dealingRules': {
         'minStepDistance': {'value': 0.01},
+        'minSizeIncrement': {'value': 0.01},
         'minDealSize': {'value': 0.01},
         'minNormalStopOrLimitDistance': {'value': 0.0001},
     },

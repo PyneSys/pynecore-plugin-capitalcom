@@ -193,19 +193,25 @@ def __test_broker_get_open_orders_parses_working_orders__(tmp_path):
     assert o.client_order_id == 'coid-xyz'
 
 
-def __test_broker_hedging_mode_startup_gate__():
+def __test_broker_hedging_mode_wires_position_port__():
     broker = _FakeBroker(config=_make_config(), responses={
         ('accounts/preferences', 'get'): {'hedgingMode': True},
     })
-    with pytest.raises(ExchangeCapabilityError):
-        asyncio.run(broker.assert_one_way_mode())
+    asyncio.run(broker._detect_account_mode())
+    assert broker._hedging_enabled is True
+    assert broker.position_port is broker
+    # Reconnect re-entry is idempotent (prefs cached, same wiring).
+    asyncio.run(broker._detect_account_mode())
+    assert broker.position_port is broker
 
 
-def __test_broker_hedging_mode_gate_passes_when_one_way__():
+def __test_broker_one_way_mode_leaves_position_port_none__():
     broker = _FakeBroker(config=_make_config(), responses={
         ('accounts/preferences', 'get'): {'hedgingMode': False},
     })
-    asyncio.run(broker.assert_one_way_mode())
+    asyncio.run(broker._detect_account_mode())
+    assert broker._hedging_enabled is False
+    assert broker.position_port is None
 
 
 # noinspection PyProtectedMember
@@ -310,6 +316,7 @@ from pynecore_capitalcom import (  # noqa: E402
 _RULES_RESP = {
     'dealingRules': {
         'minStepDistance': {'value': 0.01},
+        'minSizeIncrement': {'value': 0.01},
         'minDealSize': {'value': 0.01},
         'minNormalStopOrLimitDistance': {'value': 0.0001},
     },
@@ -652,6 +659,7 @@ def __test_get_instrument_rules_prefers_normal_distance_over_controlled_risk__(t
         ('markets/EURUSD', 'get'): {
             'dealingRules': {
                 'minStepDistance': {'value': 0.01},
+                'minSizeIncrement': {'value': 0.01},
                 'minDealSize': {'value': 0.01},
                 'minNormalStopOrLimitDistance': {'value': 0.0001},
                 'minControlledRiskStopDistance': {'value': 0.0050},
@@ -5515,10 +5523,12 @@ def __test_reconcile_snapshot_working_to_position_stamps_kind_and_entry_filled__
     )
 
     # End-to-end proof: a USER close activity now routes as LegType.CLOSE.
+    # A manual close of a long carries the TRADE direction (SELL) in
+    # ``details.direction`` — measured on demo 2026-07-10.
     close_activity = {
         'dateUTC': '2026-04-21T11:00:00.000', 'dealId': 'deal-L',
         'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER',
-        'epic': 'EURUSD', 'direction': 'BUY',
+        'epic': 'EURUSD', 'details': {'direction': 'SELL'},
         'size': 1.0, 'level': 1.17820,
     }
 
@@ -5624,10 +5634,13 @@ def __test_process_activity_manual_close_routes_as_close_when_entry_activity_rol
     activity = {
         # 1 hour after row creation — far beyond Capital.com's 60s
         # activity window, so this activity is necessarily a separate
-        # trade (manual close), not the entry's own fill.
+        # trade (manual close), not the entry's own fill. Direction is
+        # deliberately ABSENT: with a direction present the deterministic
+        # trade-direction discriminator decides instead of the time
+        # fallback this test covers.
         'dateUTC': '2026-04-21T11:00:00.000', 'dealId': 'deal-L',
         'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER',
-        'epic': 'EURUSD', 'direction': 'BUY',
+        'epic': 'EURUSD',
         'size': 1.0, 'level': 1.17820,
     }
 
@@ -5731,8 +5744,11 @@ def __test_process_activity_manual_close_routes_as_close__(tmp_path):
     activity = {
         'dateUTC': '2026-04-21T11:00:00.000', 'dealId': 'deal-L',
         'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER',
-        # Capital reports POSITION direction on close (BUY for a long
-        # being closed) — record_fill must NOT trust this for ``side``.
+        # No top-level ``direction`` exists in the real payload (measured
+        # 2026-07-10; the trade direction lives in ``details.direction``) —
+        # this stray legacy field is ignored by the classifier, so the
+        # entry_filled_at stamp decides. ``record_fill`` must not trust it
+        # for ``side`` either.
         'epic': 'EURUSD', 'direction': 'BUY',
         'size': 1.0, 'level': 1.17820,
     }
@@ -6545,6 +6561,7 @@ def __test_update_symbol_info_emits_daytime_session_markers__(monkeypatch):
             },
             'dealingRules': {
                 'minStepDistance': {'value': 0.01},
+                'minSizeIncrement': {'value': 0.01},
             },
         }
 
@@ -6602,6 +6619,7 @@ def __test_update_symbol_info_marker_uses_source_midnight__(monkeypatch):
             },
             'dealingRules': {
                 'minStepDistance': {'value': 0.0001},
+                'minSizeIncrement': {'value': 0.0001},
             },
         }
 
@@ -6656,6 +6674,7 @@ def __test_update_symbol_info_24h_emits_no_session_markers__(monkeypatch):
             },
             'dealingRules': {
                 'minStepDistance': {'value': 0.0001},
+                'minSizeIncrement': {'value': 0.0001},
             },
         }
 
@@ -6727,6 +6746,7 @@ def __test_update_symbol_info_tz_shift_splits_local_midnight__(monkeypatch):
             },
             'dealingRules': {
                 'minStepDistance': {'value': 0.01},
+                'minSizeIncrement': {'value': 0.01},
             },
         }
 
@@ -9261,3 +9281,345 @@ def __test_ws_volume_listener_buckets_quotes_by_timestamp__():
     # directly.
     assert broker._ws_quote_buckets[bar_a_open_s] == 3
     assert broker._ws_quote_buckets[bar_b_open_s] == 1
+
+
+# =======================================================================
+# PositionPort transport surface (hedging-mode one-way emulation)
+#
+# The FIFO/reversal/bracket-replication LOGIC is covered in core
+# (test_038/test_039_one_way_emulator) — these tests only verify the
+# per-entity Capital.com wire shapes and the connect-time wiring,
+# mirroring the cTrader plugin's test split.
+# =======================================================================
+
+from pynecore.core.broker.exceptions import OrderSkippedByPlugin  # noqa: E402
+from pynecore.core.broker.store_helpers import (  # noqa: E402
+    STATE_CLOSE_LEG,
+    create_close_leg_row,
+)
+from pynecore_capitalcom.helpers import _size_from_units  # noqa: E402
+
+
+def _hedged(broker):
+    broker._hedging_enabled = True
+    broker.position_port = broker
+    return broker
+
+
+def __test_fetch_raw_positions_returns_legs_oldest_first__():
+    broker = _FakeBroker(config=_make_config(), responses={
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'B', 'direction': 'BUY', 'size': 2.0,
+                          'level': 1.12, 'upl': 3.0,
+                          'createdDateUTC': '2026-07-10T10:00:01.000'}},
+            {'market': {'epic': 'GBPUSD'},  # other symbol — filtered
+             'position': {'dealId': 'X', 'direction': 'SELL', 'size': 1.0,
+                          'level': 1.25,
+                          'createdDateUTC': '2026-07-10T09:00:00.000'}},
+            {'market': {'epic': 'EURUSD'},  # missing dealId — skipped
+             'position': {'direction': 'BUY', 'size': 9.0, 'level': 1.0}},
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'A', 'direction': 'SELL', 'size': 1.0,
+                          'level': 1.15, 'upl': -1.0,
+                          'createdDateUTC': '2026-07-10T10:00:00.000'}},
+        ]},
+    })
+    legs = asyncio.run(broker.fetch_raw_positions('EURUSD'))
+    assert [leg.leg_id for leg in legs] == ['A', 'B']  # oldest first
+    assert legs[0].side == 'sell' and legs[0].qty == 1.0
+    assert legs[0].entry_price == 1.15 and legs[0].unrealized_pnl == -1.0
+    assert legs[1].side == 'buy' and legs[1].qty == 2.0
+    assert legs[0].open_time < legs[1].open_time
+
+
+def __test_get_position_hedging_branch_nets_survivor_legs__():
+    """Hedging mode: mixed rows net through the core virtual-FIFO
+    aggregator — the SELL leg consumes the oldest BUY, the survivor's
+    price becomes the entry price (NOT the gross same-side average)."""
+    broker = _hedged(_FakeBroker(config=_make_config(), responses={
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'B1', 'direction': 'BUY', 'size': 1.0,
+                          'level': 1.10, 'upl': 1.0,
+                          'createdDateUTC': '2026-07-10T10:00:00.000'}},
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'B2', 'direction': 'BUY', 'size': 2.0,
+                          'level': 1.12, 'upl': 2.0,
+                          'createdDateUTC': '2026-07-10T10:00:01.000'}},
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'S1', 'direction': 'SELL', 'size': 1.0,
+                          'level': 1.15, 'upl': 0.5,
+                          'createdDateUTC': '2026-07-10T10:00:02.000'}},
+        ]},
+    }))
+    pos = asyncio.run(broker.get_position('EURUSD'))
+    assert pos is not None
+    assert pos.side == 'long' and pos.size == 2.0
+    assert abs(pos.entry_price - 1.12) < 1e-12  # survivor leg, not gross avg
+    assert pos.unrealized_pnl == 3.5
+
+
+def __test_get_volume_quantizer_snaps_to_lot_step__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path)
+    quantize = asyncio.run(broker.get_volume_quantizer('EURUSD'))
+    assert quantize(1.237) == 124  # lot_step=0.01
+    assert quantize(0.004) == 0
+    store.close()
+
+
+def __test_size_from_units_is_float_artifact_free__():
+    assert repr(_size_from_units(7, 0.01)) == '0.07'
+    assert repr(_size_from_units(124, 0.01)) == '1.24'
+    assert repr(_size_from_units(3, 0.0001)) == '0.0003'
+    assert _size_from_units(5, 1.0) == 5.0
+
+
+def __test_place_leg_overrides_qty_in_body__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('positions', 'post'): {'dealReference': 'r'},
+        ('confirms/r', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'OPEN',
+            'dealId': 'd', 'level': 1.0, 'size': 0.5,
+        },
+    })
+    env = _entry_envelope(qty=3.0)  # residual differs from intent.qty
+    result = asyncio.run(broker.place_leg(env, 0.5))
+    call = [c for c in broker._calls if c[0] == 'positions' and c[1] == 'post'][0]
+    assert abs(call[2]['size'] - 0.5) < 1e-12
+    assert result[0].id == 'd'
+    store.close()
+
+
+def __test_reject_out_of_range_skips_below_min__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path)
+    env = _entry_envelope(qty=3.0)
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.reject_out_of_range(env, 0.001))  # min_size=0.01
+    assert exc.value.reason == 'below_min_size'
+    store.close()
+
+
+def __test_close_leg_deletes_row_and_marks_closing__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/L1', 'delete'): {},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='L1', extras={'kind': 'position'})
+    ctx.add_ref('coid-entry', 'deal_id', 'L1')
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    assert ('positions/L1', 'delete', None) in broker._calls
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.state == 'closing'
+    store.close()
+
+
+def __test_close_leg_not_found_is_benign__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): OrderNotFoundError(
+            'error.not-found.dealId', ref_type='deal_id'),
+    })
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    store.close()
+
+
+def __test_close_leg_transport_maps_to_disposition_unknown__(tmp_path):
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    store.close()
+
+
+def __test_amend_bracket_sends_full_replacement_levels__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('positions/L1', 'put'): {'dealReference': 'am'},
+        ('confirms/am', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell',
+        tp_price=1.2, sl_price=1.05, trail_offset=None, coid='c1',
+    ))
+    call = [c for c in broker._calls if c[0] == 'positions/L1'][0]
+    assert call[2] == {'profitLevel': 1.2, 'trailingStop': False,
+                       'stopLevel': 1.05}
+    store.close()
+
+
+def __test_amend_bracket_all_none_clears_explicitly__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('positions/L1', 'put'): {},
+    })
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell',
+        tp_price=None, sl_price=None, trail_offset=None, coid='c1',
+    ))
+    call = [c for c in broker._calls if c[0] == 'positions/L1'][0]
+    # Full replacement: explicit nulls/false — an empty body would no-op.
+    assert call[2] == {'profitLevel': None, 'trailingStop': False,
+                       'stopLevel': None}
+    store.close()
+
+
+def __test_amend_bracket_trailing_takes_stop_slot__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('positions/L1', 'put'): {},
+    })
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell',
+        tp_price=None, sl_price=1.05, trail_offset=0.002, coid='c1',
+    ))
+    call = [c for c in broker._calls if c[0] == 'positions/L1'][0]
+    assert call[2]['trailingStop'] is True
+    assert call[2]['stopDistance'] == 0.002
+    assert 'stopLevel' not in call[2]  # trailing owns the stop slot
+    store.close()
+
+
+def __test_amend_bracket_not_found_is_benign__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'put'): OrderNotFoundError(
+            'error.not-found.dealId', ref_type='deal_id'),
+    })
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell',
+        tp_price=1.2, sl_price=None, trail_offset=None, coid='c1',
+    ))
+    store.close()
+
+
+def __test_amend_bracket_rejected_confirm_raises__(tmp_path):
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('positions/L1', 'put'): {'dealReference': 'am'},
+        ('confirms/am', 'get'): {'dealStatus': 'REJECTED',
+                                 'reason': 'distance too small'},
+    })
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.amend_bracket(
+            'EURUSD', 'L1', side='sell',
+            tp_price=1.2, sl_price=None, trail_offset=None, coid='c1',
+        ))
+    store.close()
+
+
+def __test_amend_bracket_transport_maps_to_disposition_unknown__(tmp_path):
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'put'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.amend_bracket(
+            'EURUSD', 'L1', side='sell',
+            tp_price=1.2, sl_price=None, trail_offset=None, coid='c1',
+        ))
+    store.close()
+
+
+def __test_native_failsafe_fans_over_hedging_legs__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'A', 'direction': 'BUY', 'size': 1.0,
+                          'level': 1.10,
+                          'createdDateUTC': '2026-07-10T10:00:00.000'}},
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'B', 'direction': 'BUY', 'size': 2.0,
+                          'level': 1.12,
+                          'createdDateUTC': '2026-07-10T10:00:01.000'}},
+        ]},
+        ('positions/A', 'put'): {},
+        ('positions/B', 'put'): {},
+    })
+    _hedged(broker)
+    snapshot = NativeBracketSnapshot(
+        parent_entry_dispatch_ref='coid-entry', symbol='EURUSD',
+        parent_side='long', stop_level=1.05, profit_level=None,
+        trailing_stop=None, generation=1,
+    )
+    asyncio.run(broker.publish_native_failsafe_sl(snapshot))
+    puts = [c for c in broker._calls if c[1] == 'put']
+    assert {c[0] for c in puts} == {'positions/A', 'positions/B'}
+    assert all(c[2]['stopLevel'] == 1.05 for c in puts)
+    store.close()
+
+
+def __test_reconcile_skips_core_close_leg_rows__(tmp_path):
+    """G4 immunity: a live core close-leg ledger row (no exchange order id)
+    must never be stamped ``missing_pending_since`` nor emit events when the
+    exchange snapshot is empty."""
+    broker, store, ctx = _make_broker(tmp_path)
+    create_close_leg_row(
+        ctx, coid='pcl:Long:L1', symbol='EURUSD', side='sell', qty=1.0,
+        intent_key='Long\x00', pine_entry_id='Long',
+        parent_close_coid='pcl:Long', leg_id='L1', leg_volume=100,
+    )
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert events == []
+    row = ctx.get_order('pcl:Long:L1')
+    assert row is not None and row.state == STATE_CLOSE_LEG
+    assert not (row.extras or {}).get('missing_pending_since')
+    store.close()
+
+
+def __test_late_same_direction_open_activity_routes_as_entry__(tmp_path):
+    """Regression (measured on demo 2026-07-10): Capital.com stamps the
+    entry-fill activity up to 60+ s after the deal, which used to trip the
+    ``created_ts_ms + 60`` fallback and route the bot's OWN entry fill as
+    a manual close — a sign-flip in position accounting. The activity's
+    trade direction (same as the row's) must win over the time heuristic."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side='buy', qty=1.0, filled_qty=1.0,
+        state='confirmed', pine_entry_id='L1',
+        exchange_order_id='deal-L', extras={'kind': 'position'},
+    )
+    ctx.add_ref('coid-entry', 'deal_id', 'deal-L')
+    # Activity stamped 61+ s after row creation, direction == row side.
+    from datetime import datetime, timedelta, UTC as _UTC
+    row = ctx.get_order('coid-entry')
+    late_iso = (
+        datetime.fromtimestamp(row.created_ts_ms / 1000.0, _UTC)
+        + timedelta(seconds=61.4)
+    ).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+    open_activity = {
+        'dateUTC': late_iso, 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'details': {'direction': 'BUY', 'size': 1.0},
+        'size': 1.0, 'level': 1.17500,
+    }
+    events = asyncio.run(_drain_agen(broker._process_activity([open_activity])))
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.ENTRY, (
+        f"late-stamped same-direction open activity must stay ENTRY, got "
+        f"{events[0].leg_type!r}"
+    )
+    store.close()
+
+
+def __test_opposite_direction_close_without_stamp_routes_as_close__(tmp_path):
+    """The trade-direction discriminator classifies an opposite-direction
+    USER activity as a close even when ``entry_filled_at`` was never
+    stamped (entry activity rolled out of the 60 s window before a
+    restart) — deterministic where the old path relied on the fragile
+    time fallback."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side='buy', qty=1.0, filled_qty=1.0,
+        state='confirmed', pine_entry_id='L1',
+        exchange_order_id='deal-L', extras={'kind': 'position'},
+    )
+    ctx.add_ref('coid-entry', 'deal_id', 'deal-L')
+    close_activity = {
+        'dateUTC': '2026-07-10T12:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'details': {'direction': 'SELL', 'size': 1.0},
+        'size': 1.0, 'level': 1.17820,
+    }
+    events = asyncio.run(_drain_agen(broker._process_activity([close_activity])))
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.CLOSE
+    assert events[0].order.side == 'sell'
+    store.close()

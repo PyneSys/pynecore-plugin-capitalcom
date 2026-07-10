@@ -28,7 +28,7 @@ LiveProviderPlugin → ProviderPlugin → Plugin → object``.
 import asyncio
 import collections
 import threading
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from pynecore.core.broker.models import (
     ExchangeOrder,
@@ -42,6 +42,7 @@ from .config import CapitalComConfig
 from .models import _ActivityCursor, _InstrumentRules
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.models import DispatchEnvelope, PositionLeg
     from pynecore.core.broker.storage import OrderRow
 
 
@@ -140,6 +141,15 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     _instrument_rules_cache: dict[str, _InstrumentRules]
     _current_poll_id: int
 
+    # --- Account mode ---
+    # ``True`` once ``connect()`` reads ``hedgingMode`` from the account
+    # preferences. Drives the one-way emulation path: ``connect()`` sets
+    # ``position_port = self`` so the core OneWayEmulator decomposes
+    # close/reversal/bracket over the per-dealId rows; state reads
+    # aggregate through the core emulator helpers. A one-way (netting)
+    # account keeps the direct execute path unchanged.
+    _hedging_enabled: bool
+
     # --- Session calendar cache ---
     # Latest ``SymInfo`` returned by ``update_symbol_info``. Used by the
     # streaming watchdogs to suppress active WS-close calls (REST recovery
@@ -163,7 +173,7 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
 
     async def get_preferences(self) -> dict: ...
 
-    async def assert_one_way_mode(self) -> None: ...
+    async def _detect_account_mode(self) -> None: ...
 
     # --- Provider / market data (provider.py) ---
     def get_market_details(self, search_term: str | None = None,
@@ -194,6 +204,34 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     def _extra_fields(self) -> dict[str, float] | None: ...
 
     # --- Execution (execution.py) ---
+    # PositionPort transport surface — real bodies on the execution mix-in;
+    # declared here so the assembled plugin structurally satisfies the
+    # protocol and ``_detect_account_mode`` can assign
+    # ``self.position_port = self`` on a hedging-mode account.
+    async def fetch_raw_positions(self, symbol: str) -> 'list[PositionLeg]': ...
+
+    async def get_volume_quantizer(
+            self, symbol: str,
+    ) -> 'Callable[[float], int]': ...
+
+    async def close_leg(
+            self, symbol: str, leg_id: str, volume: int, coid: str,
+    ) -> None: ...
+
+    async def reject_out_of_range(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> None: ...
+
+    async def place_leg(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> list[ExchangeOrder]: ...
+
+    async def amend_bracket(
+            self, symbol: str, leg_id: str, *,
+            side: str, tp_price: float | None, sl_price: float | None,
+            trail_offset: float | None, coid: str,
+    ) -> None: ...
+
     async def _execute_close_partial(self, *args: Any, **kwargs: Any) -> ExchangeOrder: ...
 
     def _row_to_exchange_order(self, row: 'OrderRow', *args: Any,
