@@ -8527,6 +8527,69 @@ def __test_connect_offloads_create_session_to_thread__(monkeypatch):
 
 
 # noinspection PyProtectedMember
+def __test_connect_rolls_back_partial_init_on_subscribe_failure__(monkeypatch):
+    """A failed subscribe inside ``connect()`` must not leak the five
+    background tasks or the half-open WebSocket.
+
+    Regression: ``connect()`` started the listener/ping/watchdog/backfill
+    tasks BEFORE the subscribe ``_send`` calls; when a subscribe raised,
+    the live runner's retry loop called ``connect()`` again, overwriting
+    the task references — the orphaned old tasks kept running (a second
+    WS reader, doubled watchdogs) for the rest of the process.
+    """
+    import websockets
+
+    broker = _FakeBroker(config=_make_config(), symbol='EURUSD', timeframe='1')
+    broker.cst_token = 'cst-tok'
+    broker.security_token = 'sec-tok'
+
+    class _FakeWS:
+        def __init__(self):
+            self.close_code = None
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+            self.close_code = 1000
+
+        async def send(self, _msg):
+            raise ConnectionError('subscribe rejected')
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()  # idle until cancelled
+
+    fake_ws = _FakeWS()
+
+    async def fake_connect(*_args, **_kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(websockets, 'connect', fake_connect)
+
+    async def run():
+        with pytest.raises(ConnectionError):
+            await broker.connect()
+
+        assert broker._listen_task is None
+        assert broker._ping_task is None
+        assert broker._feed_watchdog_task is None
+        assert broker._ohlc_watchdog_task is None
+        assert broker._volume_backfill_task is None
+        assert broker._ws is None
+        assert fake_ws.closed
+
+        leftovers = [t for t in asyncio.all_tasks()
+                     if t is not asyncio.current_task()]
+        await asyncio.gather(*leftovers, return_exceptions=True)
+        for task in leftovers:
+            assert task.cancelled(), f'orphan background task survived: {task!r}'
+
+    asyncio.run(run())
+
+
+# noinspection PyProtectedMember
 def __test_call_authenticated_session_method_is_not_treated_as_bootstrap__(monkeypatch):
     """``PUT session`` (Capital.com account-switch) must keep the auth
     headers and the reactive retry path — only the unauthenticated

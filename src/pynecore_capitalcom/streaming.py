@@ -1165,16 +1165,52 @@ class _StreamingMixin(_CapitalComBase):
             self._volume_backfill_worker_loop()
         )
 
-        xchg_tf = self.to_exchange_timeframe(self.timeframe)
-        await self._send("OHLCMarketData.subscribe", {
-            "epics": [self.symbol],
-            "resolutions": [xchg_tf],
-            "type": "classic",
-        }, correlation_id="ohlc_sub")
+        # The five background tasks above are already running; if the
+        # subscribe handshake fails, the exception propagates to the
+        # live runner's retry loop and its next ``connect()`` would
+        # overwrite the task references — the old tasks would keep
+        # running orphaned (a second WS reader, doubled watchdogs) for
+        # the rest of the process. Roll the partial init back before
+        # re-raising so every retry starts from a clean slate.
+        try:
+            xchg_tf = self.to_exchange_timeframe(self.timeframe)
+            await self._send("OHLCMarketData.subscribe", {
+                "epics": [self.symbol],
+                "resolutions": [xchg_tf],
+                "type": "classic",
+            }, correlation_id="ohlc_sub")
 
-        await self._send("marketData.subscribe", {
-            "epics": [self.symbol],
-        }, correlation_id="market_sub")
+            await self._send("marketData.subscribe", {
+                "epics": [self.symbol],
+            }, correlation_id="market_sub")
+        except BaseException:
+            await self._abort_partial_connect()
+            raise
+
+    async def _abort_partial_connect(self) -> None:
+        """Tear down a partially initialised connection.
+
+        Only used by :meth:`connect` when the subscribe handshake fails
+        after the background tasks were started. Cancels all five tasks
+        and clears their references first (so nothing keeps consuming
+        the dying WS), then closes the WebSocket and drops the queues.
+        No unsubscribe frames are sent — the subscription never
+        completed and the socket is likely broken anyway.
+        """
+        for attr in ("_listen_task", "_ping_task", "_feed_watchdog_task",
+                     "_ohlc_watchdog_task", "_volume_backfill_task"):
+            task: asyncio.Task | None = getattr(self, attr)
+            if task is not None:
+                task.cancel()
+                setattr(self, attr, None)
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._update_queue = None
+        self._raw_ohlc_queue = None
 
     @override
     async def disconnect(self) -> None:
