@@ -8489,6 +8489,43 @@ def __test_call_proactive_refresh_skipped_for_bootstrap_endpoints__(monkeypatch)
     assert refresh_called == []
 
 
+def __test_connect_offloads_create_session_to_thread__(monkeypatch):
+    """``connect()`` must not run the blocking ``create_session()`` on the
+    event loop thread.
+
+    Regression: ``connect()`` used to call ``create_session()`` directly —
+    two synchronous httpx calls with a 50s timeout each, freezing the whole
+    event loop (watchdogs, WS ping) for up to 100s during login.
+    """
+    import threading
+
+    broker = _FakeBroker(config=_make_config())
+    broker.cst_token = None
+    broker.security_token = None
+
+    class _Sentinel(Exception):
+        pass
+
+    seen_threads: list = []
+
+    def fake_create_session():
+        seen_threads.append(threading.current_thread())
+        raise _Sentinel  # stop connect() before the WebSocket dial
+
+    monkeypatch.setattr(broker, 'create_session', fake_create_session)
+
+    async def run():
+        with pytest.raises(_Sentinel):
+            await broker.connect()
+        return threading.current_thread()
+
+    loop_thread = asyncio.run(run())
+    assert seen_threads, "create_session was not called"
+    assert seen_threads[0] is not loop_thread, (
+        "create_session must run on a worker thread, not the event loop"
+    )
+
+
 # noinspection PyProtectedMember
 def __test_call_authenticated_session_method_is_not_treated_as_bootstrap__(monkeypatch):
     """``PUT session`` (Capital.com account-switch) must keep the auth

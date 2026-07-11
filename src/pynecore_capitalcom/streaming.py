@@ -1074,7 +1074,10 @@ class _StreamingMixin(_CapitalComBase):
             )
 
         if not self.cst_token or not self.security_token:
-            self.create_session()
+            # ``create_session()`` runs two blocking httpx calls (50s
+            # timeout each) — offload to a thread so the event loop
+            # (watchdogs, WS ping) keeps running during login.
+            await asyncio.to_thread(self.create_session)
 
         if self.store_ctx is not None:
             # Account-mode probe BEFORE the recovery passes: a hedging-mode
