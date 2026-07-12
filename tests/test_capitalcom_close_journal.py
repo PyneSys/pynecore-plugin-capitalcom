@@ -29,6 +29,16 @@ These tests pin the externally-observable contract of that migration:
 * **Partial close race outside ±3 s window**: the hook raises
   :class:`BrokerManualInterventionError`; the journal does NOT catch
   that — the propagation matches the pre-journal semantics.
+* **Partial close race resolved via confirm ``affectedDeals``**: the
+  fresh reverse leg is identified deterministically by the ``dealId``
+  the confirm attributes to our POST — no clock involved — and the
+  corrective DELETE goes out even when ``createdDateUTC`` is stale.
+* **Partial close race, confirm names a different deal**: a fresh
+  opposite row NOT listed in the confirm's ``affectedDeals`` is
+  external (manual/other) — the hook halts instead of deleting it.
+* **Partial close race, confirm TTL-expired**: fallback identification
+  via the POST-anchored ``createdDateUTC`` band still issues the
+  corrective DELETE.
 * **Full close recovery**: when every target's ``dealId`` is gone from
   the positions snapshot, recovery promotes the command row to
   ``closing`` with ``recovery_path='full_close_targets_vanished'``.
@@ -41,6 +51,7 @@ These tests pin the externally-observable contract of that migration:
   ``confirmed`` with ``recovery_path='partial_close_units_match'``.
 """
 import asyncio
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -56,6 +67,7 @@ from pynecore.core.broker.store_helpers import (
 )
 
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
+from pynecore_capitalcom.exceptions import OrderNotFoundError
 
 
 def main():
@@ -326,6 +338,159 @@ def __test_execute_close_partial_race_outside_window_halts__(tmp_path):
     refs = dict(ctx.iter_refs_for_coid(cmd_coid))
     assert refs.get('deal_reference') == 'dr-2'
 
+    store.close()
+
+
+def _now_iso() -> str:
+    """Capital.com-style ``createdDateUTC`` stamp for the current time."""
+    return datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+
+
+def __test_execute_close_partial_race_confirm_deal_id_corrects__(tmp_path):
+    """Fresh reverse leg named by confirm ``affectedDeals`` → corrective DELETE.
+
+    ``createdDateUTC`` is deliberately stale (epoch) — the deterministic
+    confirm-``dealId`` discriminator must win without any time-band
+    involvement.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'fresh', 'direction': 'SELL',
+                              'size': 1.0,
+                              'createdDateUTC': '1970-01-01T00:00:00.000'}},
+            ]},
+        ],
+        ('positions', 'post'): {'dealReference': 'dr-3'},
+        ('confirms/dr-3', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'fresh', 'status': 'OPENED'}],
+        },
+        ('positions/fresh', 'delete'): {},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'dr-3'
+
+    assert any(
+        c[0] == 'positions/fresh' and c[1] == 'delete'
+        for c in broker._calls
+    )
+    cmd_coid = env.client_order_id(KIND_CLOSE)
+    cmd_kinds = [k for k, _ in _events_for(ctx, cmd_coid)]
+    assert 'partial_close_corrective_delete' in cmd_kinds
+    store.close()
+
+
+def __test_execute_close_partial_race_confirm_mismatch_halts__(tmp_path):
+    """Fresh opposite row NOT in confirm ``affectedDeals`` → halt, no DELETE.
+
+    The row is inside the time band (created "now"), but the confirm
+    attributes a different ``dealId`` to our POST — the fresh row is
+    someone else's position and must not be deleted.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'external', 'direction': 'SELL',
+                              'size': 1.0,
+                              'createdDateUTC': _now_iso()}},
+            ]},
+        ],
+        ('positions', 'post'): {'dealReference': 'dr-4'},
+        ('confirms/dr-4', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [
+                {'dealId': 'netted-elsewhere', 'status': 'PARTIALLY_CLOSED'},
+            ],
+        },
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    with pytest.raises(BrokerManualInterventionError):
+        asyncio.run(broker.execute_close(env))
+
+    assert not any(c[1] == 'delete' for c in broker._calls)
+    store.close()
+
+
+def __test_execute_close_partial_race_ttl_fallback_post_anchor__(tmp_path):
+    """Confirm TTL-expired → POST-anchored time-band fallback still corrects."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'fresh', 'direction': 'SELL',
+                              'size': 1.0,
+                              'createdDateUTC': _now_iso()}},
+            ]},
+        ],
+        ('positions', 'post'): {'dealReference': 'dr-5'},
+        ('error', 'confirms/dr-5', 'get'): OrderNotFoundError(
+            'confirm TTL expired', ref_type='deal_reference',
+        ),
+        ('positions/fresh', 'delete'): {},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'dr-5'
+
+    assert any(
+        c[0] == 'positions/fresh' and c[1] == 'delete'
+        for c in broker._calls
+    )
     store.close()
 
 

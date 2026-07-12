@@ -642,9 +642,11 @@ class _CapitalComCloseHooks:
         is to halt and let recovery on next start resolve the dispatch
         via the persisted ``deal_reference`` / pre-snapshot context.
         On an unresolvable race (post-snapshot has too many units AND
-        no fresh-leg candidate falls within ±3 s of the POST) it also
-        raises :class:`BrokerManualInterventionError`. The journal
-        does not catch either — operator intervention is required.
+        the fresh leg cannot be identified — neither via the confirm's
+        ``affectedDeals`` nor, when the confirm is unavailable, via the
+        POST-anchored ``createdDateUTC`` band) it also raises
+        :class:`BrokerManualInterventionError`. The journal does not
+        catch either — operator intervention is required.
         """
         store_ctx = self._plugin.store_ctx
         rules = self._rules
@@ -684,6 +686,11 @@ class _CapitalComCloseHooks:
             merged_extras['intent_units'] = intent_units
             store_ctx.upsert_order(coid, extras=merged_extras)
 
+        # Local-clock anchor for the corrective-DELETE fallback band:
+        # captured BEFORE the POST goes out so confirm/snapshot latency
+        # cannot shrink the window (the fresh leg's server-side
+        # ``createdDateUTC`` can never predate the POST dispatch).
+        post_sent_ts = epoch_time()
         try:
             post_resp = await self._plugin._call(  # type: ignore[attr-defined]
                 'positions', data=body, method='post',
@@ -710,9 +717,14 @@ class _CapitalComCloseHooks:
         if deal_ref and store_ctx is not None:
             store_ctx.add_ref(coid, 'deal_reference', deal_ref)
 
+        # ``dealId``s the confirm attributes to OUR POST. In a race the
+        # fresh reverse leg shows up here (``affectedDeals`` entry with
+        # the new position's ``dealId``), giving a deterministic
+        # discriminator for the corrective DELETE — no clock involved.
+        confirm_deal_ids: set[str] = set()
         if deal_ref:
             try:
-                await self._plugin._call(  # type: ignore[attr-defined]
+                confirm = await self._plugin._call(  # type: ignore[attr-defined]
                     f'confirms/{deal_ref}', method='get',
                 )
             except (httpx.TimeoutException, httpx.RequestError,
@@ -741,6 +753,14 @@ class _CapitalComCloseHooks:
                 # no recovery — even though the close almost certainly
                 # netted. Fall through to the post-snapshot path.
                 pass
+            else:
+                for affected in (confirm.get('affectedDeals') or []):
+                    affected_id = affected.get('dealId')
+                    if affected_id:
+                        confirm_deal_ids.add(affected_id)
+                top_deal_id = confirm.get('dealId')
+                if top_deal_id:
+                    confirm_deal_ids.add(top_deal_id)
 
         post_snap = await self._plugin._call('positions', method='get')  # type: ignore[attr-defined]
         post_rows = [
@@ -756,10 +776,16 @@ class _CapitalComCloseHooks:
 
         if post_total_units > expected_post_units:
             # Race window: our opposite POST opened a fresh row instead
-            # of netting. Identify the freshly-opened leg by direction
-            # + a ±3 s ``createdDateUTC`` band around now and issue a
-            # corrective DELETE. If no candidate falls inside the band,
-            # the race cannot be confidently resolved — halt.
+            # of netting. Identify the freshly-opened leg among the
+            # new opposite-direction rows and issue a corrective DELETE.
+            # Primary discriminator: the confirm's ``affectedDeals``
+            # ``dealId``s — deterministic, and it protects a fresh row
+            # someone ELSE opened in the window from being deleted.
+            # Fallback (confirm unavailable — TTL race or missing
+            # ``dealReference``): ``createdDateUTC`` must fall between
+            # the POST dispatch and now, with ±3 s clock-skew tolerance
+            # on both ends. If no candidate qualifies, the race cannot
+            # be confidently resolved — halt.
             fresh_opposite: dict | None = None
             now_ts = epoch_time()
             for r in post_rows:
@@ -768,10 +794,16 @@ class _CapitalComCloseHooks:
                     continue
                 if (pos_data.get('direction') or '').upper() != opposite_dir:
                     continue
+                if confirm_deal_ids:
+                    if pos_data.get('dealId') in confirm_deal_ids:
+                        fresh_opposite = pos_data
+                        break
+                    continue
                 created_at = _parse_iso_timestamp(
                     pos_data.get('createdDateUTC') or '',
                 )
-                if created_at and abs(created_at - now_ts) <= 3.0:
+                if (created_at
+                        and post_sent_ts - 3.0 <= created_at <= now_ts + 3.0):
                     fresh_opposite = pos_data
                     break
             if fresh_opposite is not None:
