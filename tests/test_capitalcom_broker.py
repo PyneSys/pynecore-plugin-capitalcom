@@ -1473,6 +1473,60 @@ def __test_process_activity_unmatched_then_matched_emits_on_second_poll__(tmp_pa
     store.close()
 
 
+def __test_process_activity_prunes_dedup_state_behind_watermark__(tmp_path):
+    """The per-poll dedup structures stay bounded by the rolling window.
+
+    ``seen_fingerprints`` drops entries whose ``dateUTC`` fell behind the
+    ``last_date_utc`` watermark (the watermark guard skips such rows
+    before their fingerprint is consulted, so the entries are
+    unreachable), and ``external_logged_fingerprints`` retains only
+    fingerprints still present in the current batch. Guards the
+    session-long memory-leak fix.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     extras={'kind': 'position'})
+    ctx.add_ref('coid', 'deal_id', 'd-1')
+    ctx.set_exchange_id('coid', 'd-1')
+    entry = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'd-1',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'DEALER',
+        'size': 1.0, 'level': 1.10,
+    }
+    external = {
+        'dateUTC': '2026-04-21T10:00:01.000', 'dealId': 'ext-deal',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'DEALER',
+        'size': 2.0, 'level': 1.20,
+    }
+
+    async def drain(acts):
+        out = []
+        async for ev in broker._process_activity(acts):
+            out.append(ev)
+        return out
+
+    cursor = broker._activity_cursor
+    asyncio.run(drain([entry, external]))
+    entry_fp = _activity_fingerprint(entry)
+    external_fp = _activity_fingerprint(external)
+    assert entry_fp in cursor.seen_fingerprints
+    assert external_fp in cursor.external_logged_fingerprints
+
+    # Next poll: the entry activity rolled out of the venue's window and a
+    # newer row advanced the watermark past it; the external row is gone.
+    later = {
+        'dateUTC': '2026-04-21T10:02:00.000', 'dealId': 'd-1',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER',
+        'size': 1.0, 'level': 1.15,
+    }
+    asyncio.run(drain([later]))
+    assert entry_fp not in cursor.seen_fingerprints
+    assert _activity_fingerprint(later) in cursor.seen_fingerprints
+    assert cursor.external_logged_fingerprints == set()
+    store.close()
+
+
 def __test_process_activity_fills_zero_level_from_position_snapshot__(tmp_path):
     """Capital.com sometimes returns a market-entry activity row with an
     empty/zero ``level`` field.  The fill price must be back-filled from

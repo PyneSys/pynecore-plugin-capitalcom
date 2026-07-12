@@ -10,8 +10,7 @@ probe (``get_balance``), the cached preferences fetch
 Capital.com error codes into the broker taxonomy.
 
 State touched: ``security_token``, ``cst_token``, ``session_data``,
-``_account_id``, ``_account_preferences``, ``_hedging_enabled``,
-``_last_auth_probe_ts``.
+``_account_id``, ``_account_preferences``, ``_hedging_enabled``.
 """
 import asyncio
 from json import JSONDecodeError
@@ -328,7 +327,6 @@ class _RestSessionMixin(_CapitalComBase):
                 if account_id:
                     mode = 'demo' if self.config.demo else 'live'
                     self._account_id = f"capitalcom-{mode}-{account_id}"
-                self._last_auth_probe_ts = epoch_time()
                 return {currency: available}
         raise BrokerError("No preferred account returned by GET /accounts")
 

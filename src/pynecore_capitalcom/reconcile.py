@@ -23,7 +23,7 @@ State touched: BrokerStore through ``self.store_ctx``,
 ``_current_poll_id`` (read).
 """
 from time import time as epoch_time
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator
 
 from pynecore.core.broker.exceptions import (
     BrokerError,
@@ -47,6 +47,9 @@ from ._base import _CapitalComBase
 from .exceptions import OrderNotFoundError
 from .helpers import _POLL_INTERVAL_S
 from .models import _compute_cumulative_fill
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
 
 
 class _ReconcileMixin(_CapitalComBase):
@@ -537,6 +540,16 @@ class _ReconcileMixin(_CapitalComBase):
                     exchange_order_id=did,
                 ),
             )
+            # Deliberate DUAL signal, not a contract violation: the
+            # synthetic ``cancelled`` event keeps the sync engine's order
+            # bookkeeping consistent (the intent mapping is released and
+            # the strategy sees the order as gone — essential under the
+            # non-halting ``ignore`` / ``re_place`` policies, where the
+            # event is the ONLY signal), while the policy raise below
+            # separately decides whether the bot also halts. Emitting only
+            # the exception would leave engine state stale under the
+            # non-halting policies; emitting only the event would drop the
+            # operator-facing halt under the default ``stop`` policy.
             yield OrderEvent(
                 order=ExchangeOrder(
                     id=did or '', symbol=row.symbol, side=row.side,
@@ -558,6 +571,11 @@ class _ReconcileMixin(_CapitalComBase):
 
     async def _maybe_raise_unexpected_cancel(self, row: 'OrderRow') -> None:
         """Apply the configured ``on_unexpected_cancel`` policy.
+
+        Always called AFTER the caller yielded the synthetic ``cancelled``
+        event for the same row — the event carries the engine-state
+        cleanup, this hook only decides whether the bot additionally
+        halts (see the dual-signal comment at the call site).
 
         - ``stop`` (default): raise :class:`UnexpectedCancelError` — the
           sync engine halts via its normal graceful-stop path.

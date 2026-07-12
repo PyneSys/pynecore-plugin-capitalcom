@@ -74,12 +74,18 @@ class _ActivityCursor:
     """Cursor state for ``GET /history/activity`` polling.
 
     ``last_date_utc`` is the ISO-8601 UTC timestamp of the most recent
-    activity row already processed. ``seen_fingerprints`` dedups the
-    current window *and* is rebuildable across restarts: every processed
+    activity row already processed. ``seen_fingerprints`` maps each
+    processed row's SHA-1 fingerprint to its ``dateUTC`` and dedups the
+    current window; it is rebuildable across restarts: every processed
     row gets an ``activity_processed`` event written to the BrokerStore
-    whose payload carries the same SHA-1 fingerprint, so
+    whose payload carries the same fingerprint, so
     :meth:`CapitalCom._load_activity_cursor_from_events` can replay the
-    last-24h window at ``connect()`` time.
+    last-24h window at ``connect()`` time. The stored ``dateUTC`` exists
+    solely so :meth:`CapitalCom._process_activity` can prune entries that
+    fall behind the ``last_date_utc`` watermark after each poll — the
+    watermark guard skips such rows before their fingerprint is ever
+    consulted, so pruned entries are unreachable by construction and the
+    mapping stays bounded by the venue's 60-second activity window.
 
     ``external_logged_fingerprints`` is a session-only set tracking
     activities that we observed *without* a matching bot-owned row. These
@@ -89,9 +95,12 @@ class _ActivityCursor:
     poller). The set just keeps the ``external_activity_ignored`` log
     one-shot per row within the session; truly external activities age
     out of Capital.com's 60-second rolling window without further noise.
+    Each poll retains only fingerprints still present in the current
+    activity batch (a row that left the rolling window can never be
+    consulted again), so the set is bounded by the window size too.
     """
     last_date_utc: str | None = None
-    seen_fingerprints: set[str] = field(default_factory=set)
+    seen_fingerprints: dict[str, str] = field(default_factory=dict)
     external_logged_fingerprints: set[str] = field(default_factory=set)
 
 
@@ -108,9 +117,10 @@ def _bracket_leg_id(deal_id: str, kind: str) -> str:
 
     :param deal_id: The Capital.com position ``dealId`` the bracket attaches to.
     :param kind: Either ``'tp'`` or ``'sl'``; other values raise.
-    :raises AssertionError: On an invalid ``kind``.
+    :raises ValueError: On an invalid ``kind``.
     """
-    assert kind in ('tp', 'sl'), f"invalid bracket leg kind: {kind!r}"
+    if kind not in ('tp', 'sl'):
+        raise ValueError(f"invalid bracket leg kind: {kind!r}")
     return f"{deal_id}:{kind}"
 
 

@@ -137,7 +137,6 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     # --- Caches & cursors ---
     _account_preferences: dict | None
     _activity_cursor: _ActivityCursor
-    _last_auth_probe_ts: float
     _instrument_rules_cache: dict[str, _InstrumentRules]
     _current_poll_id: int
 

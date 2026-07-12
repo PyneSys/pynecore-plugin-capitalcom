@@ -120,7 +120,12 @@ class CapitalCom(
         """
         super().__init__(symbol=symbol, timeframe=timeframe,
                          ohlcv_dir=ohlcv_dir, config=config)
-        assert isinstance(self.config, CapitalComConfig), "CapitalComConfig is required"
+        # Explicit raise instead of ``assert``: the check is a startup
+        # config-contract gate and must survive ``python -O``.
+        if not isinstance(self.config, CapitalComConfig):
+            raise TypeError(
+                f"CapitalComConfig is required, got {type(self.config).__name__}"
+            )
 
         # REST session state
         self.security_token: str | None = None
@@ -215,7 +220,6 @@ class CapitalCom(
         # Broker state
         self._account_preferences: dict | None = None
         self._activity_cursor = _ActivityCursor()
-        self._last_auth_probe_ts: float = 0.0
         # ``True`` once ``connect()`` reads ``hedgingMode`` from the account
         # preferences; drives the core one-way emulation path (see
         # ``_CapitalComBase._hedging_enabled``).

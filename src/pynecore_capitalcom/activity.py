@@ -183,10 +183,16 @@ class _ActivityMixin(_CapitalComBase):
         # ``date_utc < cursor.last_date_utc`` guard permanently drop the
         # deferred row and silently desync the strategy.
         deferred_in_batch = False
+        # Every fingerprint in this batch, collected BEFORE the watermark
+        # guard: the end-of-poll retention below must keep any fingerprint
+        # that a future poll could still consult, and consultable rows are
+        # exactly those the venue still returns in its rolling window.
+        batch_fingerprints: set[str] = set()
         for a in activities_sorted:
             date_utc = a.get('dateUTC') or ''
             deal_id = str(a.get('dealId') or '')
             fingerprint = _activity_fingerprint(a)
+            batch_fingerprints.add(fingerprint)
 
             if cursor.last_date_utc and date_utc < cursor.last_date_utc:
                 continue
@@ -352,7 +358,7 @@ class _ActivityMixin(_CapitalComBase):
                         )
                     continue
 
-            cursor.seen_fingerprints.add(fingerprint)
+            cursor.seen_fingerprints[fingerprint] = date_utc
             if (not deferred_in_batch
                     and (not cursor.last_date_utc
                          or date_utc > cursor.last_date_utc)):
@@ -464,6 +470,20 @@ class _ActivityMixin(_CapitalComBase):
                                 row.client_order_id, extras=mark_extras,
                             )
                 yield event
+
+        # End-of-poll pruning — both dedup structures stay bounded by the
+        # venue's 60s rolling window instead of growing for the whole
+        # session. Safe by construction: the watermark guard above skips
+        # any row older than ``last_date_utc`` before its fingerprint is
+        # consulted, and an external row that left the rolling window can
+        # never be returned by the venue again.
+        if cursor.last_date_utc:
+            watermark = cursor.last_date_utc
+            stale = [fp for fp, d in cursor.seen_fingerprints.items()
+                     if d < watermark]
+            for fp in stale:
+                del cursor.seen_fingerprints[fp]
+        cursor.external_logged_fingerprints &= batch_fingerprints
 
     def _activity_to_event(
             self, activity: dict, row: 'OrderRow',

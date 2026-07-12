@@ -119,9 +119,13 @@ class _RecoveryMixin(_CapitalComBase):
 
         for payload in processed_payloads:
             fp: str | None = payload.get('fingerprint')
-            if fp:
-                cursor.seen_fingerprints.add(fp)
             date_utc: str | None = payload.get('dateUTC')
+            if fp:
+                # A missing dateUTC replays as '' — such an entry sorts
+                # below any real watermark and the first poll prunes it,
+                # matching the poll-path guard that would skip its row
+                # before the fingerprint is consulted anyway.
+                cursor.seen_fingerprints[fp] = date_utc or ''
             if not date_utc:
                 continue
             if (deferred_min_unresolved is not None
