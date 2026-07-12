@@ -495,13 +495,20 @@ class _ProviderMixin(_CapitalComBase):
         single call keeps the bracket-distance pre-check from doubling
         the network round-trip when both are needed in the same flow.
 
-        Capital.com publishes ``minNormalStopOrLimitDistance`` for the
-        regular bracket attach this plugin issues; the controlled-risk
-        minimum is wider and only applies to guaranteed stops, which the
-        plugin never requests. Falling back to the controlled value would
-        pre-reject perfectly valid normal-bracket orders on markets where
-        both values are quoted — so the normal distance is preferred and
-        the controlled-risk value is the last-resort fallback only.
+        The bracket-distance minimum is quoted under venue-dependent field
+        names and units. Every market observed live quotes
+        ``minStopOrProfitDistance`` with a ``PERCENTAGE`` unit (BTCUSD /
+        EURUSD / GOLD / US500 measured 2026-07-11); the IG-style
+        ``minNormalStopOrLimitDistance`` is preferred where present since
+        it is specific to the normal (non-guaranteed) bracket this plugin
+        issues. The guaranteed-stop minimums
+        (``minControlledRiskStopDistance`` / ``minGuaranteedStopDistance``)
+        are much wider and only apply to guaranteed stops, which the
+        plugin never requests — falling back to them would pre-reject
+        perfectly valid normal-bracket orders, so they are deliberately
+        NOT read. The unit is stored alongside the value; conversion to a
+        price-space distance happens at validation time against the live
+        mid (:meth:`._InstrumentRules.min_bracket_distance_at`).
         """
         now = epoch_time()
         details = await self._call('markets/' + epic, method='get')
@@ -520,16 +527,24 @@ class _ProviderMixin(_CapitalComBase):
         )
         min_size = float((dealing.get('minDealSize') or {}).get('value', lot_step))
         max_size = float((dealing.get('maxDealSize') or {}).get('value', 0.0))
-        min_stop_or_limit_distance = float(
-            (dealing.get('minNormalStopOrLimitDistance') or {}).get('value', 0.0)
-            or (dealing.get('minControlledRiskStopDistance') or {}).get('value', 0.0)
-        )
+        min_distance = 0.0
+        min_distance_unit = 'POINTS'
+        for distance_field in (
+                'minNormalStopOrLimitDistance', 'minStopOrProfitDistance',
+        ):
+            rule = dealing.get(distance_field) or {}
+            value = float(rule.get('value') or 0.0)
+            if value > 0.0:
+                min_distance = value
+                min_distance_unit = str(rule.get('unit') or 'POINTS').upper()
+                break
         rules = _InstrumentRules(
             epic=epic,
             lot_step=lot_step if lot_step > 0.0 else 0.01,
             min_size=min_size,
             max_size=max_size,
-            min_stop_or_limit_distance=min_stop_or_limit_distance,
+            min_stop_or_limit_distance=min_distance,
+            min_stop_or_limit_distance_unit=min_distance_unit,
             fetched_at=now,
         )
         self._instrument_rules_cache[epic] = rules
@@ -548,8 +563,8 @@ class _ProviderMixin(_CapitalComBase):
         hitting the exchange: Capital.com rejects non-multiples with
         ``error.invalid.size``, and an implicit rounding at the REST
         boundary is a silent data-loss bug waiting to happen. The cache
-        honours the internal :data:`_INSTRUMENT_RULES_TTL_S` so
-        ``minNormalStopOrLimitDistance`` widening during volatile sessions
+        honours the internal :data:`_INSTRUMENT_RULES_TTL_S` so the
+        bracket-distance minimum widening during volatile sessions
         does not get masked by a stale entry.
 
         :param epic: Capital.com market identifier (e.g. ``"EURUSD"``).

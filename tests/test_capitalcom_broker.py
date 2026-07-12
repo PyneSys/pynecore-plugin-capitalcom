@@ -652,9 +652,11 @@ def __test_modify_exit_pre_validates_distance__(tmp_path):
 
 
 def __test_get_instrument_rules_prefers_normal_distance_over_controlled_risk__(tmp_path):
-    """Capital.com brackets are normal stops; the wider controlled-risk
-    minimum must NOT shadow ``minNormalStopOrLimitDistance`` when both
-    values are quoted."""
+    """Capital.com brackets are normal stops; the wider guaranteed-stop
+    minimums (``minControlledRiskStopDistance`` / ``minGuaranteedStopDistance``)
+    must NOT shadow ``minNormalStopOrLimitDistance``, and must not be used
+    as a fallback either — pre-rejecting a valid normal bracket would skip
+    a live SL/TP attach."""
     broker, store, _ = _make_broker(tmp_path, responses={
         ('markets/EURUSD', 'get'): {
             'dealingRules': {
@@ -669,6 +671,91 @@ def __test_get_instrument_rules_prefers_normal_distance_over_controlled_risk__(t
     })
     rules = asyncio.run(broker._get_instrument_rules('EURUSD'))
     assert abs(rules.min_stop_or_limit_distance - 0.0001) < 1e-12
+    store.close()
+
+
+def __test_get_instrument_rules_parses_percentage_distance_unit__(tmp_path):
+    """The venue quotes ``minStopOrProfitDistance`` with a PERCENTAGE unit
+    on every observed market (BTCUSD/EURUSD/GOLD/US500, measured live);
+    the value+unit pair must be parsed together and converted to a
+    price-space distance against the reference price."""
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('markets/BTCUSD', 'get'): {
+            'dealingRules': {
+                'minStepDistance': {'value': 0.05, 'unit': 'POINTS'},
+                'minSizeIncrement': {'value': 0.0001},
+                'minDealSize': {'value': 0.0001},
+                'minStopOrProfitDistance': {'value': 0.01, 'unit': 'PERCENTAGE'},
+                'minGuaranteedStopDistance': {'value': 0.5, 'unit': 'PERCENTAGE'},
+            },
+            'instrument': {'lotSize': 0.0001},
+        },
+    })
+    rules = asyncio.run(broker._get_instrument_rules('BTCUSD'))
+    assert abs(rules.min_stop_or_limit_distance - 0.01) < 1e-12
+    assert rules.min_stop_or_limit_distance_unit == 'PERCENTAGE'
+    # 0.01% of a 100_000 reference = 10.0 price units.
+    assert abs(rules.min_bracket_distance_at(100_000.0) - 10.0) < 1e-9
+    store.close()
+
+
+def __test_get_instrument_rules_ignores_guaranteed_stop_only_market__(tmp_path):
+    """A market quoting ONLY guaranteed-stop minimums yields a 0.0 distance
+    (pre-check no-op) — the REST round-trip stays the authoritative gate
+    instead of the much wider guaranteed minimum skipping valid brackets."""
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): {
+            'dealingRules': {
+                'minStepDistance': {'value': 0.01},
+                'minSizeIncrement': {'value': 0.01},
+                'minDealSize': {'value': 0.01},
+                'minGuaranteedStopDistance': {'value': 0.25, 'unit': 'PERCENTAGE'},
+                'minControlledRiskStopDistance': {'value': 0.0050},
+            },
+            'instrument': {'lotSize': 0.01},
+        },
+    })
+    rules = asyncio.run(broker._get_instrument_rules('EURUSD'))
+    assert rules.min_stop_or_limit_distance == 0.0
+    assert rules.min_bracket_distance_at(1.1) == 0.0
+    store.close()
+
+
+def __test_execute_exit_pre_validates_percentage_distance__(tmp_path):
+    """PERCENTAGE minimum converts against the live mid: on a BTC-like
+    market (min 0.01%, mid 100_000 → 10.0) an SL 5.0 away is pre-rejected
+    with the converted price-space minimum on the error."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): {
+            'dealingRules': {
+                'minStepDistance': {'value': 0.05, 'unit': 'POINTS'},
+                'minSizeIncrement': {'value': 0.0001},
+                'minDealSize': {'value': 0.0001},
+                'minStopOrProfitDistance': {'value': 0.01, 'unit': 'PERCENTAGE'},
+            },
+            'instrument': {'lotSize': 0.0001},
+            'snapshot': {'bid': 99_999.0, 'offer': 100_001.0},
+        },
+        ('positions/deal-L', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='SL', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, sl_price=99_995.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(InvalidStopDistanceError) as exc:
+        asyncio.run(broker.execute_exit(env))
+    assert abs(exc.value.min_distance - 10.0) < 1e-9
+    assert not any(
+        c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
+    ), "PUT must not be issued when the percentage pre-check rejects"
     store.close()
 
 

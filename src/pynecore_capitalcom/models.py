@@ -20,10 +20,17 @@ class _InstrumentRules:
     ``min_size`` / ``max_size`` (the smallest / largest accepted ``size``;
     ``maxDealSize`` rejects oversized orders with
     ``error.invalid.size.maxvalue``), and ``min_stop_or_limit_distance`` —
-    the dynamic minimum that ``minNormalStopOrLimitDistance`` carries; it
-    applies symmetrically to both stop level and limit (take-profit) level,
-    used to pre-filter obviously-rejectable bracket levels before the
-    round-trip.
+    the dynamic bracket-distance minimum; it applies symmetrically to both
+    stop level and limit (take-profit) level, used to pre-filter
+    obviously-rejectable bracket levels before the round-trip.
+
+    The distance minimum is quoted with a unit: every market observed on
+    the venue quotes ``minStopOrProfitDistance`` with ``PERCENTAGE``
+    (e.g. BTCUSD 0.01, i.e. 0.01% of the price), while the IG-style
+    ``minNormalStopOrLimitDistance`` — where present — carries a plain
+    price distance (``POINTS``). ``min_stop_or_limit_distance`` stores the
+    raw quoted value; :meth:`min_bracket_distance_at` converts it to a
+    price-space distance against a reference price.
 
     ``max_size`` is ``0.0`` when the venue does not quote a ``maxDealSize``
     (or the field is unavailable); the execute path treats ``<= 0`` as
@@ -41,6 +48,25 @@ class _InstrumentRules:
     min_stop_or_limit_distance: float
     fetched_at: float
     max_size: float = 0.0
+    min_stop_or_limit_distance_unit: str = 'POINTS'
+
+    def min_bracket_distance_at(self, reference_price: float) -> float:
+        """Minimum SL/TP distance in price units at ``reference_price``.
+
+        ``PERCENTAGE`` minimums are relative to the current quote, so the
+        price-space threshold can only be computed against a concrete
+        reference (the live mid the pre-check anchors on). Any other unit
+        (``POINTS`` — observed to be plain price units on this venue, or a
+        missing unit) is returned as-is.
+
+        :param reference_price: Positive anchor price the distance is
+            measured from.
+        :return: Price-space minimum distance; ``0.0`` when the venue did
+            not quote a usable minimum (pre-check no-op).
+        """
+        if self.min_stop_or_limit_distance_unit == 'PERCENTAGE':
+            return reference_price * self.min_stop_or_limit_distance / 100.0
+        return self.min_stop_or_limit_distance
 
 
 @dataclass

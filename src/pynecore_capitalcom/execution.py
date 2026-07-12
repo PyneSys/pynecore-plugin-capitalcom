@@ -106,16 +106,16 @@ class _ExecutionMixin(_CapitalComBase):
         """
         if reference_price is None or reference_price <= 0.0:
             return
-        if rules.min_stop_or_limit_distance <= 0.0:
+        min_distance = rules.min_bracket_distance_at(reference_price)
+        if min_distance <= 0.0:
             return
         distance = abs(reference_price - sl_price)
-        if distance < rules.min_stop_or_limit_distance:
+        if distance < min_distance:
             raise InvalidStopDistanceError(
                 f"Capital.com pre-check: stop distance {distance:.6f} for "
-                f"{rules.epic} is below current minimum "
-                f"{rules.min_stop_or_limit_distance:.6f} "
+                f"{rules.epic} is below current minimum {min_distance:.6f} "
                 f"(reference={reference_price}, sl={sl_price}).",
-                min_distance=rules.min_stop_or_limit_distance,
+                min_distance=min_distance,
             )
 
     @staticmethod
@@ -127,23 +127,25 @@ class _ExecutionMixin(_CapitalComBase):
         """Raise :class:`InvalidTakeProfitDistanceError` if ``tp_price`` is
         closer than the cached minimum distance to ``reference_price``.
 
-        Capital.com applies ``minNormalStopOrLimitDistance`` symmetrically
-        to both legs — the same threshold gates ``stopLevel`` and
-        ``profitLevel``. See :meth:`_validate_sl_distance` for the
-        anchor-price discussion.
+        Capital.com applies the bracket-distance minimum symmetrically to
+        both legs — the same threshold gates ``stopLevel`` and
+        ``profitLevel`` (the venue field is even named
+        ``minStopOrProfitDistance``). See :meth:`_validate_sl_distance`
+        for the anchor-price discussion.
         """
         if reference_price is None or reference_price <= 0.0:
             return
-        if rules.min_stop_or_limit_distance <= 0.0:
+        min_distance = rules.min_bracket_distance_at(reference_price)
+        if min_distance <= 0.0:
             return
         distance = abs(reference_price - tp_price)
-        if distance < rules.min_stop_or_limit_distance:
+        if distance < min_distance:
             raise InvalidTakeProfitDistanceError(
                 f"Capital.com pre-check: take-profit distance {distance:.6f} "
                 f"for {rules.epic} is below current minimum "
-                f"{rules.min_stop_or_limit_distance:.6f} "
+                f"{min_distance:.6f} "
                 f"(reference={reference_price}, tp={tp_price}).",
-                min_distance=rules.min_stop_or_limit_distance,
+                min_distance=min_distance,
             )
 
     @staticmethod

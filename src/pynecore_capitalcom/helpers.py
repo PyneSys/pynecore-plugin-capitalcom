@@ -103,8 +103,8 @@ _FUNDS_REJECT_REASON_SUBSTRINGS = ('MARGIN', 'LEVERAGE', 'FUND', 'RISK', 'BALANC
 # calls the sync engine issues.
 _POLL_INTERVAL_S = 1.5
 
-# TTL on cached ``_InstrumentRules`` entries. Capital.com widens
-# ``minNormalStopOrLimitDistance`` during volatile sessions; unbounded
+# TTL on cached ``_InstrumentRules`` entries. Capital.com widens the
+# bracket-distance minimum during volatile sessions; unbounded
 # caching would silently disable the pre-check. Five minutes bounds the
 # staleness to one news-event window without flooding the rate-limited
 # markets endpoint.
