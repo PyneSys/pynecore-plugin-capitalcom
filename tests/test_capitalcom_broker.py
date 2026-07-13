@@ -1818,6 +1818,38 @@ def __test_missing_pending_tracker_fires_unexpected_cancel__(tmp_path):
     store.close()
 
 
+def __test_missing_pending_tracker_stop_with_sink_quarantines__(tmp_path):
+    # With the runner-wired quarantine sink present, the default 'stop' policy
+    # latches the engine quarantine instead of raising: the poll loop (and the
+    # process) stays alive while trading is stopped engine-side.
+    broker, store, ctx = _make_broker(tmp_path)
+    latched = []
+    broker.quarantine_sink = lambda reason, context: latched.append(
+        (reason, context))
+    old_ts = __import__('time').time() - 120.0
+    ctx.upsert_order('lost', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='gone',
+                     extras={'missing_pending_since': old_ts,
+                             'kind': 'position'})
+
+    async def drain():
+        events = []
+        async for ev in broker._missing_pending_tracker({}, {}):
+            events.append(ev)
+        return events
+
+    events = asyncio.run(drain())   # no raise: the process stays alive
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    assert len(latched) == 1
+    reason, context = latched[0]
+    assert 'lost' in reason
+    assert context['policy'] == 'stop'
+    row = ctx.get_order('lost')
+    assert row is not None and row.closed_ts_ms is not None
+    store.close()
+
+
 def __test_missing_pending_tracker_ignore_policy_suppresses__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path)
     # The CLI normally injects the runtime policy from brokers.toml; in tests

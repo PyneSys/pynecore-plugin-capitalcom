@@ -1,4 +1,4 @@
-"""Snapshot reconcile + missing-pending tracker + unexpected-cancel raiser.
+"""Snapshot reconcile + disappearance tracking over the core tracker.
 
 The plugin's poll cycle reads ``GET /positions`` + ``GET /workingorders``
 and reconciles them against the BrokerStore — the runtime equivalent of
@@ -9,34 +9,34 @@ into:
   working order, resolves bracket leg dispositions, emits partial-fill
   events, retires confirmed siblings on mixed-bracket rejection,
   handles natural-close detection, and writes resolution markers for
-  ambiguous cases.
-* ``_missing_pending_tracker`` — separately tracks bot-owned rows that
-  vanish without a corresponding cancel event; stamps
-  ``missing_pending_since`` so a grace window must elapse before
-  raising.
-* ``_maybe_raise_unexpected_cancel`` — applies the configured policy
-  (stop / stop_and_cancel / re_place / ignore) when the grace window
-  expires. ``stop`` raises :class:`UnexpectedCancelError`; the rest
-  are quieter outcomes.
+  ambiguous cases. Ends by feeding the poll's presence sets into the
+  core :class:`DisappearanceTracker` (stamp / clear).
+* ``_missing_pending_tracker`` — drives the tracker's grace-expiry
+  protocol: rows missing past the grace window are retired as
+  unexpected cancels (dual signal) and the configured
+  ``on_unexpected_cancel`` policy is applied — ``stop`` /
+  ``stop_and_cancel`` latch the engine quarantine through
+  ``quarantine_sink``; ``halt`` (or an unwired sink) raises
+  :class:`UnexpectedCancelError`.
 
 State touched: BrokerStore through ``self.store_ctx``,
-``_current_poll_id`` (read).
+``_current_poll_id`` (read), ``_disappearance`` (lazy build).
 """
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator
 
-from pynecore.core.broker.exceptions import (
-    BrokerError,
-    OrderDispositionUnknownError,
-    UnexpectedCancelError,
+from pynecore.core.broker.disappearance import (
+    DisappearanceTracker,
+    MissingConfirmation,
+    MissingResolution,
 )
+from pynecore.core.broker.exceptions import BrokerError
 from pynecore.core.broker.journal import (
     DispatchJournal,
     ReconcileOutcome,
 )
 from pynecore.core.broker.models import (
     ExchangeOrder,
-    ExitIntent,
     LegType,
     OrderEvent,
     OrderStatus,
@@ -167,22 +167,9 @@ class _ReconcileMixin(_CapitalComBase):
                     # here so the missing-pending grace tracker does
                     # not raise a false ``UnexpectedCancelError``.
                     self._close_bracket_after_natural_close(row)
-                    continue
-                extras = dict(row.extras or {})
-                if 'missing_pending_since' not in extras:
-                    extras['missing_pending_since'] = now_ts
-                    self.store_ctx.upsert_order(
-                        row.client_order_id, extras=extras,
-                    )
+                # No breadcrumb: the disappearance is the core tracker's
+                # concern — ``observe_presence`` below stamps it.
                 continue
-
-            # Clear any stale missing_pending stamp — it came back.
-            if 'missing_pending_since' in (row.extras or {}):
-                extras = {k: v for k, v in (row.extras or {}).items()
-                          if k != 'missing_pending_since'}
-                self.store_ctx.upsert_order(
-                    row.client_order_id, extras=extras,
-                )
 
             # Clear any stale ``close_event_yielded_at`` breadcrumb on a
             # row whose deal is still present.  The breadcrumb's purpose
@@ -454,6 +441,77 @@ class _ReconcileMixin(_CapitalComBase):
                     'attached' if all_attached else 'rejected',
                 )
 
+        # Presence diff for the disappearance state machine: stamp rows
+        # whose deal vanished from BOTH namespaces, clear rows that came
+        # back. Runs AFTER the loop above so a natural-close teardown in
+        # this same pass retires its rows before they could be stamped.
+        # Both endpoints were fetched successfully when we got here (the
+        # poll raises otherwise), so both namespaces are authoritative.
+        self._disappearance_tracker().observe_presence(
+            {
+                'positions': set(positions_by_deal),
+                'working': set(working_by_deal),
+            },
+            now_ts,
+        )
+
+    def _disappearance_tracker(self) -> DisappearanceTracker:
+        """The lazily-built core disappearance tracker for this instance.
+
+        Built on first use because its inputs — ``store_ctx``,
+        ``on_unexpected_cancel``, ``quarantine_sink`` — are injected by
+        the runner / CLI after ``__init__``. Venue wiring:
+
+        * A bot order lives under ONE Capital.com ``dealId`` that
+          migrates between ``/workingorders`` and ``/positions`` on fill,
+          so every row tracks the same ref in both namespaces and is
+          visible when either carries it. Bracket-leg rows have no deal
+          id of their own → empty ref set → never tracked.
+        * Rows flagged ``natural_close_at`` are known-closed on the
+          exchange — exempt, otherwise the grace window would raise a
+          false unexpected-cancel for an expected disappearance.
+        * ``confirm_missing`` is the simple venue behavior: the poll
+          snapshot is authoritative and phase 1 already cleared any row
+          that came back, so a grace-expired stamp IS the confirmed
+          external cancel.
+        """
+        tracker = self._disappearance
+        if tracker is None:
+            assert self.store_ctx is not None
+            tracker = DisappearanceTracker(
+                self.store_ctx,
+                grace_s=max(5.0, _POLL_INTERVAL_S * 5.0),
+                policy=self.on_unexpected_cancel,
+                tracked_refs=lambda row: (
+                    {('positions', row.exchange_order_id),
+                     ('working', row.exchange_order_id)}
+                    if row.exchange_order_id else set()
+                ),
+                confirm_missing=self._confirm_missing_cancelled,
+                is_exempt=lambda row: (
+                    (row.extras or {}).get('natural_close_at') is not None
+                ),
+                cancel_siblings=self._cancel_sibling_orders,
+                request_quarantine=self.quarantine_sink,
+                cancelled_event_factory=self._missing_pending_cancelled_event,
+            )
+            self._disappearance = tracker
+        return tracker
+
+    @staticmethod
+    async def _confirm_missing_cancelled(
+            _row: 'OrderRow',
+    ) -> MissingConfirmation:
+        """Grace-expiry verdict: a still-stamped row is an external cancel.
+
+        Capital.com has no deal-history bridge to re-verify against — the
+        per-poll snapshot is the authority, the tracker's phase 1 clears
+        any row whose deal reappeared, and the stamp-version guard drops
+        a verdict that raced a concurrent clear. What is left after the
+        grace window is the genuine disappearance.
+        """
+        return MissingConfirmation(MissingResolution.CANCELLED)
+
     def _feed_native_failsafe_observed(
             self, parent_ref: str, pos: dict,
     ) -> None:
@@ -499,148 +557,99 @@ class _ReconcileMixin(_CapitalComBase):
             working_by_deal: dict[str, dict],
             positions_by_deal: dict[str, dict],
     ) -> AsyncIterator[OrderEvent]:
-        """Emit cancelled events for rows missing past the grace window.
+        """Drive the tracker's grace-expiry protocol for this poll.
 
         A row may temporarily disappear between polls (a fill in flight
         shows neither in working nor in positions for an instant). The
-        grace window (``5 × cadence``, min 5 s) absorbs that noise.
-        Rows missing past the window are treated as cancelled and fed
-        into the :meth:`_maybe_raise_unexpected_cancel` policy branch.
+        grace window (``5 × cadence``, min 5 s) absorbs that noise. Rows
+        missing past the window are retired with the tracker's dual
+        signal: the synthetic ``cancelled`` event keeps the sync engine's
+        order bookkeeping consistent (essential under the non-halting
+        ``ignore`` / ``re_place`` policies, where the event is the ONLY
+        signal), while the policy separately decides the operational
+        reaction — ``stop`` / ``stop_and_cancel`` latch the engine
+        quarantine, ``halt`` raises :class:`UnexpectedCancelError`
+        through the poll loop.
         """
         if self.store_ctx is None:
             return
-        grace = max(5.0, _POLL_INTERVAL_S * 5.0)
-        now_ts = epoch_time()
-        for row in list(self.store_ctx.iter_live_orders()):
-            extras = row.extras or {}
-            since: float | None = extras.get('missing_pending_since')
-            if since is None:
+        async for event in self._disappearance_tracker().observe(
+                {
+                    'positions': set(positions_by_deal),
+                    'working': set(working_by_deal),
+                },
+                epoch_time(),
+        ):
+            yield event
+
+    @staticmethod
+    def _missing_pending_cancelled_event(
+            row: 'OrderRow', now_ts: float,
+    ) -> OrderEvent:
+        """Synthesised cancelled event for a vanished bot-owned row.
+
+        Keyed on the row's ``dealId`` (``exchange_order_id``); carries no
+        ``leg_type`` — the pre-tracker event shape this plugin's suite
+        pins.
+        """
+        did = row.exchange_order_id
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=did or '', symbol=row.symbol, side=row.side,
+                order_type=OrderType.MARKET,
+                qty=row.qty, filled_qty=row.filled_qty,
+                remaining_qty=max(0.0, row.qty - row.filled_qty),
+                price=None, stop_price=None,
+                average_fill_price=None,
+                status=OrderStatus.CANCELLED,
+                timestamp=now_ts, fee=0.0, fee_currency='',
+                reduce_only=False, client_order_id=row.client_order_id,
+            ),
+            event_type='cancelled',
+            fill_price=None, fill_qty=None, timestamp=now_ts,
+            pine_id=row.pine_entry_id,
+            from_entry=row.from_entry,
+        )
+
+    async def _cancel_sibling_orders(self, row: 'OrderRow') -> None:
+        """Best-effort cancel sweep for the ``stop_and_cancel`` policy.
+
+        Deletes every other bot-owned working order / position in the
+        origin row's symbol at the broker and retires its store row
+        through the cascade audit path. Per-order failures are swallowed
+        — this is a best-effort pass run while the quarantine / halt is
+        already armed.
+        """
+        if self.store_ctx is None:
+            return
+        cascade_journal = DispatchJournal(self.store_ctx)
+        for other in list(self.store_ctx.iter_live_orders(symbol=row.symbol)):
+            if (other.client_order_id == row.client_order_id
+                    or not other.exchange_order_id):
                 continue
-            # Defensive: ``_reconcile_snapshot`` already skips
-            # naturally-closed rows from being stamped, but double-guard
-            # against any historical stamp surviving on a row that was
-            # later flagged as natural close.
-            if extras.get('natural_close_at') is not None:
-                continue
-            if (now_ts - float(since)) < grace:
-                continue
-            did = row.exchange_order_id
-            if did and (did in working_by_deal or did in positions_by_deal):
-                # Came back — already cleared in reconcile, skip.
-                continue
-            DispatchJournal(self.store_ctx).apply_reconcile_outcome(
-                row.client_order_id,
+            kind = (other.extras or {}).get('kind', 'working')
+            endpoint = (f'workingorders/{other.exchange_order_id}'
+                        if kind == 'working'
+                        else f'positions/{other.exchange_order_id}')
+            try:
+                await self._call(endpoint, method='delete')
+            except (OrderNotFoundError, BrokerError):
+                pass
+            cascade_journal.apply_reconcile_outcome(
+                other.client_order_id,
                 ReconcileOutcome(
                     kind='terminal_close',
-                    reason='missing_pending_grace_expired',
+                    reason='unexpected_cancel_cascade',
                     new_state='rejected',
-                    audit_event='unexpected_cancel',
+                    audit_event='unexpected_cancel_cascade',
                     close_row=True,
-                    audit_payload={'missing_since': since, 'grace': grace},
-                    exchange_order_id=did,
+                    audit_payload={
+                        'origin_coid': row.client_order_id,
+                        'origin_deal_id': row.exchange_order_id,
+                    },
+                    exchange_order_id=other.exchange_order_id,
                 ),
             )
-            # Deliberate DUAL signal, not a contract violation: the
-            # synthetic ``cancelled`` event keeps the sync engine's order
-            # bookkeeping consistent (the intent mapping is released and
-            # the strategy sees the order as gone — essential under the
-            # non-halting ``ignore`` / ``re_place`` policies, where the
-            # event is the ONLY signal), while the policy raise below
-            # separately decides whether the bot also halts. Emitting only
-            # the exception would leave engine state stale under the
-            # non-halting policies; emitting only the event would drop the
-            # operator-facing halt under the default ``stop`` policy.
-            yield OrderEvent(
-                order=ExchangeOrder(
-                    id=did or '', symbol=row.symbol, side=row.side,
-                    order_type=OrderType.MARKET,
-                    qty=row.qty, filled_qty=row.filled_qty,
-                    remaining_qty=max(0.0, row.qty - row.filled_qty),
-                    price=None, stop_price=None,
-                    average_fill_price=None,
-                    status=OrderStatus.CANCELLED,
-                    timestamp=now_ts, fee=0.0, fee_currency='',
-                    reduce_only=False, client_order_id=row.client_order_id,
-                ),
-                event_type='cancelled',
-                fill_price=None, fill_qty=None, timestamp=now_ts,
-                pine_id=row.pine_entry_id,
-                from_entry=row.from_entry,
-            )
-            await self._maybe_raise_unexpected_cancel(row)
-
-    async def _maybe_raise_unexpected_cancel(self, row: 'OrderRow') -> None:
-        """Apply the configured ``on_unexpected_cancel`` policy.
-
-        Always called AFTER the caller yielded the synthetic ``cancelled``
-        event for the same row — the event carries the engine-state
-        cleanup, this hook only decides whether the bot additionally
-        halts (see the dual-signal comment at the call site).
-
-        - ``stop`` (default): raise :class:`UnexpectedCancelError` — the
-          sync engine halts via its normal graceful-stop path.
-        - ``stop_and_cancel``: best-effort cancel pass over the other
-          bot-owned orders in the same symbol, then raise.
-        - ``re_place``: no-op — the sync engine re-dispatches the
-          protective order on the next diff cycle.
-        - ``ignore``: no-op with an audit log.
-        """
-        policy = self.on_unexpected_cancel
-        if policy == 'ignore':
-            if self.store_ctx is not None:
-                self.store_ctx.log_event(
-                    'unexpected_cancel_ignored',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                )
-            return
-        if policy == 're_place':
-            if self.store_ctx is not None:
-                self.store_ctx.log_event(
-                    'unexpected_cancel_re_place',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                )
-            return
-        if policy == 'stop_and_cancel' and self.store_ctx is not None:
-            cascade_journal = DispatchJournal(self.store_ctx)
-            for other in list(self.store_ctx.iter_live_orders(symbol=row.symbol)):
-                if (other.client_order_id == row.client_order_id
-                        or not other.exchange_order_id):
-                    continue
-                kind = (other.extras or {}).get('kind', 'working')
-                endpoint = (f'workingorders/{other.exchange_order_id}'
-                            if kind == 'working'
-                            else f'positions/{other.exchange_order_id}')
-                try:
-                    await self._call(endpoint, method='delete')
-                except (OrderNotFoundError, BrokerError):
-                    pass
-                cascade_journal.apply_reconcile_outcome(
-                    other.client_order_id,
-                    ReconcileOutcome(
-                        kind='terminal_close',
-                        reason='unexpected_cancel_cascade',
-                        new_state='rejected',
-                        audit_event='unexpected_cancel_cascade',
-                        close_row=True,
-                        audit_payload={
-                            'origin_coid': row.client_order_id,
-                            'origin_deal_id': row.exchange_order_id,
-                        },
-                        exchange_order_id=other.exchange_order_id,
-                    ),
-                )
-        raise UnexpectedCancelError(
-            f"Bot-owned order disappeared unexpectedly: "
-            f"coid={row.client_order_id!r} deal_id={row.exchange_order_id!r}",
-            context={
-                'client_order_id': row.client_order_id,
-                'exchange_order_id': row.exchange_order_id,
-                'symbol': row.symbol,
-                'policy': policy,
-            },
-        )
 
     # --- Trailing activation monitor --------------------------------------
 

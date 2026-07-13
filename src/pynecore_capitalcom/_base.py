@@ -42,6 +42,7 @@ from .config import CapitalComConfig
 from .models import _ActivityCursor, _InstrumentRules
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.disappearance import DisappearanceTracker
     from pynecore.core.broker.models import DispatchEnvelope, PositionLeg
     from pynecore.core.broker.storage import OrderRow
 
@@ -139,6 +140,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     _activity_cursor: _ActivityCursor
     _instrument_rules_cache: dict[str, _InstrumentRules]
     _current_poll_id: int
+    # Lazily-built core disappearance tracker (reconcile.py owns it).
+    _disappearance: 'DisappearanceTracker | None'
 
     # --- Account mode ---
     # ``True`` once ``connect()`` reads ``hedgingMode`` from the account
@@ -284,7 +287,7 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
             yield  # pragma: no cover
         ...
 
-    async def _maybe_raise_unexpected_cancel(self, row: 'OrderRow') -> None: ...
+    def _disappearance_tracker(self) -> 'DisappearanceTracker': ...
 
     # --- Recovery (recovery.py) ---
     async def _load_activity_cursor_from_events(self) -> None: ...

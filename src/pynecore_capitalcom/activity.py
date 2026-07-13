@@ -8,9 +8,11 @@ polling AsyncIterator that fuses three REST endpoints per cadence tick:
    in BrokerStore.
 2. ``GET /positions`` + ``GET /workingorders`` — snapshot reconcile
    (delegated to ``_reconcile_snapshot`` in ``reconcile.py``).
-3. ``_missing_pending_tracker`` — separately raises
-   :class:`UnexpectedCancelError` for bot-owned rows that vanish
-   without a corresponding cancel event.
+3. ``_missing_pending_tracker`` — drives the core disappearance
+   tracker's grace protocol for bot-owned rows that vanish without a
+   corresponding cancel event (dual signal + ``on_unexpected_cancel``
+   policy: quarantine by default, :class:`UnexpectedCancelError` under
+   ``halt``).
 
 State touched: ``_activity_cursor`` (read/write — fingerprint dedup
 set, watermark, external-activity log dedup), ``_current_poll_id``

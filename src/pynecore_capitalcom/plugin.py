@@ -241,3 +241,9 @@ class CapitalCom(
         # ``missing_pending_since`` and raises a false
         # :class:`UnexpectedCancelError`.
         self._current_poll_id: int = 0
+        # Core disappearance state machine (stamp / clear / grace /
+        # dual-signal). Built lazily by :meth:`_disappearance_tracker` —
+        # construction reads ``store_ctx``, ``on_unexpected_cancel`` and
+        # ``quarantine_sink``, all injected by the runner / CLI after
+        # ``__init__``.
+        self._disappearance = None
