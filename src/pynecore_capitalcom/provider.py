@@ -464,6 +464,9 @@ class _ProviderMixin(_CapitalComBase):
           store keyed by :attr:`DispatchEnvelope.client_order_id`.
           Restart-safe recovery is intact; the exchange does not enforce
           dedup at the API.
+        - ``short_selling = NATIVE`` — CFD venue: a SELL ``POST /positions``
+          on a flat or smaller-long book opens/flips to a short row
+          natively.
         """
         return ExchangeCapabilities(
             stop_order=CapabilityLevel.NATIVE,
@@ -478,6 +481,7 @@ class _ProviderMixin(_CapitalComBase):
             watch_orders=CapabilityLevel.SOFTWARE,
             fetch_position=CapabilityLevel.NATIVE,
             idempotency=CapabilityLevel.SOFTWARE,
+            short_selling=CapabilityLevel.NATIVE,
         )
 
     async def _fetch_market(
