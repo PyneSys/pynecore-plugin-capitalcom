@@ -115,6 +115,7 @@ class _CapitalComModifyEntryHooks:
                 f"Capital PUT workingorders/{deal_id} ambiguous: {net}",
                 client_order_id=coid,
                 cause=net if isinstance(net, Exception) else None,
+                predecessor_cancel_ids=(),
             ) from net
 
         deal_ref = put_resp.get('dealReference')
@@ -123,6 +124,7 @@ class _CapitalComModifyEntryHooks:
                 f"Capital PUT workingorders/{deal_id}: no dealReference "
                 f"in response",
                 client_order_id=coid,
+                predecessor_cancel_ids=(),
             )
 
         try:
@@ -136,6 +138,7 @@ class _CapitalComModifyEntryHooks:
                 f"working-order amend: {net}",
                 client_order_id=coid,
                 cause=net if isinstance(net, Exception) else None,
+                predecessor_cancel_ids=(),
             ) from net
 
         deal_status = (confirm.get('dealStatus') or '').upper()
@@ -1009,6 +1012,7 @@ class _CapitalComModifyExitHooks:
                 f"ambiguous: {net}",
                 client_order_id=self._target_row.client_order_id,
                 cause=net if isinstance(net, Exception) else None,
+                predecessor_cancel_ids=(),
             ) from net
 
         new_ref = resp.get('dealReference')
@@ -1052,6 +1056,7 @@ class _CapitalComModifyExitHooks:
                     f"ambiguous: {net}",
                     client_order_id=self._target_row.client_order_id,
                     cause=net if isinstance(net, Exception) else None,
+                    predecessor_cancel_ids=(),
                 ) from net
 
             deal_status = (modify_confirm.get('dealStatus') or '').upper()
