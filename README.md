@@ -11,6 +11,55 @@ Both the **data provider** (`LiveProviderPlugin`) and **live order execution**
 plus live OHLCV, and position-based order routing with server-side stop-loss /
 take-profit / trailing stop.
 
+## Demo first
+
+Capital.com has a full demo environment
+(`demo-api-capital.backend-capital.com`) — run your strategy there before
+risking funds. Set `demo = true` and the plugin talks to the demo host; the
+same API key works on both hosts, and the host you authenticate against
+decides which account list (demo or live) you see. Note two demo-side
+differences: fills are effectively deterministic at the requested price
+(slippage and partial fills are simulated away), and the hourly order-POST
+rate limit is tighter than on live.
+
+## Configuration
+
+Settings live in `workdir/config/plugins/capitalcom.toml`, auto-generated
+from [`CapitalComConfig`](src/pynecore_capitalcom/config.py) on first run.
+One credential block serves both market data and order execution:
+
+```toml
+demo = false           # demo host vs. live real funds
+user_email = ""        # your Capital.com account email
+api_key = ""           # API key from Settings -> API integrations
+api_password = ""      # the password you set when generating the key
+```
+
+Generating the key: enable two-factor authentication on your account first
+(Capital.com requires 2FA before API key generation), then create the key
+under **Settings -> API integrations** on the platform; the API password is
+set there as part of key creation. The plugin encrypts the password with
+the server-provided RSA key at login and keeps the session tokens
+refreshed proactively.
+
+## Symbols
+
+Capital.com identifies instruments by **epic** (e.g. `EURUSD`, `GOLD`) —
+use the epic directly in the provider string:
+
+```
+capitalcom:EURUSD@1
+```
+
+Pine scripts written with TradingView-style symbols keep working through
+the optional `symbol_map` translation table in the config:
+
+```toml
+[symbol_map]
+"FX:EURUSD" = "EURUSD"
+"OANDA:XAUUSD" = "GOLD"
+```
+
 ## Architecture
 
 - **Transport**: REST v1 (`api-capital.backend-capital.com`, or the demo
