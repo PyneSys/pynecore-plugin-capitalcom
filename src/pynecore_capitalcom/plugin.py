@@ -146,6 +146,13 @@ class CapitalCom(
 
         # Live WebSocket streaming state
         self._ws = None
+        # Set by the WS listener when the server rejects a frame with a
+        # session-invalid error code (e.g. a second run on the same account
+        # rotated the session out from under this one). ``connect()`` reads
+        # it on the next reconnect and forces a fresh login before
+        # re-subscribing, so a session collision self-heals instead of
+        # looping forever on stale tokens.
+        self._ws_session_invalid: bool = False
         self._last_bar_timestamp: int | None = None
         self._last_bar_ohlcv: OHLCV | None = None
         self._update_queue: asyncio.Queue | None = None

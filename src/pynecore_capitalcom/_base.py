@@ -95,6 +95,7 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     # ``WebSocketClientProtocol`` → ``asyncio.client.ClientConnection``);
     # ``Any`` keeps the annotation portable across versions.
     _ws: Any
+    _ws_session_invalid: bool
     _last_bar_timestamp: int | None
     _last_bar_ohlcv: OHLCV | None
     _update_queue: asyncio.Queue | None

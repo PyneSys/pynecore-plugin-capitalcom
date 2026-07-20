@@ -38,6 +38,7 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
+from .rest import _SESSION_RECREATE_CODES
 from .helpers import (
     WS_URL,
     _WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD,
@@ -160,6 +161,29 @@ class _StreamingMixin(_CapitalComBase):
                 try:
                     data = json.loads(raw)
                     dest = data.get("destination", "")
+                    if data.get("status") == "ERROR":
+                        # Capital.com echoes the subscribe destination with a
+                        # ``status: "ERROR"`` frame when a request is rejected.
+                        # A session-invalid code means our tokens were rotated
+                        # out (typically a second run on the same account): flag
+                        # it so the next ``connect()`` re-authenticates, then
+                        # break to trigger the reconnect. Non-session errors are
+                        # logged but must not tear the loop down — the socket is
+                        # otherwise healthy and later frames may be fine.
+                        err_code = str(data.get("errorCode") or "")
+                        if err_code in _SESSION_RECREATE_CODES:
+                            broker_warning(
+                                "Capital.com WS rejected a frame with an "
+                                "invalid session (%s); re-authenticating on "
+                                "reconnect", err_code,
+                            )
+                            self._ws_session_invalid = True
+                            break
+                        broker_warning(
+                            "Capital.com WS error frame (%s); continuing",
+                            err_code or data,
+                        )
+                        continue
                     if dest == "ohlc.event":
                         payload_dict = data.get("payload") or {}
                         price_type = str(
@@ -1073,10 +1097,20 @@ class _StreamingMixin(_CapitalComBase):
                 "pip install websockets"
             )
 
-        if not self.cst_token or not self.security_token:
+        if not self.cst_token or not self.security_token or self._ws_session_invalid:
             # ``create_session()`` runs two blocking httpx calls (50s
             # timeout each) — offload to a thread so the event loop
-            # (watchdogs, WS ping) keeps running during login.
+            # (watchdogs, WS ping) keeps running during login. Also forced
+            # when the previous connection died on a session-invalid WS error:
+            # a reconnect with the same stale tokens would loop forever, so we
+            # re-authenticate first. The retry/backoff cadence between
+            # reconnects is owned by the live runner (event-driven, no sleep).
+            if self._ws_session_invalid:
+                broker_info(
+                    "Re-authenticating Capital.com session after a WS "
+                    "session-invalid rejection"
+                )
+                self._ws_session_invalid = False
             await asyncio.to_thread(self.create_session)
 
         if self.store_ctx is not None:

@@ -4568,6 +4568,179 @@ def __test_listen_loop_sentinel_targets_local_queue_not_successor__(tmp_path):
     assert payload is None
 
 
+def __test_listen_loop_flags_session_invalid_error_frame__():
+    """A WS ERROR frame with a session-invalid code must flag re-auth.
+
+    When a second run on the same account rotates the session out, the
+    server replies to our subscribe with a ``status: "ERROR"`` frame
+    carrying ``error.invalid.session.token``. The listener must set
+    ``_ws_session_invalid`` (so the next ``connect()`` re-authenticates)
+    and break to trigger the reconnect, instead of silently ignoring the
+    frame and looping forever on dead tokens.
+    """
+    broker = _FakeBroker(symbol="EURUSD", timeframe="1", config=_make_config())
+
+    async def runner():
+        broker._update_queue = asyncio.Queue()
+        raw_q: asyncio.Queue = asyncio.Queue()
+        broker._raw_ohlc_queue = raw_q
+
+        error_frame = json.dumps({
+            "destination": "OHLCMarketData.subscribe",
+            "status": "ERROR",
+            "errorCode": "error.invalid.session.token",
+        })
+
+        class _DummyWS:
+            close_code = None
+
+            def __aiter__(self):
+                return self
+
+            def __init__(self):
+                self._sent = False
+
+            async def __anext__(self):
+                if not self._sent:
+                    self._sent = True
+                    return error_frame
+                # Should never be reached — the listener must break on the
+                # session-invalid frame before requesting the next one.
+                raise AssertionError("listener kept reading after session error")
+
+        broker._ws = _DummyWS()  # type: ignore[assignment]
+        await broker._listen_loop()
+        return raw_q
+
+    raw_q = asyncio.run(runner())
+    assert broker._ws_session_invalid is True
+    # The disconnect sentinel must still be posted so the live runner
+    # reconnects (which re-authenticates via the flag).
+    event_type, payload = raw_q.get_nowait()
+    assert event_type == "disconnect"
+    assert payload is None
+
+
+def __test_listen_loop_ignores_non_session_error_frame__():
+    """A non-session WS ERROR frame must not tear the loop down or re-auth.
+
+    The socket is otherwise healthy — a rejected request for one epic must
+    be logged and skipped, never flag a session re-authentication or drop
+    the connection.
+    """
+    broker = _FakeBroker(symbol="EURUSD", timeframe="1", config=_make_config())
+
+    async def runner():
+        broker._update_queue = asyncio.Queue()
+        raw_q: asyncio.Queue = asyncio.Queue()
+        broker._raw_ohlc_queue = raw_q
+
+        frames = iter([
+            json.dumps({
+                "destination": "marketData.subscribe",
+                "status": "ERROR",
+                "errorCode": "error.invalid.epic",
+            }),
+        ])
+
+        class _DummyWS:
+            close_code = None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(frames)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        broker._ws = _DummyWS()  # type: ignore[assignment]
+        await broker._listen_loop()
+        return raw_q
+
+    raw_q = asyncio.run(runner())
+    assert broker._ws_session_invalid is False
+    # Loop ended naturally (stream exhausted) → disconnect sentinel posted,
+    # but the flag was never set.
+    event_type, _ = raw_q.get_nowait()
+    assert event_type == "disconnect"
+
+
+def __test_connect_reauthenticates_after_session_invalid__(monkeypatch):
+    """``connect()`` must force a fresh login when the invalid-session flag is set.
+
+    A reconnect after a session-invalid WS rejection carries stale (but
+    non-empty) tokens: without the flag check, ``connect()`` would skip
+    ``create_session`` and re-subscribe with the dead tokens, looping
+    forever. With the flag, it re-authenticates first and clears the flag.
+    """
+    broker = _FakeBroker(symbol="EURUSD", timeframe="1", config=_make_config())
+    broker.store_ctx = None  # skip broker-side recovery passes
+    # Stale-but-present tokens, as after a session-invalidation.
+    broker.cst_token = "stale-cst"
+    broker.security_token = "stale-sec"
+    broker._ws_session_invalid = True
+
+    login_calls: list[int] = []
+
+    def fake_create_session():
+        login_calls.append(1)
+        broker.cst_token = "fresh-cst"
+        broker.security_token = "fresh-sec"
+
+    monkeypatch.setattr(broker, "create_session", fake_create_session)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("pynecore_capitalcom.streaming.asyncio.to_thread",
+                        fake_to_thread)
+
+    sent: list[str] = []
+
+    async def fake_send(destination, payload=None, correlation_id="1"):
+        sent.append(destination)
+
+    monkeypatch.setattr(broker, "_send", fake_send)
+
+    class _DummyWS:
+        close_code = None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(3600)
+            raise StopAsyncIteration
+
+        async def close(self, code=None, reason=None):
+            self.close_code = code
+
+    import pynecore_capitalcom.streaming as _streaming_mod
+
+    class _FakeWebsockets:
+        @staticmethod
+        async def connect(url, **kwargs):
+            return _DummyWS()
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "websockets", _FakeWebsockets,
+    )
+
+    async def runner():
+        await broker.connect()
+        try:
+            assert login_calls == [1], "connect() must re-authenticate once"
+            assert broker._ws_session_invalid is False, "flag must be cleared"
+            assert broker.cst_token == "fresh-cst"
+            assert "OHLCMarketData.subscribe" in sent
+        finally:
+            await broker.disconnect()
+
+    asyncio.run(runner())
+
+
 def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypatch):
     """Repeated REST recovery means the OHLC subscription is stale, not healthy.
 
