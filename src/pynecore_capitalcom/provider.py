@@ -391,7 +391,13 @@ class _ProviderMixin(_CapitalComBase):
                     # not advance ``bar_index``.
                     self._last_bar_ohlcv = ohlcv
                     self._last_bar_timestamp = ohlcv.timestamp
-                    tf = t + timedelta(minutes=1)
+                    # Advance the pagination cursor one full timeframe past
+                    # the last stored bar. ``/prices`` treats ``from`` as
+                    # inclusive, so ``t + interval`` starts the next page at
+                    # the first not-yet-stored slot with neither overlap nor
+                    # an off-by-one skip. A hardcoded one-minute step here
+                    # under-advanced on every non-1m timeframe.
+                    tf = t + interval
 
         except StopIteration:
             pass

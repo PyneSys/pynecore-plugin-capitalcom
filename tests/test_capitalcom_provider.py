@@ -101,6 +101,83 @@ def __test_capitalcom_known_limits__():
     assert 1000 == 1000  # This is just a placeholder, actual limit is in the function parameter
 
 
+def _build_price_page(bars):
+    """Wrap naive-datetime bars in a Capital.com ``/prices`` payload."""
+    return {'prices': [{
+        'snapshotTimeUTC': b.strftime('%Y-%m-%dT%H:%M:%S'),
+        'openPrice': {'bid': 1.0, 'ask': 1.0},
+        'highPrice': {'bid': 1.0, 'ask': 1.0},
+        'lowPrice': {'bid': 1.0, 'ask': 1.0},
+        'closePrice': {'bid': 1.0, 'ask': 1.0},
+        'lastTradedVolume': 1.0,
+    } for b in bars]}
+
+
+def __test_capitalcom_pagination_covers_multipage_range__(tmp_path):
+    """Paginated 1-minute download covers a multi-page range with no lost or
+    duplicated bars across page boundaries.
+
+    Regression: the cursor is advanced one full timeframe past the last stored
+    bar (``t + interval``), and ``/prices`` ``from`` is inclusive, so adjacent
+    pages meet with neither overlap nor an off-by-one skip.
+    """
+    from datetime import timedelta
+    from pynecore_capitalcom import CapitalComConfig
+
+    cfg = CapitalComConfig(user_email="a@b.c", api_key="k", api_password="p")
+    provider = CapitalCom(symbol="EURUSD", timeframe="1", ohlcv_dir=tmp_path,
+                          config=cfg)
+
+    start = datetime(2025, 1, 6, 9, 0)  # naive UTC, Monday, well in the past
+    all_bars = [start + timedelta(minutes=i) for i in range(2500)]
+    page_size = 1000
+
+    def fake_get(time_from=None, time_to=None, limit=1000):
+        selected = [b for b in all_bars if b >= time_from][:min(limit, page_size)]
+        return _build_price_page(selected)
+
+    provider.get_historical_prices = fake_get  # type: ignore[method-assign]
+
+    with provider:
+        provider.download_ohlcv(start, start + timedelta(minutes=2500))
+
+    with OHLCVReader(str(provider.ohlcv_path)) as reader:
+        got = [b.timestamp for b in reader]
+
+    expected = [int(b.replace(tzinfo=UTC).timestamp()) for b in all_bars]
+    assert got == expected  # every bar, in order, no gaps or duplicates
+
+
+def __test_capitalcom_pagination_non_minute_timeframe__(tmp_path):
+    """A 5-minute download advances the cursor by the real interval, so the
+    whole multi-page range is covered on the 5-minute grid."""
+    from datetime import timedelta
+    from pynecore_capitalcom import CapitalComConfig
+
+    cfg = CapitalComConfig(user_email="a@b.c", api_key="k", api_password="p")
+    provider = CapitalCom(symbol="EURUSD", timeframe="5", ohlcv_dir=tmp_path,
+                          config=cfg)
+
+    start = datetime(2025, 1, 6, 9, 0)
+    all_bars = [start + timedelta(minutes=5 * i) for i in range(1500)]
+    page_size = 1000
+
+    def fake_get(time_from=None, time_to=None, limit=1000):
+        selected = [b for b in all_bars if b >= time_from][:min(limit, page_size)]
+        return _build_price_page(selected)
+
+    provider.get_historical_prices = fake_get  # type: ignore[method-assign]
+
+    with provider:
+        provider.download_ohlcv(start, start + timedelta(minutes=5 * 1500))
+
+    with OHLCVReader(str(provider.ohlcv_path)) as reader:
+        got = [b.timestamp for b in reader]
+
+    expected = [int(b.replace(tzinfo=UTC).timestamp()) for b in all_bars]
+    assert got == expected
+
+
 def __test_capitalcom_real_data_download__(tmp_path):
     """Test CapitalCom provider with real data download if configuration exists"""
     # Disable debug logging to reduce output noise
