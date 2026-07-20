@@ -231,6 +231,101 @@ class _RecoveryMixin(_CapitalComBase):
             pos_by_deal_id, wo_by_deal_id, promoted_coids,
         )
 
+        # Symmetric counterpart to orphan retirement: adopt live exchange
+        # positions the BrokerStore is NOT tracking into confirmed
+        # per-leg ``position`` rows. A fresh process (or a recovery run
+        # under a different ``run_id``) that finds an existing venue
+        # position has no store row for it — the engine's startup
+        # reconcile adopts the net size into ``_position``, but
+        # ``execute_close`` / ``execute_exit`` derive their DELETE targets
+        # from confirmed ``position`` rows, so a subsequent
+        # ``strategy.close_all()`` would raise "no confirmed position
+        # rows" and strand the adopted exposure. Reconcile each untracked
+        # leg into a confirmed row so the normal close/exit paths can
+        # flatten it.
+        self._adopt_untracked_positions(positions_resp)
+
+    def _adopt_untracked_positions(self, positions_resp: Mapping) -> None:
+        """Seed confirmed ``position`` rows for untracked live venue legs.
+
+        Netting-account only: on a hedging account the core one-way
+        emulator closes per leg via ``close_leg`` reading
+        :meth:`fetch_raw_positions` directly, so no store row is needed
+        and seeding would double-count against the emulator's virtual
+        FIFO. On a one-way account the DELETE-per-``dealId`` close path
+        needs a confirmed ``position`` row per live leg.
+
+        Idempotent: a leg already tracked by a live store row (matched by
+        ``exchange_order_id`` or a ``deal_id`` ref — e.g. an entry row
+        adopted across a same-``run_id`` restart, or a row just promoted
+        by the in-flight recovery pass) is skipped, so no duplicate row is
+        created. Rows are seeded ``filled_qty == qty`` with
+        ``kind='position'`` + ``entry_filled_at`` so activity
+        classification treats the eventual close leg as a reduction, and a
+        ``deal_id`` ref mirrors the normal entry path so the activity loop
+        can route the close-leg activity back to the row.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None or self._hedging_enabled:
+            return
+
+        tracked_deal_ids: set[str] = set()
+        for row in store_ctx.iter_live_orders():
+            if row.exchange_order_id:
+                tracked_deal_ids.add(str(row.exchange_order_id))
+
+        adopted_count = 0
+        for raw in positions_resp.get('positions') or []:
+            market = raw.get('market') or {}
+            symbol = market.get('epic')
+            position = raw.get('position') or {}
+            direction = (position.get('direction') or '').upper()
+            deal_id = position.get('dealId')
+            size = float(position.get('size', 0.0))
+            if (not symbol or not deal_id
+                    or direction not in ('BUY', 'SELL') or size <= 0.0):
+                continue
+            deal_id = str(deal_id)
+            if deal_id in tracked_deal_ids:
+                continue
+            if store_ctx.find_by_ref('deal_id', deal_id) is not None:
+                continue
+            synthetic_coid = f"__pyne_adopted__{symbol}__{deal_id}"
+            store_ctx.upsert_order(
+                synthetic_coid,
+                symbol=symbol,
+                side='buy' if direction == 'BUY' else 'sell',
+                qty=size,
+                filled_qty=size,
+                state='confirmed',
+                exchange_order_id=deal_id,
+                extras={
+                    'kind': 'position',
+                    'entry_filled_at': epoch_time(),
+                    'adopted_startup': True,
+                },
+            )
+            store_ctx.add_ref(synthetic_coid, 'deal_id', deal_id)
+            store_ctx.log_event(
+                'startup_position_adopted',
+                client_order_id=synthetic_coid,
+                exchange_order_id=deal_id,
+                payload={
+                    'symbol': symbol,
+                    'direction': direction,
+                    'size': size,
+                },
+            )
+            tracked_deal_ids.add(deal_id)
+            adopted_count += 1
+
+        if adopted_count:
+            broker_info(
+                "startup: adopted %d untracked exchange position leg(s) "
+                "into confirmed store rows for close/exit routing",
+                adopted_count,
+            )
+
     def _retire_startup_orphans(
             self,
             pos_by_deal_id: dict[str, dict],

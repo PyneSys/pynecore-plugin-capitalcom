@@ -56,7 +56,10 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.core.broker.exceptions import (
+    BrokerManualInterventionError,
+    ExchangeOrderRejectedError,
+)
 from pynecore.core.broker.idempotency import KIND_CLOSE
 from pynecore.core.broker.models import CloseIntent, DispatchEnvelope
 from pynecore.core.broker.run_identity import RunIdentity
@@ -494,6 +497,183 @@ def __test_execute_close_partial_race_ttl_fallback_post_anchor__(tmp_path):
     store.close()
 
 
+def __test_execute_close_partial_netting_pending_no_reverse_leg__(tmp_path):
+    """Post-snapshot un-netted, no reverse leg → benign, NO halt.
+
+    Regression for the live partial-close failure: a 200-unit one-way
+    position reduced by 100 whose ``/positions`` snapshot has not settled
+    the netting yet (Capital.com eventual consistency). The post-snapshot
+    still shows the full 200 units and there is NO opposite-direction row,
+    so the old guard could not identify a "reverse leg" and halted with
+    ``BrokerManualInterventionError`` — stranding the bot on a fully
+    recoverable path. The excess is same-direction lots pending
+    settlement, which is benign: the POST was accepted and will net.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        # Both pre- and post-POST snapshots still show the FULL BUY 2.0
+        # (netting reduction not yet reflected); no SELL row exists.
+        ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+        ],
+        ('positions', 'post'): {'dealReference': 'dr-pending'},
+        ('confirms/dr-pending', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    # Must NOT raise — the benign netting-latency path returns the partial
+    # close outcome and the journal confirms the command row.
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'dr-pending'
+
+    cmd_coid = env.client_order_id(KIND_CLOSE)
+    cmd_row = ctx.get_order(cmd_coid)
+    assert cmd_row is not None
+    assert cmd_row.state == 'confirmed'
+    extras = cmd_row.extras or {}
+    assert extras.get('kind') == KIND_PARTIAL_CLOSE
+
+    # No corrective DELETE was issued (there was no reverse leg to sweep).
+    assert not any(c[1] == 'delete' for c in broker._calls)
+
+    # The benign path is audited so the operator can see why the reduction
+    # was accepted despite the un-settled snapshot.
+    cmd_kinds = [k for k, _ in _events_for(ctx, cmd_coid)]
+    assert 'partial_close_netting_pending' in cmd_kinds
+    store.close()
+
+
+def __test_execute_close_partial_confirm_rejected_routes_reject__(tmp_path):
+    """Confirm ``dealStatus == 'REJECTED'`` → reject, NOT silent success.
+
+    A genuinely rejected reduce POST (market closed/suspended, below min
+    deal size) leaves the venue position unchanged and creates no row —
+    observationally identical to benign netting lag. The confirm's
+    ``dealStatus`` is the discriminator: REJECTED must raise
+    ``ExchangeOrderRejectedError`` so the journal marks the command row
+    rejected and the engine's internal position stays in sync with the
+    venue, instead of the benign fall-through reporting a successful
+    reduction that never happened.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'orig', 'direction': 'BUY',
+                          'size': 2.0}},
+        ]},
+        ('positions', 'post'): {'dealReference': 'dr-rej'},
+        ('confirms/dr-rej', 'get'): {
+            'dealStatus': 'REJECTED',
+            'rejectReason': 'MARKET_CLOSED',
+        },
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    with pytest.raises(ExchangeOrderRejectedError, match='MARKET_CLOSED'):
+        asyncio.run(broker.execute_close(env))
+
+    # The journal persisted the rejection — the command row is terminal
+    # ``rejected``, not ``confirmed``.
+    cmd_coid = env.client_order_id(KIND_CLOSE)
+    cmd_row = ctx.get_order(cmd_coid)
+    assert cmd_row is not None
+    assert cmd_row.state == 'rejected'
+
+    cmd_events = _events_for(ctx, cmd_coid)
+    cmd_kinds = [k for k, _ in cmd_events]
+    assert 'rejected' in cmd_kinds
+    assert 'partial_close_netting_pending' not in cmd_kinds
+    assert 'confirmed' not in cmd_kinds
+    reject_payload = dict(cmd_events)['rejected']
+    assert reject_payload.get('phase') == 'partial_close_post'
+
+    # The rejected POST executed no deal, so nothing was swept.
+    assert not any(c[1] == 'delete' for c in broker._calls)
+    store.close()
+
+
+def __test_execute_close_partial_unsettled_no_confirm_verdict_halts__(tmp_path):
+    """Unsettled snapshot + no opposite row + confirm TTL-expired → halt.
+
+    Without a confirm verdict a silently-rejected POST cannot be told
+    apart from netting lag (both leave the position unchanged with no
+    fresh row). Reporting success risks a silent desync; reporting a
+    reject risks a retry that would OPEN a reverse position on the
+    netting venue once the original reduce settles. The hook must halt
+    with ``BrokerManualInterventionError`` on this genuinely ambiguous
+    corner instead of guessing.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        # Pre- and post-snapshot identical: reduction not reflected,
+        # no opposite-direction row.
+        ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+        ],
+        ('positions', 'post'): {'dealReference': 'dr-ttl'},
+        ('error', 'confirms/dr-ttl', 'get'): OrderNotFoundError(
+            'confirm TTL expired', ref_type='deal_reference',
+        ),
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    with pytest.raises(BrokerManualInterventionError,
+                       match='no confirm verdict'):
+        asyncio.run(broker.execute_close(env))
+
+    # Not reported as a benign netting lag, and nothing was deleted.
+    cmd_coid = env.client_order_id(KIND_CLOSE)
+    cmd_kinds = [k for k, _ in _events_for(ctx, cmd_coid)]
+    assert 'partial_close_netting_pending' not in cmd_kinds
+    assert 'confirmed' not in cmd_kinds
+    assert not any(c[1] == 'delete' for c in broker._calls)
+
+    # The mid-flow add_ref preserved the deal_reference for the operator.
+    refs = dict(ctx.iter_refs_for_coid(cmd_coid))
+    assert refs.get('deal_reference') == 'dr-ttl'
+    store.close()
+
+
 def __test_execute_close_full_recovery_targets_vanished_confirms__(tmp_path):
     """All targets gone from positions snapshot → recovery promotes to ``closing``."""
     broker, store, ctx = _make_broker(tmp_path, responses={
@@ -622,4 +802,114 @@ def __test_execute_close_partial_recovery_units_match_confirms__(tmp_path):
     # Recovery closes the command row (kind-aware _apply_resume_outcome).
     live_coids = [r.client_order_id for r in ctx.iter_live_orders()]
     assert cmd_coid not in live_coids
+    store.close()
+
+
+def __test_recovery_adopts_untracked_position_then_close_all__(tmp_path):
+    """Untracked venue position → confirmed rows → ``close_all`` flattens it.
+
+    Regression for the post-restart recovery failure: a fresh process
+    adopts an existing 200-unit EURUSD position (reported as two 100-unit
+    netting lots) that the BrokerStore never tracked. Startup recovery
+    must reconcile each live leg into a confirmed ``position`` row so a
+    subsequent normal ``strategy.close_all()`` no longer raises
+    ``ExchangeOrderRejectedError: no confirmed position rows``.
+
+    A confirmed market position carries ``filled_qty == qty`` (the entry
+    fill), so — exactly like every normal in-session full close — the
+    close routes through the emulated opposite-POST partial path rather
+    than a DELETE; the flatten is a full-size opposite POST that nets the
+    one-way position to zero.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): [
+            # (1) recovery snapshot, (2) partial-close pre-snapshot: both
+            # show the untracked two-lot BUY 2.0 position.
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'lot-a', 'direction': 'BUY',
+                              'size': 1.0}},
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'lot-b', 'direction': 'BUY',
+                              'size': 1.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'lot-a', 'direction': 'BUY',
+                              'size': 1.0}},
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'lot-b', 'direction': 'BUY',
+                              'size': 1.0}},
+            ]},
+            # (3) partial-close post-snapshot: the opposite POST netted the
+            # one-way position flat.
+            {'positions': []},
+        ],
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+        ('positions', 'post'): {'dealReference': 'dr-flat'},
+        ('confirms/dr-flat', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+
+    # Fresh store: no rows track the live position.
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    # Both legs are now confirmed ``position`` rows with the load-bearing
+    # ``deal_id`` ref so the activity loop can route the close-leg fills.
+    for deal_id in ('lot-a', 'lot-b'):
+        row = ctx.find_by_ref('deal_id', deal_id)
+        assert row is not None, f"leg {deal_id!r} was not adopted"
+        assert row.state == 'confirmed'
+        assert row.exchange_order_id == deal_id
+        assert (row.extras or {}).get('kind') == 'position'
+        assert (row.extras or {}).get('adopted_startup') is True
+
+    # A normal full close of the adopted 2.0 total must now succeed instead
+    # of raising "no confirmed position rows".
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=2.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'dr-flat'
+
+    # Flattened via the emulated opposite POST (one-way netting), not a
+    # DELETE.
+    assert any(c[0] == 'positions' and c[1] == 'post' for c in broker._calls)
+    assert not any(c[1] == 'delete' for c in broker._calls)
+
+    cmd_coid = env.client_order_id(KIND_CLOSE)
+    cmd_row = ctx.get_order(cmd_coid)
+    assert cmd_row is not None
+    assert cmd_row.state == 'confirmed'
+    assert (cmd_row.extras or {}).get('kind') == KIND_PARTIAL_CLOSE
+    store.close()
+
+
+def __test_recovery_skips_tracked_position_no_duplicate_adopt__(tmp_path):
+    """A leg already tracked by a live row is not re-adopted (idempotent)."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'orig', 'direction': 'BUY',
+                          'size': 1.0}},
+        ]},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    # Existing tracked entry row for the same dealId.
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    # No synthetic adoption row was created for the already-tracked leg.
+    live = list(ctx.iter_live_orders())
+    adopted = [r for r in live
+               if (r.extras or {}).get('adopted_startup') is True]
+    assert adopted == []
+    assert any(r.client_order_id == 'coid-entry' for r in live)
     store.close()

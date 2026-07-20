@@ -644,12 +644,26 @@ class _CapitalComCloseHooks:
         second POST could compound the exposure), so the safe contract
         is to halt and let recovery on next start resolve the dispatch
         via the persisted ``deal_reference`` / pre-snapshot context.
-        On an unresolvable race (post-snapshot has too many units AND
-        the fresh leg cannot be identified — neither via the confirm's
-        ``affectedDeals`` nor, when the confirm is unavailable, via the
-        POST-anchored ``createdDateUTC`` band) it also raises
-        :class:`BrokerManualInterventionError`. The journal does not
-        catch either — operator intervention is required.
+        A post-snapshot with too many units is only an unresolvable race
+        when an *opposite-direction* row exists that cannot be attributed
+        to our POST (neither via the confirm's ``affectedDeals`` nor, when
+        the confirm is unavailable, via the POST-anchored
+        ``createdDateUTC`` band) — then it raises
+        :class:`BrokerManualInterventionError` and the journal does not
+        catch it, so operator intervention is required. When no
+        opposite-direction row exists and the confirm reports the deal
+        as accepted, the excess units are same-direction lots whose
+        netting reduction the snapshot has not settled yet (eventual
+        consistency on a one-way account); that is benign and returns
+        the normal partial outcome rather than halting. A confirm with
+        ``dealStatus == 'REJECTED'`` produces the same snapshot shape
+        (position unchanged, no fresh row) but means the reduce never
+        executed — it raises :class:`ExchangeOrderRejectedError`
+        (:class:`InsufficientMarginError` for funds rejects) so the
+        journal marks the command rejected and the engine keeps running
+        with its position intact. With no confirm verdict at all, an
+        un-settled snapshot without an opposite row is genuinely
+        ambiguous and halts.
         """
         store_ctx = self._plugin.store_ctx
         rules = self._rules
@@ -724,7 +738,11 @@ class _CapitalComCloseHooks:
         # fresh reverse leg shows up here (``affectedDeals`` entry with
         # the new position's ``dealId``), giving a deterministic
         # discriminator for the corrective DELETE — no clock involved.
+        # ``confirm_accepted`` records that the confirm was fetched AND
+        # its ``dealStatus`` was not REJECTED — the only evidence strong
+        # enough to treat an un-settled post-snapshot as benign below.
         confirm_deal_ids: set[str] = set()
+        confirm_accepted = False
         if deal_ref:
             try:
                 confirm = await self._plugin._call(  # type: ignore[attr-defined]
@@ -757,6 +775,28 @@ class _CapitalComCloseHooks:
                 # netted. Fall through to the post-snapshot path.
                 pass
             else:
+                # A REJECTED confirm means the reduce POST executed no
+                # deal at all (market closed/suspended, below min deal
+                # size, ...): the venue position is untouched, so
+                # reporting a successful partial here would desync the
+                # engine from the venue. Route it as a reject — the
+                # journal marks the command row ``rejected`` and the
+                # engine keeps running with its position unchanged —
+                # exactly like every other POST+confirm path
+                # (``confirm_submission``, working-order amend,
+                # position amend, bracket SL PUT).
+                deal_status = (confirm.get('dealStatus') or '').upper()
+                if deal_status == 'REJECTED':
+                    reason = _extract_reject_reason(confirm)
+                    if _is_funds_reject(reason):
+                        raise InsufficientMarginError(
+                            f"Capital reject on partial close: {reason}",
+                        )
+                    raise ExchangeOrderRejectedError(
+                        f"Capital confirm REJECTED on partial close: "
+                        f"{reason}",
+                    )
+                confirm_accepted = True
                 for affected in (confirm.get('affectedDeals') or []):
                     affected_id = affected.get('dealId')
                     if affected_id:
@@ -778,29 +818,66 @@ class _CapitalComCloseHooks:
         expected_post_units = pre_total_units - intent_units
 
         if post_total_units > expected_post_units:
-            # Race window: our opposite POST opened a fresh row instead
-            # of netting. Identify the freshly-opened leg among the
-            # new opposite-direction rows and issue a corrective DELETE.
-            # Primary discriminator: the confirm's ``affectedDeals``
-            # ``dealId``s — deterministic, and it protects a fresh row
-            # someone ELSE opened in the window from being deleted.
-            # Fallback (confirm unavailable — TTL race or missing
-            # ``dealReference``): ``createdDateUTC`` must fall between
-            # the POST dispatch and now, with ±3 s clock-skew tolerance
-            # on both ends. If no candidate qualifies, the race cannot
-            # be confidently resolved — halt.
+            # The post-snapshot still carries more units than the netted
+            # reduction should leave. Three distinct cases, resolved by
+            # whether an *opposite-direction* row exists and whether the
+            # confirm's verdict is in hand:
+            #
+            #   (a) Our opposite POST opened a fresh reverse leg instead of
+            #       netting (a genuine race, or a concurrent REST session).
+            #       Identify the freshly-opened leg among the new
+            #       opposite-direction rows and issue a corrective DELETE.
+            #       Primary discriminator: the confirm's ``affectedDeals``
+            #       ``dealId``s — deterministic, and it protects a fresh row
+            #       someone ELSE opened in the window from being deleted.
+            #       Fallback (confirm unavailable — TTL race or missing
+            #       ``dealReference``): ``createdDateUTC`` must fall between
+            #       the POST dispatch and now, with ±3 s clock-skew tolerance
+            #       on both ends. When an opposite-direction row exists but
+            #       cannot be confidently attributed to our POST, the race is
+            #       unresolvable — halt for operator intervention.
+            #
+            #   (b) No opposite-direction row exists at all AND the confirm
+            #       verdict is in hand (``dealStatus`` inspected above, not
+            #       REJECTED): the excess is purely same-direction lots
+            #       (Capital.com netting keeps one row per fill), and the
+            #       ``/positions`` snapshot simply has not settled the
+            #       reduction yet — eventual consistency on a one-way
+            #       account, where an opposite order always nets and never
+            #       persists as an independent leg. This is benign: the
+            #       venue accepted the deal and it will net. Halting here
+            #       would strand the bot on a fully recoverable path;
+            #       recovery / the periodic reconcile verify the dispatch
+            #       via the persisted ``deal_reference`` and the eventual
+            #       settled snapshot. Fall through to the normal partial
+            #       :class:`CloseOutcome`.
+            #
+            #   (c) No opposite-direction row AND no confirm verdict (no
+            #       ``dealReference``, or the confirms TTL expired): a
+            #       silently-rejected POST is observationally identical to
+            #       netting lag — position unchanged, no fresh row. Neither
+            #       success (silent desync if it was rejected) nor reject
+            #       (re-close of an already-netted reduction would OPEN a
+            #       reverse position on a netting venue) is safe to report,
+            #       so this genuinely ambiguous corner halts for operator
+            #       intervention, per this hook's documented contract.
             fresh_opposite: dict | None = None
+            unresolved_opposite = False
             now_ts = epoch_time()
             for r in post_rows:
                 pos_data = r.get('position') or {}
-                if pos_data.get('dealId') in pre_deal_ids:
-                    continue
                 if (pos_data.get('direction') or '').upper() != opposite_dir:
+                    continue
+                if pos_data.get('dealId') in pre_deal_ids:
+                    # Pre-existing opposite leg — not opened by our POST, so
+                    # it cannot be attributed to this close.
+                    unresolved_opposite = True
                     continue
                 if confirm_deal_ids:
                     if pos_data.get('dealId') in confirm_deal_ids:
                         fresh_opposite = pos_data
                         break
+                    unresolved_opposite = True
                     continue
                 created_at = _parse_iso_timestamp(
                     pos_data.get('createdDateUTC') or '',
@@ -809,6 +886,7 @@ class _CapitalComCloseHooks:
                         and post_sent_ts - 3.0 <= created_at <= now_ts + 3.0):
                     fresh_opposite = pos_data
                     break
+                unresolved_opposite = True
             if fresh_opposite is not None:
                 fresh_id = fresh_opposite.get('dealId')
                 await self._plugin._call(  # type: ignore[attr-defined]
@@ -822,7 +900,7 @@ class _CapitalComCloseHooks:
                         intent_key=intent.intent_key,
                         payload={'reason': 'race_reverse_leg_corrected'},
                     )
-            else:
+            elif unresolved_opposite:
                 raise BrokerManualInterventionError(
                     f"Partial close race detected but reverse leg cannot "
                     f"be confidently identified (expected "
@@ -831,6 +909,36 @@ class _CapitalComCloseHooks:
                     intent_key=intent.intent_key,
                     context={
                         'coid': coid,
+                        'pre_total_units': pre_total_units,
+                        'post_total_units': post_total_units,
+                        'intent_units': intent_units,
+                        'symbol': intent.symbol,
+                    },
+                )
+            elif confirm_accepted:
+                if store_ctx is not None:
+                    store_ctx.log_event(
+                        'partial_close_netting_pending',
+                        client_order_id=coid,
+                        intent_key=intent.intent_key,
+                        payload={
+                            'reason': 'reduction_unsettled_no_reverse_leg',
+                            'pre_total_units': pre_total_units,
+                            'post_total_units': post_total_units,
+                            'intent_units': intent_units,
+                            'symbol': intent.symbol,
+                        },
+                    )
+            else:
+                raise BrokerManualInterventionError(
+                    f"Partial close disposition ambiguous: reduction not "
+                    f"reflected in positions snapshot (expected "
+                    f"{expected_post_units} units, have {post_total_units}) "
+                    f"and no confirm verdict is available",
+                    intent_key=intent.intent_key,
+                    context={
+                        'coid': coid,
+                        'deal_reference': deal_ref,
                         'pre_total_units': pre_total_units,
                         'post_total_units': post_total_units,
                         'intent_units': intent_units,
