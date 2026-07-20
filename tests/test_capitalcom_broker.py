@@ -5945,6 +5945,307 @@ def __test_process_activity_first_entry_fill_within_window_still_routes_as_entry
     store.close()
 
 
+def _seed_reversal_short_leg(ctx, *, coid='coid-short', deal_id='deal-short',
+                             qty=100.0, confirm_level=1.14156,
+                             pine_id='LAB-CAP-REV-S'):
+    """Seed a confirmed, filled SHORT position entry row on EURUSD.
+
+    Mirrors the pre-reversal state: a 100-unit short that later gets
+    net-closed by an opposite reversal entry on a one-way account.
+    """
+    ctx.upsert_order(
+        coid, symbol='EURUSD', side='sell', qty=qty,
+        state='confirmed', pine_entry_id=pine_id,
+        exchange_order_id=deal_id, filled_qty=qty,
+        extras={'kind': 'position', 'confirm_level': confirm_level,
+                'entry_filled_at': 1700000000.0},
+    )
+    ctx.add_ref(coid, 'deal_id', deal_id)
+    return coid
+
+
+def __test_process_activity_reversal_netting_close_is_suppressed__(tmp_path):
+    """Regression: a short→long reversal on a one-way (netting) account
+    must not double-count the venue's netting-close of the old short.
+
+    The Order Sync Engine folds the Pine reversal into a single 200-unit
+    BUY dispatched through ``execute_entry``; the venue closes the 100-unit
+    short and opens a fresh 100-unit long. The engine already booked the
+    whole flip via the folded ENTRY fill, so the short's netting-close must
+    NOT be surfaced as a second ``LegType.CLOSE`` fill — routing it would
+    add a buy-100 onto the freshly-opened long (``record_fill``'s opening
+    branch), leaving the engine long by 200 and stranding the strategy's
+    position-size-gated final close (observed live 2026-07-20 as
+    ``position=100`` at shutdown with no close dispatched).
+
+    With the fresh opposite (long) entry row present, the short's
+    netting-close activity must be SUPPRESSED (no event yielded) while the
+    natural-close teardown still stamps the row.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    short_coid = _seed_reversal_short_leg(ctx)
+    # The folded reversal entry: a fresh, still-live LONG on the same
+    # symbol, opposite the short, created after it.
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        state='confirmed', pine_entry_id='LAB-CAP-REV-L',
+        exchange_order_id='deal-long', filled_qty=200.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162,
+                'entry_filled_at': 1700000001.0},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        # Closing trade of a short is a BUY (opposite the entry direction).
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        # No positions snapshot → the netted deal is absent → full close.
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert events == [], (
+        "the short's reversal-netting close must be suppressed (the engine "
+        "already booked the flip via the folded reversal entry); yielding "
+        f"it double-counts. Got {events!r}"
+    )
+    # Teardown still ran so reconcile does not later stamp missing_pending.
+    short_row = ctx.get_order(short_coid)
+    assert short_row is not None
+    assert (short_row.extras or {}).get('natural_close_at') is not None, (
+        "the suppressed close must still stamp natural_close_at so the "
+        "missing-pending watchdog does not raise a false UnexpectedCancel"
+    )
+    kinds = [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE run_instance_id = ?",
+        (ctx.run_instance_id,),
+    )]
+    assert 'reversal_netting_close_suppressed' in kinds
+    store.close()
+
+
+def __test_process_activity_reversal_netting_close_suppressed_lagging_snapshot__(tmp_path):
+    """Regression: the reversal-netting suppression must not depend on the
+    same-poll ``/positions`` snapshot.
+
+    In the "/history/activity ahead of /positions" race the snapshot can
+    still show the netted short deal alive (size > 0) while the venue has
+    already closed it. Routing the netting-close through the
+    partial-close breadcrumb path in that window would yield the
+    double-counting CLOSE fill and reproduce the stranded-position bug
+    (engine long 200 instead of 100, final close never dispatched). The
+    live opposite entry row proves the netting on a one-way account, so
+    the close must be suppressed and torn down regardless of the stale
+    snapshot.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    short_coid = _seed_reversal_short_leg(ctx)
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        state='confirmed', pine_entry_id='LAB-CAP-REV-L',
+        exchange_order_id='deal-long', filled_qty=200.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162,
+                'entry_filled_at': 1700000001.0},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+    # STALE snapshot: /positions still carries the netted short at full
+    # size — exactly the lag race the breadcrumb machinery elsewhere in
+    # ``_process_activity`` exists for.
+    positions_by_deal = {
+        'deal-short': {'position': {'dealId': 'deal-short',
+                                    'size': 100.0, 'level': 1.14156}},
+        'deal-long': {'position': {'dealId': 'deal-long',
+                                   'size': 100.0, 'level': 1.14162}},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity], positions_by_deal):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert events == [], (
+        "the netting close must be suppressed even while the same-poll "
+        "/positions snapshot still shows the netted deal alive; got "
+        f"{events!r}"
+    )
+    short_row = ctx.get_order(short_coid)
+    assert short_row is not None
+    short_extras = short_row.extras or {}
+    assert short_extras.get('natural_close_at') is not None, (
+        "the stale-snapshot suppression must still tear the row down — "
+        "the breadcrumb path would let a two-poll lag clear the "
+        "breadcrumb and end in a false UnexpectedCancelError"
+    )
+    assert 'close_event_yielded_at' not in short_extras, (
+        "the reversal netting close must take the teardown path, not the "
+        "partial-close breadcrumb path"
+    )
+    kinds = [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE run_instance_id = ?",
+        (ctx.run_instance_id,),
+    )]
+    assert 'reversal_netting_close_suppressed' in kinds
+    store.close()
+
+
+def __test_process_activity_reversal_netting_close_priceless_not_deferred__(tmp_path):
+    """Regression: a PRICELESS reversal netting-close (Capital.com left
+    ``level`` empty) must be suppressed immediately, not deferred.
+
+    The defer guard exists to avoid yielding ``fill_price=0`` closes, but
+    a reversal netting-close is never yielded at all — deferring it would
+    loop until the activity rolls out of the 60s window, leaving the row
+    without its ``natural_close_at`` teardown and eventually tripping a
+    false unexpected-cancel on a perfectly healthy reversal.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    short_coid = _seed_reversal_short_leg(ctx)
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        state='confirmed', pine_entry_id='LAB-CAP-REV-L',
+        exchange_order_id='deal-long', filled_qty=200.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162,
+                'entry_filled_at': 1700000001.0},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0,
+        # No usable price anywhere on the close activity.
+        'details': {'direction': 'BUY', 'size': 100.0},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert events == [], (
+        f"the priceless netting close must be suppressed; got {events!r}"
+    )
+    short_row = ctx.get_order(short_coid)
+    assert short_row is not None
+    assert (short_row.extras or {}).get('natural_close_at') is not None
+    kinds = [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE run_instance_id = ?",
+        (ctx.run_instance_id,),
+    )]
+    assert 'reversal_netting_close_suppressed' in kinds
+    assert 'activity_close_deferred_no_price' not in kinds, (
+        "a suppressed netting close needs no price — deferring it would "
+        "strand the teardown past the 60s activity window"
+    )
+    store.close()
+
+
+def __test_process_activity_manual_close_without_reversal_still_yields__(tmp_path):
+    """Guard against over-suppression: a genuine close (no fresh opposite
+    entry) must still yield its reducing ``LegType.CLOSE`` fill.
+
+    Same short + USER close as the reversal test, but with NO opposite
+    long entry — the engine dispatched nothing to account for this close,
+    so it needs the reducing fill.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_reversal_short_leg(ctx)
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1, (
+        "a close with no reversal leg must still yield its reducing fill; "
+        f"got {events!r}"
+    )
+    assert events[0].leg_type == LegType.CLOSE
+    assert events[0].order.side == 'buy', (
+        "closing a short is a buy (opposite the entry side)"
+    )
+    store.close()
+
+
+def __test_process_activity_explicit_close_with_opposite_entry_still_yields__(tmp_path):
+    """Guard against over-suppression: an explicit ``strategy.close``
+    (row moved to ``'closing'``) that coincides with a fresh opposite
+    entry must still yield its reducing fill.
+
+    The reversal suppression keys on the closed row still being at
+    ``'confirmed'`` — an explicit DELETE close moves it to ``'closing'``,
+    and the engine dispatched that close and needs the fill.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    # Short entry that was explicitly closed via strategy.close (DELETE):
+    # state is 'closing', not 'confirmed'.
+    ctx.upsert_order(
+        'coid-short', symbol='EURUSD', side='sell', qty=100.0,
+        state='closing', pine_entry_id='ShortId',
+        exchange_order_id='deal-short', filled_qty=100.0,
+        extras={'kind': 'position', 'confirm_level': 1.14156,
+                'entry_filled_at': 1700000000.0},
+    )
+    ctx.add_ref('coid-short', 'deal_id', 'deal-short')
+    # A coincident fresh opposite (long) entry on the same symbol.
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=100.0,
+        state='confirmed', pine_entry_id='LongId',
+        exchange_order_id='deal-long', filled_qty=100.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162,
+                'entry_filled_at': 1700000001.0},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1, (
+        "an explicitly-closed row (state 'closing') must still yield its "
+        f"reducing fill even with a coincident opposite entry; got {events!r}"
+    )
+    assert events[0].leg_type == LegType.CLOSE
+    store.close()
+
+
 def __test_process_activity_manual_close_routes_as_close__(tmp_path):
     """USER source on an entry row that already has
     ``extras['entry_filled_at']`` set is a manual close (web UI /

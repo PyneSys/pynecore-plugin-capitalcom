@@ -242,6 +242,31 @@ class _ActivityMixin(_CapitalComBase):
             )
             event = self._activity_to_event(a, row, position_snapshot)
 
+            # Reversal-netting detection — deliberately INDEPENDENT of the
+            # same-poll ``positions_by_deal`` snapshot. On a one-way
+            # (netting) account the Order Sync Engine folds a Pine
+            # ``strategy.entry`` reversal into a SINGLE opposite-direction
+            # MARKET entry of ``new_qty + |position|``; the venue nets —
+            # it closes the pre-existing opposite position and opens the
+            # folded residual as a fresh deal — and surfaces that
+            # netting-close on the old entry row as a ``LegType.CLOSE``
+            # activity. The engine already books the whole flip via the
+            # folded ENTRY fill, so this close must NEVER reach the
+            # engine as a second reducing fill (see the suppression at
+            # the yield below). Detection keys on the live opposite
+            # entry row in the store, NOT on the snapshot, because in
+            # the "/history/activity ahead of /positions" race the
+            # snapshot can still show the netted deal alive (size > 0)
+            # while the venue has in fact already closed it.
+            reversal_netted = (
+                event is not None
+                and event.event_type == 'filled'
+                and event.leg_type == LegType.CLOSE
+                and (row.extras or {}).get('kind') == 'position'
+                and (row.extras or {}).get('leg_kind') not in ('tp', 'sl')
+                and self._is_reversal_netting_close(row)
+            )
+
             # DEFER guard: a closing-leg fill with no resolvable price
             # (Capital.com sometimes leaves ``level`` empty on closes
             # whose position is already gone from ``/positions`` by the
@@ -257,7 +282,17 @@ class _ActivityMixin(_CapitalComBase):
             # vanished deal and routes through the missing-pending grace
             # window (UnexpectedCancelError), which is preferable to a
             # silent desync.
-            if (event is not None
+            #
+            # Reversal-netting closes are exempt: their fill is dropped
+            # at the yield below (the engine already booked the flip via
+            # the folded ENTRY fill), so the price is irrelevant — and
+            # deferring a priceless one would loop until the activity
+            # rolls out of Capital.com's 60s window, leaving the row
+            # without its ``natural_close_at`` teardown and eventually
+            # tripping a FALSE unexpected-cancel on a perfectly healthy
+            # reversal.
+            if (not reversal_netted
+                    and event is not None
                     and event.event_type == 'filled'
                     and (event.fill_price or 0.0) <= 0.0
                     and event.leg_type in (
@@ -414,6 +449,7 @@ class _ActivityMixin(_CapitalComBase):
                 # race, the snapshot would lack the breadcrumb that
                 # ``_reconcile_snapshot`` relies on to upgrade to a
                 # teardown without waiting for the grace window).
+                suppress_fill = False
                 if (event.event_type == 'filled'
                         and event.leg_type in (
                             LegType.TAKE_PROFIT,
@@ -453,8 +489,53 @@ class _ActivityMixin(_CapitalComBase):
                             positions_by_deal[deal_id].get('position') or {}
                         )
                         deal_remaining = float(pos_snap.get('size') or 0.0)
-                    if deal_remaining is None or deal_remaining <= 0.0:
+                    # Reversal-netting close (``reversal_netted`` computed
+                    # above, snapshot-independently): the engine already
+                    # accounted for the whole flip via the folded ENTRY
+                    # fill (``record_fill`` FIFO-closed the old trade and
+                    # opened the residual), so routing this close as a
+                    # second reducing fill DOUBLE-COUNTS: the close of a
+                    # short is a BUY that ``record_fill`` adds onto the
+                    # freshly-opened long, leaving the engine long by
+                    # twice the intended size and stranding the
+                    # strategy's position-size-gated follow-up close. The
+                    # natural-close teardown keeps reconcile clean;
+                    # suppress only the position-affecting yield. Genuine
+                    # closes (manual ``USER``/``DEALER``,
+                    # ``strategy.close`` DELETE, margin / stop-out) leave
+                    # NO fresh opposite entry, so the engine still needs
+                    # their reducing fill and they are yielded normally.
+                    #
+                    # The teardown branch is taken even when the same-poll
+                    # snapshot still shows the netted deal at size > 0 —
+                    # that is the "/history/activity ahead of /positions"
+                    # race and the snapshot is stale: on a netting account
+                    # the live opposite entry proves the venue already
+                    # closed this deal. Routing it through the
+                    # ``close_event_yielded_at`` breadcrumb path instead
+                    # would both YIELD the double-counting fill and, if
+                    # the lag spans two polls, let ``_reconcile_snapshot``
+                    # clear the breadcrumb and end in a false
+                    # :class:`UnexpectedCancelError`.
+                    if (deal_remaining is None or deal_remaining <= 0.0
+                            or reversal_netted):
                         self._close_bracket_after_natural_close(row)
+                        if reversal_netted:
+                            suppress_fill = True
+                            if self.store_ctx is not None:
+                                self.store_ctx.log_event(
+                                    'reversal_netting_close_suppressed',
+                                    client_order_id=row.client_order_id,
+                                    exchange_order_id=deal_id,
+                                    payload={
+                                        'reason': (
+                                            'closed_by_own_reversal_entry'
+                                        ),
+                                        'symbol': row.symbol,
+                                        'side': row.side,
+                                        'deal_remaining': deal_remaining,
+                                    },
+                                )
                     elif self.store_ctx is not None:
                         refreshed = self.store_ctx.get_order(row.client_order_id)
                         if refreshed is not None:
@@ -471,6 +552,12 @@ class _ActivityMixin(_CapitalComBase):
                             self.store_ctx.upsert_order(
                                 row.client_order_id, extras=mark_extras,
                             )
+                if suppress_fill:
+                    # The activity is already durable (``activity_processed``
+                    # logged, cursor advanced) and the entry/bracket rows were
+                    # torn down above — only the double-counting fill is
+                    # dropped.
+                    continue
                 yield event
 
         # End-of-poll pruning — both dedup structures stay bounded by the
@@ -806,6 +893,63 @@ class _ActivityMixin(_CapitalComBase):
             # relying on the ``filled_qty`` cursor watermark instead.
             fill_id=_activity_fingerprint(activity),
         )
+
+    def _is_reversal_netting_close(self, entry_row: 'OrderRow') -> bool:
+        """True when ``entry_row``'s close is our own reversal netting it.
+
+        On a one-way (netting) account a Pine ``strategy.entry`` reversal is
+        folded by the Order Sync Engine into a SINGLE opposite-direction
+        MARKET entry of ``new_qty + |position|`` dispatched through
+        :meth:`execute_entry`. The venue nets: it closes the pre-existing
+        opposite position (``entry_row``) and opens the folded residual as a
+        fresh, still-live deal of the opposite direction. The engine has
+        already booked the whole flip via that folded ENTRY fill, so
+        ``entry_row``'s netting-close must NOT be surfaced as a second
+        reducing fill (it would double-count — see the call site).
+
+        The signature of a reversal netting-close is a still-live
+        ``kind='position'`` entry row on the SAME symbol, of the OPPOSITE
+        direction, created at or after ``entry_row`` and not itself flagged
+        naturally closed. On a netting account long and short positions
+        cannot coexist, so such a fresh opposite live entry can only be the
+        reversal leg that netted ``entry_row``. Genuine closes (manual
+        ``USER``/``DEALER``, ``strategy.close`` DELETE, margin / stop-out)
+        leave no such row.
+
+        Hedging-mode reversals run through ``OneWayEmulator.run_reversal`` /
+        ``close_leg`` DELETEs whose close fills the engine explicitly
+        expects, so the check is gated to netting accounts.
+
+        An explicit ``strategy.close`` DELETEs the position and moves the
+        row to ``'closing'`` (see ``submit_full_close``); the engine
+        dispatched that close and needs its reducing fill, so only rows
+        still at ``'confirmed'`` — never explicitly closed — qualify. This
+        keeps a ``strategy.close`` that happens to coincide with an
+        opposite entry in the same bar from being wrongly suppressed.
+        """
+        if self._hedging_enabled or self.store_ctx is None:
+            return False
+        if entry_row.state != 'confirmed':
+            return False
+        opposite = 'sell' if entry_row.side == 'buy' else 'buy'
+        for r in self.store_ctx.iter_live_orders(symbol=entry_row.symbol):
+            if r.client_order_id == entry_row.client_order_id:
+                continue
+            rextras = r.extras or {}
+            if rextras.get('kind') != 'position':
+                continue
+            if rextras.get('leg_kind') in ('tp', 'sl'):
+                continue
+            if r.side != opposite:
+                continue
+            if not r.exchange_order_id:
+                continue
+            if rextras.get('natural_close_at') is not None:
+                continue
+            if r.created_ts_ms < entry_row.created_ts_ms:
+                continue
+            return True
+        return False
 
     def _find_active_entry_row(
             self, symbol: str, pine_entry_id: str | None,
