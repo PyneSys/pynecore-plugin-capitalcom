@@ -269,6 +269,14 @@ class _RestSessionMixin(_CapitalComBase):
         concurrent WebSocket ``_send`` keeps observing valid tokens
         until the response of the ``session`` POST is applied through
         the rotation handler (which atomically swaps both halves).
+
+        Latches the plugin-qualified ``_account_id`` from the session
+        response. Session creation is the earliest authenticated call —
+        it runs on the provider (OHLCV download) path too, well before
+        the broker's ``get_balance`` startup probe. Deferring the latch
+        to ``get_balance`` alone left ``account_id`` at the ``"default"``
+        sentinel when the run-identity contract validation ran between
+        provider authentication and broker startup, aborting the run.
         """
         res: dict = self('session/encryptionKey', method='get')
         encryption_key = res['encryptionKey']
@@ -281,6 +289,10 @@ class _RestSessionMixin(_CapitalComBase):
             identifier=user,
             password=password
         ))
+        current_account_id = (self.session_data or {}).get('currentAccountId')
+        if current_account_id:
+            mode = 'demo' if self.config.demo else 'live'
+            self._account_id = f"capitalcom-{mode}-{current_account_id}"
 
     async def _call(self, endpoint: str, *, data: dict | None = None,
                     method: str = 'post') -> dict:

@@ -122,6 +122,57 @@ def __test_broker_get_balance_selects_preferred_account__():
     assert result == {'USD': 12345.67}
 
 
+def __test_create_session_latches_account_id__(monkeypatch):
+    """create_session must populate account_id from the session response.
+
+    The provider-side OHLCV download authenticates via create_session
+    well before the broker's get_balance startup probe. The run-identity
+    contract validation runs in between, so account_id has to be resolved
+    already or the run aborts on the "default" sentinel.
+    """
+    import pynecore_capitalcom.rest as rest_mod
+    monkeypatch.setattr(rest_mod, 'encrypt_password',
+                        lambda *a, **kw: 'encrypted')
+
+    sync_responses = {
+        ('session/encryptionKey', 'get'): {
+            'encryptionKey': 'key', 'timeStamp': 1,
+        },
+        ('session', 'post'): {'currentAccountId': '9374'},
+    }
+
+    class _SyncFakeBroker(CapitalCom):
+        def __call__(self, endpoint, *, data=None, method='post'):
+            return sync_responses[(endpoint, method.lower())]
+
+    broker = _SyncFakeBroker(config=_make_config())
+    assert broker.account_id == 'default'
+    broker.create_session()
+    assert broker.account_id == 'capitalcom-demo-9374'
+
+
+def __test_create_session_latches_live_account_id__(monkeypatch):
+    """Live host qualifies the account_id with the ``live`` mode tag."""
+    import pynecore_capitalcom.rest as rest_mod
+    monkeypatch.setattr(rest_mod, 'encrypt_password',
+                        lambda *a, **kw: 'encrypted')
+
+    sync_responses = {
+        ('session/encryptionKey', 'get'): {
+            'encryptionKey': 'key', 'timeStamp': 1,
+        },
+        ('session', 'post'): {'currentAccountId': '9374'},
+    }
+
+    class _SyncFakeBroker(CapitalCom):
+        def __call__(self, endpoint, *, data=None, method='post'):
+            return sync_responses[(endpoint, method.lower())]
+
+    broker = _SyncFakeBroker(config=_make_config(demo=False))
+    broker.create_session()
+    assert broker.account_id == 'capitalcom-live-9374'
+
+
 def __test_broker_get_position_aggregates_same_direction_rows__():
     """Pyramiding creates multiple BUY rows; get_position averages them."""
     broker = _FakeBroker(config=_make_config(), responses={
