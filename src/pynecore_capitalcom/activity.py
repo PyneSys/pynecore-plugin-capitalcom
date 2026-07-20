@@ -732,6 +732,26 @@ class _ActivityMixin(_CapitalComBase):
             )
         )
 
+        # Reversal-fold entry fill (netting accounts): the Order Sync Engine
+        # folds a Pine ``strategy.entry`` reversal into a SINGLE opposite-
+        # direction MARKET entry of ``new_qty + |opposite position|`` (=
+        # ``row.qty``). The venue nets the pre-existing opposite deal and opens
+        # only the residual, so the POSITION activity's ``details.size`` reports
+        # the RESIDUAL (``new_qty``), NOT the volume the order actually traded.
+        # ``BrokerPosition.record_fill`` must see the full traded quantity to
+        # FIFO-close the opposite leg AND open the residual on the far side;
+        # feeding it the residual alone closes the position to flat and never
+        # flips the side, stranding the strategy's position-size-gated follow-up
+        # (the observed short-to-long reversal desync). The dispatched
+        # ``row.qty`` is the authoritative traded volume for a fully-executed
+        # market fold, so use it whenever this ENTRY fill netted a live
+        # opposite position row.
+        if (activity_type == 'POSITION'
+                and status in ('EXECUTED', 'ACCEPTED')
+                and not is_closing_leg
+                and self._is_reversal_fold_entry(row)):
+            size = float(row.qty)
+
         # Snapshot fallback is gated to NON-closing activities. A
         # ``/positions`` snapshot's ``level`` field is the position's
         # OPEN price, which is the correct fill price for a market
@@ -947,6 +967,56 @@ class _ActivityMixin(_CapitalComBase):
             if rextras.get('natural_close_at') is not None:
                 continue
             if r.created_ts_ms < entry_row.created_ts_ms:
+                continue
+            return True
+        return False
+
+    def _is_reversal_fold_entry(self, entry_row: 'OrderRow') -> bool:
+        """True when ``entry_row`` is the folded far side of a reversal.
+
+        The netting-account mirror of :meth:`_is_reversal_netting_close`,
+        keyed from the NEW entry instead of the closed one. When the Order
+        Sync Engine folds a Pine reversal it dispatches ONE opposite-
+        direction MARKET entry of ``new_qty + |opposite position|`` through
+        :meth:`execute_entry`; the venue nets the pre-existing opposite deal
+        and opens only the residual. Its POSITION activity therefore reports
+        the residual size, not the traded volume — the caller substitutes
+        ``entry_row.qty`` so ``BrokerPosition.record_fill`` can FIFO-close the
+        opposite leg and open the residual.
+
+        The signature is a still-live ``kind='position'`` entry row on the
+        SAME symbol, of the OPPOSITE direction, created at or before
+        ``entry_row``. On a netting account long and short cannot coexist, so
+        a live opposite entry present when this one fills can only be the leg
+        this reversal netted. A plain add or a fresh entry with no opposing
+        exposure leaves no such row and reports its true size unchanged.
+
+        Gated to netting accounts: hedging-mode reversals run through
+        ``OneWayEmulator.run_reversal`` — the residual leg is opened as its
+        own full-size ``place_leg`` order whose activity size is already
+        correct, and the opposing legs are closed by explicit DELETEs.
+        """
+        if self._hedging_enabled or self.store_ctx is None:
+            return False
+        entry_extras = entry_row.extras or {}
+        if entry_extras.get('kind') != 'position':
+            return False
+        if entry_extras.get('leg_kind') in ('tp', 'sl'):
+            return False
+        opposite = 'sell' if entry_row.side == 'buy' else 'buy'
+        for r in self.store_ctx.iter_live_orders(symbol=entry_row.symbol):
+            if r.client_order_id == entry_row.client_order_id:
+                continue
+            rextras = r.extras or {}
+            if rextras.get('kind') != 'position':
+                continue
+            if rextras.get('leg_kind') in ('tp', 'sl'):
+                continue
+            if r.side != opposite:
+                continue
+            if not r.exchange_order_id:
+                continue
+            if r.created_ts_ms > entry_row.created_ts_ms:
                 continue
             return True
         return False

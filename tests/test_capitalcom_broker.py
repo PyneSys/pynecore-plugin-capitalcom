@@ -6158,6 +6158,96 @@ def __test_process_activity_reversal_netting_close_priceless_not_deferred__(tmp_
     store.close()
 
 
+def __test_process_activity_reversal_fold_entry_fill_uses_full_order_qty__(tmp_path):
+    """Regression: the folded reversal ENTRY fill must carry the full traded
+    quantity, not the venue's netted residual.
+
+    On a one-way (netting) account the Order Sync Engine folds a short→long
+    reversal into a single 200-unit BUY (``new_qty + |short|``). The venue
+    nets the 100-unit short and opens only the 100-unit residual long, so the
+    residual deal's POSITION activity reports ``details.size == 100``. Feeding
+    that to ``BrokerPosition.record_fill`` closes the short to flat and never
+    flips to long, stranding the strategy's position-size-gated final close
+    (observed live 2026-07-20 as an intermediate flat with a residual long
+    left on the venue). The plugin must substitute the dispatched order qty
+    (200) so ``record_fill`` FIFO-closes the short AND opens the residual
+    long.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_reversal_short_leg(ctx)
+    # The folded reversal entry row: dispatched 200 (100 residual + 100 to
+    # net the short), fully filled on the wire.
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        state='confirmed', pine_entry_id='LAB-CAP-REV-L',
+        exchange_order_id='deal-long', filled_qty=200.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    # The residual long's POSITION activity — venue reports the netted
+    # residual size (100), same direction as the entry row (BUY).
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-long',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1, f"the folded entry fill must be yielded; got {events!r}"
+    ev = events[0]
+    assert ev.leg_type == LegType.ENTRY
+    assert ev.order.side == 'buy'
+    assert ev.fill_qty == 200.0, (
+        "the folded reversal entry fill must carry the full dispatched order "
+        f"qty (200) so record_fill flips short→long, not the netted residual; "
+        f"got fill_qty={ev.fill_qty!r}"
+    )
+    assert ev.order.filled_qty == 200.0
+    assert ev.order.remaining_qty == 0.0
+    store.close()
+
+
+def __test_process_activity_plain_entry_fill_uses_activity_size__(tmp_path):
+    """Guard: a plain entry with no opposing position must report its own
+    activity size unchanged (the fold override is scoped to reversals).
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=100.0,
+        state='confirmed', pine_entry_id='LAB-CAP-LONG',
+        exchange_order_id='deal-long', filled_qty=100.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-long',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.ENTRY
+    assert events[0].fill_qty == 100.0
+    store.close()
+
+
 def __test_process_activity_manual_close_without_reversal_still_yields__(tmp_path):
     """Guard against over-suppression: a genuine close (no fresh opposite
     entry) must still yield its reducing ``LegType.CLOSE`` fill.
