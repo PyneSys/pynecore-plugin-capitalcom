@@ -104,7 +104,6 @@ class _ProviderMixin(_CapitalComBase):
     @override
     def update_symbol_info(self) -> SymInfo:
         """Update symbol info, including opening hours and sessions."""
-        assert self.timeframe is not None
         market_details = self.get_single_market_details()
         instrument = market_details['instrument']
 
@@ -247,7 +246,7 @@ class _ProviderMixin(_CapitalComBase):
             ticker=instrument['epic'],
             currency=instrument['currency'],
             basecurrency=instrument['symbol'].split('/')[0] if '/' in instrument['symbol'] else None,
-            period=self.timeframe,
+            period=self.timeframe or "1D",
             type=TYPES[instrument['type']] if instrument['type'] in TYPES else 'other',
             mintick=mintick,
             pricescale=pricescale,
