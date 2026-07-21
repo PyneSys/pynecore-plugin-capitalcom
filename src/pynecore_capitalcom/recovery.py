@@ -34,6 +34,7 @@ from time import time as epoch_time
 from typing import TYPE_CHECKING
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 from pynecore.core.broker.journal import (
     DispatchJournal,
     ResumeOutcome,
@@ -302,7 +303,7 @@ class _RecoveryMixin(_CapitalComBase):
                 extras={
                     'kind': 'position',
                     'entry_filled_at': epoch_time(),
-                    'adopted_startup': True,
+                    ADOPTED_STARTUP_EXTRA_KEY: True,
                 },
             )
             store_ctx.add_ref(synthetic_coid, 'deal_id', deal_id)
