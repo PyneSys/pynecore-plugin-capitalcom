@@ -413,6 +413,32 @@ class _ActivityMixin(_CapitalComBase):
                 )
 
             if event is not None:
+                # Idempotent entry-fill replay guard. An ENTRY fill whose
+                # matched row already carries ``entry_filled_at`` was
+                # ALREADY accounted for — either earlier in this session
+                # (the first emit stamps it, and the venue's 60s rolling
+                # window keeps re-serving the same activity) or in a prior
+                # process incarnation whose durable row persisted the
+                # stamp. On restart the engine's startup reconcile adopts
+                # the venue position, which already INCLUDES this entry
+                # fill; re-emitting it would drive
+                # :meth:`BrokerPosition.record_fill` to double-count the
+                # exposure (the observed 100 -> 200 desync). Capital.com
+                # opens a fresh ``dealId`` for every entry, so a genuine
+                # second entry matches a different row that carries no
+                # ``entry_filled_at`` — this guard only ever fires on a
+                # replay of the same accounted fill. The activity stays
+                # durable (``activity_processed`` logged + cursor advanced
+                # above); only the position-affecting yield is dropped.
+                # Robust to the venue backfilling the activity ``level``
+                # between ingest and restart (which changes the content-
+                # addressed fingerprint and would otherwise defeat
+                # ``seen_fingerprints`` dedup).
+                entry_fill_already_recorded = (
+                    event.event_type == 'filled'
+                    and event.leg_type == LegType.ENTRY
+                    and (row.extras or {}).get('entry_filled_at') is not None
+                )
                 # Stamp the entry row before yielding its first
                 # filled-as-ENTRY activity so :meth:`_activity_to_event`
                 # can recognise subsequent ``USER`` / ``DEALER`` activities
@@ -450,7 +476,24 @@ class _ActivityMixin(_CapitalComBase):
                 # ``_reconcile_snapshot`` relies on to upgrade to a
                 # teardown without waiting for the grace window).
                 suppress_fill = False
-                if (event.event_type == 'filled'
+                if entry_fill_already_recorded:
+                    suppress_fill = True
+                    if self.store_ctx is not None:
+                        self.store_ctx.log_event(
+                            'entry_fill_replay_suppressed',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=deal_id,
+                            payload={
+                                'reason': 'entry_already_accounted',
+                                'fingerprint': fingerprint,
+                                'dateUTC': date_utc,
+                                'deal_id': deal_id,
+                                'symbol': row.symbol,
+                                'side': row.side,
+                            },
+                        )
+                if (not suppress_fill
+                        and event.event_type == 'filled'
                         and event.leg_type in (
                             LegType.TAKE_PROFIT,
                             LegType.STOP_LOSS,

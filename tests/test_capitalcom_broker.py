@@ -8661,6 +8661,78 @@ def __test_process_activity_entry_fill_stamp_persists_before_yield__(tmp_path):
     store.close()
 
 
+def __test_process_activity_suppresses_already_recorded_entry_fill_replay__(tmp_path):
+    """A restart must NOT re-emit an entry fill the venue-adopted
+    position already includes.
+
+    Repro (issue ``capitalcom.md`` — restart double-counts an adopted
+    bracketed position): a prior process incarnation opened a 100-unit
+    market position, ingested its entry fill via the activity stream
+    (stamping ``entry_filled_at`` on the durable row), and stopped. On
+    restart the engine's startup reconcile adopts the venue's 100-unit
+    position; the first activity poll then re-serves the SAME entry-fill
+    row (Capital.com keeps it in the 60s window and may backfill the
+    ``level`` field, which changes the content-addressed fingerprint and
+    so defeats ``seen_fingerprints`` dedup). Without the idempotency
+    guard the replayed ENTRY fill flows to ``BrokerPosition.record_fill``
+    and drives the local position from 100 to 200 while the venue holds
+    100.
+
+    Verification: a matched entry row that already carries
+    ``entry_filled_at`` must NOT yield an ENTRY fill event, yet the
+    activity must still be marked durable (fingerprint recorded, cursor
+    advanced) so it is not re-evaluated forever.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    # Durable row from the prior incarnation: filled market entry with
+    # the entry-fill breadcrumb already persisted.
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side='buy', qty=100.0,
+        filled_qty=100.0, state='confirmed', pine_entry_id='Long',
+        exchange_order_id='deal-L',
+        extras={'kind': 'position', 'confirm_level': 1.17500,
+                'entry_filled_at': 1700000000.0},
+    )
+    ctx.add_ref('coid-entry', 'deal_id', 'deal-L')
+
+    # The same entry-fill activity re-served on the post-restart poll,
+    # with the venue having backfilled ``level`` (so the fingerprint
+    # differs from whatever a prior seen_fingerprints entry held).
+    activity = {
+        'dateUTC': '2026-04-21T09:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SYSTEM',
+        'epic': 'EURUSD', 'direction': 'BUY',
+        'size': 100.0, 'level': 1.17512,
+    }
+    fingerprint = _activity_fingerprint(activity)
+
+    async def drain():
+        events = []
+        async for ev in broker._process_activity([activity]):
+            events.append(ev)
+        return events
+
+    events = asyncio.run(drain())
+
+    entry_fills = [
+        ev for ev in events
+        if ev.event_type == 'filled' and ev.leg_type == LegType.ENTRY
+    ]
+    assert not entry_fills, (
+        f"an entry fill the adopted position already includes must NOT "
+        f"be re-emitted on restart (would double-count 100 -> 200); got "
+        f"{entry_fills!r}"
+    )
+    # Durability: the replayed activity must still be deduped so it is
+    # not re-evaluated on every subsequent poll.
+    cursor = broker._activity_cursor
+    assert fingerprint in cursor.seen_fingerprints, (
+        "the suppressed entry-fill replay must still be marked seen so "
+        "the next poll does not re-evaluate it"
+    )
+    store.close()
+
+
 def __test_process_activity_close_breadcrumb_persists_before_yield__(tmp_path):
     """The close-event breadcrumb (``close_event_yielded_at`` for the
     partial / race case, ``natural_close_at`` for the full close)
