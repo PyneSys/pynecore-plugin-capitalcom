@@ -213,7 +213,7 @@ class _ReconcileMixin(_CapitalComBase):
                     )
 
             # Working → position transition (entry fill)
-            if (row.state == 'server_ref_seen' and pos is not None
+            if (row.state in ('server_ref_seen', 'confirmed') and pos is not None
                     and (row.extras or {}).get('kind') == 'working'):
                 pos_data = pos.get('position') or {}
                 filled = float(pos_data.get('size') or row.qty)
@@ -652,4 +652,3 @@ class _ReconcileMixin(_CapitalComBase):
             )
 
     # --- Trailing activation monitor --------------------------------------
-

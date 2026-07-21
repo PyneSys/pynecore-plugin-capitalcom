@@ -1536,8 +1536,14 @@ class _ExecutionMixin(_CapitalComBase):
         if has_orphan_synthetic:
             kind = KIND_FULL_CLOSE
         else:
+            # ``kind='position'`` rows represent live venue exposure. Their
+            # ``filled_qty`` is the entry fill already incorporated into that
+            # exposure, not a quantity to subtract from it. Using
+            # ``qty - filled_qty`` here turns every normally filled position
+            # into zero live units and misroutes a whole-row close through the
+            # opposite-POST partial-close path.
             total_live_units = sum(
-                round(max(0.0, row.qty - row.filled_qty) / rules.lot_step)
+                round(max(0.0, row.qty) / rules.lot_step)
                 if rules.lot_step > 0 else 0
                 for row in targets
             )
@@ -2016,6 +2022,14 @@ class _ExecutionMixin(_CapitalComBase):
         trail_pending = (
             new_i.trail_offset is not None and new_i.trail_price is not None
         )
+        old_trailing_active = False
+        if self.store_ctx is not None:
+            old_trailing_active = any(
+                row.from_entry == old_i.from_entry
+                and (row.extras or {}).get('leg_kind') == 'sl'
+                and row.trailing_stop
+                for row in self.store_ctx.iter_live_orders(symbol=old_i.symbol)
+            )
         body: dict = {}
         if new_i.tp_price is not None:
             body['profitLevel'] = float(new_i.tp_price)
@@ -2049,7 +2063,7 @@ class _ExecutionMixin(_CapitalComBase):
             body['trailingStop'] = True
             body['stopDistance'] = float(new_i.trail_offset)
         elif (old_i.trail_offset is not None
-                and old_i.trail_price is None
+                and (old_i.trail_price is None or old_trailing_active)
                 and new_i.trail_offset is None):
             # Native-trailing removal: Capital.com ``PUT /positions/{dealId}``
             # is full-replacement (§9 #19 Exp D2) — an absent
