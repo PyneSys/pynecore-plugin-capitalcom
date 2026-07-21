@@ -1077,6 +1077,80 @@ class _StreamingMixin(_CapitalComBase):
         except Exception:
             return None
 
+    def _fetch_reconnect_gap_payloads(
+        self,
+        current_bar_open: int | None = None,
+    ) -> list[dict]:
+        """Fetch real closed bars missed since the last emitted bar.
+
+        Capital.com's ``/prices`` response is the source of truth here:
+        absent timestamps remain venue session gaps, while returned bars
+        are replayed before the new WS subscription can publish anything.
+        Pages advance by one full timeframe past the last returned row,
+        matching the inclusive ``from`` semantics used by historical
+        downloads.
+        """
+        if self._last_bar_timestamp is None or self.timeframe is None:
+            return []
+        tf_seconds = int(in_seconds(self.timeframe))
+        if current_bar_open is None:
+            current_bar_open = int(epoch_time() // tf_seconds * tf_seconds)
+        cursor = self._last_bar_timestamp + tf_seconds
+        if cursor >= current_bar_open:
+            return []
+
+        payloads: dict[int, dict] = {}
+        try:
+            while cursor < current_bar_open:
+                time_from = datetime.fromtimestamp(
+                    cursor, tz=timezone.utc,
+                ).replace(tzinfo=None)
+                time_to = datetime.fromtimestamp(
+                    current_bar_open, tz=timezone.utc,
+                ).replace(tzinfo=None)
+                res = self.get_historical_prices(
+                    time_from=time_from,
+                    time_to=time_to,
+                    limit=1000,
+                )
+                prices = res.get('prices') or []
+                if not prices:
+                    break
+                last_returned_ts: int | None = None
+                for bar in prices:
+                    snap = bar.get('snapshotTimeUTC')
+                    if not snap:
+                        continue
+                    timestamp = int(
+                        datetime.fromisoformat(snap).replace(
+                            tzinfo=timezone.utc,
+                        ).timestamp()
+                    )
+                    last_returned_ts = timestamp
+                    if not (self._last_bar_timestamp < timestamp
+                            < current_bar_open):
+                        continue
+                    payloads[timestamp] = {
+                        "priceType": "bid",
+                        "t": int(timestamp * 1000),
+                        "o": float(bar['openPrice']['bid']),
+                        "h": float(bar['highPrice']['bid']),
+                        "l": float(bar['lowPrice']['bid']),
+                        "c": float(bar['closePrice']['bid']),
+                        "_volume": float(bar.get('lastTradedVolume') or 0.0),
+                    }
+                if last_returned_ts is None or last_returned_ts < cursor:
+                    break
+                cursor = last_returned_ts + tf_seconds
+        except Exception as exc:  # noqa: BLE001
+            broker_warning(
+                "reconnect history repair failed after ts=%d: %s",
+                self._last_bar_timestamp,
+                repr(exc),
+            )
+            return []
+        return [payloads[timestamp] for timestamp in sorted(payloads)]
+
     @override
     async def connect(self) -> None:
         """Establish REST session, run broker-side recovery, and open WebSocket.
@@ -1122,6 +1196,11 @@ class _StreamingMixin(_CapitalComBase):
             await self._load_activity_cursor_from_events()
             await self._recover_in_flight_submissions()
 
+        assert self.timeframe is not None and self.symbol is not None
+        reconnect_payloads = await asyncio.to_thread(
+            self._fetch_reconnect_gap_payloads,
+        )
+
         # WS ping/pong cadence: default `websockets` is 20s/20s = up to
         # 40s before a half-open connection is dropped. On a 1-minute
         # strategy that is too coarse — tighten to 5s/5s (≤10s detect)
@@ -1129,8 +1208,6 @@ class _StreamingMixin(_CapitalComBase):
         self._ws = await websockets.connect(
             WS_URL, ping_interval=5, ping_timeout=5,
         )
-
-        assert self.timeframe is not None and self.symbol is not None
 
         self._update_queue = asyncio.Queue()
         self._raw_ohlc_queue = asyncio.Queue()
@@ -1148,6 +1225,16 @@ class _StreamingMixin(_CapitalComBase):
         )
         self._ws_bad_bar_streak = 0
         self._ws_quote_timestamp_warned = False
+        for payload in reconnect_payloads:
+            self._update_queue.put_nowait(("ohlc", payload))
+        if reconnect_payloads:
+            repaired_through = int(reconnect_payloads[-1]["t"] / 1000)
+            self._last_bar_open_ts = float(repaired_through)
+            broker_warning(
+                "reconnect restored %d closed bar(s) from REST through ts=%d",
+                len(reconnect_payloads),
+                repaired_through,
+            )
         # Seed the bar-time anchor from the warmup baseline if the
         # provider already loaded one. Without this, the OHLC
         # watchdog stays disarmed (``_last_bar_open_ts == 0.0`` short-
@@ -1190,6 +1277,9 @@ class _StreamingMixin(_CapitalComBase):
         else:
             self._last_bar_open_ts = 0.0
             self._last_ohlc_event_ts = 0.0
+        if reconnect_payloads:
+            self._last_bar_open_ts = float(repaired_through)
+            self._last_ohlc_event_ts = now_ts
 
         self._listen_task = asyncio.create_task(self._listen_loop())
         self._ping_task = asyncio.create_task(self._ping_loop())

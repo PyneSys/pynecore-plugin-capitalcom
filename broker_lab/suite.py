@@ -566,6 +566,38 @@ class CapitalComProfile(ReferenceVenueProfile):
                     f"Capital.com pagination cursors moved incorrectly: {requested}"
                 )
             return True
+        if step.kind == "capital_reconnect_history_repair_probe":
+            start = datetime(2025, 1, 6, 9, 0)
+            bars = [
+                start + timedelta(minutes=5),
+                start + timedelta(minutes=15),
+                start + timedelta(minutes=20),
+            ]
+            repair_dir = runner.workdir / "capital-reconnect-history"
+            repair_dir.mkdir(parents=True, exist_ok=True)
+            requested: list[datetime] = []
+            provider = OfflinePriceCapitalCom(
+                bars=bars,
+                requested=requested,
+                ohlcv_dir=repair_dir,
+            )
+            provider._last_bar_timestamp = int(start.replace(tzinfo=UTC).timestamp())
+            current_open = int(
+                (start + timedelta(minutes=20)).replace(tzinfo=UTC).timestamp()
+            )
+            payloads = provider._fetch_reconnect_gap_payloads(current_open)
+            actual = [int(payload["t"] / 1000) for payload in payloads]
+            expected = [int(bar.replace(tzinfo=UTC).timestamp()) for bar in bars[:2]]
+            if actual != expected:
+                raise AssertionError(
+                    "Capital.com reconnect did not restore exact REST history "
+                    f"without inventing the venue gap: {actual} != {expected}"
+                )
+            if requested != [start + timedelta(minutes=5)]:
+                raise AssertionError(
+                    f"Capital.com reconnect history cursor mismatch: {requested}"
+                )
+            return True
         if step.kind == "capital_activity_close":
             runtime = runner.runs[step.run]
             entry_activity = self.activities.get(step.run)
@@ -874,6 +906,12 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             profile_factory=CapitalComProfile,
             seed=seed,
             steps=(Step("capital_price_pagination_probe"),),
+        ),
+        Scenario(
+            name="capitalcom-reconnect-restores-real-history-and-preserves-session-gap",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(Step("capital_reconnect_history_repair_probe"),),
         ),
         Scenario(
             name="capitalcom-position-bracket-attach-replace-shape",
