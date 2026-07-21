@@ -1061,6 +1061,31 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             ),
         ),
         Scenario(
+            name="capitalcom-residual-full-close-uses-native-delete",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 2.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step("close", values={"id": "Long", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_close_route",
+                    values={"deletes": 0, "posts": 2, "size": 1.0},
+                ),
+                Step("capital_activity_close", values={"qty": 1.0, "price": 1.10}),
+                Step("expect", values={"position": 1.0, "engine_position": 1.0}),
+                Step("close", values={"id": "Long", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}, check_invariants=False),
+                Step(
+                    "expect_capital_close_route",
+                    values={"deletes": 1, "posts": 2},
+                    check_invariants=False,
+                ),
+            ),
+        ),
+        Scenario(
             name="capitalcom-activity-replay-after-restart-is-durable",
             profile_factory=CapitalComProfile,
             seed=seed,

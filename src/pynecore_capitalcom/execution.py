@@ -1542,7 +1542,7 @@ class _ExecutionMixin(_CapitalComBase):
             # ``qty - filled_qty`` here turns every normally filled position
             # into zero live units and misroutes a whole-row close through the
             # opposite-POST partial-close path.
-            total_live_units = sum(
+            stored_live_units = sum(
                 round(max(0.0, row.qty) / rules.lot_step)
                 if rules.lot_step > 0 else 0
                 for row in targets
@@ -1550,6 +1550,32 @@ class _ExecutionMixin(_CapitalComBase):
             intent_units = (
                 round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
             )
+
+            # A successful emulated partial close reduces the venue row but
+            # deliberately leaves ``OrderRow.qty`` as the original entry-fill
+            # quantity. A later close of the residual therefore cannot decide
+            # full-vs-partial from the stored quantity alone: 100 remaining
+            # units still sit behind a 200-unit entry row. When the intent is
+            # smaller than that original quantity, resolve the current size at
+            # the authoritative positions seam and compare only the dealIds
+            # owned by these targets. This keeps the first 100-unit reduction
+            # on the opposite-POST path and routes the subsequent residual 100
+            # through native DELETE.
+            total_live_units = stored_live_units
+            if intent_units != stored_live_units:
+                raw_positions = await self._call('positions', method='get')
+                target_deal_ids = {
+                    row.exchange_order_id for row in targets
+                    if row.exchange_order_id
+                }
+                total_live_units = sum(
+                    round(float(position.get('size', 0.0)) / rules.lot_step)
+                    if rules.lot_step > 0 else 0
+                    for raw in (raw_positions.get('positions') or [])
+                    if (raw.get('market') or {}).get('epic') == intent.symbol
+                    for position in [raw.get('position') or {}]
+                    if position.get('dealId') in target_deal_ids
+                )
 
             kind = (
                 KIND_FULL_CLOSE if intent_units == total_live_units
