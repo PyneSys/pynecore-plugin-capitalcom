@@ -815,40 +815,24 @@ def __test_recovery_adopts_untracked_position_then_close_all__(tmp_path):
     subsequent normal ``strategy.close_all()`` no longer raises
     ``ExchangeOrderRejectedError: no confirmed position rows``.
 
-    A confirmed market position carries ``filled_qty == qty`` (the entry
-    fill), so — exactly like every normal in-session full close — the
-    close routes through the emulated opposite-POST partial path rather
-    than a DELETE; the flatten is a full-size opposite POST that nets the
-    one-way position to zero.
+    A confirmed market position carries ``filled_qty == qty`` because that
+    field records the entry fill; it does not reduce the live venue quantity.
+    Closing the complete adopted quantity therefore routes through the native
+    full-close path and DELETEs every adopted ``dealId`` exactly once.
     """
     broker, store, ctx = _make_broker(tmp_path, responses={
-        ('positions', 'get'): [
-            # (1) recovery snapshot, (2) partial-close pre-snapshot: both
-            # show the untracked two-lot BUY 2.0 position.
-            {'positions': [
-                {'market': {'epic': 'EURUSD'},
-                 'position': {'dealId': 'lot-a', 'direction': 'BUY',
-                              'size': 1.0}},
-                {'market': {'epic': 'EURUSD'},
-                 'position': {'dealId': 'lot-b', 'direction': 'BUY',
-                              'size': 1.0}},
-            ]},
-            {'positions': [
-                {'market': {'epic': 'EURUSD'},
-                 'position': {'dealId': 'lot-a', 'direction': 'BUY',
-                              'size': 1.0}},
-                {'market': {'epic': 'EURUSD'},
-                 'position': {'dealId': 'lot-b', 'direction': 'BUY',
-                              'size': 1.0}},
-            ]},
-            # (3) partial-close post-snapshot: the opposite POST netted the
-            # one-way position flat.
-            {'positions': []},
-        ],
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'lot-a', 'direction': 'BUY',
+                          'size': 1.0}},
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'lot-b', 'direction': 'BUY',
+                          'size': 1.0}},
+        ]},
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': []},
-        ('positions', 'post'): {'dealReference': 'dr-flat'},
-        ('confirms/dr-flat', 'get'): {'dealStatus': 'ACCEPTED'},
+        ('positions/lot-a', 'delete'): {},
+        ('positions/lot-b', 'delete'): {},
     })
 
     # Fresh store: no rows track the live position.
@@ -873,18 +857,30 @@ def __test_recovery_adopts_untracked_position_then_close_all__(tmp_path):
         run_tag='test', bar_ts_ms=1700000000000,
     )
     result = asyncio.run(broker.execute_close(env))
-    assert result.id == 'dr-flat'
+    assert result.id == 'lot-a'
 
-    # Flattened via the emulated opposite POST (one-way netting), not a
-    # DELETE.
-    assert any(c[0] == 'positions' and c[1] == 'post' for c in broker._calls)
-    assert not any(c[1] == 'delete' for c in broker._calls)
+    delete_calls = [
+        call for call in broker._calls if call[1] == 'delete'
+    ]
+    assert delete_calls == [
+        ('positions/lot-a', 'delete', None),
+        ('positions/lot-b', 'delete', None),
+    ]
+    assert not any(
+        call[0] == 'positions' and call[1] == 'post'
+        for call in broker._calls
+    )
 
     cmd_coid = env.client_order_id(KIND_CLOSE)
     cmd_row = ctx.get_order(cmd_coid)
     assert cmd_row is not None
-    assert cmd_row.state == 'confirmed'
-    assert (cmd_row.extras or {}).get('kind') == KIND_PARTIAL_CLOSE
+    assert cmd_row.state == 'closing'
+    assert (cmd_row.extras or {}).get('kind') == KIND_FULL_CLOSE
+    assert (cmd_row.extras or {}).get('targets') == ['lot-a', 'lot-b']
+    for deal_id in ('lot-a', 'lot-b'):
+        row = ctx.find_by_ref('deal_id', deal_id)
+        assert row is not None
+        assert row.state == 'closing'
     store.close()
 
 

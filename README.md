@@ -42,6 +42,13 @@ set there as part of key creation. The plugin encrypts the password with
 the server-provided RSA key at login and keeps the session tokens
 refreshed proactively.
 
+Capital.com limits `POST /session` to one request per second per API key.
+Concurrent broker/provider instances in one process therefore share a keyed
+bootstrap gate. Session POST starts are spaced by at least one second, and a
+bootstrap throttle receives one bounded retry. Existing tokens stay visible
+while a replacement session is created, so an active WebSocket is never sent
+an empty credential pair.
+
 ## Symbols
 
 Capital.com identifies instruments by **epic** (e.g. `EURUSD`, `GOLD`) —

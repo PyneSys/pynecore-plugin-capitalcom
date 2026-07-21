@@ -1,8 +1,11 @@
 """Opt-in offline conformance scenarios for the Capital.com broker plugin."""
 
 import asyncio
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from pynecore.core.broker.models import LegType, OrderStatus, OrderType
@@ -10,6 +13,7 @@ from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
 from pynecore.testing.broker_lab.reference import ReferenceVenueProfile, VenueOrder
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
+from pynecore_capitalcom.exceptions import CapitalComError
 
 _RULES = {
     "dealingRules": {
@@ -47,6 +51,7 @@ class OfflineCapitalCom(CapitalCom):
     async def _call(self, endpoint: str, *, data=None, method: str = "post"):
         payload = dict(data) if data is not None else None
         self.rest_calls.append((endpoint, method, payload))
+        self.profile.transport_calls.append((endpoint, method, payload))
         if endpoint == f"markets/{self.profile.symbol}" and method == "get":
             return _RULES
         if endpoint == "workingorders" and method == "post":
@@ -179,6 +184,70 @@ class OfflineCapitalCom(CapitalCom):
         return result
 
 
+class BrokenBracketClearCapitalCom(OfflineCapitalCom):
+    """Control broker that acknowledges bracket clears without sending them."""
+
+    async def _call(self, endpoint: str, *, data=None, method: str = "post"):
+        payload = dict(data) if data is not None else None
+        is_bracket_clear = (
+            endpoint.startswith("positions/")
+            and method == "put"
+            and payload is not None
+            and any(value is None for value in payload.values())
+        )
+        if is_bracket_clear:
+            return {"dealReference": "bracket-attach"}
+        return await super()._call(endpoint, data=data, method=method)
+
+
+class OfflinePriceCapitalCom(CapitalCom):
+    """Real provider pagination over the shared lowest REST seam."""
+
+    def __init__(
+        self,
+        *,
+        bars: list[datetime],
+        requested: list[datetime],
+        ohlcv_dir: Path,
+    ) -> None:
+        super().__init__(
+            symbol="EURUSD",
+            timeframe="5",
+            ohlcv_dir=ohlcv_dir,
+            config=CapitalComConfig(
+                demo=True,
+                user_email="offline@example.invalid",
+                api_key="offline",
+                api_password="offline",
+            ),
+        )
+        self._offline_bars = bars
+        self._offline_requested = requested
+
+    def __call__(
+        self,
+        endpoint: str,
+        *,
+        data: dict[str, Any] | None = None,
+        method: str = "post",
+        _level: int = 0,
+    ) -> dict[str, Any]:
+        del _level
+        return asyncio.run(self._call(endpoint, data=data, method=method))
+
+    async def _call(self, endpoint: str, *, data=None, method: str = "post"):
+        if endpoint != "prices/EURUSD" or method != "get" or data is None:
+            raise AssertionError(
+                f"unexpected offline Capital.com REST call: {method} {endpoint}"
+            )
+        cursor = datetime.fromisoformat(str(data["from"]))
+        self._offline_requested.append(cursor)
+        selected = [bar for bar in self._offline_bars if bar >= cursor][
+            : int(data["max"])
+        ]
+        return {"prices": [CapitalComProfile._price_row(bar) for bar in selected]}
+
+
 class CapitalComProfile(ReferenceVenueProfile):
     """Netting profile around the real Capital.com broker implementation."""
 
@@ -193,11 +262,114 @@ class CapitalComProfile(ReferenceVenueProfile):
         self.positions: dict[str, dict[str, Any]] = {}
         self.activities: dict[str, dict[str, Any]] = {}
         self.polled_activities: list[dict[str, Any]] = []
+        self.transport_calls: list[tuple[str, str, dict[str, Any] | None]] = []
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCapitalCom:
         return OfflineCapitalCom(self, run_name, store_ctx)
 
     def handle_step(self, runner: Any, step: Step) -> bool:
+        if step.kind == "capital_concurrent_session_bootstrap":
+            import pynecore_capitalcom.rest as capital_rest
+
+            class StubResponse:
+                is_error = False
+
+                def __init__(
+                    self,
+                    body: dict[str, Any],
+                    headers: dict[str, str] | None = None,
+                ) -> None:
+                    self.body = body
+                    self.headers = headers or {}
+
+                def json(self) -> dict[str, Any]:
+                    return self.body
+
+            original_get = capital_rest.httpx.get
+            original_post = capital_rest.httpx.post
+            original_encrypt = capital_rest.encrypt_password
+            post_started: list[float] = []
+            transport_lock = threading.Lock()
+
+            def fake_get(url: str, **kwargs: Any) -> StubResponse:
+                del url, kwargs
+                return StubResponse({"encryptionKey": "offline", "timeStamp": 1})
+
+            def fake_post(url: str, **kwargs: Any) -> StubResponse:
+                del url, kwargs
+                with transport_lock:
+                    started = time.monotonic()
+                    if (
+                        post_started
+                        and started - post_started[-1]
+                        < capital_rest._SESSION_CREATE_MIN_INTERVAL_S
+                    ):
+                        raise CapitalComError(
+                            "API error occured: error.too-many.requests"
+                        )
+                    post_started.append(started)
+                    number = len(post_started)
+                return StubResponse(
+                    {"currentAccountId": "offline-account"},
+                    {
+                        "CST": f"cst-{number}",
+                        "X-SECURITY-TOKEN": f"security-{number}",
+                    },
+                )
+
+            config = CapitalComConfig(
+                demo=True,
+                user_email="offline@example.invalid",
+                api_key="shared-offline-key",
+                api_password="offline",
+            )
+            brokers = [CapitalCom(config=config), CapitalCom(config=config)]
+            errors: list[BaseException] = []
+
+            def login(broker: CapitalCom) -> None:
+                try:
+                    broker.create_session()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            capital_rest.httpx.get = fake_get
+            capital_rest.httpx.post = fake_post
+            capital_rest.encrypt_password = lambda *_args, **_kwargs: "encrypted"
+            try:
+                workers = [
+                    threading.Thread(target=login, args=(broker,)) for broker in brokers
+                ]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(timeout=3.0)
+            finally:
+                capital_rest.httpx.get = original_get
+                capital_rest.httpx.post = original_post
+                capital_rest.encrypt_password = original_encrypt
+
+            if errors:
+                raise AssertionError(
+                    f"concurrent Capital.com session bootstrap failed: {errors}"
+                )
+            if any(worker.is_alive() for worker in workers):
+                raise AssertionError("concurrent Capital.com session bootstrap stalled")
+            if len(post_started) != 2:
+                raise AssertionError(
+                    f"expected two session POSTs, got {len(post_started)}"
+                )
+            spacing = post_started[1] - post_started[0]
+            if spacing < capital_rest._SESSION_CREATE_MIN_INTERVAL_S:
+                raise AssertionError(
+                    f"session POST spacing {spacing:.6f}s violated venue limit"
+                )
+            if {broker.account_id for broker in brokers} != {
+                "capitalcom-demo-offline-account"
+            }:
+                raise AssertionError(
+                    "concurrent sessions did not preserve account identity"
+                )
+            return True
         if step.kind == "expect_capital_request":
             broker = runner.runs[step.run].broker
             requests = [
@@ -369,28 +541,18 @@ class CapitalComProfile(ReferenceVenueProfile):
             bars = [start + timedelta(minutes=5 * index) for index in range(8)]
             pagination_dir = runner.workdir / "capital-pagination"
             pagination_dir.mkdir(parents=True, exist_ok=True)
-            provider = CapitalCom(
-                symbol=self.symbol,
-                timeframe="5",
-                ohlcv_dir=pagination_dir,
-                config=CapitalComConfig(
-                    demo=True,
-                    user_email="offline@example.invalid",
-                    api_key="offline",
-                    api_password="offline",
-                ),
-            )
             requested: list[datetime] = []
-
-            def fake_prices(time_from=None, time_to=None, limit=1000):
-                del time_to, limit
-                requested.append(time_from)
-                selected = [bar for bar in bars if bar >= time_from][:page_size]
-                return {"prices": [self._price_row(bar) for bar in selected]}
-
-            provider.get_historical_prices = fake_prices
+            provider = OfflinePriceCapitalCom(
+                bars=bars,
+                requested=requested,
+                ohlcv_dir=pagination_dir,
+            )
             with provider:
-                provider.download_ohlcv(start, start + timedelta(minutes=5 * len(bars)))
+                provider.download_ohlcv(
+                    start,
+                    start + timedelta(minutes=5 * len(bars)),
+                    limit=page_size,
+                )
             with OHLCVReader(str(provider.ohlcv_path)) as reader:
                 actual = [bar.timestamp for bar in reader]
             expected = [int(bar.replace(tzinfo=UTC).timestamp()) for bar in bars]
@@ -487,21 +649,38 @@ class CapitalComProfile(ReferenceVenueProfile):
                     f"Capital.com bracket did not expose two reduce-only legs: {legs}"
                 )
             return True
+        if step.kind == "expect_capital_bracket_clear_requests":
+            requests = [
+                call
+                for call in self.transport_calls
+                if call[0].startswith("positions/") and call[1] == "put"
+            ]
+            expected_bodies = [
+                {"profitLevel": 1.20, "stopLevel": 1.05},
+                {"profitLevel": None},
+                {"stopLevel": None},
+            ]
+            actual_bodies = [call[2] for call in requests]
+            if actual_bodies != expected_bodies:
+                raise AssertionError(
+                    "Capital.com bracket clear REST requests mismatch: "
+                    f"expected {expected_bodies}, got {actual_bodies}"
+                )
+            return True
         if step.kind == "expect_capital_close_route":
-            runtime = runner.runs[step.run]
             deletes = [
                 call
-                for call in runtime.broker.rest_calls
+                for call in self.transport_calls
                 if call[0].startswith("positions/") and call[1] == "delete"
             ]
             position_posts = [
                 call
-                for call in runtime.broker.rest_calls
+                for call in self.transport_calls
                 if call[0] == "positions" and call[1] == "post"
             ]
             bracket_puts = [
                 call
-                for call in runtime.broker.rest_calls
+                for call in self.transport_calls
                 if call[0].startswith("positions/") and call[1] == "put"
             ]
             expected_deletes = int(step.values.get("deletes", 0))
@@ -541,6 +720,8 @@ class CapitalComProfile(ReferenceVenueProfile):
                 raise AssertionError(
                     f"expected {expected_count} Capital.com trailing PUTs, got {len(requests)}"
                 )
+            if expected_count == 0:
+                return True
             body = requests[-1][2] or {}
             if body.get("trailingStop") is not step.values["enabled"]:
                 raise AssertionError(f"unexpected Capital.com trailing body: {body}")
@@ -550,6 +731,23 @@ class CapitalComProfile(ReferenceVenueProfile):
             ):
                 raise AssertionError(
                     f"expected trailing distance {step.values['distance']}, got {body.get('stopDistance')}"
+                )
+            return True
+        if step.kind == "expect_capital_no_live_trailing":
+            runtime = runner.runs[step.run]
+            trailing_rows = [
+                row
+                for row in runtime.store_ctx.iter_live_orders(symbol=self.symbol)
+                if (row.extras or {}).get("leg_kind") == "sl"
+                and (
+                    row.trailing_stop
+                    or row.trailing_distance is not None
+                    or (row.extras or {}).get("trail_offset") is not None
+                )
+            ]
+            if trailing_rows:
+                raise AssertionError(
+                    f"Capital.com trailing protection resurrected: {trailing_rows}"
                 )
             return True
         if step.kind == "capital_trailing_tick":
@@ -584,8 +782,23 @@ class CapitalComProfile(ReferenceVenueProfile):
         }
 
 
+class BrokenBracketClearProfile(CapitalComProfile):
+    """Control profile proving that bracket-clear wire assertions are independent."""
+
+    def create_broker(
+        self, run_name: str, store_ctx: Any
+    ) -> BrokenBracketClearCapitalCom:
+        return BrokenBracketClearCapitalCom(self, run_name, store_ctx)
+
+
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
     return [
+        Scenario(
+            name="capitalcom-concurrent-session-bootstrap-respects-venue-rate-limit",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(Step("capital_concurrent_session_bootstrap"),),
+        ),
         Scenario(
             name="capitalcom-limit-entry-uses-real-rest-shape",
             profile_factory=CapitalComProfile,
@@ -737,6 +950,15 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                     "expect_capital_close_route",
                     values={"deletes": 1, "posts": 1},
                 ),
+                Step("capital_activity_close", values={"qty": 1.0, "price": 1.10}),
+                Step("expect", values={"position": 0.0, "engine_position": 0.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("restart", check_invariants=False),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_close_route",
+                    values={"deletes": 1, "posts": 1},
+                ),
             ),
         ),
         Scenario(
@@ -757,6 +979,15 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                         "stop": 1.11,
                     },
                 ),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_close_route",
+                    values={"deletes": 1, "posts": 1},
+                ),
+                Step("capital_activity_close", values={"qty": 1.0, "price": 1.10}),
+                Step("expect", values={"position": 0.0, "engine_position": 0.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("restart", check_invariants=False),
                 Step("sync", values={"last_price": 1.10}),
                 Step(
                     "expect_capital_close_route",
@@ -872,10 +1103,37 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("sync", values={"last_price": 1.10}),
                 Step("cancel", values={"id": "Bracket"}),
                 Step("sync", values={"last_price": 1.10}),
+                Step("expect_capital_bracket_clear_requests"),
                 Step("expect", values={"open_orders": 0}),
                 Step("restart", check_invariants=False),
                 Step("sync", values={"last_price": 1.10}),
                 Step("expect", values={"open_orders": 0}),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-missing-bracket-clear-is-detected",
+            profile_factory=BrokenBracketClearProfile,
+            seed=seed,
+            expected_violation="Capital.com bracket clear REST requests mismatch",
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "Bracket",
+                        "from_entry": "Long",
+                        "side": "sell",
+                        "qty": 1.0,
+                        "limit": 1.20,
+                        "stop": 1.05,
+                    },
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step("cancel", values={"id": "Bracket"}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("expect_capital_bracket_clear_requests"),
             ),
         ),
         Scenario(
@@ -939,6 +1197,11 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 ),
                 Step("restart", check_invariants=False),
                 Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_trailing_request",
+                    values={"count": 0},
+                ),
+                Step("expect_capital_no_live_trailing"),
             ),
         ),
     ]

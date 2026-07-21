@@ -13,8 +13,10 @@ State touched: ``security_token``, ``cst_token``, ``session_data``,
 ``_account_id``, ``_account_preferences``, ``_hedging_enabled``.
 """
 import asyncio
+import hashlib
+import threading
 from json import JSONDecodeError
-from time import time as epoch_time
+from time import monotonic, sleep, time as epoch_time
 
 import httpx
 
@@ -61,6 +63,16 @@ from .helpers import (
 # trading loop never sees ``error.invalid.session.token``.
 _SESSION_REFRESH_FALLBACK_S = 50 * 60
 _SESSION_REFRESH_SAFETY_S = 5 * 60
+# Capital.com permits one ``POST /session`` per second per API key. Broker and
+# provider instances can start concurrently in one process, so their instance
+# locks are insufficient: coordinate bootstrap POSTs across all instances that
+# share a key. The transport still gets one bounded retry because another
+# process may have consumed the venue slot immediately before this process.
+_SESSION_CREATE_MIN_INTERVAL_S = 1.0
+_SESSION_CREATE_RETRY_COUNT = 1
+_SESSION_CREATE_GUARD = threading.Lock()
+_SESSION_CREATE_LOCKS: dict[bytes, threading.Lock] = {}
+_SESSION_CREATE_LAST_POST: dict[bytes, float] = {}
 # Bootstrap requests — must NOT trigger a proactive refresh (would
 # recurse into ``create_session`` itself), MUST go out without auth
 # headers, and MUST NOT trigger reactive retry on
@@ -278,17 +290,43 @@ class _RestSessionMixin(_CapitalComBase):
         sentinel when the run-identity contract validation ran between
         provider authentication and broker startup, aborting the run.
         """
-        res: dict = self('session/encryptionKey', method='get')
-        encryption_key = res['encryptionKey']
-        timestamp = res['timeStamp']
-        user = self.config.user_email
-        api_password = self.config.api_password
-        password = encrypt_password(api_password, encryption_key, timestamp)
-        self.session_data = self('session', data=dict(
-            encryptedPassword=True,
-            identifier=user,
-            password=password
-        ))
+        key_fingerprint = hashlib.sha256(
+            self.config.api_key.encode('utf-8')
+        ).digest()
+        with _SESSION_CREATE_GUARD:
+            bootstrap_lock = _SESSION_CREATE_LOCKS.setdefault(
+                key_fingerprint, threading.Lock(),
+            )
+
+        with bootstrap_lock:
+            for attempt in range(_SESSION_CREATE_RETRY_COUNT + 1):
+                elapsed = monotonic() - _SESSION_CREATE_LAST_POST.get(
+                    key_fingerprint, float('-inf'),
+                )
+                delay = _SESSION_CREATE_MIN_INTERVAL_S - elapsed
+                if delay > 0.0:
+                    sleep(delay)
+
+                res: dict = self('session/encryptionKey', method='get')
+                encryption_key = res['encryptionKey']
+                timestamp = res['timeStamp']
+                password = encrypt_password(
+                    self.config.api_password, encryption_key, timestamp,
+                )
+                _SESSION_CREATE_LAST_POST[key_fingerprint] = monotonic()
+                try:
+                    session_data = self('session', data=dict(
+                        encryptedPassword=True,
+                        identifier=self.config.user_email,
+                        password=password,
+                    ))
+                except CapitalComError as exc:
+                    if (_extract_error_code(exc) != 'error.too-many.requests'
+                            or attempt >= _SESSION_CREATE_RETRY_COUNT):
+                        raise
+                    continue
+                self.session_data = session_data
+                break
         current_account_id = (self.session_data or {}).get('currentAccountId')
         if current_account_id:
             mode = 'demo' if self.config.demo else 'live'
