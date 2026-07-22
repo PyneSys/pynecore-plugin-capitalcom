@@ -275,6 +275,7 @@ class CapitalComProfile(ReferenceVenueProfile):
         self.activities: dict[str, dict[str, Any]] = {}
         self.polled_activities: list[dict[str, Any]] = []
         self.transport_calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.manual_close_events = 0
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCapitalCom:
         return OfflineCapitalCom(self, run_name, store_ctx)
@@ -659,6 +660,80 @@ class CapitalComProfile(ReferenceVenueProfile):
             self.state.position_owners[step.run] = residual
             self.state.position = sum(self.state.position_owners.values())
             return True
+        if step.kind == "capital_external_manual_close":
+            runtime = runner.runs[step.run]
+            entry_activity = self.activities.get(step.run)
+            if entry_activity is None:
+                raise AssertionError(
+                    "Capital.com external close requires a prior activity fill"
+                )
+            deal_id = str(entry_activity["dealId"])
+            entry_direction = str(entry_activity["details"]["direction"])
+            qty = abs(self.state.position_owners.get(step.run, 0.0))
+            if qty <= 0.0:
+                raise AssertionError("Capital.com external close requires exposure")
+            activity = {
+                "dateUTC": "2026-07-21T10:02:00.000",
+                "dealId": deal_id,
+                "type": "POSITION",
+                "status": "EXECUTED",
+                "source": "USER",
+                "details": {
+                    "direction": "SELL" if entry_direction == "BUY" else "BUY",
+                    "size": qty,
+                    "level": float(step.values.get("price", 1.10)),
+                },
+            }
+            self.positions.pop(deal_id, None)
+            self.polled_activities = [activity]
+            prior_intents = dict(runtime.engine._active_intents)
+
+            async def poll() -> list[Any]:
+                return [event async for event in runtime.broker._poll_once()]
+
+            events = asyncio.run(poll())
+            closes = [event for event in events if event.leg_type is LegType.CLOSE]
+            if len(closes) != 1:
+                raise AssertionError(
+                    "Capital.com external close did not emit exactly one CLOSE event: "
+                    f"{events}"
+                )
+            for event in events:
+                runtime.engine.on_order_event(event)
+            runtime.engine.apply_async_events()
+            self.manual_close_events += len(closes)
+            self.state.position_owners[step.run] = 0.0
+            self.state.position = sum(self.state.position_owners.values())
+            if getattr(self, "restore_retired_manual_close_intents", False):
+                runtime.engine._active_intents.update(prior_intents)
+            return True
+        if step.kind == "expect_capital_external_close_retired":
+            runtime = runner.runs[step.run]
+            if self.manual_close_events != 1:
+                raise AssertionError(
+                    "Capital.com external close was not observed exactly once: "
+                    f"{self.manual_close_events}"
+                )
+            if runtime.engine._active_intents:
+                raise AssertionError(
+                    "Capital.com external close did not retire strategy intents: "
+                    f"{sorted(runtime.engine._active_intents)}"
+                )
+            position_posts = [
+                call
+                for call in self.transport_calls
+                if call[0] == "positions" and call[1] == "post"
+            ]
+            if len(position_posts) != 1:
+                raise AssertionError(
+                    "Capital.com external close caused a defensive duplicate or reopen: "
+                    f"{position_posts}"
+                )
+            if self.positions:
+                raise AssertionError(
+                    f"Capital.com venue was not flat after external close: {self.positions}"
+                )
+            return True
         if step.kind == "expect_capital_bracket_request":
             runtime = runner.runs[step.run]
             requests = [
@@ -852,6 +927,12 @@ class BrokenBracketClearProfile(CapitalComProfile):
         return BrokenBracketClearCapitalCom(self, run_name, store_ctx)
 
 
+class BrokenManualCloseRetireProfile(CapitalComProfile):
+    """Control profile proving that stale intent retention is detected."""
+
+    restore_retired_manual_close_intents = True
+
+
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
     return [
         Scenario(
@@ -992,6 +1073,38 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("sync", values={"last_price": 1.10}),
                 Step("capital_activity_fill", values={"price": 1.10}),
                 Step("expect", values={"position": 1.0, "engine_position": 1.0}),
+            ),
+        ),
+        Scenario(
+            name="capitalcom-external-manual-close-retires-intent-once",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step("capital_external_manual_close", values={"price": 1.11}),
+                Step("expect", values={"position": 0.0, "engine_position": 0.0}),
+                Step("sync", values={"last_price": 1.11}),
+                Step("expect_capital_external_close_retired"),
+                Step("restart", check_invariants=False),
+                Step("sync", values={"last_price": 1.11}),
+                Step("expect_capital_external_close_retired"),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-external-close-stale-intent-is-detected",
+            profile_factory=BrokenManualCloseRetireProfile,
+            seed=seed,
+            expected_violation=(
+                "Capital.com external close did not retire strategy intents"
+            ),
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step("capital_external_manual_close", values={"price": 1.11}),
+                Step("expect_capital_external_close_retired"),
             ),
         ),
         Scenario(
