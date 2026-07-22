@@ -274,6 +274,9 @@ class _RecoveryMixin(_CapitalComBase):
         for row in store_ctx.iter_live_orders():
             if row.exchange_order_id:
                 tracked_deal_ids.add(str(row.exchange_order_id))
+        foreign_deal_ids = store_ctx.foreign_live_exchange_order_ids(
+            symbol=self.symbol,
+        )
 
         adopted_count = 0
         for raw in positions_resp.get('positions') or []:
@@ -288,6 +291,8 @@ class _RecoveryMixin(_CapitalComBase):
                 continue
             deal_id = str(deal_id)
             if deal_id in tracked_deal_ids:
+                continue
+            if deal_id in foreign_deal_ids:
                 continue
             if store_ctx.find_by_ref('deal_id', deal_id) is not None:
                 continue

@@ -261,6 +261,16 @@ class BrokenBracketClearCapitalCom(OfflineCapitalCom):
         return await super()._call(endpoint, data=data, method=method)
 
 
+class CrossRunDeleteCapitalCom(OfflineCapitalCom):
+    """Control broker that incorrectly deletes every run's position row."""
+
+    async def _call(self, endpoint: str, *, data=None, method: str = "post"):
+        response = await super()._call(endpoint, data=data, method=method)
+        if endpoint.startswith("positions/") and method == "delete":
+            self.profile.positions.clear()
+        return response
+
+
 class OfflinePriceCapitalCom(CapitalCom):
     """Real provider pagination over the shared lowest REST seam."""
 
@@ -381,6 +391,15 @@ class CapitalComProfile(ReferenceVenueProfile):
                     f"expected {expected} {method.upper()} {endpoint} attempts, got {actual}"
                 )
             return True
+        if step.kind == "capital_inject_transport_call":
+            self.transport_calls.append(
+                (
+                    str(step.values["endpoint"]),
+                    str(step.values["method"]),
+                    dict(step.values.get("body") or {}),
+                )
+            )
+            return True
         if step.kind == "expect_capital_recovered_working_order":
             runtime = runner.runs[step.run]
             if len(self.working_orders) != 1:
@@ -396,6 +415,74 @@ class CapitalComProfile(ReferenceVenueProfile):
                 raise AssertionError(
                     f"Capital.com POST disposition did not recover: {rows}"
                 )
+            return True
+        if step.kind == "expect_capital_run_position":
+            activity = self.activities.get(step.run)
+            if activity is None:
+                raise AssertionError(
+                    f"Capital.com run {step.run} has no owned entry activity"
+                )
+            deal_id = str(activity["dealId"])
+            raw = self.positions.get(deal_id)
+            expected_present = bool(step.values.get("present", True))
+            if expected_present and raw is None:
+                raise AssertionError(
+                    f"Capital.com cross-run ownership violation: run {step.run} "
+                    f"position {deal_id} disappeared"
+                )
+            if not expected_present and raw is not None:
+                raise AssertionError(
+                    f"Capital.com run {step.run} position {deal_id} still exists"
+                )
+            if raw is None:
+                return True
+            position = raw.get("position") or {}
+            for key, value in step.values.items():
+                if key == "present":
+                    continue
+                if position.get(key) != value:
+                    raise AssertionError(
+                        f"Capital.com run {step.run} expected {key}={value!r}, "
+                        f"got {position.get(key)!r}"
+                    )
+            return True
+        if step.kind == "expect_capital_run_store_deals":
+            runtime = runner.runs[step.run]
+            owner_runs = [str(value) for value in step.values["owners"]]
+            expected = {
+                str(self.activities[owner]["dealId"])
+                for owner in owner_runs
+            }
+            actual = {
+                str(row.exchange_order_id)
+                for row in runtime.store_ctx.iter_live_orders(symbol=self.symbol)
+                if row.exchange_order_id
+                and (row.extras or {}).get("kind") == "position"
+            }
+            if actual != expected:
+                raise AssertionError(
+                    f"Capital.com cross-run store ownership violation: run "
+                    f"{step.run} owns deals {sorted(actual)}, expected "
+                    f"{sorted(expected)}"
+                )
+            return True
+        if step.kind == "capital_inject_foreign_store_position":
+            runtime = runner.runs[step.run]
+            foreign_run = str(step.values["foreign_run"])
+            activity = self.activities[foreign_run]
+            deal_id = str(activity["dealId"])
+            position = self.positions[deal_id]["position"]
+            client_order_id = f"__control_foreign__{deal_id}"
+            runtime.store_ctx.upsert_order(
+                client_order_id,
+                symbol=self.symbol,
+                side=str(position["direction"]).lower(),
+                qty=float(position["size"]),
+                filled_qty=float(position["size"]),
+                state="confirmed",
+                exchange_order_id=deal_id,
+                extras={"kind": "position", "control_foreign": True},
+            )
             return True
         if step.kind == "capital_concurrent_session_bootstrap":
             import pynecore_capitalcom.rest as capital_rest
@@ -694,6 +781,76 @@ class CapitalComProfile(ReferenceVenueProfile):
                 raise AssertionError(
                     f"Capital.com pagination cursors moved incorrectly: {requested}"
                 )
+            return True
+        if step.kind == "capital_shared_ohlcv_reader_gap":
+            from pynecore.cli.commands.run import _atomic_ohlcv_download_target
+
+            start = datetime(2025, 1, 6, 9, 0)
+            bars = [start, start + timedelta(minutes=5)]
+            shared_dir = runner.workdir / "capital-shared-ohlcv"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            first = OfflinePriceCapitalCom(
+                bars=bars,
+                requested=[],
+                ohlcv_dir=shared_dir,
+            )
+            with _atomic_ohlcv_download_target(first):
+                with first as writer:
+                    writer.seek(0)
+                    writer.truncate()
+                    first.download_ohlcv(start, bars[-1] + timedelta(minutes=5))
+
+            truncated = threading.Event()
+            allow_finish = threading.Event()
+
+            def rewrite() -> None:
+                second = OfflinePriceCapitalCom(
+                    bars=bars,
+                    requested=[],
+                    ohlcv_dir=shared_dir,
+                )
+                with _atomic_ohlcv_download_target(second):
+                    with second as writer:
+                        writer.seek(0)
+                        writer.truncate()
+                        truncated.set()
+                        if not allow_finish.wait(2.0):
+                            raise AssertionError("OHLCV gap control timed out")
+                        second.download_ohlcv(
+                            start, bars[-1] + timedelta(minutes=5)
+                        )
+
+            worker = threading.Thread(target=rewrite, daemon=True)
+            worker.start()
+            if not truncated.wait(2.0):
+                raise AssertionError("concurrent OHLCV writer did not reach truncate")
+            try:
+                with OHLCVReader(str(first.ohlcv_path)) as reader:
+                    if reader.end_timestamp is None:
+                        raise AssertionError(
+                            "shared OHLCV reader observed header-only file"
+                        )
+            finally:
+                allow_finish.set()
+                worker.join(2.0)
+            if worker.is_alive():
+                raise AssertionError("concurrent OHLCV writer did not finish")
+            return True
+        if step.kind == "capital_header_only_ohlcv_control":
+            start = datetime(2025, 1, 6, 9, 0)
+            control_dir = runner.workdir / "capital-header-only-control"
+            control_dir.mkdir(parents=True, exist_ok=True)
+            provider = OfflinePriceCapitalCom(
+                bars=[start], requested=[], ohlcv_dir=control_dir
+            )
+            with provider as writer:
+                writer.seek(0)
+                writer.truncate()
+            with OHLCVReader(str(provider.ohlcv_path)) as reader:
+                if reader.end_timestamp is None:
+                    raise AssertionError(
+                        "shared OHLCV reader observed header-only file"
+                    )
             return True
         if step.kind == "capital_reconnect_history_repair_probe":
             start = datetime(2025, 1, 6, 9, 0)
@@ -1043,6 +1200,15 @@ class BrokenBracketClearProfile(CapitalComProfile):
         return BrokenBracketClearCapitalCom(self, run_name, store_ctx)
 
 
+class CrossRunDeleteProfile(CapitalComProfile):
+    """Control profile proving that a close cannot sweep another run."""
+
+    def create_broker(
+        self, run_name: str, store_ctx: Any
+    ) -> CrossRunDeleteCapitalCom:
+        return CrossRunDeleteCapitalCom(self, run_name, store_ctx)
+
+
 class BrokenManualCloseRetireProfile(CapitalComProfile):
     """Control profile proving that stale intent retention is detected."""
 
@@ -1140,6 +1306,19 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             profile_factory=CapitalComProfile,
             seed=seed,
             steps=(Step("capital_price_pagination_probe"),),
+        ),
+        Scenario(
+            name="capitalcom-concurrent-download-reader-never-sees-header-only-file",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(Step("capital_shared_ohlcv_reader_gap"),),
+        ),
+        Scenario(
+            name="control-capitalcom-header-only-ohlcv-is-detected",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            expected_violation="shared OHLCV reader observed header-only file",
+            steps=(Step("capital_header_only_ohlcv_control"),),
         ),
         Scenario(
             name="capitalcom-reconnect-restores-real-history-and-preserves-session-gap",
@@ -1594,14 +1773,70 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("entry", run="A", values={"id": "A", "side": "buy", "qty": 1.0}),
                 Step("sync", run="A", values={"last_price": 1.10}),
                 Step("capital_activity_fill", run="A", values={"price": 1.10}),
-                Step("restart", run="B", check_invariants=False),
-                Step(
-                    "expect", run="B", values={"position": 0.0, "engine_position": 0.0}
-                ),
                 Step("entry", run="B", values={"id": "B", "side": "buy", "qty": 1.0}),
                 Step("sync", run="B", values={"last_price": 1.10}),
                 Step("capital_activity_fill", run="B", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    run="A",
+                    values={
+                        "id": "A-Bracket",
+                        "from_entry": "A",
+                        "side": "sell",
+                        "qty": 1.0,
+                        "limit": 1.20,
+                        "stop": 1.05,
+                    },
+                ),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step(
+                    "exit",
+                    run="B",
+                    values={
+                        "id": "B-Bracket",
+                        "from_entry": "B",
+                        "side": "sell",
+                        "qty": 1.0,
+                        "limit": 1.21,
+                        "stop": 1.04,
+                    },
+                ),
+                Step("sync", run="B", values={"last_price": 1.10}),
+                Step(
+                    "exit",
+                    run="A",
+                    values={
+                        "id": "A-Bracket",
+                        "from_entry": "A",
+                        "side": "sell",
+                        "qty": 1.0,
+                        "limit": 1.22,
+                        "stop": 1.03,
+                    },
+                ),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_run_position",
+                    run="A",
+                    values={"size": 1.0, "profitLevel": 1.22, "stopLevel": 1.03},
+                ),
+                Step(
+                    "expect_capital_run_position",
+                    run="B",
+                    values={"size": 1.0, "profitLevel": 1.21, "stopLevel": 1.04},
+                ),
                 Step("restart", run="A", check_invariants=False),
+                Step("restart", run="B", check_invariants=False),
+                Step(
+                    "expect_capital_run_store_deals",
+                    run="A",
+                    values={"owners": ["A"]},
+                ),
+                Step(
+                    "expect_capital_run_store_deals",
+                    run="B",
+                    values={"owners": ["B"]},
+                ),
                 Step(
                     "expect",
                     run="A",
@@ -1618,6 +1853,18 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("sync", run="A", values={"last_price": 1.10}),
                 Step("capital_activity_close", run="A", values={"qty": 1.0}),
                 Step(
+                    "expect_capital_run_position",
+                    run="A",
+                    values={"present": False},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_capital_run_position",
+                    run="B",
+                    values={"size": 1.0, "profitLevel": 1.21, "stopLevel": 1.04},
+                    check_invariants=False,
+                ),
+                Step(
                     "expect",
                     run="A",
                     values={
@@ -1629,6 +1876,124 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step(
                     "expect", run="B", values={"position": 1.0, "engine_position": 1.0}
                 ),
+                Step("close", run="B", values={"id": "B", "qty": 1.0}),
+                Step("sync", run="B", values={"last_price": 1.10}),
+                Step("capital_activity_close", run="B", values={"qty": 1.0}),
+                Step(
+                    "expect",
+                    run="B",
+                    values={
+                        "position": 0.0,
+                        "engine_position": 0.0,
+                        "account_position": 0.0,
+                    },
+                ),
+            ),
+        ),
+        Scenario(
+            name="capitalcom-restart-does-not-adopt-stopped-sibling-position",
+            profile_factory=CapitalComProfile,
+            runs=("A", "B"),
+            seed=seed,
+            steps=(
+                Step("entry", run="A", values={"id": "A", "side": "buy", "qty": 1.0}),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step("capital_activity_fill", run="A", values={"price": 1.10}),
+                Step("entry", run="B", values={"id": "B", "side": "buy", "qty": 1.0}),
+                Step("sync", run="B", values={"last_price": 1.10}),
+                Step("capital_activity_fill", run="B", values={"price": 1.10}),
+                Step("shutdown", run="A", check_invariants=False),
+                Step("restart", run="B", check_invariants=False),
+                Step("capital_recover_inflight", run="B", check_invariants=False),
+                Step(
+                    "expect_capital_run_store_deals",
+                    run="B",
+                    values={"owners": ["B"]},
+                ),
+            ),
+        ),
+        Scenario(
+            name="capitalcom-filled-entry-recovery-does-not-post-again",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "B", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step("restart", check_invariants=False),
+                Step("capital_recover_inflight", check_invariants=False),
+                Step("entry", values={"id": "B", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_transport_attempts",
+                    values={"endpoint": "positions", "method": "post", "count": 1},
+                ),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-duplicate-recovery-post-is-detected",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            expected_violation="expected 1 POST positions attempts, got 2",
+            steps=(
+                Step("entry", values={"id": "B", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step(
+                    "capital_inject_transport_call",
+                    values={"endpoint": "positions", "method": "post"},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_capital_transport_attempts",
+                    values={"endpoint": "positions", "method": "post", "count": 1},
+                ),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-foreign-restart-adoption-is-detected",
+            profile_factory=CapitalComProfile,
+            runs=("A", "B"),
+            seed=seed,
+            expected_violation="Capital.com cross-run store ownership violation",
+            steps=(
+                Step("entry", run="A", values={"id": "A", "side": "buy", "qty": 1.0}),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step("capital_activity_fill", run="A", values={"price": 1.10}),
+                Step("entry", run="B", values={"id": "B", "side": "buy", "qty": 1.0}),
+                Step("sync", run="B", values={"last_price": 1.10}),
+                Step("capital_activity_fill", run="B", values={"price": 1.10}),
+                Step("restart", run="B", check_invariants=False),
+                Step("capital_recover_inflight", run="B", check_invariants=False),
+                Step(
+                    "capital_inject_foreign_store_position",
+                    run="B",
+                    values={"foreign_run": "A"},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_capital_run_store_deals",
+                    run="B",
+                    values={"owners": ["B"]},
+                ),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-cross-run-delete-is-detected",
+            profile_factory=CrossRunDeleteProfile,
+            runs=("A", "B"),
+            seed=seed,
+            expected_violation="Capital.com cross-run ownership violation",
+            steps=(
+                Step("entry", run="A", values={"id": "A", "side": "buy", "qty": 1.0}),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step("capital_activity_fill", run="A", values={"price": 1.10}),
+                Step("entry", run="B", values={"id": "B", "side": "buy", "qty": 1.0}),
+                Step("sync", run="B", values={"last_price": 1.10}),
+                Step("capital_activity_fill", run="B", values={"price": 1.10}),
+                Step("close", run="A", values={"id": "A", "qty": 1.0}),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step("expect_capital_run_position", run="B", values={"size": 1.0}),
             ),
         ),
         Scenario(

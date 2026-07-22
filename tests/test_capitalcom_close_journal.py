@@ -232,9 +232,19 @@ def __test_execute_close_full_delete_timeout_parks_for_recovery__(tmp_path):
 def __test_execute_close_partial_happy_path_routes_through_journal__(tmp_path):
     """Partial close → command row CONFIRMED + audit + closed out."""
     broker, store, ctx = _make_broker(tmp_path, responses={
-        # Sequential snapshots: pre-POST = size 2.0, post-POST = size 1.0
-        # (broker has netted the opposite leg internally).
+        # Sequential snapshots: route-selection = size 2.0, pre-POST =
+        # size 2.0, post-POST = size 1.0 (broker netted the opposite leg).
         ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
             {'positions': [
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'orig', 'direction': 'BUY',
@@ -355,6 +365,11 @@ def __test_execute_close_partial_race_confirm_deal_id_corrects__(tmp_path):
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'orig', 'direction': 'BUY',
                               'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'fresh', 'direction': 'SELL',
                               'size': 1.0,
@@ -409,6 +424,11 @@ def __test_execute_close_partial_race_confirm_mismatch_halts__(tmp_path):
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'orig', 'direction': 'BUY',
                               'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'external', 'direction': 'SELL',
                               'size': 1.0,
@@ -444,6 +464,11 @@ def __test_execute_close_partial_race_ttl_fallback_post_anchor__(tmp_path):
     """Confirm TTL-expired → POST-anchored time-band fallback still corrects."""
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
             {'positions': [
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'orig', 'direction': 'BUY',
@@ -501,6 +526,11 @@ def __test_execute_close_partial_netting_pending_no_reverse_leg__(tmp_path):
         # Both pre- and post-POST snapshots still show the FULL BUY 2.0
         # (netting reduction not yet reflected); no SELL row exists.
         ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
             {'positions': [
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'orig', 'direction': 'BUY',
@@ -619,6 +649,11 @@ def __test_execute_close_partial_unsettled_no_confirm_verdict_halts__(tmp_path):
         # Pre- and post-snapshot identical: reduction not reflected,
         # no opposite-direction row.
         ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
             {'positions': [
                 {'market': {'epic': 'EURUSD'},
                  'position': {'dealId': 'orig', 'direction': 'BUY',
