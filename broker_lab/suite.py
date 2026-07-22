@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.core.broker.models import LegType, OrderStatus, OrderType
@@ -319,6 +320,91 @@ class OfflinePriceCapitalCom(CapitalCom):
         return {"prices": [CapitalComProfile._price_row(bar) for bar in selected]}
 
 
+class OfflineWeekendCapitalCom(CapitalCom):
+    """Real provider calendar/history code over a scripted REST boundary."""
+
+    def __init__(self, *, ohlcv_dir: Path) -> None:
+        super().__init__(
+            symbol="EURUSD",
+            timeframe="1",
+            ohlcv_dir=ohlcv_dir,
+            config=CapitalComConfig(
+                demo=True,
+                user_email="offline@example.invalid",
+                api_key="offline",
+                api_password="offline",
+            ),
+        )
+        self.phase = "closed"
+        self.requests: list[tuple[str, dict[str, Any] | None]] = []
+        self.reopen_bars = [
+            datetime(2025, 1, 12, 22, 0),
+            datetime(2025, 1, 12, 22, 1),
+        ]
+
+    def __call__(
+        self,
+        endpoint: str,
+        *,
+        data: dict[str, Any] | None = None,
+        method: str = "post",
+        _level: int = 0,
+    ) -> dict[str, Any]:
+        del _level
+        if method != "get":
+            raise AssertionError(
+                f"unexpected offline Capital.com REST call: {method} {endpoint}"
+            )
+        payload = dict(data) if data is not None else None
+        self.requests.append((endpoint, payload))
+        if endpoint == "markets/EURUSD":
+            return {
+                "instrument": {
+                    "name": "EUR/USD",
+                    "epic": "EURUSD",
+                    "currency": "USD",
+                    "symbol": "EUR/USD",
+                    "type": "CURRENCIES",
+                    "lotSize": 1.0,
+                    "openingHours": {
+                        "zone": "US/Eastern",
+                        "mon": ["00:00 - 00:00"],
+                        "tue": ["00:00 - 00:00"],
+                        "wed": ["00:00 - 00:00"],
+                        "thu": ["00:00 - 00:00"],
+                        "fri": ["00:00 - 00:00"],
+                        "sat": [],
+                        "sun": ["17:00 - 00:00"],
+                    },
+                },
+                "dealingRules": {
+                    "minStepDistance": {"value": 0.0001},
+                    "minSizeIncrement": {"value": 0.01},
+                    "minDealSize": {"value": 1.0},
+                },
+            }
+        if endpoint != "prices/EURUSD" or payload is None:
+            raise AssertionError(
+                f"unexpected offline Capital.com REST call: {method} {endpoint}"
+            )
+        if "from" not in payload:
+            return {
+                "prices": [
+                    CapitalComProfile._price_row(datetime(2025, 1, 10, 12, 0))
+                ]
+            }
+        if self.phase == "closed":
+            raise CapitalComError("API error occured: error.prices.not-found")
+        cursor = datetime.fromisoformat(str(payload["from"]))
+        selected = [bar for bar in self.reopen_bars if bar >= cursor]
+        return {
+            "prices": [
+                CapitalComProfile._price_row(bar)
+                for bar in selected[: int(payload["max"])]
+            ]
+        }
+
+
 class CapitalComProfile(ReferenceVenueProfile):
     """Netting profile around the real Capital.com broker implementation."""
 
@@ -326,6 +412,7 @@ class CapitalComProfile(ReferenceVenueProfile):
     symbol = "EURUSD"
     timeframe = "60"
     quantity_step = 0.01
+    break_weekend_calendar = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -782,6 +869,149 @@ class CapitalComProfile(ReferenceVenueProfile):
                     f"Capital.com pagination cursors moved incorrectly: {requested}"
                 )
             return True
+        if step.kind == "capital_weekend_boundary_probe":
+            from datetime import time as datetime_time
+
+            from pynecore.cli.commands.run import (
+                _classify_missing_slots,
+                _missing_slots,
+            )
+            from pynecore.core.syminfo import SymInfoInterval
+            from pynecore.lib.session import _is_point_in_session
+
+            boundary_dir = runner.workdir / "capital-weekend-boundary"
+            boundary_dir.mkdir(parents=True, exist_ok=True)
+            provider = OfflineWeekendCapitalCom(ohlcv_dir=boundary_dir)
+            sym_info = provider.update_symbol_info()
+            if self.break_weekend_calendar:
+                sym_info.opening_hours.append(
+                    SymInfoInterval(
+                        day=5,
+                        start=datetime_time(0, 0),
+                        end=datetime_time(23, 59, 59),
+                    )
+                )
+            provider._sym_info = sym_info
+
+            eastern = ZoneInfo("US/Eastern")
+            friday_last = datetime(2025, 1, 10, 23, 59, tzinfo=eastern)
+            saturday = datetime(2025, 1, 11, 12, 0, tzinfo=eastern)
+            sunday_preopen = datetime(2025, 1, 12, 16, 59, tzinfo=eastern)
+            sunday_open = datetime(2025, 1, 12, 17, 0, tzinfo=eastern)
+            observed_calendar = [
+                _is_point_in_session(sym_info.opening_hours, moment)
+                for moment in (friday_last, saturday, sunday_preopen, sunday_open)
+            ]
+            if (
+                not self.break_weekend_calendar
+                and observed_calendar != [True, False, False, True]
+            ):
+                raise AssertionError(
+                    "Capital.com weekend calendar did not preserve the measured "
+                    f"Friday-close/Sunday-open boundary: {observed_calendar}"
+                )
+
+            closed_from = datetime.fromtimestamp(
+                friday_last.timestamp() + 60, tz=UTC
+            ).replace(tzinfo=None)
+            closed_to = datetime.fromtimestamp(
+                sunday_preopen.timestamp(), tz=UTC
+            ).replace(tzinfo=None)
+            with provider:
+                provider.download_ohlcv(closed_from, closed_to, limit=1000)
+            with OHLCVReader(str(provider.ohlcv_path)) as reader:
+                if list(reader):
+                    raise AssertionError(
+                        "Capital.com closed weekend window invented historical bars"
+                    )
+
+            provider.phase = "reopen"
+            friday_ts = int(friday_last.timestamp())
+            reopen_ts = [
+                int(bar.replace(tzinfo=UTC).timestamp())
+                for bar in provider.reopen_bars
+            ]
+            provider._last_bar_timestamp = friday_ts
+            current_open = reopen_ts[-1] + 60
+            payloads = provider._fetch_reconnect_gap_payloads(current_open)
+            actual = [int(payload["t"] / 1000) for payload in payloads]
+            if actual != reopen_ts:
+                raise AssertionError(
+                    "Capital.com weekend reconnect handoff did not replay only "
+                    f"venue-returned reopen bars: {actual} != {reopen_ts}"
+                )
+
+            real_ts = [friday_ts, *reopen_ts]
+            missing = _missing_slots(real_ts, friday_ts, current_open, 60)
+            in_session, closed = _classify_missing_slots(missing, sym_info, 60)
+            if in_session:
+                raise AssertionError(
+                    "Capital.com weekend gap misclassified as in-session anomaly: "
+                    f"{in_session[:3]}"
+                )
+            if not closed:
+                raise AssertionError(
+                    "Capital.com weekend boundary produced no closed-session gap"
+                )
+            return True
+        if step.kind == "capital_weekend_session_refresh_probe":
+            import pynecore_capitalcom.rest as capital_rest
+
+            class StubResponse:
+                status_code = 200
+                is_error = False
+                headers: dict[str, str] = {}
+                text = ""
+
+                def json(self) -> dict[str, Any]:
+                    return {"prices": []}
+
+            broker = CapitalCom(
+                symbol="EURUSD",
+                timeframe="1",
+                config=CapitalComConfig(
+                    demo=True,
+                    user_email="offline@example.invalid",
+                    api_key="offline-weekend-refresh",
+                    api_password="offline",
+                ),
+            )
+            broker.security_token = "security-old"
+            broker.cst_token = "cst-old"
+            broker._session_token_expiry_ts = capital_rest.epoch_time() + 60
+            events: list[str] = []
+
+            def refresh() -> None:
+                events.append("refresh")
+                broker.security_token = "security-fresh"
+                broker.cst_token = "cst-fresh"
+                broker._session_token_expiry_ts = capital_rest.epoch_time() + 3600
+
+            def get(_url: str, **kwargs: Any) -> StubResponse:
+                events.append(f"get:{kwargs['headers'].get('CST')}")
+                return StubResponse()
+
+            original_get = capital_rest.httpx.get
+            broker.create_session = refresh
+            capital_rest.httpx.get = get
+            try:
+                broker(
+                    "prices/EURUSD",
+                    data={
+                        "resolution": "MINUTE",
+                        "max": 1000,
+                        "from": "2025-01-12T22:00:00",
+                    },
+                    method="get",
+                )
+            finally:
+                capital_rest.httpx.get = original_get
+            if events != ["refresh", "get:cst-fresh"]:
+                raise AssertionError(
+                    "Capital.com session refresh did not precede the reopen "
+                    f"history request: {events}"
+                )
+            return True
         if step.kind == "capital_shared_ohlcv_reader_gap":
             from pynecore.cli.commands.run import _atomic_ohlcv_download_target
 
@@ -1209,6 +1439,12 @@ class CrossRunDeleteProfile(CapitalComProfile):
         return CrossRunDeleteCapitalCom(self, run_name, store_ctx)
 
 
+class BrokenWeekendCalendarProfile(CapitalComProfile):
+    """Control profile that incorrectly marks Saturday as tradable."""
+
+    break_weekend_calendar = True
+
+
 class BrokenManualCloseRetireProfile(CapitalComProfile):
     """Control profile proving that stale intent retention is detected."""
 
@@ -1325,6 +1561,27 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             profile_factory=CapitalComProfile,
             seed=seed,
             steps=(Step("capital_reconnect_history_repair_probe"),),
+        ),
+        Scenario(
+            name="capitalcom-weekend-close-open-handoff-preserves-session-gaps",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(Step("capital_weekend_boundary_probe"),),
+        ),
+        Scenario(
+            name="control-capitalcom-weekend-gap-misclassification-is-detected",
+            profile_factory=BrokenWeekendCalendarProfile,
+            seed=seed,
+            expected_violation=(
+                "Capital.com weekend gap misclassified as in-session anomaly"
+            ),
+            steps=(Step("capital_weekend_boundary_probe"),),
+        ),
+        Scenario(
+            name="capitalcom-session-refresh-precedes-weekend-reopen-history-read",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(Step("capital_weekend_session_refresh_probe"),),
         ),
         Scenario(
             name="capitalcom-position-bracket-attach-replace-shape",
