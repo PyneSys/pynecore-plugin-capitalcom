@@ -20,12 +20,9 @@ These tests pin the externally-observable contract of that migration:
   post-snapshot reconcile lands a clean unit-count delta → the command
   row reaches ``state='confirmed'`` and gets closed; the audit chain
   ends in ``confirmed`` + ``order_closed``.
-* **Full close DELETE timeout**: the hook raises
-  :class:`BrokerManualInterventionError` rather than parking — the
-  sync engine cannot verify a parked close in-session
-  (``get_open_orders`` only returns working orders, not positions), so
-  halting hands the ambiguity to the operator while ``targets`` in
-  extras + the next-restart positions snapshot drive recovery.
+* **Full close DELETE timeout**: the hook parks the command as
+  ``disposition_unknown``; ``targets`` in extras and the next-restart
+  positions snapshot drive deterministic recovery without a duplicate DELETE.
 * **Partial close race outside ±3 s window**: the hook raises
   :class:`BrokerManualInterventionError`; the journal does NOT catch
   that — the propagation matches the pre-journal semantics.
@@ -59,6 +56,7 @@ import pytest
 from pynecore.core.broker.exceptions import (
     BrokerManualInterventionError,
     ExchangeOrderRejectedError,
+    OrderDispositionUnknownError,
 )
 from pynecore.core.broker.idempotency import KIND_CLOSE
 from pynecore.core.broker.models import CloseIntent, DispatchEnvelope
@@ -195,15 +193,8 @@ def __test_execute_close_full_happy_path_routes_through_journal__(tmp_path):
     store.close()
 
 
-def __test_execute_close_full_delete_timeout_halts__(tmp_path):
-    """Network timeout on DELETE → ``BrokerManualInterventionError``.
-
-    The sync engine cannot verify a parked close in-session
-    (``get_open_orders`` only returns working orders, not positions),
-    so the hook halts and lets recovery on next start drive the
-    contract via the persisted ``targets`` extras + the positions
-    snapshot.
-    """
+def __test_execute_close_full_delete_timeout_parks_for_recovery__(tmp_path):
+    """Network timeout on DELETE parks the persisted close command."""
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('error', 'positions/deal-L', 'delete'):
             httpx.TimeoutException('DELETE timeout'),
@@ -218,16 +209,13 @@ def __test_execute_close_full_delete_timeout_halts__(tmp_path):
         run_tag='test', bar_ts_ms=1700000000000,
     )
 
-    with pytest.raises(BrokerManualInterventionError):
+    with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.execute_close(env))
 
     cmd_coid = env.client_order_id(KIND_CLOSE)
     cmd_row = ctx.get_order(cmd_coid)
     assert cmd_row is not None
-    # The journal does not catch ``BrokerManualInterventionError`` so
-    # the command row stays at ``submitted`` — operator intervention
-    # / next-restart recovery resolves the state.
-    assert cmd_row.state == 'submitted'
+    assert cmd_row.state == 'disposition_unknown'
     extras = cmd_row.extras or {}
     assert extras.get('kind') == KIND_FULL_CLOSE
     # Targets captured in extras so recovery can reconcile against the

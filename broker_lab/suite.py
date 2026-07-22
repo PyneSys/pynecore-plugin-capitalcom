@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.core.broker.models import LegType, OrderStatus, OrderType
 from pynecore.core.ohlcv_file import OHLCVReader
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
@@ -48,10 +49,34 @@ class OfflineCapitalCom(CapitalCom):
         self.rest_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self._references: dict[str, str] = {}
 
+    def _matches_fault(self, endpoint: str, method: str) -> bool:
+        return (
+            not self.profile.fault_consumed
+            and self.profile.fault_endpoint == endpoint
+            and self.profile.fault_method == method
+        )
+
+    def _raise_pre_write_fault(self, endpoint: str, method: str) -> None:
+        if not self._matches_fault(endpoint, method):
+            return
+        if not self.profile.fault_before_write:
+            return
+        self.profile.fault_consumed = True
+        self.profile.fault_barriers.append((endpoint, method, False))
+        raise ExchangeConnectionError("offline pre-write control fault")
+
+    def _raise_post_write_fault(self, endpoint: str, method: str) -> None:
+        if not self._matches_fault(endpoint, method):
+            return
+        self.profile.fault_consumed = True
+        self.profile.fault_barriers.append((endpoint, method, True))
+        raise ExchangeConnectionError("offline post-write response suppression")
+
     async def _call(self, endpoint: str, *, data=None, method: str = "post"):
         payload = dict(data) if data is not None else None
         self.rest_calls.append((endpoint, method, payload))
         self.profile.transport_calls.append((endpoint, method, payload))
+        self._raise_pre_write_fault(endpoint, method)
         if endpoint == f"markets/{self.profile.symbol}" and method == "get":
             return _RULES
         if endpoint == "workingorders" and method == "post":
@@ -62,6 +87,7 @@ class OfflineCapitalCom(CapitalCom):
             self.profile.working_orders[deal_id] = {
                 "workingOrderData": {
                     "dealId": deal_id,
+                    "dealReference": ref,
                     "direction": payload["direction"],
                     "orderType": payload["type"],
                     "orderLevel": payload["level"],
@@ -70,6 +96,21 @@ class OfflineCapitalCom(CapitalCom):
                 },
                 "market": {"epic": payload["epic"]},
             }
+            now = datetime.now(UTC).isoformat()
+            self.profile.polled_activities.append(
+                {
+                    "dateUTC": now,
+                    "dealId": deal_id,
+                    "dealReference": ref,
+                    "epic": payload["epic"],
+                    "direction": payload["direction"],
+                    "size": payload["size"],
+                    "source": "USER",
+                    "status": "ACCEPTED",
+                    "type": "WORKING_ORDER",
+                }
+            )
+            self._raise_post_write_fault(endpoint, method)
             return {"dealReference": ref}
         if endpoint == "workingorders" and method == "get":
             return {"workingOrders": list(self.profile.working_orders.values())}
@@ -86,6 +127,7 @@ class OfflineCapitalCom(CapitalCom):
                     if residual >= 0.0:
                         position["size"] = residual
                         break
+            self._raise_post_write_fault(endpoint, method)
             return {"dealReference": ref}
         if endpoint == "positions" and method == "get":
             return {"positions": list(self.profile.positions.values())}
@@ -94,6 +136,12 @@ class OfflineCapitalCom(CapitalCom):
         if endpoint.startswith("positions/") and method == "delete":
             deal_id = endpoint.removeprefix("positions/")
             self.profile.positions.pop(deal_id, None)
+            if self._matches_fault(endpoint, method):
+                self.profile.state.position_owners[self.run_name] = 0.0
+                self.profile.state.position = sum(
+                    self.profile.state.position_owners.values()
+                )
+            self._raise_post_write_fault(endpoint, method)
             return {}
         if endpoint.startswith("positions/") and method == "put":
             deal_id = endpoint.removeprefix("positions/")
@@ -108,6 +156,7 @@ class OfflineCapitalCom(CapitalCom):
                     position["trailingStop"] = payload["trailingStop"]
                 if "stopDistance" in payload:
                     position["stopDistance"] = payload["stopDistance"]
+            self._raise_post_write_fault(endpoint, method)
             return {"dealReference": "bracket-attach"}
         if endpoint.startswith("confirms/") and method == "get":
             ref = endpoint.removeprefix("confirms/")
@@ -276,11 +325,78 @@ class CapitalComProfile(ReferenceVenueProfile):
         self.polled_activities: list[dict[str, Any]] = []
         self.transport_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.manual_close_events = 0
+        self.fault_endpoint: str | None = None
+        self.fault_method: str | None = None
+        self.fault_consumed = False
+        self.fault_before_write = False
+        self.fault_barriers: list[tuple[str, str, bool]] = []
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCapitalCom:
         return OfflineCapitalCom(self, run_name, store_ctx)
 
     def handle_step(self, runner: Any, step: Step) -> bool:
+        if step.kind == "arm_capital_transport_fault":
+            self.fault_endpoint = str(step.values["endpoint"])
+            self.fault_method = str(step.values["method"])
+            self.fault_consumed = False
+            return True
+        if step.kind == "expect_capital_post_write_barrier":
+            endpoint = str(step.values["endpoint"])
+            method = str(step.values["method"])
+            matching = [
+                barrier
+                for barrier in self.fault_barriers
+                if barrier[0] == endpoint and barrier[1] == method
+            ]
+            if len(matching) != 1:
+                raise AssertionError(
+                    f"expected one exact Capital.com transport barrier, got {matching}"
+                )
+            if not matching[0][2]:
+                raise AssertionError(
+                    "Capital.com post-write barrier fired before venue mutation"
+                )
+            return True
+        if step.kind == "capital_recover_inflight":
+            runtime = runner.runs[step.run]
+
+            async def recover() -> None:
+                await runtime.broker._recover_in_flight_submissions()
+                async for event in runtime.broker._poll_once():
+                    runtime.engine.on_order_event(event)
+
+            asyncio.run(recover())
+            runtime.engine.apply_async_events()
+            return True
+        if step.kind == "expect_capital_transport_attempts":
+            endpoint = str(step.values["endpoint"])
+            method = str(step.values["method"])
+            expected = int(step.values.get("count", 1))
+            actual = sum(
+                call[0] == endpoint and call[1] == method
+                for call in self.transport_calls
+            )
+            if actual != expected:
+                raise AssertionError(
+                    f"expected {expected} {method.upper()} {endpoint} attempts, got {actual}"
+                )
+            return True
+        if step.kind == "expect_capital_recovered_working_order":
+            runtime = runner.runs[step.run]
+            if len(self.working_orders) != 1:
+                raise AssertionError(
+                    f"expected one venue working order, got {self.working_orders}"
+                )
+            rows = [
+                row
+                for row in runtime.store_ctx.iter_live_orders(symbol=self.symbol)
+                if (row.extras or {}).get("kind") == "working"
+            ]
+            if len(rows) != 1 or rows[0].state != "confirmed":
+                raise AssertionError(
+                    f"Capital.com POST disposition did not recover: {rows}"
+                )
+            return True
         if step.kind == "capital_concurrent_session_bootstrap":
             import pynecore_capitalcom.rest as capital_rest
 
@@ -933,6 +1049,14 @@ class BrokenManualCloseRetireProfile(CapitalComProfile):
     restore_retired_manual_close_intents = True
 
 
+class PreWriteFaultControlProfile(CapitalComProfile):
+    """Control profile proving that the exact barrier follows venue mutation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fault_before_write = True
+
+
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
     return [
         Scenario(
@@ -1073,6 +1197,184 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("sync", values={"last_price": 1.10}),
                 Step("capital_activity_fill", values={"price": 1.10}),
                 Step("expect", values={"position": 1.0, "engine_position": 1.0}),
+            ),
+        ),
+        Scenario(
+            name="capitalcom-post-write-post-loss-recovers-without-duplicate",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(
+                Step(
+                    "entry",
+                    values={"id": "Pending", "side": "buy", "qty": 1.0, "limit": 1.09},
+                ),
+                Step(
+                    "arm_capital_transport_fault",
+                    values={"endpoint": "workingorders", "method": "post"},
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_post_write_barrier",
+                    values={"endpoint": "workingorders", "method": "post"},
+                ),
+                Step("capital_recover_inflight"),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_transport_attempts",
+                    values={"endpoint": "workingorders", "method": "post", "count": 1},
+                ),
+                Step("expect_capital_recovered_working_order"),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-post-barrier-before-write-is-detected",
+            profile_factory=PreWriteFaultControlProfile,
+            seed=seed,
+            expected_violation=(
+                "Capital.com post-write barrier fired before venue mutation"
+            ),
+            steps=(
+                Step(
+                    "entry",
+                    values={"id": "Pending", "side": "buy", "qty": 1.0, "limit": 1.09},
+                ),
+                Step(
+                    "arm_capital_transport_fault",
+                    values={"endpoint": "workingorders", "method": "post"},
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_post_write_barrier",
+                    values={"endpoint": "workingorders", "method": "post"},
+                ),
+            ),
+        ),
+        Scenario(
+            name="capitalcom-post-write-put-loss-reconciles-without-duplicate",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "Bracket",
+                        "from_entry": "Long",
+                        "side": "sell",
+                        "qty": 1.0,
+                        "limit": 1.20,
+                        "stop": 1.05,
+                    },
+                ),
+                Step(
+                    "arm_capital_transport_fault",
+                    values={"endpoint": "positions/lab-2", "method": "put"},
+                ),
+                Step("sync", values={"last_price": 1.10}, check_invariants=False),
+                Step(
+                    "expect_capital_post_write_barrier",
+                    values={"endpoint": "positions/lab-2", "method": "put"},
+                    check_invariants=False,
+                ),
+                Step("capital_recover_inflight", check_invariants=False),
+                Step("sync", values={"last_price": 1.10}, check_invariants=False),
+                Step(
+                    "expect_capital_transport_attempts",
+                    values={"endpoint": "positions/lab-2", "method": "put", "count": 1},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_capital_position_snapshot",
+                    values={"profitLevel": 1.20, "stopLevel": 1.05},
+                    check_invariants=False,
+                ),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-put-barrier-before-write-is-detected",
+            profile_factory=PreWriteFaultControlProfile,
+            seed=seed,
+            expected_violation=(
+                "Capital.com post-write barrier fired before venue mutation"
+            ),
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "Bracket",
+                        "from_entry": "Long",
+                        "side": "sell",
+                        "qty": 1.0,
+                        "limit": 1.20,
+                        "stop": 1.05,
+                    },
+                ),
+                Step(
+                    "arm_capital_transport_fault",
+                    values={"endpoint": "positions/lab-2", "method": "put"},
+                ),
+                Step("sync", values={"last_price": 1.10}, check_invariants=False),
+                Step(
+                    "expect_capital_post_write_barrier",
+                    values={"endpoint": "positions/lab-2", "method": "put"},
+                ),
+            ),
+        ),
+        Scenario(
+            name="capitalcom-post-write-delete-loss-recovers-without-double-close",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step("close", values={"id": "Long", "qty": 1.0}),
+                Step(
+                    "arm_capital_transport_fault",
+                    values={"endpoint": "positions/lab-2", "method": "delete"},
+                ),
+                Step("sync", values={"last_price": 1.10}, check_invariants=False),
+                Step(
+                    "expect_capital_post_write_barrier",
+                    values={"endpoint": "positions/lab-2", "method": "delete"},
+                    check_invariants=False,
+                ),
+                Step("restart", check_invariants=False),
+                Step("capital_recover_inflight", check_invariants=False),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_transport_attempts",
+                    values={"endpoint": "positions/lab-2", "method": "delete", "count": 1},
+                ),
+                Step("expect", values={"position": 0.0, "engine_position": 0.0}),
+            ),
+        ),
+        Scenario(
+            name="control-capitalcom-delete-barrier-before-write-is-detected",
+            profile_factory=PreWriteFaultControlProfile,
+            seed=seed,
+            expected_violation=(
+                "Capital.com post-write barrier fired before venue mutation"
+            ),
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step("close", values={"id": "Long", "qty": 1.0}),
+                Step(
+                    "arm_capital_transport_fault",
+                    values={"endpoint": "positions/lab-2", "method": "delete"},
+                ),
+                Step("sync", values={"last_price": 1.10}, check_invariants=False),
+                Step(
+                    "expect_capital_post_write_barrier",
+                    values={"endpoint": "positions/lab-2", "method": "delete"},
+                ),
             ),
         ),
         Scenario(

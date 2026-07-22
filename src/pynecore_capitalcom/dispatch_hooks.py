@@ -559,14 +559,12 @@ class _CapitalComCloseHooks:
         activity stream's subsequent ``CLOSED`` event can match the
         local row.
 
-        Network errors raise :class:`BrokerManualInterventionError`
-        rather than :class:`OrderDispositionUnknownError`: a parked
-        close cannot be verified in-session because
-        :meth:`get_open_orders` only returns working orders, not
-        positions, so the parked intent would never resolve while a
-        position may remain open. Halting hands the ambiguity to the
-        operator; recovery on next start verifies the DELETE landed by
-        checking each target ``dealId`` against the positions snapshot.
+        Network errors raise :class:`OrderDispositionUnknownError`. The
+        persist-first close command retains every target ``dealId`` and restart
+        recovery resolves the ambiguity against the authoritative positions
+        snapshot. Treating the same condition as manual intervention would
+        permanently halt the engine even when the DELETE landed and the venue
+        is already flat.
         """
         store_ctx = self._plugin.store_ctx
         applied_targets: list[str] = []
@@ -577,16 +575,11 @@ class _CapitalComCloseHooks:
                 )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
-                raise BrokerManualInterventionError(
+                raise OrderDispositionUnknownError(
                     f"Capital DELETE positions/{row.exchange_order_id} "
                     f"ambiguous during full close: {net}",
-                    intent_key=intent.intent_key,
-                    context={
-                        'coid': coid,
-                        'target_deal_id': row.exchange_order_id,
-                        'symbol': intent.symbol,
-                        'error': str(net),
-                    },
+                    client_order_id=coid,
+                    cause=net if isinstance(net, Exception) else None,
                 ) from net
             except OrderNotFoundError:
                 # Target vanished between local snapshot and the DELETE
