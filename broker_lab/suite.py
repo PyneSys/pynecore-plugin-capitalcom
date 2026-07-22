@@ -96,6 +96,18 @@ class OfflineCapitalCom(CapitalCom):
             self.profile.positions.pop(deal_id, None)
             return {}
         if endpoint.startswith("positions/") and method == "put":
+            deal_id = endpoint.removeprefix("positions/")
+            raw = self.profile.positions.get(deal_id)
+            if raw is not None and payload is not None:
+                position = raw["position"]
+                if "profitLevel" in payload:
+                    position["profitLevel"] = payload["profitLevel"]
+                if "stopLevel" in payload:
+                    position["stopLevel"] = payload["stopLevel"]
+                if "trailingStop" in payload:
+                    position["trailingStop"] = payload["trailingStop"]
+                if "stopDistance" in payload:
+                    position["stopDistance"] = payload["stopDistance"]
             return {"dealReference": "bracket-attach"}
         if endpoint.startswith("confirms/") and method == "get":
             ref = endpoint.removeprefix("confirms/")
@@ -681,6 +693,22 @@ class CapitalComProfile(ReferenceVenueProfile):
                     f"Capital.com bracket did not expose two reduce-only legs: {legs}"
                 )
             return True
+        if step.kind == "expect_capital_position_snapshot":
+            runtime = runner.runs[step.run]
+            snapshot = asyncio.run(runtime.broker._call("positions", method="get"))
+            positions = snapshot.get("positions") or []
+            if len(positions) != 1:
+                raise AssertionError(
+                    f"expected one Capital.com position, got {len(positions)}"
+                )
+            position = positions[0].get("position") or {}
+            for key, value in step.values.items():
+                if position.get(key) != value:
+                    raise AssertionError(
+                        f"expected Capital.com position {key}={value!r}, "
+                        f"got {position.get(key)!r}"
+                    )
+            return True
         if step.kind == "expect_capital_bracket_clear_requests":
             requests = [
                 call
@@ -717,6 +745,7 @@ class CapitalComProfile(ReferenceVenueProfile):
             ]
             expected_deletes = int(step.values.get("deletes", 0))
             expected_posts = int(step.values.get("posts", 1))
+            expected_bracket_puts = int(step.values.get("bracket_puts", 0))
             if len(deletes) != expected_deletes:
                 raise AssertionError(
                     f"expected {expected_deletes} Capital.com position DELETEs, "
@@ -727,10 +756,10 @@ class CapitalComProfile(ReferenceVenueProfile):
                     f"expected {expected_posts} Capital.com position POSTs, "
                     f"got {len(position_posts)}"
                 )
-            if bracket_puts:
+            if len(bracket_puts) != expected_bracket_puts:
                 raise AssertionError(
-                    "marketable Capital.com exit was incorrectly dispatched "
-                    f"as native bracket PUT: {bracket_puts}"
+                    f"expected {expected_bracket_puts} Capital.com bracket PUTs, "
+                    f"got {len(bracket_puts)}: {bracket_puts}"
                 )
             if "size" in step.values:
                 body = position_posts[-1][2] or {}
@@ -1058,6 +1087,49 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 ),
                 Step("capital_activity_close", values={"qty": 0.5, "price": 1.10}),
                 Step("expect", values={"position": 1.5, "engine_position": 1.5}),
+            ),
+        ),
+        Scenario(
+            name="capitalcom-protected-partial-close-preserves-venue-protection",
+            profile_factory=CapitalComProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "Long", "side": "buy", "qty": 2.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("capital_activity_fill", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "Bracket",
+                        "from_entry": "Long",
+                        "side": "sell",
+                        "qty": 2.0,
+                        "limit": 1.20,
+                        "stop": 1.05,
+                    },
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_position_snapshot",
+                    values={"size": 2.0, "profitLevel": 1.20, "stopLevel": 1.05},
+                ),
+                Step("close", values={"id": "Long", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_capital_close_route",
+                    values={
+                        "deletes": 0,
+                        "posts": 2,
+                        "size": 1.0,
+                        "bracket_puts": 1,
+                    },
+                ),
+                Step(
+                    "expect_capital_position_snapshot",
+                    values={"size": 1.0, "profitLevel": 1.20, "stopLevel": 1.05},
+                ),
+                Step("capital_activity_close", values={"qty": 1.0, "price": 1.10}),
+                Step("expect", values={"position": 1.0, "engine_position": 1.0}),
             ),
         ),
         Scenario(
