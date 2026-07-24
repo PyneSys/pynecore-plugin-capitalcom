@@ -11,9 +11,21 @@ name = "pynesys-pynecore-capitalcom"
 version = "0.9.1"
 description = "Capital.com integration for PyneCore"
 authors = [{ name = "PYNESYS LLC", email = "hello@pynesys.com" }]
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = ["pynesys-pynecore>=6.6", "httpx", "pycryptodome", "websockets"]
+
+[project.urls]
+"Homepage" = "https://pynecore.org"
+"Repository" = "https://github.com/PyneSys/pynecore-plugin-capitalcom"
+"Documentation" = "https://pynecore.org/docs"
+"Issues" = "https://github.com/PyneSys/pynecore-plugin-capitalcom/issues"
+
+# Social
+"X" = "https://x.com/pynesys"
+"Discord" = "https://discord.com/invite/jegnhtq6gy"
+"Reddit" = "https://www.reddit.com/r/pynesys"
 
 [project.entry-points."pyne.plugin"]
 capitalcom = "pynecore_capitalcom:CapitalCom"
