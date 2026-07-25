@@ -1562,6 +1562,11 @@ class _StreamingMixin(_CapitalComBase):
         if price_type != "bid":
             return None
         timestamp = int(payload["t"] / 1000)
+        if (
+            self._last_bar_timestamp is not None
+            and timestamp <= self._last_bar_timestamp
+        ):
+            return None
         # The payload is pre-enriched with ``_volume`` by either
         # :meth:`_volume_backfill_worker_loop` (regular WS path) or
         # :meth:`_fetch_bar_payload` (watchdog REST-inject path). The

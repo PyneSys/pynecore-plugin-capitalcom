@@ -4834,6 +4834,32 @@ def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypa
     assert recovered == [("ohlc", 1_060_000), ("ohlc", 1_120_000)]
 
 
+def __test_late_ws_bar_after_watchdog_rest_recovery_is_deduplicated__():
+    """A late WS event must not repeat a bar already injected from REST."""
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    recovered = {
+        "priceType": "bid",
+        "t": 1_060_000,
+        "o": 1.0,
+        "h": 1.1,
+        "l": 0.9,
+        "c": 1.05,
+        "_volume": 123.0,
+    }
+    late_ws = {**recovered, "_volume": 124.0}
+
+    first = broker._on_ohlc_event(recovered)
+    duplicate = broker._on_ohlc_event(late_ws)
+
+    assert first is not None
+    assert first.timestamp == 1_060
+    assert duplicate is None
+
+
 def __test_resolve_bracket_leg_disposition_force_rejected_marker_overrides_native_trail_match__(tmp_path):
     """The force-rejected marker must override the native-trailing
     branch too: existing native-trail SL → pending-trail transition
