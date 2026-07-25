@@ -25,7 +25,6 @@ dependencies = ["pynesys-pynecore>=6.6.0", "httpx", "pycryptodome", "websockets"
 # Social
 "X" = "https://x.com/pynesys"
 "Discord" = "https://discord.com/invite/jegnhtq6gy"
-"Reddit" = "https://www.reddit.com/r/pynesys"
 
 [project.entry-points."pyne.plugin"]
 capitalcom = "pynecore_capitalcom:CapitalCom"
