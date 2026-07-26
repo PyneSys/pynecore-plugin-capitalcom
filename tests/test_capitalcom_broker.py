@@ -4860,6 +4860,62 @@ def __test_late_ws_bar_after_watchdog_rest_recovery_is_deduplicated__():
     assert duplicate is None
 
 
+def __test_reopen_drops_stale_previous_session_ws_bar__(monkeypatch):
+    """Capital.com can replay the previous session's close on reopen."""
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    broker._update_queue = asyncio.Queue()
+    broker._raw_ohlc_queue = asyncio.Queue()
+
+    stale_timestamp = 1_000
+    now = stale_timestamp + 48 * 60 * 60
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.epoch_time",
+        lambda: float(now),
+    )
+
+    class _ReplayWS:
+        close_code = None
+
+        def __init__(self):
+            self._frames = iter(
+                [
+                    json.dumps(
+                        {
+                            "destination": "ohlc.event",
+                            "payload": {
+                                "priceType": "bid",
+                                "t": stale_timestamp * 1000,
+                                "o": 1.0,
+                                "h": 1.1,
+                                "l": 0.9,
+                                "c": 1.05,
+                            },
+                        }
+                    )
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._frames)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    broker._ws = _ReplayWS()
+
+    asyncio.run(broker._listen_loop())
+
+    assert broker._last_bar_open_ts == 0.0
+    assert broker._raw_ohlc_queue.get_nowait() == ("disconnect", None)
+
+
 def __test_resolve_bracket_leg_disposition_force_rejected_marker_overrides_native_trail_match__(tmp_path):
     """The force-rejected marker must override the native-trailing
     branch too: existing native-trail SL → pending-trail transition

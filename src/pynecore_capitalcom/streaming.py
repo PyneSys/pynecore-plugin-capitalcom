@@ -33,7 +33,7 @@ from websockets.exceptions import WebSocketException
 
 from pynecore.core.plugin import override
 from pynecore.lib.log import broker_info, broker_warning
-from pynecore.lib.session import _is_in_session, _is_point_in_session
+from pynecore.core.session import is_in_session, is_point_in_session
 from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
@@ -79,7 +79,7 @@ class _StreamingMixin(_CapitalComBase):
         except Exception:  # noqa: BLE001
             return True
         local_dt = datetime.fromtimestamp(epoch_time(), tz=tz)
-        return _is_point_in_session(sym_info.opening_hours, local_dt)
+        return is_point_in_session(sym_info.opening_hours, local_dt)
 
     def _market_open_at(self, epoch_ts: float) -> bool:
         """True iff the symbol's opening_hours mark ``epoch_ts`` as open.
@@ -102,7 +102,7 @@ class _StreamingMixin(_CapitalComBase):
         assert self.timeframe is not None
         tf_seconds = max(1, int(in_seconds(self.timeframe)))
         local_dt = datetime.fromtimestamp(epoch_ts, tz=tz)
-        return _is_in_session(sym_info.opening_hours, local_dt, tf_seconds)
+        return is_in_session(sym_info.opening_hours, local_dt, tf_seconds)
 
     # --- LiveProviderPlugin (WebSocket) ------------------------------------
 
@@ -203,6 +203,21 @@ class _StreamingMixin(_CapitalComBase):
                         self._last_ohlc_event_ts = epoch_time()
                         t_ms = payload_dict.get("t")
                         if t_ms is not None:
+                            timestamp = int(t_ms) // 1000
+                            tf_seconds = (
+                                int(in_seconds(self.timeframe))
+                                if self.timeframe is not None
+                                else 60
+                            )
+                            max_live_age = max(300, 3 * tf_seconds)
+                            if epoch_time() - timestamp > max_live_age:
+                                broker_warning(
+                                    "dropping stale Capital.com WS OHLC "
+                                    "event ts=%d age=%.1fs",
+                                    timestamp,
+                                    epoch_time() - timestamp,
+                                )
+                                continue
                             # Stamp the bar OPEN of the latest forwarded
                             # event so the OHLC watchdog can anchor on
                             # the same axis as live_runner's synth

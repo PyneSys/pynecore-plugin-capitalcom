@@ -877,7 +877,7 @@ class CapitalComProfile(ReferenceVenueProfile):
                 _missing_slots,
             )
             from pynecore.core.syminfo import SymInfoInterval
-            from pynecore.lib.session import _is_point_in_session
+            from pynecore.core.session import is_point_in_session
 
             boundary_dir = runner.workdir / "capital-weekend-boundary"
             boundary_dir.mkdir(parents=True, exist_ok=True)
@@ -899,7 +899,7 @@ class CapitalComProfile(ReferenceVenueProfile):
             sunday_preopen = datetime(2025, 1, 12, 16, 59, tzinfo=eastern)
             sunday_open = datetime(2025, 1, 12, 17, 0, tzinfo=eastern)
             observed_calendar = [
-                _is_point_in_session(sym_info.opening_hours, moment)
+                is_point_in_session(sym_info.opening_hours, moment)
                 for moment in (friday_last, saturday, sunday_preopen, sunday_open)
             ]
             if (
