@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.core.broker.models import LegType, OrderStatus, OrderType
-from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.ohlcv import OHLCVReader
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
 from pynecore.testing.broker_lab.reference import ReferenceVenueProfile, VenueOrder
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
@@ -858,7 +858,7 @@ class CapitalComProfile(ReferenceVenueProfile):
                 )
             with OHLCVReader(str(provider.ohlcv_path)) as reader:
                 actual = [bar.timestamp for bar in reader]
-            expected = [int(bar.replace(tzinfo=UTC).timestamp()) for bar in bars]
+            expected = [int(bar.replace(tzinfo=UTC).timestamp()) * 1000 for bar in bars]
             if actual != expected:
                 raise AssertionError(
                     f"Capital.com pagination gap/overlap: {actual} != {expected}"
@@ -1026,7 +1026,6 @@ class CapitalComProfile(ReferenceVenueProfile):
             )
             with _atomic_ohlcv_download_target(first):
                 with first as writer:
-                    writer.seek(0)
                     writer.truncate()
                     first.download_ohlcv(start, bars[-1] + timedelta(minutes=5))
 
@@ -1041,7 +1040,6 @@ class CapitalComProfile(ReferenceVenueProfile):
                 )
                 with _atomic_ohlcv_download_target(second):
                     with second as writer:
-                        writer.seek(0)
                         writer.truncate()
                         truncated.set()
                         if not allow_finish.wait(2.0):
@@ -1074,7 +1072,6 @@ class CapitalComProfile(ReferenceVenueProfile):
                 bars=[start], requested=[], ohlcv_dir=control_dir
             )
             with provider as writer:
-                writer.seek(0)
                 writer.truncate()
             with OHLCVReader(str(provider.ohlcv_path)) as reader:
                 if reader.end_timestamp is None:

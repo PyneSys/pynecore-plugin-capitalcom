@@ -10,7 +10,7 @@ import os
 import tempfile
 
 from pynecore_capitalcom import CapitalCom
-from pynecore.core.ohlcv_file import OHLCVReader
+from pynecore.core.ohlcv import OHLCVReader
 from pynecore.cli.app import app_state
 
 
@@ -144,7 +144,7 @@ def __test_capitalcom_pagination_covers_multipage_range__(tmp_path):
     with OHLCVReader(str(provider.ohlcv_path)) as reader:
         got = [b.timestamp for b in reader]
 
-    expected = [int(b.replace(tzinfo=UTC).timestamp()) for b in all_bars]
+    expected = [int(b.replace(tzinfo=UTC).timestamp()) * 1000 for b in all_bars]
     assert got == expected  # every bar, in order, no gaps or duplicates
 
 
@@ -174,7 +174,7 @@ def __test_capitalcom_pagination_non_minute_timeframe__(tmp_path):
     with OHLCVReader(str(provider.ohlcv_path)) as reader:
         got = [b.timestamp for b in reader]
 
-    expected = [int(b.replace(tzinfo=UTC).timestamp()) for b in all_bars]
+    expected = [int(b.replace(tzinfo=UTC).timestamp()) * 1000 for b in all_bars]
     assert got == expected
 
 
@@ -291,7 +291,8 @@ def __test_capitalcom_real_data_download__(tmp_path):
                 for candle in actual_candles:
                     candle_data.append({
                         "timestamp": candle.timestamp,
-                        "datetime": datetime.fromtimestamp(candle.timestamp, UTC).isoformat(),
+                        "datetime": datetime.fromtimestamp(
+                            candle.timestamp / 1000, UTC).isoformat(),
                         "open": float(candle.open),
                         "high": float(candle.high),
                         "low": float(candle.low),

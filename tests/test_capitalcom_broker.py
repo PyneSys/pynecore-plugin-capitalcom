@@ -4856,7 +4856,7 @@ def __test_late_ws_bar_after_watchdog_rest_recovery_is_deduplicated__():
     duplicate = broker._on_ohlc_event(late_ws)
 
     assert first is not None
-    assert first.timestamp == 1_060
+    assert first.timestamp == 1_060_000
     assert duplicate is None
 
 

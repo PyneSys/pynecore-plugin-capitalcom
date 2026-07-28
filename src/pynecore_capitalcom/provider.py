@@ -366,8 +366,9 @@ class _ProviderMixin(_CapitalComBase):
                     ask_l = float(p['lowPrice']['ask'])
                     ask_c = float(p['closePrice']['ask'])
 
+                    bar_open_s = int(t.replace(tzinfo=UTC).timestamp())
                     ohlcv = OHLCV(
-                        timestamp=int(t.replace(tzinfo=UTC).timestamp()),
+                        timestamp=bar_open_s * 1000,
                         open=bid_o, high=bid_h, low=bid_l, close=bid_c,
                         volume=float(p['lastTradedVolume']),
                         extra_fields={
@@ -389,7 +390,7 @@ class _ProviderMixin(_CapitalComBase):
                     # intra-bar update (``is_new_bar=False``) and does
                     # not advance ``bar_index``.
                     self._last_bar_ohlcv = ohlcv
-                    self._last_bar_timestamp = ohlcv.timestamp
+                    self._last_bar_timestamp = bar_open_s
                     # Advance the pagination cursor one full timeframe past
                     # the last stored bar. ``/prices`` treats ``from`` as
                     # inclusive, so ``t + interval`` starts the next page at

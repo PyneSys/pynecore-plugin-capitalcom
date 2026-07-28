@@ -96,6 +96,11 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     # ``Any`` keeps the annotation portable across versions.
     _ws: Any
     _ws_session_invalid: bool
+    # Bar OPEN of the most recent emitted closed bar, in epoch SECONDS —
+    # the axis every REST call, session-calendar check and watchdog
+    # deadline in this plugin runs on. The emitted
+    # :class:`~pynecore.types.ohlcv.OHLCV` carries the same instant in
+    # milliseconds, so the two must never be compared directly.
     _last_bar_timestamp: int | None
     _last_bar_ohlcv: OHLCV | None
     _update_queue: asyncio.Queue | None

@@ -1576,7 +1576,8 @@ class _StreamingMixin(_CapitalComBase):
         price_type = str(payload.get("priceType", "bid")).lower()
         if price_type != "bid":
             return None
-        timestamp = int(payload["t"] / 1000)
+        timestamp_ms = int(payload["t"])
+        timestamp = timestamp_ms // 1000
         if (
             self._last_bar_timestamp is not None
             and timestamp <= self._last_bar_timestamp
@@ -1591,7 +1592,7 @@ class _StreamingMixin(_CapitalComBase):
         # - doing so would corrupt the next bar's accumulator.
         volume = float(payload.get("_volume", 0.0))
         closed = OHLCV(
-            timestamp=timestamp,
+            timestamp=timestamp_ms,
             open=float(payload["o"]),
             high=float(payload["h"]),
             low=float(payload["l"]),
