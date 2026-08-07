@@ -10,6 +10,7 @@ pipeline at the end of warm-up so the very first quote can produce an
 intra-bar update).
 """
 from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal
 from time import time as epoch_time
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -219,11 +220,13 @@ class _ProviderMixin(_CapitalComBase):
 
         dealing_rules = market_details['dealingRules']
         mintick = dealing_rules['minStepDistance']["value"]
-        minmove = mintick
-        pricescale = 1
-        while minmove < 1.0:
-            pricescale *= 10
-            minmove *= 10
+        decimal_mintick = Decimal(str(mintick))
+        decimal_exponent = decimal_mintick.as_tuple().exponent
+        if type(decimal_exponent) is not int:
+            raise ValueError("Capital.com minStepDistance must be finite")
+        decimal_places = max(0, -decimal_exponent)
+        pricescale = 10 ** decimal_places
+        minmove = int(decimal_mintick * pricescale)
 
         # minDealSize is the smallest tradable amount — TV's mincontract
         # definition. 0.0 lets the provider chain fall back to volume
@@ -279,6 +282,12 @@ class _ProviderMixin(_CapitalComBase):
         live-runner reconnect loop.
         """
         sym_info = super().get_symbol_info(force_update=force_update)
+        minmove = int(sym_info.minmove)
+        pricescale = int(sym_info.pricescale)
+        if minmove != sym_info.minmove or pricescale != sym_info.pricescale:
+            raise ValueError("Capital.com tick grid must contain integer values")
+        sym_info.minmove = minmove
+        sym_info.pricescale = pricescale
         self._sym_info = sym_info
         return sym_info
 

@@ -200,7 +200,7 @@ class _StreamingMixin(_CapitalComBase):
                             # would mask the missing bid bar from the
                             # OHLC watchdog.
                             continue
-                        self._last_ohlc_event_ts = epoch_time()
+                        now = epoch_time()
                         t_ms = payload_dict.get("t")
                         if t_ms is not None:
                             timestamp = int(t_ms) // 1000
@@ -209,13 +209,22 @@ class _StreamingMixin(_CapitalComBase):
                                 if self.timeframe is not None
                                 else 60
                             )
+                            closes_at = timestamp + tf_seconds
+                            if now < closes_at:
+                                broker_warning(
+                                    "dropping premature Capital.com WS OHLC "
+                                    "event ts=%d closes_in=%.1fs",
+                                    timestamp,
+                                    closes_at - now,
+                                )
+                                continue
                             max_live_age = max(300, 3 * tf_seconds)
-                            if epoch_time() - timestamp > max_live_age:
+                            if now - timestamp > max_live_age:
                                 broker_warning(
                                     "dropping stale Capital.com WS OHLC "
                                     "event ts=%d age=%.1fs",
                                     timestamp,
-                                    epoch_time() - timestamp,
+                                    now - timestamp,
                                 )
                                 continue
                             # Stamp the bar OPEN of the latest forwarded
@@ -223,6 +232,7 @@ class _StreamingMixin(_CapitalComBase):
                             # the same axis as live_runner's synth
                             # deadline (bar-time, not arrival-wallclock).
                             self._last_bar_open_ts = float(t_ms) / 1000.0
+                        self._last_ohlc_event_ts = now
                         # The worker owns volume resolution end-to-end:
                         # it reads ``_ws_quote_buckets[bar_open_s]``
                         # (filled by the quote branch using per-quote

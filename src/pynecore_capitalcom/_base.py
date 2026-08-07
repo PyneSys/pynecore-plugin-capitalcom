@@ -28,6 +28,7 @@ LiveProviderPlugin → ProviderPlugin → Plugin → object``.
 import asyncio
 import collections
 import threading
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from pynecore.core.broker.models import (
@@ -62,6 +63,23 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     # runtime ``__init__`` asserts the value is a ``CapitalComConfig``,
     # so every method can treat it as non-``None``.
     config: CapitalComConfig
+
+    if TYPE_CHECKING:
+        def __call__(
+                self,
+                endpoint: str,
+                *,
+                data: dict | None = None,
+                method: str = 'post',
+                _level: int = 0,
+        ) -> dict: ...
+
+        def get_historical_prices(
+                self,
+                time_from: datetime | None = None,
+                time_to: datetime | None = None,
+                limit: int = 1000,
+        ) -> dict: ...
 
     # --- REST/auth state ---
     security_token: str | None

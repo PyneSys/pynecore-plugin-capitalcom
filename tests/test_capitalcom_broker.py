@@ -4568,6 +4568,46 @@ def __test_listen_loop_sentinel_targets_local_queue_not_successor__(tmp_path):
     assert payload is None
 
 
+def __test_listen_loop_drops_premature_ohlc_without_advancing_liveness__(
+        monkeypatch,
+):
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    premature = json.dumps({
+        "destination": "ohlc.event",
+        "payload": {
+            "priceType": "bid",
+            "t": 1_060_000,
+        },
+    })
+    closed = json.dumps({
+        "destination": "ohlc.event",
+        "payload": {
+            "priceType": "bid",
+            "t": 1_000_000,
+        },
+    })
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.epoch_time",
+        lambda: 1_061.0,
+    )
+
+    _drive_listener_with_frames(broker, [premature, closed])
+
+    event_type, payload = broker._raw_ohlc_queue.get_nowait()
+    assert event_type == "ohlc"
+    assert payload["t"] == 1_000_000
+    event_type, payload = broker._raw_ohlc_queue.get_nowait()
+    assert event_type == "disconnect"
+    assert payload is None
+    assert broker._raw_ohlc_queue.empty()
+    assert broker._last_ohlc_event_ts == 1_061.0
+    assert broker._last_bar_open_ts == 1_000.0
+
+
 def __test_listen_loop_flags_session_invalid_error_frame__():
     """A WS ERROR frame with a session-invalid code must flag re-auth.
 
@@ -7341,6 +7381,33 @@ def __test_parse_opening_hours_bare_dash_returns_none__():
     assert _parse_opening_hours_segment("- 17:00") is None
 
 
+def __test_get_symbol_info_normalizes_cached_integer_tick_grid__(monkeypatch):
+    from pynecore_capitalcom._base import _CapitalComBase
+
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    class CachedSymbolInfo:
+        minmove = 1.0
+        pricescale = 100000
+
+    cached = CachedSymbolInfo()
+    monkeypatch.setattr(
+        _CapitalComBase,
+        "get_symbol_info",
+        lambda _self, force_update=False: cached,
+    )
+
+    info = broker.get_symbol_info()
+
+    assert info.minmove == 1
+    assert type(info.minmove) is int
+    assert info.pricescale == 100000
+    assert type(info.pricescale) is int
+
+
 def __test_update_symbol_info_dash_closed_marker_does_not_open_24h__(monkeypatch):
     """Integration: ``openingHours`` weekday entries that contain only a
     bare ``"-"`` (Capital.com closed-day marker on some symbols) must
@@ -7387,6 +7454,10 @@ def __test_update_symbol_info_dash_closed_marker_does_not_open_24h__(monkeypatch
     monkeypatch.setattr(broker, 'get_historical_prices', fake_historical_prices)
 
     info = broker.update_symbol_info()
+    assert info.mintick == 0.01
+    assert info.minmove == 1
+    assert type(info.minmove) is int
+    assert info.pricescale == 100
     sat = Weekdays.Sat.value
     sun = Weekdays.Sun.value
     weekend_intervals = [iv for iv in info.opening_hours
