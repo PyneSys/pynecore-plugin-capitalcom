@@ -38,6 +38,7 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
+from .exceptions import CapitalComError
 from .rest import _SESSION_RECREATE_CODES
 from .helpers import (
     WS_URL,
@@ -1130,14 +1131,15 @@ class _StreamingMixin(_CapitalComBase):
                 time_from = datetime.fromtimestamp(
                     cursor, tz=timezone.utc,
                 ).replace(tzinfo=None)
-                time_to = datetime.fromtimestamp(
-                    current_bar_open, tz=timezone.utc,
-                ).replace(tzinfo=None)
-                res = self.get_historical_prices(
-                    time_from=time_from,
-                    time_to=time_to,
-                    limit=1000,
-                )
+                try:
+                    res = self.get_historical_prices(
+                        time_from=time_from,
+                        limit=1000,
+                    )
+                except CapitalComError as exc:
+                    if 'error.prices.not-found' in str(exc):
+                        break
+                    raise
                 prices = res.get('prices') or []
                 if not prices:
                     break

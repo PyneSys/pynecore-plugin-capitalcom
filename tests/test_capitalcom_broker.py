@@ -3,10 +3,12 @@
 """
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
+import pynecore_capitalcom.streaming as streaming_module
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
     BracketAttachAfterFillRejectedError,
@@ -9500,6 +9502,106 @@ def __test_call_proactive_refresh_skipped_for_bootstrap_endpoints__(monkeypatch)
     broker('session/encryptionKey', method='get')
     broker('session', data={'identifier': 'x'}, method='post')
     assert refresh_called == []
+
+
+# noinspection PyProtectedMember
+
+def __test_reconnect_gap_history_omits_wide_to_and_accepts_closed_session__(
+        monkeypatch,
+):
+    """Reconnect paging must not submit the full weekend range as ``to``."""
+    broker = _FakeBroker(
+        config=_make_config(), symbol="EURUSD", timeframe="1",
+    )
+    broker._last_bar_timestamp = int(
+        datetime(2026, 8, 7, 20, 59, tzinfo=timezone.utc).timestamp()
+    )
+    requests: list[tuple[datetime | None, datetime | None, int]] = []
+    warnings: list[tuple[str, tuple]] = []
+
+    def fake_get_historical_prices(
+            time_from=None, time_to=None, limit=1000,
+    ):
+        requests.append((time_from, time_to, limit))
+        if time_to is not None:
+            raise CapitalComError(
+                "API error occured: error.invalid.max.daterange"
+            )
+        raise CapitalComError("API error occured: error.prices.not-found")
+
+    monkeypatch.setattr(
+        broker, "get_historical_prices", fake_get_historical_prices,
+    )
+    monkeypatch.setattr(
+        streaming_module,
+        "broker_warning",
+        lambda message, *args: warnings.append((message, args)),
+    )
+
+    current_bar_open = int(
+        datetime(2026, 8, 9, 20, 45, tzinfo=timezone.utc).timestamp()
+    )
+    assert broker._fetch_reconnect_gap_payloads(current_bar_open) == []
+    assert requests == [(datetime(2026, 8, 7, 21, 0), None, 1000)]
+    assert warnings == []
+
+
+# noinspection PyProtectedMember
+
+def __test_reconnect_gap_history_pages_from_last_returned_bar__(monkeypatch):
+    """Each reconnect page starts one timeframe after the prior last row."""
+    broker = _FakeBroker(
+        config=_make_config(), symbol="EURUSD", timeframe="1",
+    )
+    broker._last_bar_timestamp = int(
+        datetime(2026, 8, 7, 20, 59, tzinfo=timezone.utc).timestamp()
+    )
+    requests: list[tuple[datetime | None, datetime | None, int]] = []
+
+    def price(bar_open: datetime, value: float) -> dict:
+        return {
+            "snapshotTimeUTC": bar_open.isoformat(),
+            "openPrice": {"bid": value},
+            "highPrice": {"bid": value + 0.1},
+            "lowPrice": {"bid": value - 0.1},
+            "closePrice": {"bid": value + 0.05},
+            "lastTradedVolume": value,
+        }
+
+    pages = [
+        {
+            "prices": [
+                price(datetime(2026, 8, 9, 21, 0), 1.0),
+                price(datetime(2026, 8, 9, 21, 1), 2.0),
+            ]
+        },
+        {"prices": [price(datetime(2026, 8, 9, 21, 2), 3.0)]},
+    ]
+
+    def fake_get_historical_prices(
+            time_from=None, time_to=None, limit=1000,
+    ):
+        requests.append((time_from, time_to, limit))
+        return pages[len(requests) - 1]
+
+    monkeypatch.setattr(
+        broker, "get_historical_prices", fake_get_historical_prices,
+    )
+
+    current_bar_open = int(
+        datetime(2026, 8, 9, 21, 3, tzinfo=timezone.utc).timestamp()
+    )
+    payloads = broker._fetch_reconnect_gap_payloads(current_bar_open)
+
+    assert requests == [
+        (datetime(2026, 8, 7, 21, 0), None, 1000),
+        (datetime(2026, 8, 9, 21, 2), None, 1000),
+    ]
+    assert [payload["t"] for payload in payloads] == [
+        int(datetime(2026, 8, 9, 21, minute, tzinfo=timezone.utc).timestamp()
+            * 1000)
+        for minute in range(3)
+    ]
 
 
 def __test_connect_offloads_create_session_to_thread__(monkeypatch):
