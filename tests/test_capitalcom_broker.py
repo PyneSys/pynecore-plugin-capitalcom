@@ -3,6 +3,7 @@
 """
 import asyncio
 import json
+import threading
 from datetime import datetime, timezone
 
 import httpx
@@ -29,6 +30,7 @@ from pynecore_capitalcom import (
     CapitalComConfig,
     CapitalComError,
 )
+from pynecore_capitalcom.exceptions import HistoricalPricesNotFoundError
 from pynecore_capitalcom.helpers import _WS_VOLUME_BASELINE_BARS
 from pynecore_capitalcom.plugin import _activity_fingerprint
 
@@ -4656,6 +4658,13 @@ def __test_listen_loop_flags_session_invalid_error_frame__():
 
     raw_q = asyncio.run(runner())
     assert broker._ws_session_invalid is True
+    assert broker.take_stream_disconnect_evidence() == (
+        streaming_module.StreamDisconnectEvidence(
+            streaming_module.StreamDisconnectOrigin.REMOTE,
+            streaming_module.StreamDisconnectReason.SESSION_INVALID,
+            0,
+        )
+    )
     # The disconnect sentinel must still be posted so the live runner
     # reconnects (which re-authenticates via the flag).
     event_type, payload = raw_q.get_nowait()
@@ -4868,12 +4877,232 @@ def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypa
     assert fetches == [1_060, 1_120]
     assert ws.close_calls == [(4001, "ohlc-rest-recovered-stale")]
     assert broker._last_ohlc_event_ts == 1_000.0
+    assert broker.take_stream_disconnect_evidence() == (
+        streaming_module.StreamDisconnectEvidence(
+            streaming_module.StreamDisconnectOrigin.OHLC_WATCHDOG,
+            streaming_module.StreamDisconnectReason.OHLC_REST_RECOVERED_STALE,
+            0,
+        )
+    )
 
     recovered = []
     while not broker._update_queue.empty():
         event_type, payload = broker._update_queue.get_nowait()
         recovered.append((event_type, payload["t"]))
     assert recovered == [("ohlc", 1_060_000), ("ohlc", 1_120_000)]
+
+
+def __test_ohlc_watchdog_keeps_socket_after_exact_rest_absent_slot__(monkeypatch):
+    """One exact REST-absent slot must not be classified as WS degradation."""
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    broker._update_queue = asyncio.Queue()
+    broker._raw_ohlc_queue = asyncio.Queue()
+    broker._last_bar_open_ts = 1_000.0
+    broker._last_ohlc_event_ts = 1_000.0
+
+    class _DummyWS:
+        close_code = None
+
+        def __init__(self):
+            self.close_calls: list[tuple[int | None, str | None]] = []
+
+        async def close(self, code=None, reason=None):
+            self.close_calls.append((code, reason))
+            self.close_code = code
+
+    ws = _DummyWS()
+    broker._ws = ws  # type: ignore[assignment]
+    wake_times = iter([1_131.0, 1_152.0, 1_191.0])
+    now = {"t": 1_000.0}
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(_delay):
+        try:
+            now["t"] = next(wake_times)
+        except StopIteration:
+            await asyncio.Event().wait()
+            return
+        broker._last_quote_event_ts = now["t"]
+        await original_sleep(0)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    fetches: list[int] = []
+
+    def fake_fetch_bar_payload(timestamp: int) -> dict | None:
+        fetches.append(timestamp)
+        if timestamp != 1_120:
+            return None
+        return {
+            "priceType": "bid",
+            "t": timestamp * 1000,
+            "o": 1.0,
+            "h": 1.1,
+            "l": 0.9,
+            "c": 1.05,
+            "_volume": 123.0,
+        }
+
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.epoch_time",
+        lambda: now["t"],
+    )
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.asyncio.sleep",
+        fake_sleep,
+    )
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.asyncio.to_thread",
+        fake_to_thread,
+    )
+    monkeypatch.setattr(broker, "_fetch_bar_payload", fake_fetch_bar_payload)
+
+    async def runner():
+        task = asyncio.create_task(broker._ohlc_watchdog_loop())
+        try:
+            for _ in range(20):
+                await original_sleep(0)
+                if not broker._update_queue.empty():
+                    break
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(runner())
+
+    assert fetches == [1_060, 1_060, 1_120]
+    assert ws.close_calls == []
+    event_type, payload = broker._update_queue.get_nowait()
+    assert event_type == "ohlc"
+    assert payload["t"] == 1_120_000
+    assert broker._last_bar_open_ts == 1_120.0
+
+
+def __test_ohlc_watchdog_reconnects_after_indeterminate_rest_window__(monkeypatch):
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    broker._update_queue = asyncio.Queue()
+    broker._raw_ohlc_queue = asyncio.Queue()
+    broker._last_bar_open_ts = 1_000.0
+    broker._last_ohlc_event_ts = 1_000.0
+
+    class _DummyWS:
+        close_code = None
+
+        def __init__(self):
+            self.close_calls: list[tuple[int | None, str | None]] = []
+
+        async def close(self, code=None, reason=None):
+            self.close_calls.append((code, reason))
+            self.close_code = code
+
+    websocket = _DummyWS()
+    broker._ws = websocket  # type: ignore[assignment]
+    wake_times = iter([1_131.0, 1_152.0])
+    now = {"t": 1_000.0}
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(_delay):
+        try:
+            now["t"] = next(wake_times)
+        except StopIteration:
+            await asyncio.Event().wait()
+            return
+        broker._last_quote_event_ts = now["t"]
+        await original_sleep(0)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    fetches: list[int] = []
+
+    def fail_fetch(timestamp: int) -> dict | None:
+        fetches.append(timestamp)
+        raise CapitalComError("authentication unavailable")
+
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.epoch_time",
+        lambda: now["t"],
+    )
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.asyncio.sleep",
+        fake_sleep,
+    )
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.asyncio.to_thread",
+        fake_to_thread,
+    )
+    monkeypatch.setattr(broker, "_fetch_bar_payload", fail_fetch)
+
+    async def runner():
+        task = asyncio.create_task(broker._ohlc_watchdog_loop())
+        try:
+            for _ in range(20):
+                await original_sleep(0)
+                if websocket.close_calls:
+                    break
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(runner())
+
+    assert fetches == [1_060, 1_060]
+    assert websocket.close_calls == [(4002, "ohlc-rest-indeterminate")]
+    assert broker._update_queue.empty()
+    assert broker.take_stream_disconnect_evidence() == (
+        streaming_module.StreamDisconnectEvidence(
+            streaming_module.StreamDisconnectOrigin.OHLC_WATCHDOG,
+            streaming_module.StreamDisconnectReason.OHLC_REST_INDETERMINATE,
+            0,
+        )
+    )
+
+
+def __test_worker_liveness_reconnect_records_closed_reason_and_generation__():
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    broker._connection_generation = 4
+
+    class _DummyWS:
+        close_code = None
+
+        def __init__(self):
+            self.close_calls: list[tuple[int | None, str | None]] = []
+
+        async def close(self, code=None, reason=None):
+            self.close_calls.append((code, reason))
+            self.close_code = code
+
+    websocket = _DummyWS()
+    broker._ws = websocket  # type: ignore[assignment]
+
+    requested = asyncio.run(
+        broker.request_stream_reconnect(
+            streaming_module.StreamDisconnectReason.FRESH_STREAM_STALE
+        )
+    )
+
+    assert requested is True
+    assert websocket.close_calls == [(4001, "fresh-stream-stale")]
+    assert broker.take_stream_disconnect_evidence() == (
+        streaming_module.StreamDisconnectEvidence(
+            streaming_module.StreamDisconnectOrigin.WORKER_LIVENESS,
+            streaming_module.StreamDisconnectReason.FRESH_STREAM_STALE,
+            4,
+        )
+    )
 
 
 def __test_late_ws_bar_after_watchdog_rest_recovery_is_deduplicated__():
@@ -9349,6 +9578,293 @@ def __test_create_session_keeps_old_tokens_visible_during_login__(monkeypatch):
     assert broker.cst_token == 'cst-NEW'
 
 
+# noinspection PyProtectedMember
+@pytest.mark.parametrize('first_path', ['direct', 'refresh'])
+def __test_concurrent_login_paths_coalesce_without_deadlock__(monkeypatch, first_path):
+    """Direct and stale-refresh login paths must share one bootstrap attempt.
+
+    The queued path waits on the per-instance refresh lock without holding
+    ``_session_lock``. After the first login installs a new generation, the
+    second path must return without a redundant rate-limited login.
+    """
+    broker = _FakeBroker(config=_make_config(
+        api_key=f'concurrency-test-key-{first_path}',
+    ))
+    broker.security_token = 'sec-old'
+    broker.cst_token = 'cst-old'
+    broker._session_token_expiry_ts = 1.0
+
+    bootstrap_started = threading.Event()
+    release_bootstrap = threading.Event()
+    queued_waiting = threading.Event()
+    first_completed = threading.Event()
+    second_completed = threading.Event()
+    errors: list[BaseException] = []
+    calls: list[str] = []
+    second_path = 'refresh' if first_path == 'direct' else 'direct'
+    first_thread_name = f'capital-{first_path}-first'
+    second_thread_name = f'capital-{second_path}-second'
+
+    class _SignalingCondition(threading.Condition):
+        def wait(self, timeout=None):
+            if threading.current_thread().name == second_thread_name:
+                queued_waiting.set()
+            return super().wait(timeout)
+
+    class _EncryptionKeyResponse:
+        is_error = False
+        headers: dict = {}
+
+        @staticmethod
+        def json():
+            return {'encryptionKey': 'fake-key', 'timeStamp': 12345}
+
+    class _SessionResponse:
+        is_error = False
+        headers = {'X-SECURITY-TOKEN': 'sec-new', 'CST': 'cst-new'}
+
+        @staticmethod
+        def json():
+            return {'currentAccountId': 'account-1'}
+
+    def fake_get(_url, **_kwargs):
+        calls.append('get')
+        bootstrap_started.set()
+        if not release_bootstrap.wait(5.0):
+            raise TimeoutError('bootstrap release was not signaled')
+        return _EncryptionKeyResponse()
+
+    def fake_post(_url, **_kwargs):
+        calls.append('post')
+        return _SessionResponse()
+
+    def run_path(path, completed):
+        try:
+            if path == 'direct':
+                broker.create_session()
+            else:
+                broker._refresh_session_if_stale()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    broker._session_refresh_condition = _SignalingCondition(
+        broker._session_refresh_lock
+    )
+    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(httpx, 'post', fake_post)
+    monkeypatch.setattr(
+        'pynecore_capitalcom.rest.encrypt_password',
+        lambda *_args, **_kwargs: 'fake-encrypted',
+    )
+
+    first_thread = threading.Thread(
+        target=run_path,
+        args=(first_path, first_completed),
+        name=first_thread_name,
+        daemon=True,
+    )
+    second_thread = threading.Thread(
+        target=run_path,
+        args=(second_path, second_completed),
+        name=second_thread_name,
+        daemon=True,
+    )
+    first_thread.start()
+    assert bootstrap_started.wait(5.0)
+    second_thread.start()
+    assert queued_waiting.wait(5.0)
+    release_bootstrap.set()
+
+    assert first_completed.wait(5.0)
+    assert second_completed.wait(5.0)
+    assert errors == []
+    assert calls == ['get', 'post']
+    assert broker.security_token == 'sec-new'
+    assert broker.cst_token == 'cst-new'
+    assert broker._session_generation == 1
+    assert broker.account_id == 'capitalcom-demo-account-1'
+
+
+# noinspection PyProtectedMember
+def __test_direct_login_coalesces_after_owner_installs_session__(monkeypatch):
+    """An active login remains the owner after token generation advances."""
+    broker = _FakeBroker(config=_make_config(
+        api_key='late-concurrency-test-key',
+    ))
+    broker.security_token = 'sec-old'
+    broker.cst_token = 'cst-old'
+    broker._session_token_expiry_ts = 1.0
+
+    login_installed = threading.Event()
+    release_owner = threading.Event()
+    direct_waiting = threading.Event()
+    refresh_completed = threading.Event()
+    direct_completed = threading.Event()
+    errors: list[BaseException] = []
+    calls: list[str] = []
+
+    class _SignalingCondition(threading.Condition):
+        def wait(self, timeout=None):
+            if threading.current_thread().name == 'capital-late-direct':
+                direct_waiting.set()
+            return super().wait(timeout)
+
+    original_login = broker._perform_session_login
+
+    def perform_and_pause():
+        original_login()
+        login_installed.set()
+        if not release_owner.wait(5.0):
+            raise TimeoutError('login owner release was not signaled')
+
+    def fake_get(_url, **_kwargs):
+        calls.append('get')
+        return _MockHttpResponse(
+            200,
+            {'encryptionKey': 'fake-key', 'timeStamp': 12345},
+        )
+
+    def fake_post(_url, **_kwargs):
+        calls.append('post')
+        return _MockHttpResponse(
+            200,
+            {'currentAccountId': 'account-1'},
+            {'X-SECURITY-TOKEN': 'sec-new', 'CST': 'cst-new'},
+        )
+
+    def run_refresh():
+        try:
+            broker._refresh_session_if_stale()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            refresh_completed.set()
+
+    def run_direct():
+        try:
+            broker.create_session()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            direct_completed.set()
+
+    broker._session_refresh_condition = _SignalingCondition(
+        broker._session_refresh_lock
+    )
+    monkeypatch.setattr(broker, '_perform_session_login', perform_and_pause)
+    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(httpx, 'post', fake_post)
+    monkeypatch.setattr(
+        'pynecore_capitalcom.rest.encrypt_password',
+        lambda *_args, **_kwargs: 'fake-encrypted',
+    )
+
+    refresh_thread = threading.Thread(
+        target=run_refresh,
+        name='capital-refresh-owner',
+        daemon=True,
+    )
+    direct_thread = threading.Thread(
+        target=run_direct,
+        name='capital-late-direct',
+        daemon=True,
+    )
+    refresh_thread.start()
+    assert login_installed.wait(5.0)
+    direct_thread.start()
+    assert direct_waiting.wait(5.0)
+    release_owner.set()
+
+    assert refresh_completed.wait(5.0)
+    assert direct_completed.wait(5.0)
+    assert errors == []
+    assert calls == ['get', 'post']
+    assert broker.security_token == 'sec-new'
+    assert broker.cst_token == 'cst-new'
+    assert broker._session_generation == 1
+    assert broker._session_login_completion == 1
+    assert broker.account_id == 'capitalcom-demo-account-1'
+
+
+# noinspection PyProtectedMember
+def __test_queued_login_retries_after_owner_failure__(monkeypatch):
+    """A failed login owner must hand ownership to the next queued caller."""
+    broker = _FakeBroker(config=_make_config())
+    first_attempt_started = threading.Event()
+    release_first_attempt = threading.Event()
+    second_waiting = threading.Event()
+    first_completed = threading.Event()
+    second_completed = threading.Event()
+    errors: list[BaseException] = []
+    attempts = 0
+
+    class _SignalingCondition(threading.Condition):
+        def wait(self, timeout=None):
+            if threading.current_thread().name == 'capital-login-retry':
+                second_waiting.set()
+            return super().wait(timeout)
+
+    def perform_session_login():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first_attempt_started.set()
+            if not release_first_attempt.wait(5.0):
+                raise TimeoutError('failed login release was not signaled')
+            raise CapitalComError('first login failed')
+        with broker._session_lock:
+            broker.security_token = 'sec-new'
+            broker.cst_token = 'cst-new'
+            broker._session_generation += 1
+
+    def run_login(completed):
+        try:
+            broker.create_session()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    broker._session_refresh_condition = _SignalingCondition(
+        broker._session_refresh_lock
+    )
+    monkeypatch.setattr(
+        broker,
+        '_perform_session_login',
+        perform_session_login,
+    )
+
+    first = threading.Thread(
+        target=run_login,
+        args=(first_completed,),
+        name='capital-login-owner',
+        daemon=True,
+    )
+    second = threading.Thread(
+        target=run_login,
+        args=(second_completed,),
+        name='capital-login-retry',
+        daemon=True,
+    )
+    first.start()
+    assert first_attempt_started.wait(5.0)
+    second.start()
+    assert second_waiting.wait(5.0)
+    release_first_attempt.set()
+
+    assert first_completed.wait(5.0)
+    assert second_completed.wait(5.0)
+    assert len(errors) == 1
+    assert isinstance(errors[0], CapitalComError)
+    assert attempts == 2
+    assert broker.security_token == 'sec-new'
+    assert broker.cst_token == 'cst-new'
+    assert broker._session_generation == 1
+    assert broker._session_login_completion == 1
+
+
 def __test_call_does_not_recurse_when_bootstrap_returns_session_token_error__(monkeypatch):
     """A bootstrap endpoint returning ``error.invalid.session.token`` must
     surface the error directly, never recurse via ``create_session``.
@@ -9391,7 +9907,7 @@ def __test_refresh_session_if_stale_skips_when_fresh__(monkeypatch):
     broker = _FakeBroker(config=_make_config())
     broker._session_token_expiry_ts = epoch_time() + 3600
     refresh_called: list = []
-    monkeypatch.setattr(broker, 'create_session',
+    monkeypatch.setattr(broker, '_perform_session_login',
                         lambda: refresh_called.append(True))
     broker._refresh_session_if_stale()
     assert refresh_called == []
@@ -9404,7 +9920,7 @@ def __test_refresh_session_if_stale_triggers_inside_safety_window__(monkeypatch)
     broker = _FakeBroker(config=_make_config())
     broker._session_token_expiry_ts = epoch_time() + 60
     refresh_called: list = []
-    monkeypatch.setattr(broker, 'create_session',
+    monkeypatch.setattr(broker, '_perform_session_login',
                         lambda: refresh_called.append(True))
     broker._refresh_session_if_stale()
     assert refresh_called == [True]
@@ -9416,7 +9932,7 @@ def __test_refresh_session_if_stale_skips_when_no_session__(monkeypatch):
     broker = _FakeBroker(config=_make_config())
     broker._session_token_expiry_ts = 0.0
     refresh_called: list = []
-    monkeypatch.setattr(broker, 'create_session',
+    monkeypatch.setattr(broker, '_perform_session_login',
                         lambda: refresh_called.append(True))
     broker._refresh_session_if_stale()
     assert refresh_called == []
@@ -9433,7 +9949,7 @@ def __test_call_reactive_retry_on_invalid_session_token__(monkeypatch):
     def fake_create_session():
         broker.security_token = 'new-x-sec'
         broker.cst_token = 'new-cst'
-    monkeypatch.setattr(broker, 'create_session', fake_create_session)
+    monkeypatch.setattr(broker, '_perform_session_login', fake_create_session)
 
     responses = [
         _MockHttpResponse(401, {'errorCode': 'error.invalid.session.token'}),
@@ -9452,6 +9968,33 @@ def __test_call_reactive_retry_on_invalid_session_token__(monkeypatch):
 
 
 # noinspection PyProtectedMember
+def __test_call_maps_prices_not_found_to_typed_empty_range__(monkeypatch):
+    broker = _FakeBroker(config=_make_config())
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **kwargs: _MockHttpResponse(
+            404,
+            {"errorCode": "error.prices.not-found"},
+        ),
+    )
+
+    with pytest.raises(HistoricalPricesNotFoundError):
+        broker("prices/EURUSD", method="get")
+
+
+def __test_call_rejects_non_object_rest_response_root__(monkeypatch):
+    broker = _FakeBroker(config=_make_config())
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **kwargs: _MockHttpResponse(200, [], {}),
+    )
+
+    with pytest.raises(CapitalComError, match="root schema changed"):
+        broker("prices/EURUSD", method="get")
+
+
 def __test_call_proactive_refresh_runs_before_request__(monkeypatch):
     """Proactive refresh fires when token is inside the safety window."""
     from time import time as epoch_time
@@ -9464,7 +10007,7 @@ def __test_call_proactive_refresh_runs_before_request__(monkeypatch):
         broker.security_token = 'tok-v2'
         broker.cst_token = 'cst-v2'
         broker._session_token_expiry_ts = epoch_time() + 3600
-    monkeypatch.setattr(broker, 'create_session', fake_create_session)
+    monkeypatch.setattr(broker, '_perform_session_login', fake_create_session)
 
     captured_csts: list[str] = []
 
@@ -9489,7 +10032,7 @@ def __test_call_proactive_refresh_skipped_for_bootstrap_endpoints__(monkeypatch)
     broker.cst_token = 'cst'
     broker._session_token_expiry_ts = epoch_time() + 60  # stale
     refresh_called: list = []
-    monkeypatch.setattr(broker, 'create_session',
+    monkeypatch.setattr(broker, '_perform_session_login',
                         lambda: refresh_called.append(True))
     monkeypatch.setattr(
         httpx, 'get',
@@ -9527,7 +10070,7 @@ def __test_reconnect_gap_history_omits_wide_to_and_accepts_closed_session__(
             raise CapitalComError(
                 "API error occured: error.invalid.max.daterange"
             )
-        raise CapitalComError("API error occured: error.prices.not-found")
+        raise HistoricalPricesNotFoundError("historical price range is empty")
 
     monkeypatch.setattr(
         broker, "get_historical_prices", fake_get_historical_prices,
@@ -9602,6 +10145,63 @@ def __test_reconnect_gap_history_pages_from_last_returned_bar__(monkeypatch):
             * 1000)
         for minute in range(3)
     ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type", "message"),
+    [
+        ("transport", CapitalComError, "transport failed"),
+        ("missing_prices", ValueError, "prices schema changed"),
+        ("missing_timestamp", ValueError, "timestamp is missing"),
+        ("stale_page", ValueError, "did not reach its cursor"),
+        ("unordered_page", ValueError, "not strictly ordered"),
+    ],
+)
+def __test_reconnect_gap_history_propagates_indeterminate_failures__(
+        monkeypatch, mode, expected_type, message,
+):
+    """Reconnect must fail before a newer stream can bypass an unknown gap."""
+    broker = _FakeBroker(
+        config=_make_config(), symbol="EURUSD", timeframe="1",
+    )
+    broker._last_bar_timestamp = int(
+        datetime(2026, 8, 9, 20, 59, tzinfo=timezone.utc).timestamp()
+    )
+
+    def price(bar_open: datetime) -> dict:
+        return {
+            "snapshotTimeUTC": bar_open.isoformat(),
+            "openPrice": {"bid": 1.0},
+            "highPrice": {"bid": 1.1},
+            "lowPrice": {"bid": 0.9},
+            "closePrice": {"bid": 1.05},
+        }
+
+    def fake_get_historical_prices(**_kwargs):
+        if mode == "transport":
+            raise CapitalComError("transport failed")
+        if mode == "missing_prices":
+            return {}
+        if mode == "missing_timestamp":
+            return {"prices": [{}]}
+        if mode == "stale_page":
+            return {"prices": [price(datetime(2026, 8, 9, 20, 59))]}
+        return {
+            "prices": [
+                price(datetime(2026, 8, 9, 21, 1)),
+                price(datetime(2026, 8, 9, 21, 0)),
+            ]
+        }
+
+    monkeypatch.setattr(
+        broker, "get_historical_prices", fake_get_historical_prices,
+    )
+    current_bar_open = int(
+        datetime(2026, 8, 9, 21, 1, tzinfo=timezone.utc).timestamp()
+    )
+
+    with pytest.raises(expected_type, match=message):
+        broker._fetch_reconnect_gap_payloads(current_bar_open)
 
 
 def __test_connect_offloads_create_session_to_thread__(monkeypatch):
@@ -10372,6 +10972,13 @@ def __test_ws_volume_consecutive_bad_bars_force_reconnect__():
     assert rest_calls == [base_open, base_open + 60]
     # WS close called exactly once with the reconnect signal.
     assert broker._ws.close_calls == [(4001, "quote-volume-stale")]
+    assert broker.take_stream_disconnect_evidence() == (
+        streaming_module.StreamDisconnectEvidence(
+            streaming_module.StreamDisconnectOrigin.QUOTE_VOLUME_WATCHDOG,
+            streaming_module.StreamDisconnectReason.QUOTE_VOLUME_STALE,
+            0,
+        )
+    )
     # Streak counter reset after the close.
     assert broker._ws_bad_bar_streak == 0
 

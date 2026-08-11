@@ -9,6 +9,7 @@ State touched: ``_instrument_rules_cache`` (TTL-bounded per-epic cache),
 pipeline at the end of warm-up so the very first quote can produce an
 intra-bar update).
 """
+from abc import ABC
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from time import time as epoch_time
@@ -25,7 +26,7 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
-from .exceptions import CapitalComError
+from .exceptions import HistoricalPricesNotFoundError
 from .helpers import (
     TIMEFRAMES,
     TIMEFRAMES_INV,
@@ -36,7 +37,7 @@ from .helpers import (
 from .models import _InstrumentRules
 
 
-class _ProviderMixin(_CapitalComBase):
+class _ProviderMixin(_CapitalComBase, ABC):
     """Provider mix-in: timeframe converters, symbol metadata, REST OHLCV."""
 
     # --- timeframe helpers --------------------------------------------------
@@ -61,7 +62,11 @@ class _ProviderMixin(_CapitalComBase):
 
     # --- market-data helpers ------------------------------------------------
 
-    def get_market_details(self, search_term: str = None, symbols: list[str] = None) -> dict:
+    def get_market_details(
+            self,
+            search_term: str | None = None,
+            symbols: list[str] | None = None,
+    ) -> dict:
         """Get and search market details."""
         data = {}
         if search_term:
@@ -76,8 +81,12 @@ class _ProviderMixin(_CapitalComBase):
         assert self.symbol is not None
         return self('markets/' + self.symbol, method='get')
 
-    def get_historical_prices(self, time_from: datetime = None, time_to: datetime = None,
-                              limit=1000) -> dict:
+    def get_historical_prices(
+            self,
+            time_from: datetime | None = None,
+            time_to: datetime | None = None,
+            limit: int = 1000,
+    ) -> dict:
         """Get historical prices of the plugin's current symbol.
 
         :param time_from: The start time (interpreted as UTC).
@@ -95,7 +104,7 @@ class _ProviderMixin(_CapitalComBase):
         return res
 
     @override
-    def get_list_of_symbols(self, *args, search_term: str = None) -> list[str]:
+    def get_list_of_symbols(self, *args, search_term: str | None = None) -> list[str]:
         """Get list of symbols, optionally filtered by ``search_term``."""
         res: dict = self.get_market_details(search_term=search_term)
         markets = [m['epic'] for m in res['markets']]
@@ -222,7 +231,7 @@ class _ProviderMixin(_CapitalComBase):
         mintick = dealing_rules['minStepDistance']["value"]
         decimal_mintick = Decimal(str(mintick))
         decimal_exponent = decimal_mintick.as_tuple().exponent
-        if type(decimal_exponent) is not int:
+        if not isinstance(decimal_exponent, int):
             raise ValueError("Capital.com minStepDistance must be finite")
         decimal_places = max(0, -decimal_exponent)
         pricescale = 10 ** decimal_places
@@ -334,18 +343,10 @@ class _ProviderMixin(_CapitalComBase):
 
                 try:
                     res: dict = self.get_historical_prices(time_from=tf, limit=limit or 1000)
-                except CapitalComError as exc:
-                    # Capital.com returns HTTP 404 with
-                    # ``error.prices.not-found`` (rather than an empty
-                    # ``prices`` list) when the requested window has no
-                    # bars at all — typically when ``tf`` has advanced
-                    # past the Friday close on a weekend or into any
-                    # other market-closed gap. Treat it identically to
-                    # an empty response: stop downloading, keep what we
-                    # already wrote. All other error codes propagate.
-                    if 'error.prices.not-found' in str(exc):
-                        break
-                    raise
+                except HistoricalPricesNotFoundError:
+                    # A confirmed empty venue range ends this download while
+                    # preserving every bar already written.
+                    break
                 if not res or not res['prices']:
                     break
                 ps = res['prices']

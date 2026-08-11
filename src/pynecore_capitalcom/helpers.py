@@ -18,7 +18,7 @@ from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
 from datetime import UTC, datetime, time
 from decimal import Decimal
 from time import time as epoch_time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
@@ -51,7 +51,7 @@ TIMEFRAMES = {
 
 TIMEFRAMES_INV = {v: k for k, v in TIMEFRAMES.items()}
 
-TYPES = {
+TYPES: dict[str, Literal['forex', 'crypto', 'stock', 'index']] = {
     'CURRENCIES': 'forex',
     'CRYTOCURRENCIES': 'crypto',
     'SHARES': 'stock',

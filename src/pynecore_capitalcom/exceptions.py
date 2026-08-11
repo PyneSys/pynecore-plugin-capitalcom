@@ -20,6 +20,10 @@ class CapitalComError(ProviderError):
     """
 
 
+class HistoricalPricesNotFoundError(CapitalComError):
+    """The venue confirmed that a requested historical price range is empty."""
+
+
 class InvalidStopDistanceError(ExchangeOrderRejectedError):
     """Capital.com rejected an order because the requested stop distance is
     below the instrument's current minimum.

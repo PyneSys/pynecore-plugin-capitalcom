@@ -28,8 +28,9 @@ LiveProviderPlugin → ProviderPlugin → Plugin → object``.
 import asyncio
 import collections
 import threading
+from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, cast
 
 from pynecore.core.broker.models import (
     ExchangeOrder,
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
 
-class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
+class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     """Shared instance state + Capital.com–private cross-mix-in surface.
 
     See module docstring. Every Capital.com mix-in derives from this
@@ -59,10 +60,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     Config = CapitalComConfig
     timezone = 'US/Eastern'
 
-    # Narrow the base ``ProviderPlugin.config: ConfigT | None`` — the
-    # runtime ``__init__`` asserts the value is a ``CapitalComConfig``,
-    # so every method can treat it as non-``None``.
-    config: CapitalComConfig
+    @property
+    def _capital_config(self) -> CapitalComConfig:
+        """Return the configuration validated by the final plugin constructor."""
+        return cast(CapitalComConfig, self.config)
 
     if TYPE_CHECKING:
         def __call__(
@@ -95,14 +96,17 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     # opaque deadline forward and let proactive refresh wait past expiry.
     _security_token_deadline: float
     _cst_token_deadline: float
-    # Guards re-entrant ``create_session()`` calls when several worker
-    # threads (``asyncio.to_thread`` callers) trip the proactive refresh
-    # at the same time. Also serialises the rotation handler in
-    # ``__call__`` so a slow response cannot roll back tokens issued by
-    # a concurrent refresh. ``RLock`` because ``_refresh_session_if_stale``
-    # holds the lock while ``create_session`` calls back into ``__call__``
-    # which re-enters the lock for its own rotation step.
+    # Protects token, expiry, and generation snapshots and updates. Network
+    # calls and bootstrap-lock acquisition must never happen while held.
     _session_lock: threading.RLock
+    # Coordinates direct, proactive, and reactive login attempts. The
+    # condition lets queued callers wait without holding ``_session_lock``;
+    # the completion counter distinguishes a successful preceding login from
+    # a failed attempt that the next caller must retry.
+    _session_refresh_lock: threading.RLock
+    _session_refresh_condition: threading.Condition
+    _session_login_active: bool
+    _session_login_completion: int
     # Monotonic counter incremented by each successful bootstrap login —
     # see the long ``__init__`` comment in ``plugin.py``.
     _session_generation: int
@@ -197,6 +201,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
 
     def create_session(self) -> None: ...
 
+    def _perform_session_login(self) -> None: ...
+
     async def get_preferences(self) -> dict: ...
 
     async def _detect_account_mode(self) -> None: ...
@@ -264,16 +270,15 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
                                **kwargs: Any) -> ExchangeOrder: ...
 
     # --- Activity polling (activity.py) ---
-    def _poll_once(self) -> AsyncIterator[OrderEvent]:
-        if False:
-            yield  # pragma: no cover
-        ...
+    @abstractmethod
+    def _poll_once(self) -> AsyncIterator[OrderEvent]: ...
 
-    def _process_activity(self, *args: Any,
-                          **kwargs: Any) -> AsyncIterator[OrderEvent]:
-        if False:
-            yield  # pragma: no cover
-        ...
+    @abstractmethod
+    def _process_activity(
+            self,
+            *args: Any,
+            **kwargs: Any,
+    ) -> AsyncIterator[OrderEvent]: ...
 
     def _activity_to_event(self, *args: Any, **kwargs: Any) -> OrderEvent | None: ...
 
@@ -292,24 +297,26 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig]):
     def _levels_match(expected: object, actual: object,
                       *args: Any, **kwargs: Any) -> bool: ...
 
-    def _resolve_bracket_leg_disposition(self, *args: Any, **kwargs: Any) -> bool: ...
+    def _resolve_bracket_leg_disposition(self, *args: Any, **kwargs: Any) -> None: ...
 
     def _record_bracket_resolution(self, *args: Any, **kwargs: Any) -> None: ...
 
     async def _trailing_activation_monitor(self, *args: Any, **kwargs: Any) -> Any: ...
 
     # --- Reconcile (reconcile.py) ---
-    def _reconcile_snapshot(self, *args: Any,
-                            **kwargs: Any) -> AsyncIterator[OrderEvent]:
-        if False:
-            yield  # pragma: no cover
-        ...
+    @abstractmethod
+    def _reconcile_snapshot(
+            self,
+            *args: Any,
+            **kwargs: Any,
+    ) -> AsyncIterator[OrderEvent]: ...
 
-    def _missing_pending_tracker(self, *args: Any,
-                                 **kwargs: Any) -> AsyncIterator[OrderEvent]:
-        if False:
-            yield  # pragma: no cover
-        ...
+    @abstractmethod
+    def _missing_pending_tracker(
+            self,
+            *args: Any,
+            **kwargs: Any,
+    ) -> AsyncIterator[OrderEvent]: ...
 
     def _disappearance_tracker(self) -> 'DisappearanceTracker': ...
 

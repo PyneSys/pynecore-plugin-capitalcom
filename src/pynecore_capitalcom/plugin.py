@@ -135,6 +135,16 @@ class CapitalCom(
         self._security_token_deadline: float = 0.0
         self._cst_token_deadline: float = 0.0
         self._session_lock = threading.RLock()
+        # Coordinates login ownership without holding ``_session_lock`` across
+        # bootstrap I/O. Waiting callers sleep on the condition and coalesce
+        # after a successful owner, while a failed owner leaves the next caller
+        # eligible to retry.
+        self._session_refresh_lock = threading.RLock()
+        self._session_refresh_condition = threading.Condition(
+            self._session_refresh_lock
+        )
+        self._session_login_active = False
+        self._session_login_completion = 0
         # Bumped by every successful bootstrap login. The rotation handler
         # uses it to tell apart "another worker rotated tokens via a normal
         # response" (same generation — keep both rotations, last writer

@@ -15,6 +15,7 @@ State touched: ``security_token``, ``cst_token``, ``session_data``,
 import asyncio
 import hashlib
 import threading
+from abc import ABC
 from json import JSONDecodeError
 from time import monotonic, sleep, time as epoch_time
 
@@ -32,6 +33,7 @@ from pynecore.core.broker.exceptions import (
 from ._base import _CapitalComBase
 from .exceptions import (
     CapitalComError,
+    HistoricalPricesNotFoundError,
     InvalidStopDistanceError,
     InvalidStopMaxValueError,
     InvalidTakeProfitDistanceError,
@@ -92,7 +94,7 @@ _SESSION_RECREATE_CODES = frozenset({
 })
 
 
-class _RestSessionMixin(_CapitalComBase):
+class _RestSessionMixin(_CapitalComBase, ABC):
     """REST/auth surface: dispatcher, session, balance probe, exception mapper."""
 
     # --- REST core ----------------------------------------------------------
@@ -113,7 +115,7 @@ class _RestSessionMixin(_CapitalComBase):
         # re-entering ``create_session`` from ``__call__``.
         if (_level == 0
                 and not is_bootstrap
-                and self.config.user_email and self.config.api_password):
+                and self._capital_config.user_email and self._capital_config.api_password):
             self._refresh_session_if_stale()
 
         # Snapshot the tokens used for THIS request. Two purposes:
@@ -144,7 +146,7 @@ class _RestSessionMixin(_CapitalComBase):
             req_cst_token = self.cst_token
             req_generation = self._session_generation
 
-        headers = {'X-CAP-API-KEY': self.config.api_key}
+        headers = {'X-CAP-API-KEY': self._capital_config.api_key}
         if not is_bootstrap:
             if req_security_token:
                 headers['X-SECURITY-TOKEN'] = req_security_token
@@ -157,7 +159,7 @@ class _RestSessionMixin(_CapitalComBase):
         elif method_lc in ('post', 'put'):
             params['json'] = data
 
-        url = URL_DEMO if self.config.demo else URL
+        url = URL_DEMO if self._capital_config.demo else URL
         url += ENDPOINT_PREFIX + endpoint
 
         res: httpx.Response = getattr(httpx, method_lc)(url, **params)
@@ -165,8 +167,15 @@ class _RestSessionMixin(_CapitalComBase):
             dict_res = res.json()
         except JSONDecodeError:
             raise CapitalComError(f"JSON Error: {res.text}")
+        if not isinstance(dict_res, dict):
+            raise CapitalComError("REST response root schema changed")
 
         if res.is_error:
+            error_code = dict_res.get('errorCode')
+            if error_code == 'error.prices.not-found':
+                raise HistoricalPricesNotFoundError(
+                    'Capital.com historical price range is empty'
+                )
             # Bootstrap endpoints must NOT trigger a re-login retry —
             # ``create_session`` calls them with the default ``_level=0``,
             # so a session-token error there would recurse into another
@@ -174,20 +183,17 @@ class _RestSessionMixin(_CapitalComBase):
             # error directly; bootstrap requests already go out without
             # stale auth headers (see snapshot above), so a real auth
             # failure here is terminal and needs operator attention.
-            if dict_res['errorCode'] in _SESSION_RECREATE_CODES \
+            if error_code in _SESSION_RECREATE_CODES \
                     and not is_bootstrap \
-                    and self.config.user_email and self.config.api_password and _level < 3:
-                # Serialise re-creation under the session lock — otherwise
-                # several workers seeing the same expiry would each POST
-                # ``/session`` in parallel. Double-check the generation
-                # inside the lock so workers that lost the race retry
-                # against the fresh session another worker just installed
-                # instead of issuing yet another redundant login.
-                with self._session_lock:
-                    if self._session_generation == req_generation:
-                        self.create_session()
+                    and self._capital_config.user_email and self._capital_config.api_password and _level < 3:
+                # Coordinate re-creation without holding ``_session_lock``
+                # across bootstrap I/O. Workers that lose the race observe the
+                # advanced generation and skip a redundant login.
+                self._create_session_coordinated(
+                    expected_generation=req_generation,
+                )
                 return self(endpoint=endpoint, data=data, method=method, _level=_level + 1)
-            raise CapitalComError(f"API error occured: {dict_res['errorCode']}")
+            raise CapitalComError(f"API error occured: {error_code or 'unknown-error'}")
 
         # Apply rotation under the session lock so a concurrent refresh
         # cannot interleave with this update. If a fresh session was
@@ -257,23 +263,21 @@ class _RestSessionMixin(_CapitalComBase):
     def _refresh_session_if_stale(self) -> None:
         """Re-create the session when the current one is within the safety window.
 
-        Double-checked locking so several worker threads tripping the
-        check at once don't all queue behind a single refresh — the
-        first thread re-creates, subsequent ones see the fresh expiry
-        on the second check inside the lock and return immediately.
+        The fast state snapshot avoids coordinator traffic for fresh sessions.
+        The coordinated path repeats the check after any active login finishes,
+        without holding the session lock while it waits or performs network I/O.
         """
-        if self._session_token_expiry_ts == 0.0:
-            return
-        deadline = self._session_token_expiry_ts - _SESSION_REFRESH_SAFETY_S
-        if epoch_time() < deadline:
-            return
         with self._session_lock:
-            if epoch_time() < self._session_token_expiry_ts - _SESSION_REFRESH_SAFETY_S:
-                return
-            self.create_session()
+            expiry = self._session_token_expiry_ts
+        if expiry == 0.0 or epoch_time() < expiry - _SESSION_REFRESH_SAFETY_S:
+            return
+        self._create_session_coordinated(stale_only=True)
 
-    def create_session(self):
+    def create_session(self) -> None:
         """Create a session with the Capital.com API (login).
+
+        Concurrent direct and refresh callers coalesce around one active login.
+        If that owner fails, the next queued caller takes ownership and retries.
 
         Leaves the existing CST / X-SECURITY-TOKEN attributes intact.
         :meth:`__call__` skips auth headers on the bootstrap endpoints,
@@ -290,8 +294,54 @@ class _RestSessionMixin(_CapitalComBase):
         sentinel when the run-identity contract validation ran between
         provider authentication and broker startup, aborting the run.
         """
+        self._create_session_coordinated()
+
+    def _create_session_coordinated(
+            self,
+            *,
+            expected_generation: int | None = None,
+            stale_only: bool = False,
+    ) -> None:
+        """Run one login owner and coalesce concurrent callers around it."""
+        with self._session_refresh_condition:
+            observed_completion = self._session_login_completion
+            while self._session_login_active:
+                self._session_refresh_condition.wait()
+            if self._session_login_completion != observed_completion:
+                return
+            with self._session_lock:
+                if (
+                    expected_generation is not None
+                    and self._session_generation != expected_generation
+                ):
+                    return
+                expiry = self._session_token_expiry_ts
+            if (
+                stale_only
+                and (
+                    expiry == 0.0
+                    or epoch_time() < expiry - _SESSION_REFRESH_SAFETY_S
+                )
+            ):
+                return
+            self._session_login_active = True
+
+        try:
+            self._perform_session_login()
+        except BaseException:
+            with self._session_refresh_condition:
+                self._session_login_active = False
+                self._session_refresh_condition.notify_all()
+            raise
+        with self._session_refresh_condition:
+            self._session_login_completion += 1
+            self._session_login_active = False
+            self._session_refresh_condition.notify_all()
+
+    def _perform_session_login(self) -> None:
+        """Authenticate and install one complete Capital.com session."""
         key_fingerprint = hashlib.sha256(
-            self.config.api_key.encode('utf-8')
+            self._capital_config.api_key.encode('utf-8')
         ).digest()
         with _SESSION_CREATE_GUARD:
             bootstrap_lock = _SESSION_CREATE_LOCKS.setdefault(
@@ -311,13 +361,13 @@ class _RestSessionMixin(_CapitalComBase):
                 encryption_key = res['encryptionKey']
                 timestamp = res['timeStamp']
                 password = encrypt_password(
-                    self.config.api_password, encryption_key, timestamp,
+                    self._capital_config.api_password, encryption_key, timestamp,
                 )
                 _SESSION_CREATE_LAST_POST[key_fingerprint] = monotonic()
                 try:
                     session_data = self('session', data=dict(
                         encryptedPassword=True,
-                        identifier=self.config.user_email,
+                        identifier=self._capital_config.user_email,
                         password=password,
                     ))
                 except CapitalComError as exc:
@@ -329,7 +379,7 @@ class _RestSessionMixin(_CapitalComBase):
                 break
         current_account_id = (self.session_data or {}).get('currentAccountId')
         if current_account_id:
-            mode = 'demo' if self.config.demo else 'live'
+            mode = 'demo' if self._capital_config.demo else 'live'
             self._account_id = f"capitalcom-{mode}-{current_account_id}"
 
     async def _call(self, endpoint: str, *, data: dict | None = None,
@@ -375,7 +425,7 @@ class _RestSessionMixin(_CapitalComBase):
                 # the preferred accountId is the stable durable id.
                 account_id = acc.get('accountId')
                 if account_id:
-                    mode = 'demo' if self.config.demo else 'live'
+                    mode = 'demo' if self._capital_config.demo else 'live'
                     self._account_id = f"capitalcom-{mode}-{account_id}"
                 return {currency: available}
         raise BrokerError("No preferred account returned by GET /accounts")

@@ -25,10 +25,14 @@ import asyncio
 import collections
 import json
 import statistics
+from abc import ABC
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from time import time as epoch_time
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from httpx import HTTPError
 from websockets.exceptions import WebSocketException
 
 from pynecore.core.plugin import override
@@ -38,7 +42,7 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
-from .exceptions import CapitalComError
+from .exceptions import CapitalComError, HistoricalPricesNotFoundError
 from .rest import _SESSION_RECREATE_CODES
 from .helpers import (
     WS_URL,
@@ -49,8 +53,101 @@ from .helpers import (
 )
 
 
-class _StreamingMixin(_CapitalComBase):
+class StreamDisconnectOrigin(StrEnum):
+    """Closed origin vocabulary for WebSocket disconnect evidence."""
+
+    REMOTE = "remote"
+    OHLC_WATCHDOG = "ohlc-watchdog"
+    QUOTE_VOLUME_WATCHDOG = "quote-volume-watchdog"
+    WORKER_LIVENESS = "worker-liveness"
+
+
+class StreamDisconnectReason(StrEnum):
+    """Closed reason vocabulary for WebSocket disconnect evidence."""
+
+    LISTENER_ENDED = "listener-ended"
+    LISTENER_ERROR = "listener-error"
+    SESSION_INVALID = "session-invalid"
+    FEED_STALE = "feed-stale"
+    OHLC_REST_RECOVERED_STALE = "ohlc-rest-recovered-stale"
+    OHLC_REST_INDETERMINATE = "ohlc-rest-indeterminate"
+    QUOTE_VOLUME_STALE = "quote-volume-stale"
+    FRESH_STREAM_STALE = "fresh-stream-stale"
+
+
+@dataclass(frozen=True, slots=True)
+class StreamDisconnectEvidence:
+    """Credential-free cause and connection generation for one disconnect."""
+
+    origin: StreamDisconnectOrigin
+    reason: StreamDisconnectReason
+    connection_generation: int
+
+
+class _StreamingMixin(_CapitalComBase, ABC):
     """WebSocket streaming mix-in: connect / listen / ping / watchdog / synth."""
+
+    _connection_generation: int = 0
+    _last_disconnect_evidence: StreamDisconnectEvidence | None = None
+
+    @property
+    def stream_connection_generation(self) -> int:
+        """Return the generation of the current or most recent WebSocket."""
+        return self._connection_generation
+
+    def _record_stream_disconnect(
+        self,
+        origin: StreamDisconnectOrigin,
+        reason: StreamDisconnectReason,
+        *,
+        generation: int | None = None,
+    ) -> StreamDisconnectEvidence:
+        """Record the first structured cause observed for one connection generation."""
+        connection_generation = (
+            self._connection_generation if generation is None else generation
+        )
+        current: StreamDisconnectEvidence | None = self._last_disconnect_evidence
+        if current is not None and current.connection_generation == connection_generation:
+            return current
+        evidence = StreamDisconnectEvidence(
+            origin=origin,
+            reason=reason,
+            connection_generation=connection_generation,
+        )
+        self._last_disconnect_evidence = evidence
+        return evidence
+
+    def take_stream_disconnect_evidence(self) -> StreamDisconnectEvidence:
+        """Consume the structured cause for the most recent WebSocket disconnect."""
+        evidence = self._last_disconnect_evidence
+        if (
+            evidence is None
+            or evidence.connection_generation != self._connection_generation
+        ):
+            evidence = StreamDisconnectEvidence(
+                origin=StreamDisconnectOrigin.REMOTE,
+                reason=StreamDisconnectReason.LISTENER_ENDED,
+                connection_generation=self._connection_generation,
+            )
+        self._last_disconnect_evidence = None
+        return evidence
+
+    async def request_stream_reconnect(self, reason: StreamDisconnectReason) -> bool:
+        """Close the active WebSocket with structured worker-liveness evidence."""
+        if reason is not StreamDisconnectReason.FRESH_STREAM_STALE:
+            raise ValueError(f"unsupported worker reconnect reason: {reason}")
+        websocket = self._ws
+        if websocket is None or websocket.close_code is not None:
+            return False
+        self._record_stream_disconnect(
+            StreamDisconnectOrigin.WORKER_LIVENESS,
+            reason,
+        )
+        try:
+            await websocket.close(code=4001, reason=reason.value)
+        except (WebSocketException, OSError):
+            pass
+        return True
 
     # --- Session-calendar helper -----------------------------------------
 
@@ -77,7 +174,7 @@ class _StreamingMixin(_CapitalComBase):
             return True
         try:
             tz = ZoneInfo(sym_info.timezone)
-        except Exception:  # noqa: BLE001
+        except (ZoneInfoNotFoundError, ValueError):
             return True
         local_dt = datetime.fromtimestamp(epoch_time(), tz=tz)
         return is_point_in_session(sym_info.opening_hours, local_dt)
@@ -98,7 +195,7 @@ class _StreamingMixin(_CapitalComBase):
             return True
         try:
             tz = ZoneInfo(sym_info.timezone)
-        except Exception:  # noqa: BLE001
+        except (ZoneInfoNotFoundError, ValueError):
             return True
         assert self.timeframe is not None
         tf_seconds = max(1, int(in_seconds(self.timeframe)))
@@ -152,6 +249,7 @@ class _StreamingMixin(_CapitalComBase):
         # ``watch_ohlcv`` would raise ``ConnectionError`` on an
         # otherwise healthy reconnect.
         raw_q = self._raw_ohlc_queue
+        connection_generation = self._connection_generation
         # Initialise the stale-feed stamp at the first iteration of the
         # loop so the watchdog does not fire while we are still in the
         # subscribe handshake (no market payloads yet by definition).
@@ -179,6 +277,11 @@ class _StreamingMixin(_CapitalComBase):
                                 "reconnect", err_code,
                             )
                             self._ws_session_invalid = True
+                            self._record_stream_disconnect(
+                                StreamDisconnectOrigin.REMOTE,
+                                StreamDisconnectReason.SESSION_INVALID,
+                                generation=connection_generation,
+                            )
                             break
                         broker_warning(
                             "Capital.com WS error frame (%s); continuing",
@@ -202,9 +305,10 @@ class _StreamingMixin(_CapitalComBase):
                             # OHLC watchdog.
                             continue
                         now = epoch_time()
-                        t_ms = payload_dict.get("t")
+                        t_ms: int | float | str | None = payload_dict.get("t")
                         if t_ms is not None:
-                            timestamp = int(t_ms) // 1000
+                            timestamp_ms = int(t_ms)
+                            timestamp = timestamp_ms // 1000
                             tf_seconds = (
                                 int(in_seconds(self.timeframe))
                                 if self.timeframe is not None
@@ -232,7 +336,7 @@ class _StreamingMixin(_CapitalComBase):
                             # event so the OHLC watchdog can anchor on
                             # the same axis as live_runner's synth
                             # deadline (bar-time, not arrival-wallclock).
-                            self._last_bar_open_ts = float(t_ms) / 1000.0
+                            self._last_bar_open_ts = timestamp_ms / 1000.0
                         self._last_ohlc_event_ts = now
                         # The worker owns volume resolution end-to-end:
                         # it reads ``_ws_quote_buckets[bar_open_s]``
@@ -335,11 +439,21 @@ class _StreamingMixin(_CapitalComBase):
             # Loop-level failure (likely from ``async for raw in self._ws``
             # itself: socket reset, decode error past json.loads, etc.).
             # Surface it so the next reconnect is not a complete mystery.
+            self._record_stream_disconnect(
+                StreamDisconnectOrigin.REMOTE,
+                StreamDisconnectReason.LISTENER_ERROR,
+                generation=connection_generation,
+            )
             broker_warning(
                 "Capital.com WS listener loop ended with %s: %s",
                 type(exc).__name__, exc,
             )
         finally:
+            self._record_stream_disconnect(
+                StreamDisconnectOrigin.REMOTE,
+                StreamDisconnectReason.LISTENER_ENDED,
+                generation=connection_generation,
+            )
             # Live runner reconnect is gated on a ``None`` sentinel in
             # the consumer queue. Route the disconnect signal through
             # ``raw_q`` so any bid bar still parked there (waiting for
@@ -425,8 +539,15 @@ class _StreamingMixin(_CapitalComBase):
                 # while the close is still in flight; the listener's
                 # finally clause delivers the sentinel.
                 self._last_payload_ts = 0.0
+                self._record_stream_disconnect(
+                    StreamDisconnectOrigin.REMOTE,
+                    StreamDisconnectReason.FEED_STALE,
+                )
                 try:
-                    await self._ws.close(code=4000, reason="feed-stale")
+                    await self._ws.close(
+                        code=4000,
+                        reason=StreamDisconnectReason.FEED_STALE.value,
+                    )
                 except (WebSocketException, OSError):
                     # Already-broken socket: the listener's finally is
                     # what guarantees the sentinel anyway.
@@ -469,11 +590,9 @@ class _StreamingMixin(_CapitalComBase):
            as if it had come from WS; ``watch_ohlcv`` then returns a
            real closed bar and the framework's ``wait_for`` never
            times out.
-        4. If REST hasn't published the bar yet (or timed out) - retry
-           on the next iteration. Only after ``MAX_REST_WAIT_S`` has
-           elapsed for the same slot do we escalate to ``ws.close``
-           and force a reconnect (publish lag alone must not trigger
-           a reconnect storm).
+        4. If REST has no exact-slot bar after ``MAX_REST_WAIT_S``, retain
+           the WebSocket and move only the private probe cursor to the next
+           slot. REST absence does not prove subscription degradation.
         5. If multiple consecutive bars are recovered from REST, the
            OHLC subscription itself is stale even though REST can hide
            the gap. Emit the recovered bar first, then close the WS so
@@ -498,6 +617,7 @@ class _StreamingMixin(_CapitalComBase):
         # the slot. Prevents an indefinite retry loop on publish lag.
         missing_slot_ts: int | None = None
         missing_slot_first_seen_at: float = 0.0
+        last_rest_absent_slot_ts: int | None = None
         consecutive_rest_recoveries = 0
         last_real_ohlc_event_ts = self._last_ohlc_event_ts
         try:
@@ -544,12 +664,14 @@ class _StreamingMixin(_CapitalComBase):
                     if not slot_in_session:
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
+                        last_rest_absent_slot_ts = None
                         consecutive_rest_recoveries = 0
                         self._last_bar_open_ts = 0.0
                         continue
                     now = epoch_time()
                     if self._last_ohlc_event_ts > last_real_ohlc_event_ts:
                         last_real_ohlc_event_ts = self._last_ohlc_event_ts
+                        last_rest_absent_slot_ts = None
                         consecutive_rest_recoveries = 0
                     if self._last_bar_open_ts == 0.0:
                         # Watchdog is disarmed — either we just connected
@@ -578,23 +700,35 @@ class _StreamingMixin(_CapitalComBase):
                             consecutive_rest_recoveries = 0
                             missing_slot_ts = None
                             missing_slot_first_seen_at = 0.0
+                            last_rest_absent_slot_ts = None
                         continue
-                    next_bar_close_at = (
-                        self._last_bar_open_ts + 2.0 * tf_seconds
-                    )
+                    missing_ts = int(self._last_bar_open_ts + tf_seconds)
+                    if (
+                        last_rest_absent_slot_ts is not None
+                        and last_rest_absent_slot_ts >= missing_ts
+                    ):
+                        missing_ts = last_rest_absent_slot_ts + int(tf_seconds)
+                    if not self._market_open_at(missing_ts):
+                        missing_slot_ts = None
+                        missing_slot_first_seen_at = 0.0
+                        last_rest_absent_slot_ts = None
+                        consecutive_rest_recoveries = 0
+                        self._last_bar_open_ts = 0.0
+                        continue
+                    next_bar_close_at = missing_ts + tf_seconds
                     if now < next_bar_close_at + rest_publish_lag_s:
                         # Reset slot tracking - we're still inside the
-                        # normal arrival window for the next bar.
+                        # normal arrival window for the exact slot being probed.
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
                         continue
 
-                    missing_ts = int(self._last_bar_open_ts + tf_seconds)
                     if missing_slot_ts != missing_ts:
                         missing_slot_ts = missing_ts
                         missing_slot_first_seen_at = now
                     ohlc_silent_for = now - self._last_ohlc_event_ts
 
+                    rest_indeterminate = False
                     try:
                         payload = await asyncio.wait_for(
                             asyncio.to_thread(
@@ -603,18 +737,31 @@ class _StreamingMixin(_CapitalComBase):
                             timeout=rest_fetch_timeout_s,
                         )
                     except asyncio.TimeoutError:
-                        # REST roundtrip stalled past our short cap.
-                        # The orphaned ``to_thread`` blocks one worker
-                        # thread until httpx times out at 50s, but the
-                        # watchdog stays responsive: treat this iteration
-                        # as "no bar yet" and let ``slot_wait`` below
-                        # decide between retry and reconnect escalation.
+                        # The request still owns its worker thread until the
+                        # httpx timeout, but this watchdog remains responsive.
                         broker_warning(
                             "ohlc watchdog REST fetch timed out for ts=%d "
                             "after %.1fs - retrying",
                             missing_ts, rest_fetch_timeout_s,
                         )
                         payload = None
+                        rest_indeterminate = True
+                    except (
+                        CapitalComError,
+                        HTTPError,
+                        KeyError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                    ) as error:
+                        broker_warning(
+                            "ohlc watchdog REST fetch was indeterminate for "
+                            "ts=%d: %s",
+                            missing_ts,
+                            type(error).__name__,
+                        )
+                        payload = None
+                        rest_indeterminate = True
                     if payload is not None:
                         broker_warning(
                             "ohlc.event missed for ts=%d (silent %.1fs) "
@@ -644,6 +791,7 @@ class _StreamingMixin(_CapitalComBase):
                         consecutive_rest_recoveries += 1
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
+                        last_rest_absent_slot_ts = None
                         assert self._update_queue is not None
                         await self._update_queue.put(("ohlc", payload))
                         if (consecutive_rest_recoveries
@@ -663,19 +811,55 @@ class _StreamingMixin(_CapitalComBase):
                             )
                             self._last_bar_open_ts = 0.0
                             consecutive_rest_recoveries = 0
+                            self._record_stream_disconnect(
+                                StreamDisconnectOrigin.OHLC_WATCHDOG,
+                                StreamDisconnectReason.OHLC_REST_RECOVERED_STALE,
+                            )
                             try:
                                 await self._ws.close(
                                     code=4001,
-                                    reason="ohlc-rest-recovered-stale",
+                                    reason=(
+                                        StreamDisconnectReason
+                                        .OHLC_REST_RECOVERED_STALE.value
+                                    ),
                                 )
                             except (WebSocketException, OSError):
                                 pass
                         continue
 
                     slot_wait = now - missing_slot_first_seen_at
+                    if rest_indeterminate:
+                        if slot_wait < max_rest_wait_s:
+                            continue
+                        broker_warning(
+                            "ohlc watchdog REST remained indeterminate for "
+                            "ts=%d after %.1fs - forcing WS reconnect",
+                            missing_ts,
+                            slot_wait,
+                        )
+                        self._last_bar_open_ts = 0.0
+                        missing_slot_ts = None
+                        missing_slot_first_seen_at = 0.0
+                        last_rest_absent_slot_ts = None
+                        consecutive_rest_recoveries = 0
+                        self._record_stream_disconnect(
+                            StreamDisconnectOrigin.OHLC_WATCHDOG,
+                            StreamDisconnectReason.OHLC_REST_INDETERMINATE,
+                        )
+                        try:
+                            await self._ws.close(
+                                code=4002,
+                                reason=(
+                                    StreamDisconnectReason
+                                    .OHLC_REST_INDETERMINATE.value
+                                ),
+                            )
+                        except (WebSocketException, OSError):
+                            pass
+                        continue
                     if slot_wait < max_rest_wait_s:
-                        # REST hasn't published the bar yet; retry on
-                        # the next iteration before escalating.
+                        # A successful exact-slot query found no bar yet;
+                        # retry until the bounded publication-settle window.
                         continue
 
                     # Distinguish a token-bound OHLC failure (quotes
@@ -706,24 +890,23 @@ class _StreamingMixin(_CapitalComBase):
                         self._last_bar_open_ts = 0.0
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
+                        last_rest_absent_slot_ts = None
                         continue
 
-                    broker_warning(
+                    broker_info(
                         "ohlc.event missed for ts=%d (silent %.1fs, "
-                        "quotes alive %.1fs ago) and REST has no bar "
-                        "after %.1fs - forcing WS reconnect",
+                        "quotes alive %.1fs ago) and exact-slot REST has no bar "
+                        "after %.1fs - retaining the WS and probing the next slot",
                         missing_ts, ohlc_silent_for,
                         quote_silent_for, slot_wait,
                     )
-                    # Reset the anchor so a second pass doesn't double-fire
-                    # while the close + reconnect is in flight.
-                    self._last_bar_open_ts = 0.0
+                    # REST absence is venue evidence, not subscription-failure
+                    # evidence. Advance only this watchdog's private probe cursor;
+                    # the emitted-bar cursor remains unchanged until a real WS or
+                    # REST-present bar is delivered.
+                    last_rest_absent_slot_ts = missing_ts
                     missing_slot_ts = None
                     missing_slot_first_seen_at = 0.0
-                    try:
-                        await self._ws.close(code=4001, reason="ohlc-stale")
-                    except (WebSocketException, OSError):
-                        pass
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -734,7 +917,6 @@ class _StreamingMixin(_CapitalComBase):
                         "ohlc watchdog iteration failed: %s",
                         repr(exc),
                     )
-                    await asyncio.sleep(2.0)
         except asyncio.CancelledError:
             pass
 
@@ -986,10 +1168,14 @@ class _StreamingMixin(_CapitalComBase):
                     "(consecutive bad bars=%d), forcing reconnect",
                     streak,
                 )
+                self._record_stream_disconnect(
+                    StreamDisconnectOrigin.QUOTE_VOLUME_WATCHDOG,
+                    StreamDisconnectReason.QUOTE_VOLUME_STALE,
+                )
                 try:
                     await ws.close(
                         code=4001,
-                        reason="quote-volume-stale",
+                        reason=StreamDisconnectReason.QUOTE_VOLUME_STALE.value,
                     )
                 except (WebSocketException, OSError):
                     # Already-broken socket: the listener's finally
@@ -1052,7 +1238,7 @@ class _StreamingMixin(_CapitalComBase):
                 timestamp, rest_timeout_s,
             )
             return 0.0
-        except Exception:  # noqa: BLE001
+        except (CapitalComError, HTTPError, KeyError, OSError, TypeError, ValueError):
             return 0.0
 
     def _fetch_bar_payload(self, timestamp: int) -> dict | None:
@@ -1068,40 +1254,45 @@ class _StreamingMixin(_CapitalComBase):
         :attr:`_update_queue`; pre-resolving volume here keeps the
         consumer path REST-free in both code paths.
 
-        Returns ``None`` if the bar is not yet published, the request
-        fails, or the returned bar's ``snapshotTimeUTC`` does not
-        match ``timestamp``.
+        Returns ``None`` only after a successful empty/wrong-slot response or
+        the venue's explicit ``error.prices.not-found`` empty-range response.
+        Transport, authentication and schema failures propagate so watchdogs
+        cannot misclassify indeterminate REST state as verified absence.
         """
+        time_from = datetime.fromtimestamp(
+            timestamp, tz=timezone.utc,
+        ).replace(tzinfo=None)
         try:
-            time_from = datetime.fromtimestamp(
-                timestamp, tz=timezone.utc,
-            ).replace(tzinfo=None)
             res = self.get_historical_prices(time_from=time_from, limit=1)
-            prices = res.get('prices') or []
-            if not prices:
-                return None
-            bar = prices[0]
-            snap = bar.get('snapshotTimeUTC')
-            if not snap:
-                return None
-            returned_ts = int(
-                datetime.fromisoformat(snap).replace(
-                    tzinfo=timezone.utc,
-                ).timestamp()
-            )
-            if returned_ts != timestamp:
-                return None
-            return {
-                "priceType": "bid",
-                "t": int(timestamp * 1000),
-                "o": float(bar['openPrice']['bid']),
-                "h": float(bar['highPrice']['bid']),
-                "l": float(bar['lowPrice']['bid']),
-                "c": float(bar['closePrice']['bid']),
-                "_volume": float(bar.get('lastTradedVolume') or 0.0),
-            }
-        except Exception:
+        except HistoricalPricesNotFoundError:
             return None
+        prices = res.get('prices')
+        if not isinstance(prices, list):
+            raise CapitalComError("historical price response schema changed")
+        if not prices:
+            return None
+        bar = prices[0]
+        if not isinstance(bar, dict):
+            raise CapitalComError("historical price row schema changed")
+        snap = bar.get('snapshotTimeUTC')
+        if not isinstance(snap, str):
+            raise CapitalComError("historical price row lacks a timestamp")
+        returned_ts = int(
+            datetime.fromisoformat(snap).replace(
+                tzinfo=timezone.utc,
+            ).timestamp()
+        )
+        if returned_ts != timestamp:
+            return None
+        return {
+            "priceType": "bid",
+            "t": int(timestamp * 1000),
+            "o": float(bar['openPrice']['bid']),
+            "h": float(bar['highPrice']['bid']),
+            "l": float(bar['lowPrice']['bid']),
+            "c": float(bar['closePrice']['bid']),
+            "_volume": float(bar.get('lastTradedVolume') or 0.0),
+        }
 
     def _fetch_reconnect_gap_payloads(
         self,
@@ -1126,56 +1317,58 @@ class _StreamingMixin(_CapitalComBase):
             return []
 
         payloads: dict[int, dict] = {}
-        try:
-            while cursor < current_bar_open:
-                time_from = datetime.fromtimestamp(
-                    cursor, tz=timezone.utc,
-                ).replace(tzinfo=None)
-                try:
-                    res = self.get_historical_prices(
-                        time_from=time_from,
-                        limit=1000,
+        while cursor < current_bar_open:
+            time_from = datetime.fromtimestamp(
+                cursor, tz=timezone.utc,
+            ).replace(tzinfo=None)
+            try:
+                res = self.get_historical_prices(
+                    time_from=time_from,
+                    limit=1000,
+                )
+            except HistoricalPricesNotFoundError:
+                break
+            prices = res.get('prices')
+            if not isinstance(prices, list):
+                raise ValueError("Capital.com reconnect history prices schema changed")
+            if not prices:
+                break
+            last_returned_ts: int | None = None
+            for bar in prices:
+                if not isinstance(bar, dict):
+                    raise ValueError("Capital.com reconnect history bar schema changed")
+                snap = bar.get('snapshotTimeUTC')
+                if not isinstance(snap, str):
+                    raise ValueError("Capital.com reconnect history timestamp is missing")
+                timestamp = int(
+                    datetime.fromisoformat(snap).replace(
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                )
+                if timestamp < cursor:
+                    raise ValueError(
+                        "Capital.com reconnect history page did not reach its cursor"
                     )
-                except CapitalComError as exc:
-                    if 'error.prices.not-found' in str(exc):
-                        break
-                    raise
-                prices = res.get('prices') or []
-                if not prices:
-                    break
-                last_returned_ts: int | None = None
-                for bar in prices:
-                    snap = bar.get('snapshotTimeUTC')
-                    if not snap:
-                        continue
-                    timestamp = int(
-                        datetime.fromisoformat(snap).replace(
-                            tzinfo=timezone.utc,
-                        ).timestamp()
+                if last_returned_ts is not None and timestamp <= last_returned_ts:
+                    raise ValueError(
+                        "Capital.com reconnect history page is not strictly ordered"
                     )
-                    last_returned_ts = timestamp
-                    if not (self._last_bar_timestamp < timestamp
-                            < current_bar_open):
-                        continue
-                    payloads[timestamp] = {
-                        "priceType": "bid",
-                        "t": int(timestamp * 1000),
-                        "o": float(bar['openPrice']['bid']),
-                        "h": float(bar['highPrice']['bid']),
-                        "l": float(bar['lowPrice']['bid']),
-                        "c": float(bar['closePrice']['bid']),
-                        "_volume": float(bar.get('lastTradedVolume') or 0.0),
-                    }
-                if last_returned_ts is None or last_returned_ts < cursor:
-                    break
-                cursor = last_returned_ts + tf_seconds
-        except Exception as exc:  # noqa: BLE001
-            broker_warning(
-                "reconnect history repair failed after ts=%d: %s",
-                self._last_bar_timestamp,
-                repr(exc),
-            )
-            return []
+                last_returned_ts = timestamp
+                if not (self._last_bar_timestamp < timestamp
+                        < current_bar_open):
+                    continue
+                payloads[timestamp] = {
+                    "priceType": "bid",
+                    "t": int(timestamp * 1000),
+                    "o": float(bar['openPrice']['bid']),
+                    "h": float(bar['highPrice']['bid']),
+                    "l": float(bar['lowPrice']['bid']),
+                    "c": float(bar['closePrice']['bid']),
+                    "_volume": float(bar.get('lastTradedVolume') or 0.0),
+                }
+            if last_returned_ts is None:
+                raise ValueError("Capital.com reconnect history page was not consumed")
+            cursor = last_returned_ts + tf_seconds
         return [payloads[timestamp] for timestamp in sorted(payloads)]
 
     @override
@@ -1235,8 +1428,11 @@ class _StreamingMixin(_CapitalComBase):
         self._ws = await websockets.connect(
             WS_URL, ping_interval=5, ping_timeout=5,
         )
+        self._connection_generation += 1
+        self._last_disconnect_evidence = None
 
-        self._update_queue = asyncio.Queue()
+        update_queue: asyncio.Queue = asyncio.Queue()
+        self._update_queue = update_queue
         self._raw_ohlc_queue = asyncio.Queue()
         self._tick_volume = 0
         # WS-primary volume state. Buckets restart per-connect because
@@ -1252,15 +1448,17 @@ class _StreamingMixin(_CapitalComBase):
         )
         self._ws_bad_bar_streak = 0
         self._ws_quote_timestamp_warned = False
+        repaired_through: int | None = None
         for payload in reconnect_payloads:
-            self._update_queue.put_nowait(("ohlc", payload))
+            update_queue.put_nowait(("ohlc", payload))
         if reconnect_payloads:
-            repaired_through = int(reconnect_payloads[-1]["t"] / 1000)
-            self._last_bar_open_ts = float(repaired_through)
+            repaired_timestamp = int(reconnect_payloads[-1]["t"] / 1000)
+            repaired_through = repaired_timestamp
+            self._last_bar_open_ts = float(repaired_timestamp)
             broker_warning(
                 "reconnect restored %d closed bar(s) from REST through ts=%d",
                 len(reconnect_payloads),
-                repaired_through,
+                repaired_timestamp,
             )
         # Seed the bar-time anchor from the warmup baseline if the
         # provider already loaded one. Without this, the OHLC
@@ -1304,7 +1502,7 @@ class _StreamingMixin(_CapitalComBase):
         else:
             self._last_bar_open_ts = 0.0
             self._last_ohlc_event_ts = 0.0
-        if reconnect_payloads:
+        if repaired_through is not None:
             self._last_bar_open_ts = float(repaired_through)
             self._last_ohlc_event_ts = now_ts
 
@@ -1357,7 +1555,7 @@ class _StreamingMixin(_CapitalComBase):
         if self._ws is not None:
             try:
                 await self._ws.close()
-            except Exception:
+            except (WebSocketException, OSError):
                 pass
             self._ws = None
         self._update_queue = None
@@ -1550,7 +1748,7 @@ class _StreamingMixin(_CapitalComBase):
                 if returned_ts != timestamp:
                     return 0.0
             return float(bar.get('lastTradedVolume') or 0.0)
-        except Exception:
+        except (CapitalComError, HTTPError, KeyError, OSError, TypeError, ValueError):
             return 0.0
 
     def _extra_fields(self) -> dict[str, float] | None:
