@@ -184,7 +184,6 @@ class CapitalCom(
         # (consumer that adds REST volume and forwards to
         # ``_update_queue``).
         self._raw_ohlc_queue: asyncio.Queue | None = None
-        self._tick_volume: int = 0
         # Latest tick quote snapshot, updated by each ``quote`` event and
         # attached to every OHLCV emitted by ``watch_ohlcv`` so the spinner
         # and the per-bar OHLCV log can show ``bid``, ``ask`` and ``spread``.

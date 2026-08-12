@@ -4,6 +4,7 @@
 import asyncio
 import json
 import threading
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -4610,6 +4611,132 @@ def __test_listen_loop_drops_premature_ohlc_without_advancing_liveness__(
     assert broker._raw_ohlc_queue.empty()
     assert broker._last_ohlc_event_ts == 1_061.0
     assert broker._last_bar_open_ts == 1_000.0
+
+
+def __test_listen_loop_defers_near_boundary_ohlc_until_local_close__(
+        monkeypatch,
+):
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    near_boundary = json.dumps({
+        "destination": "ohlc.event",
+        "payload": {
+            "priceType": "bid",
+            "t": 1_000_000,
+        },
+    })
+    released = asyncio.Event()
+    original_sleep = asyncio.sleep
+    started = time.monotonic()
+
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.epoch_time",
+        lambda: 1_059.995 + time.monotonic() - started,
+    )
+
+    async def runner() -> tuple[float, float, tuple[str, dict], tuple[str, None]]:
+        class _ObservedQueue(asyncio.Queue):
+            async def put(self, item) -> None:
+                await super().put(item)
+                if item[0] == "ohlc":
+                    released.set()
+
+        broker._raw_ohlc_queue = _ObservedQueue()
+        broker._update_queue = asyncio.Queue()
+
+        class _ScriptedWS:
+            close_code = None
+
+            def __init__(self):
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.sent:
+                    self.sent = True
+                    return near_boundary
+                await released.wait()
+                await original_sleep(0)
+                raise StopAsyncIteration
+
+        broker._ws = _ScriptedWS()  # type: ignore[assignment]
+        await broker._listen_loop()
+        first = broker._raw_ohlc_queue.get_nowait()
+        second = broker._raw_ohlc_queue.get_nowait()
+        return broker._last_ohlc_event_ts, broker._last_bar_open_ts, first, second
+
+    event_ts, bar_ts, first, second = asyncio.run(runner())
+
+    assert event_ts >= 1_060.0
+    assert bar_ts == 1_000.0
+    assert first[0] == "ohlc"
+    assert first[1]["t"] == 1_000_000
+    assert second == ("disconnect", None)
+
+
+def __test_listen_loop_cancels_near_boundary_ohlc_on_generation_change__(
+        monkeypatch,
+):
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    near_boundary = json.dumps({
+        "destination": "ohlc.event",
+        "payload": {
+            "priceType": "bid",
+            "t": 1_000_000,
+        },
+    })
+    release = asyncio.Event()
+    original_sleep = asyncio.sleep
+    started = time.monotonic()
+
+    monkeypatch.setattr(
+        "pynecore_capitalcom.streaming.epoch_time",
+        lambda: 1_059.995 + time.monotonic() - started,
+    )
+
+    async def runner() -> list[tuple[str, dict | None]]:
+        broker._raw_ohlc_queue = asyncio.Queue()
+        broker._update_queue = asyncio.Queue()
+
+        class _ScriptedWS:
+            close_code = None
+
+            def __init__(self):
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.sent:
+                    self.sent = True
+                    return near_boundary
+                broker._connection_generation += 1
+                release.set()
+                await original_sleep(0.01)
+                raise StopAsyncIteration
+
+        broker._ws = _ScriptedWS()  # type: ignore[assignment]
+        await broker._listen_loop()
+        items: list[tuple[str, dict | None]] = []
+        while not broker._raw_ohlc_queue.empty():
+            items.append(broker._raw_ohlc_queue.get_nowait())
+        return items
+
+    items = asyncio.run(runner())
+
+    assert items == [("disconnect", None)]
+    assert broker._last_ohlc_event_ts == 0.0
+    assert broker._last_bar_open_ts == 0.0
 
 
 def __test_listen_loop_flags_session_invalid_error_frame__():
@@ -11052,6 +11179,199 @@ def __test_ws_volume_rest_failed_no_baseline_emits_raw__():
     assert items[0][1]["_volume"] == 0.0
     assert rest_calls == [bar_open_s]
     assert list(broker._ws_volume_baseline) == []
+
+
+def __test_ws_volume_backfill_preserves_next_bar_forming_volume__(monkeypatch):
+    """A slow REST lookup for bar T cannot erase T+60 forming volume."""
+
+    async def run_scenario() -> None:
+        broker = _make_volume_broker(tf="1")
+        bar_a_open_s = 1_700_000_040
+        bar_b_open_s = bar_a_open_s + 60
+        broker._ws_coverage_started_at = float(bar_a_open_s) + 30.0
+        monkeypatch.setattr(
+            streaming_module,
+            "epoch_time",
+            lambda: float(bar_a_open_s) + 65.0,
+        )
+
+        frames = [
+            json.dumps({
+                "destination": "ohlc.event",
+                "payload": {
+                    "priceType": "bid",
+                    "t": bar_a_open_s * 1000,
+                    "o": 1.0,
+                    "h": 1.001,
+                    "l": 0.999,
+                    "c": 1.0005,
+                },
+            }),
+            *[
+                json.dumps({
+                    "destination": "quote",
+                    "payload": {
+                        "bid": 1.0005 + index * 0.0001,
+                        "ofr": 1.0007 + index * 0.0001,
+                        "timestamp": (bar_b_open_s + index + 1) * 1000,
+                    },
+                })
+                for index in range(3)
+            ],
+        ]
+
+        class _ScriptedWS:
+            close_code = None
+
+            def __aiter__(self):
+                self._iter = iter(frames)
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def close(self, code=None, reason=None):
+                self.close_code = code
+
+        rest_started = asyncio.Event()
+        release_rest = asyncio.Event()
+
+        async def blocked_rest_volume(*_args, **_kwargs) -> float:
+            rest_started.set()
+            await release_rest.wait()
+            return 137.0
+
+        broker._ws = _ScriptedWS()
+        monkeypatch.setattr(
+            broker,
+            "_fetch_bar_volume_with_budget",
+            blocked_rest_volume,
+        )
+
+        listener_task = asyncio.create_task(broker._listen_loop())
+        worker_task = asyncio.create_task(broker._volume_backfill_worker_loop())
+        await rest_started.wait()
+        await listener_task
+
+        assert broker._ws_quote_buckets[bar_b_open_s] == 3
+        release_rest.set()
+        await worker_task
+
+        closed = await broker.watch_ohlcv("EURUSD", "1")
+        forming = await broker.watch_ohlcv("EURUSD", "1")
+        assert closed.is_closed is True
+        assert closed.volume == 137.0
+        assert forming.is_closed is False
+        assert forming.volume == 1.0
+
+    asyncio.run(run_scenario())
+
+
+def __test_ws_quote_snapshots_survive_consumer_lag_through_same_bar_close__(
+        monkeypatch,
+):
+    """Queued ticks retain cumulative volume and prices after bucket cleanup."""
+
+    async def run_scenario() -> None:
+        broker = _make_volume_broker(tf="1")
+        bar_open_s = 1_700_000_040
+        broker._ws_coverage_started_at = float(bar_open_s) - 5.0
+        monkeypatch.setattr(
+            streaming_module,
+            "epoch_time",
+            lambda: float(bar_open_s) + 60.0,
+        )
+        broker._last_bar_ohlcv = streaming_module.OHLCV(
+            timestamp=(bar_open_s - 60) * 1000,
+            open=1.0,
+            high=1.0,
+            low=1.0,
+            close=1.0,
+            volume=1.0,
+            is_closed=True,
+        )
+
+        frames = [
+            json.dumps({
+                "destination": "quote",
+                "payload": {
+                    "bid": 1.1,
+                    "ofr": 1.1002,
+                    "timestamp": (bar_open_s + 1) * 1000,
+                },
+            }),
+            json.dumps({
+                "destination": "quote",
+                "payload": {
+                    "bid": 1.3,
+                    "ofr": 1.3002,
+                    "timestamp": (bar_open_s + 2) * 1000,
+                },
+            }),
+            json.dumps({
+                "destination": "quote",
+                "payload": {
+                    "bid": 1.2,
+                    "ofr": 1.2002,
+                    "timestamp": (bar_open_s + 3) * 1000,
+                },
+            }),
+            json.dumps({
+                "destination": "ohlc.event",
+                "payload": {
+                    "priceType": "bid",
+                    "t": bar_open_s * 1000,
+                    "o": 1.0,
+                    "h": 1.3,
+                    "l": 1.0,
+                    "c": 1.2,
+                },
+            }),
+        ]
+
+        class _ScriptedWS:
+            close_code = None
+
+            def __aiter__(self):
+                self._iter = iter(frames)
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def close(self, code=None, reason=None):
+                self.close_code = code
+
+        broker._ws = _ScriptedWS()
+        listener_task = asyncio.create_task(broker._listen_loop())
+        worker_task = asyncio.create_task(broker._volume_backfill_worker_loop())
+        await listener_task
+        await worker_task
+
+        assert bar_open_s not in broker._ws_quote_buckets
+        first = await broker.watch_ohlcv("EURUSD", "1")
+        second = await broker.watch_ohlcv("EURUSD", "1")
+        third = await broker.watch_ohlcv("EURUSD", "1")
+        closed = await broker.watch_ohlcv("EURUSD", "1")
+
+        assert [first.close, second.close, third.close] == [1.1, 1.3, 1.2]
+        assert [first.volume, second.volume, third.volume] == [1.0, 2.0, 3.0]
+        assert [
+            first.extra_fields["ask_close"],
+            second.extra_fields["ask_close"],
+            third.extra_fields["ask_close"],
+        ] == [1.1002, 1.3002, 1.2002]
+        assert third.high == 1.3
+        assert closed.is_closed is True
+        assert closed.volume == 3.0
+
+    asyncio.run(run_scenario())
 
 
 def __test_ws_volume_listener_buckets_quotes_by_timestamp__():

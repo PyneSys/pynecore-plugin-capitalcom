@@ -18,8 +18,8 @@ updates) over a single WS endpoint. This mix-in owns:
 State touched: ``_ws``, ``_update_queue``, ``_listen_task``,
 ``_ping_task``, ``_feed_watchdog_task``, ``_last_payload_ts``,
 ``_last_bar_timestamp``, ``_last_bar_ohlcv``, ``_last_bid``,
-``_last_ask``, ``_tick_volume``, ``_ws_quote_buckets``,
-``_ws_coverage_started_at``, ``_ws_volume_baseline``, ``_ws_bad_bar_streak``.
+``_last_ask``, ``_ws_quote_buckets``, ``_ws_coverage_started_at``,
+``_ws_volume_baseline``, ``_ws_bad_bar_streak``.
 """
 import asyncio
 import collections
@@ -41,7 +41,7 @@ from pynecore.core.session import is_in_session, is_point_in_session
 from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
-from ._base import _CapitalComBase
+from ._base import _CapitalComBase, _QuoteSnapshot
 from .exceptions import CapitalComError, HistoricalPricesNotFoundError
 from .rest import _SESSION_RECREATE_CODES
 from .helpers import (
@@ -51,6 +51,9 @@ from .helpers import (
     _WS_VOLUME_LOW_RATIO,
     _WS_VOLUME_MIN_BASELINE_BARS,
 )
+
+
+_OHLC_CLOSE_CLOCK_SKEW_TOLERANCE_S = 3.0
 
 
 class StreamDisconnectOrigin(StrEnum):
@@ -230,10 +233,11 @@ class _StreamingMixin(_CapitalComBase, ABC):
         here would silently discard every update.
 
         Events are routed to ``_update_queue`` as ``("ohlc", payload)`` or
-        ``("quote", None)`` tuples. The consumer (``watch_ohlcv``) turns a
-        ``quote`` tick into a synthetic intra-bar OHLCV update so the
-        live spinner and tick hooks see fresh bid/ask at every tick, not
-        only on bar close.
+        ``("quote", bar_open_s)`` tuples. The backfill worker snapshots the
+        current bar-scoped quote count when forwarding each quote to the
+        consumer, which turns it into a synthetic intra-bar OHLCV update. The
+        spinner and tick hooks therefore see fresh bid/ask at every tick, not
+        only on bar close, without REST or consumer lag erasing forming volume.
         """
         assert (self._ws is not None
                 and self._update_queue is not None
@@ -250,6 +254,65 @@ class _StreamingMixin(_CapitalComBase, ABC):
         # otherwise healthy reconnect.
         raw_q = self._raw_ohlc_queue
         connection_generation = self._connection_generation
+        pending_ohlc_tasks: set[asyncio.Task[None]] = set()
+
+        async def forward_ohlc_at_close(
+            ohlc_payload: dict,
+            bar_timestamp_ms: int,
+            close_boundary: float,
+        ) -> None:
+            delay = max(0.0, close_boundary - epoch_time())
+            if delay > 0.0:
+                loop = asyncio.get_running_loop()
+                deadline_reached: asyncio.Future[None] = loop.create_future()
+
+                def release_deadline(_timer_arg: object | None = None) -> None:
+                    if not deadline_reached.done():
+                        deadline_reached.set_result(None)
+
+                timer = loop.call_later(delay, release_deadline, None)
+                try:
+                    await deadline_reached
+                finally:
+                    timer.cancel()
+            if (
+                self._connection_generation != connection_generation
+                or self._raw_ohlc_queue is not raw_q
+            ):
+                return
+            forwarded_at = epoch_time()
+            max_live_age = max(
+                300,
+                3 * (
+                    int(in_seconds(self.timeframe))
+                    if self.timeframe is not None
+                    else 60
+                ),
+            )
+            bar_timestamp = bar_timestamp_ms // 1000
+            if forwarded_at - bar_timestamp > max_live_age:
+                broker_warning(
+                    "dropping stale Capital.com WS OHLC event ts=%d age=%.1fs",
+                    bar_timestamp,
+                    forwarded_at - bar_timestamp,
+                )
+                return
+            self._last_bar_open_ts = bar_timestamp_ms / 1000.0
+            self._last_ohlc_event_ts = forwarded_at
+            await raw_q.put(("ohlc", ohlc_payload))
+
+        def task_completed(task: asyncio.Task[None]) -> None:
+            pending_ohlc_tasks.discard(task)
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                broker_warning(
+                    "Capital.com deferred OHLC forwarding raised %s: %s",
+                    type(error).__name__,
+                    error,
+                )
+
         # Initialise the stale-feed stamp at the first iteration of the
         # loop so the watchdog does not fire while we are still in the
         # subscribe handshake (no market payloads yet by definition).
@@ -306,61 +369,63 @@ class _StreamingMixin(_CapitalComBase, ABC):
                             continue
                         now = epoch_time()
                         t_ms: int | float | str | None = payload_dict.get("t")
+                        timestamp_ms: int | None = None
                         if t_ms is not None:
-                            timestamp_ms = int(t_ms)
-                            timestamp = timestamp_ms // 1000
+                            parsed_timestamp_ms = int(t_ms)
+                            timestamp_ms = parsed_timestamp_ms
+                            timestamp = parsed_timestamp_ms // 1000
                             tf_seconds = (
                                 int(in_seconds(self.timeframe))
                                 if self.timeframe is not None
                                 else 60
                             )
                             closes_at = timestamp + tf_seconds
-                            if now < closes_at:
+                            closes_in = closes_at - now
+                            if closes_in > _OHLC_CLOSE_CLOCK_SKEW_TOLERANCE_S:
                                 broker_warning(
                                     "dropping premature Capital.com WS OHLC "
                                     "event ts=%d closes_in=%.1fs",
                                     timestamp,
-                                    closes_at - now,
+                                    closes_in,
                                 )
                                 continue
-                            max_live_age = max(300, 3 * tf_seconds)
-                            if now - timestamp > max_live_age:
-                                broker_warning(
-                                    "dropping stale Capital.com WS OHLC "
-                                    "event ts=%d age=%.1fs",
-                                    timestamp,
-                                    now - timestamp,
+                            if closes_in > 0.0:
+                                pending_task = asyncio.create_task(
+                                    forward_ohlc_at_close(
+                                        dict(payload_dict),
+                                        parsed_timestamp_ms,
+                                        closes_at,
+                                    )
                                 )
+                                pending_ohlc_tasks.add(pending_task)
+                                pending_task.add_done_callback(task_completed)
                                 continue
-                            # Stamp the bar OPEN of the latest forwarded
-                            # event so the OHLC watchdog can anchor on
-                            # the same axis as live_runner's synth
-                            # deadline (bar-time, not arrival-wallclock).
-                            self._last_bar_open_ts = timestamp_ms / 1000.0
-                        self._last_ohlc_event_ts = now
-                        # The worker owns volume resolution end-to-end:
-                        # it reads ``_ws_quote_buckets[bar_open_s]``
-                        # (filled by the quote branch using per-quote
-                        # ``timestamp``), decides REST vs. WS, and
-                        # resets ``_tick_volume`` for the synth
-                        # spinner. Doing the reset here would race a
-                        # late quote whose bucket the worker has not
-                        # yet pulled.
-                        await raw_q.put(("ohlc", payload_dict))
+                        # The worker owns closed-bar volume resolution
+                        # end-to-end: it consumes only this bar's quote
+                        # bucket and decides REST vs. WS. Forming updates
+                        # read their own bar-scoped bucket, so asynchronous
+                        # REST backfill cannot reset or contaminate them.
+                        if t_ms is None:
+                            self._last_ohlc_event_ts = now
+                            await raw_q.put(("ohlc", payload_dict))
+                        elif timestamp_ms is not None:
+                            await forward_ohlc_at_close(
+                                payload_dict,
+                                timestamp_ms,
+                                now,
+                            )
                     elif dest == "quote":
                         payload = data.get("payload") or {}
                         bid: float | str | None = payload.get("bid")
                         ofr: float | str | None = payload.get("ofr")
-                        if bid is not None:
-                            self._last_bid = float(bid)
-                        if ofr is not None:
-                            self._last_ask = float(ofr)
+                        bid_snapshot = float(bid) if bid is not None else None
+                        ask_snapshot = float(ofr) if ofr is not None else None
                         # Bucket the tick into the bar the quote
                         # actually belongs to (via its own
                         # ``timestamp``), NOT into whichever bar
                         # happens to be open when ``ohlc.event``
                         # arrives. A reconnect mid-bar would otherwise
-                        # stamp ``_tick_volume`` against the new
+                        # stamp one shared counter against the new
                         # connection's current bar, then close it as
                         # if it were the full count -> deterministic
                         # V=1 contamination. With bucketing, a partial
@@ -387,20 +452,24 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         tf_seconds = (int(in_seconds(self.timeframe))
                                       if self.timeframe is not None
                                       else 0)
+                        bar_open_s: int | None
+                        cumulative_volume: int
                         if tf_seconds > 0:
                             ts_s = int(ts_ms) // 1000
-                            bar_open_s = ts_s - (ts_s % tf_seconds)
-                            self._ws_quote_buckets[bar_open_s] = (
-                                self._ws_quote_buckets.get(bar_open_s, 0)
-                                + 1
+                            calculated_bar_open_s = ts_s - (ts_s % tf_seconds)
+                            bar_open_s = calculated_bar_open_s
+                            cumulative_volume = (
+                                self._ws_quote_buckets.get(
+                                    calculated_bar_open_s,
+                                    0,
+                                ) + 1
                             )
-                        # Global counter remains the source for the
-                        # intra-bar synth spinner
-                        # (``_synth_from_quote``). The worker resets it
-                        # when the bid bar closes so the next bar's
-                        # spinner starts from 0, matching the legacy
-                        # behaviour.
-                        self._tick_volume += 1
+                            self._ws_quote_buckets[calculated_bar_open_s] = (
+                                cumulative_volume
+                            )
+                        else:
+                            bar_open_s = None
+                            cumulative_volume = 0
                         # Stamp the quote-liveness anchor so the OHLC
                         # watchdog can tell "quotes still flowing =>
                         # token-bound OHLC failure, must reconnect"
@@ -416,7 +485,15 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         # Otherwise ``_synth_from_quote`` would
                         # mutate/emit the previous bar with next-bar
                         # prices before the closed bar lands.
-                        await raw_q.put(("quote", None))
+                        await raw_q.put((
+                            "quote",
+                            _QuoteSnapshot(
+                                bar_open_s=bar_open_s,
+                                cumulative_volume=cumulative_volume,
+                                bid=bid_snapshot,
+                                ask=ask_snapshot,
+                            ),
+                        ))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -449,6 +526,10 @@ class _StreamingMixin(_CapitalComBase, ABC):
                 type(exc).__name__, exc,
             )
         finally:
+            for pending_task in pending_ohlc_tasks:
+                pending_task.cancel()
+            if pending_ohlc_tasks:
+                await asyncio.gather(*pending_ohlc_tasks, return_exceptions=True)
             self._record_stream_disconnect(
                 StreamDisconnectOrigin.REMOTE,
                 StreamDisconnectReason.LISTENER_ENDED,
@@ -773,21 +854,17 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         # on the same slot while the injected bar is
                         # still in the queue.
                         self._last_bar_open_ts = float(missing_ts)
-                        # Reset the tick-volume accumulator at the
-                        # recovered bar boundary. ``_listen_loop``
-                        # normally snapshots-and-resets ``_tick_volume``
-                        # in lockstep with every bid bar (so each bar's
-                        # synth/REST-fallback volume counts only its own
-                        # ticks); because the bid event was missed, no
-                        # such reset happened. Without this, the next
-                        # ``_synth_from_quote`` or the REST-volume
-                        # fallback would include quote ticks accumulated
-                        # across the missed slot AND the current slot,
-                        # inflating volume after every recovered bar.
-                        # We do not need the missed-slot count: REST's
-                        # ``lastTradedVolume`` is the authoritative volume
-                        # for the recovered bar.
-                        self._tick_volume = 0
+                        # Drop only the recovered slot's quote bucket.
+                        # The injected payload already carries REST's
+                        # authoritative ``lastTradedVolume``; buckets for
+                        # later forming bars must survive while this slot
+                        # is being recovered.
+                        self._ws_quote_buckets.pop(missing_ts, None)
+                        for stale_ts in [
+                            bucket_ts for bucket_ts in self._ws_quote_buckets
+                            if bucket_ts < missing_ts
+                        ]:
+                            self._ws_quote_buckets.pop(stale_ts, None)
                         consecutive_rest_recoveries += 1
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
@@ -967,8 +1044,10 @@ class _StreamingMixin(_CapitalComBase, ABC):
         — mirrors the OHLC watchdog's stale-subscription recovery.
         Partial-coverage bars NEVER count toward this streak.
 
-        Quote frames are forwarded verbatim and preserve their order
-        relative to in-flight bid bars (single-consumer FIFO).
+        Quote frames preserve their order relative to in-flight bid bars
+        (single-consumer FIFO) and carry immutable bar-open, cumulative-volume,
+        bid and ask snapshots. A slow REST lookup for the preceding close or a
+        lagging consumer therefore cannot erase or replace queued tick state.
 
         REST stall bound: the underlying ``httpx`` client uses a 50s
         request timeout. Cap each REST lookup at
@@ -1002,8 +1081,10 @@ class _StreamingMixin(_CapitalComBase, ABC):
                     out_q.put_nowait(None)
                     return
                 if event_type != "ohlc":
-                    # Quote frame - forward verbatim, preserves order
-                    # relative to any in-flight bid bar.
+                    # The listener already froze this frame's bar, cumulative
+                    # count and prices. Forward the immutable snapshot verbatim
+                    # so neither REST nor consumer lag can substitute later
+                    # mutable state.
                     await out_q.put((event_type, payload))
                     continue
                 try:
@@ -1149,13 +1230,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
 
         payload["_volume"] = chosen
         await out_q.put(("ohlc", payload))
-
-        # Reset the global tick counter at bar close so
-        # ``_synth_from_quote`` starts the next bar's intra-bar
-        # spinner from 0 (matches legacy spinner behaviour). Doing
-        # this here, not in the listener, avoids a race against a
-        # late quote whose bucket the worker has yet to consume.
-        self._tick_volume = 0
 
         if (self._ws_bad_bar_streak
                 >= _WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD):
@@ -1434,7 +1508,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
         update_queue: asyncio.Queue = asyncio.Queue()
         self._update_queue = update_queue
         self._raw_ohlc_queue = asyncio.Queue()
-        self._tick_volume = 0
         # WS-primary volume state. Buckets restart per-connect because
         # they key on the THIS connection's quote stream; baseline is
         # also fresh — the rolling median is only useful between bars
@@ -1659,7 +1732,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
         # gap), ``connect()`` discards it on its own and the quote-alive
         # re-arm branch inside ``_ohlc_watchdog_loop`` takes over.
         self._last_bar_ohlcv = None
-        self._tick_volume = 0
         self._last_bid = None
         self._last_ask = None
         # Quote buckets are per-connection only — they cannot survive
@@ -1706,15 +1778,16 @@ class _StreamingMixin(_CapitalComBase, ABC):
             else:
                 # Quote arrived before any OHLC baseline yields None;
                 # keep waiting until the first ``ohlc.event`` lands.
-                result = self._synth_from_quote()
+                assert isinstance(payload, _QuoteSnapshot)
+                result = self._synth_from_quote(payload)
             if result is not None:
                 return result
 
     def _fetch_bar_volume(self, timestamp: int) -> float:
         """Fetch ``lastTradedVolume`` for a single closed bar via REST.
 
-        Used by :meth:`watch_ohlcv` to override the throttled local
-        ``_tick_volume`` with Capital.com's authoritative per-bar
+        Used by the volume backfill worker to override a suspect WS quote
+        bucket with Capital.com's authoritative per-bar
         ``lastTradedVolume``. Returns ``0.0`` if the bar is not yet
         published, the request fails, or the returned bar doesn't match
         our timestamp — callers keep the local tick count in that case.
@@ -1795,11 +1868,9 @@ class _StreamingMixin(_CapitalComBase, ABC):
             return None
         # The payload is pre-enriched with ``_volume`` by either
         # :meth:`_volume_backfill_worker_loop` (regular WS path) or
-        # :meth:`_fetch_bar_payload` (watchdog REST-inject path). The
-        # ``_tick_volume`` snapshot/reset for the consumed bar already
-        # happened in :meth:`_listen_loop` synchronously with the bar
-        # boundary, so this method must not touch ``self._tick_volume``
-        # - doing so would corrupt the next bar's accumulator.
+        # :meth:`_fetch_bar_payload` (watchdog REST-inject path). Quote
+        # volume is bar-scoped, so this method must not mutate any later
+        # forming bar's bucket.
         volume = float(payload.get("_volume", 0.0))
         closed = OHLCV(
             timestamp=timestamp_ms,
@@ -1815,8 +1886,8 @@ class _StreamingMixin(_CapitalComBase, ABC):
         self._last_bar_ohlcv = closed
         return closed
 
-    def _synth_from_quote(self) -> OHLCV | None:
-        """Synthesize an intra-bar OHLCV from the latest tick quote.
+    def _synth_from_quote(self, quote: _QuoteSnapshot) -> OHLCV | None:
+        """Synthesize an intra-bar OHLCV from one immutable tick snapshot.
 
         ``ohlc.event`` only pushes on bar close at some resolutions; the
         live spinner and tick hooks would then freeze between closes. To
@@ -1827,19 +1898,30 @@ class _StreamingMixin(_CapitalComBase, ABC):
         ``extra_fields`` snapshot carries the current bid/ask/spread so
         consumers can render real-time quotes.
 
-        Returns ``None`` if no OHLC baseline has been received yet — the
-        caller then waits for the next event.
+        The listener freezes bar-open timestamp, cumulative volume, bid and ask
+        when the frame arrives. The consumer applies exactly that snapshot, so
+        queued ticks preserve spikes, retracements and volume even when REST or
+        consumer work delays them.
+
+        Returns ``None`` if no OHLC baseline or bid has been received yet — the
+        caller then waits for the next event. The snapshot still updates the
+        latest quote state before that gate so the first later close can expose
+        bid/ask fields even if no forming baseline existed yet.
         """
-        if self._last_bar_ohlcv is None or self._last_bid is None:
+        if quote.bid is not None:
+            self._last_bid = quote.bid
+        if quote.ask is not None:
+            self._last_ask = quote.ask
+        if self._last_bar_ohlcv is None or quote.bid is None:
             return None
-        new_close = self._last_bid
+        new_close = quote.bid
         new_high = max(self._last_bar_ohlcv.high, new_close)
         new_low = min(self._last_bar_ohlcv.low, new_close)
         synth = self._last_bar_ohlcv._replace(
             high=new_high,
             low=new_low,
             close=new_close,
-            volume=float(self._tick_volume),
+            volume=float(quote.cumulative_volume),
             extra_fields=self._extra_fields(),
             is_closed=False,
         )

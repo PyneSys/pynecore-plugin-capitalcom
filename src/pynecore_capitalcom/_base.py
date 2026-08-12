@@ -29,6 +29,7 @@ import asyncio
 import collections
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, cast
 
@@ -47,6 +48,16 @@ if TYPE_CHECKING:
     from pynecore.core.broker.disappearance import DisappearanceTracker
     from pynecore.core.broker.models import DispatchEnvelope, PositionLeg
     from pynecore.core.broker.storage import OrderRow
+
+
+@dataclass(frozen=True, slots=True)
+class _QuoteSnapshot:
+    """Immutable per-frame quote state carried through both FIFO queues."""
+
+    bar_open_s: int | None
+    cumulative_volume: int
+    bid: float | None
+    ask: float | None
 
 
 class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
@@ -132,7 +143,6 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     _ohlc_watchdog_task: asyncio.Task | None
     _volume_backfill_task: asyncio.Task | None
     _raw_ohlc_queue: asyncio.Queue | None
-    _tick_volume: int
     _last_bid: float | None
     _last_ask: float | None
     _last_payload_ts: float
@@ -231,7 +241,7 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _on_ohlc_event(self, payload: dict) -> OHLCV | None: ...
 
-    def _synth_from_quote(self) -> OHLCV | None: ...
+    def _synth_from_quote(self, quote: _QuoteSnapshot) -> OHLCV | None: ...
 
     def _extra_fields(self) -> dict[str, float] | None: ...
 
