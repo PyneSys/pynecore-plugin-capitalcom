@@ -20,6 +20,7 @@ set, watermark, external-activity log dedup), ``_current_poll_id``
 the reconciler).
 """
 import asyncio
+from abc import ABC
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator
 
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
 
-class _ActivityMixin(_CapitalComBase):
+class _ActivityMixin(_CapitalComBase, ABC):
     """Activity-poll mix-in: the ``watch_orders`` AsyncIterator + helpers."""
 
     @override

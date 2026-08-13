@@ -28,13 +28,15 @@ LiveProviderPlugin → ProviderPlugin → Plugin → object``.
 import asyncio
 import collections
 import threading
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Protocol, cast
 
 from pynecore.core.broker.models import (
+    EntryIntent,
     ExchangeOrder,
+    ExitIntent,
     OrderEvent,
 )
 from pynecore.core.plugin.broker import BrokerPlugin
@@ -42,12 +44,13 @@ from pynecore.core.syminfo import SymInfo
 from pynecore.types.ohlcv import OHLCV
 
 from .config import CapitalComConfig
+from .helpers import _size_from_units
 from .models import _ActivityCursor, _InstrumentRules
 
 if TYPE_CHECKING:
     from pynecore.core.broker.disappearance import DisappearanceTracker
     from pynecore.core.broker.models import DispatchEnvelope, PositionLeg
-    from pynecore.core.broker.storage import OrderRow
+    from pynecore.core.broker.storage import OrderRow, RunContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +61,33 @@ class _QuoteSnapshot:
     cumulative_volume: int
     bid: float | None
     ask: float | None
+
+
+class CapitalComHookCollaborator(Protocol):
+    """Public collaborator surface used by standalone dispatch/recovery hooks."""
+
+    store_ctx: 'RunContext | None'
+
+    async def call_api(
+            self, endpoint: str, *, data: dict | None = None,
+            method: str = 'post',
+    ) -> dict: ...
+
+    async def submit_exclusive_partial_close(
+            self, *, coid: str, symbol: str, expected_direction: str,
+            target_deal_ids: frozenset[str], body: dict,
+            intent_qty: float, lot_step: float,
+    ) -> tuple[dict, list[dict]]: ...
+
+    async def instrument_rules(self, epic: str) -> _InstrumentRules: ...
+
+    def quantize_size(self, qty: float, rules: _InstrumentRules) -> float: ...
+
+    def mark_bracket_legs_disposition_unknown(
+            self, *, intent: ExitIntent, parent_coid: str, deal_id: str,
+            tp_coid: str | None, sl_coid: str | None, reason: str,
+            stage: str, deal_reference: str | None = None,
+    ) -> None: ...
 
 
 class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
@@ -75,6 +105,58 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _capital_config(self) -> CapitalComConfig:
         """Return the configuration validated by the final plugin constructor."""
         return cast(CapitalComConfig, self.config)
+
+    async def call_api(
+            self, endpoint: str, *, data: dict | None = None,
+            method: str = 'post',
+    ) -> dict:
+        """Call the Capital.com REST transport for a standalone hook."""
+        return await self._call(endpoint, data=data, method=method)
+
+    async def submit_exclusive_partial_close(
+            self, *, coid: str, symbol: str, expected_direction: str,
+            target_deal_ids: frozenset[str], body: dict,
+            intent_qty: float, lot_step: float,
+    ) -> tuple[dict, list[dict]]:
+        """Submit one account-serialized partial close after a final snapshot."""
+        return await self._submit_exclusive_partial_close(
+            coid=coid,
+            symbol=symbol,
+            expected_direction=expected_direction,
+            target_deal_ids=target_deal_ids,
+            body=body,
+            intent_qty=intent_qty,
+            lot_step=lot_step,
+        )
+
+    async def instrument_rules(self, epic: str) -> _InstrumentRules:
+        """Return cached or freshly fetched instrument rules for a hook."""
+        return await self._get_instrument_rules(epic)
+
+    @staticmethod
+    def quantize_size(qty: float, rules: _InstrumentRules) -> float:
+        """Quantize a hook quantity on the venue lot grid."""
+        if rules.lot_step <= 0.0:
+            return qty
+        units = round(qty / rules.lot_step)
+        return _size_from_units(units, rules.lot_step)
+
+    def mark_bracket_legs_disposition_unknown(
+            self, *, intent: ExitIntent, parent_coid: str, deal_id: str,
+            tp_coid: str | None, sl_coid: str | None, reason: str,
+            stage: str, deal_reference: str | None = None,
+    ) -> None:
+        """Expose bracket ambiguity bookkeeping to standalone hooks."""
+        self._mark_bracket_legs_disposition_unknown(
+            intent=intent,
+            parent_coid=parent_coid,
+            deal_id=deal_id,
+            tp_coid=tp_coid,
+            sl_coid=sl_coid,
+            reason=reason,
+            stage=stage,
+            deal_reference=deal_reference,
+        )
 
     if TYPE_CHECKING:
         def __call__(
@@ -209,6 +291,17 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     async def _call(self, endpoint: str, *, data: dict | None = None,
                     method: str = 'post') -> dict: ...
 
+    def _call_serialized_write(
+            self, endpoint: str, *, data: dict | None = None,
+            method: str = 'post',
+    ) -> dict: ...
+
+    async def _submit_exclusive_partial_close(
+            self, *, coid: str, symbol: str, expected_direction: str,
+            target_deal_ids: frozenset[str], body: dict,
+            intent_qty: float, lot_step: float,
+    ) -> tuple[dict, list[dict]]: ...
+
     def create_session(self) -> None: ...
 
     def _perform_session_login(self) -> None: ...
@@ -276,14 +369,14 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     async def _execute_close_partial(self, *args: Any, **kwargs: Any) -> ExchangeOrder: ...
 
-    def _row_to_exchange_order(self, row: 'OrderRow', *args: Any,
-                               **kwargs: Any) -> ExchangeOrder: ...
+    @staticmethod
+    def _row_to_exchange_order(
+            row: 'OrderRow', intent: EntryIntent,
+    ) -> ExchangeOrder: ...
 
     # --- Activity polling (activity.py) ---
-    @abstractmethod
     def _poll_once(self) -> AsyncIterator[OrderEvent]: ...
 
-    @abstractmethod
     def _process_activity(
             self,
             *args: Any,
@@ -304,8 +397,9 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _mark_bracket_legs_disposition_unknown(self, *args: Any, **kwargs: Any) -> None: ...
 
     @staticmethod
-    def _levels_match(expected: object, actual: object,
-                      *args: Any, **kwargs: Any) -> bool: ...
+    def _levels_match(
+            expected: object, actual: object, tol: float = 1e-6,
+    ) -> bool: ...
 
     def _resolve_bracket_leg_disposition(self, *args: Any, **kwargs: Any) -> None: ...
 
@@ -314,14 +408,12 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     async def _trailing_activation_monitor(self, *args: Any, **kwargs: Any) -> Any: ...
 
     # --- Reconcile (reconcile.py) ---
-    @abstractmethod
     def _reconcile_snapshot(
             self,
             *args: Any,
             **kwargs: Any,
     ) -> AsyncIterator[OrderEvent]: ...
 
-    @abstractmethod
     def _missing_pending_tracker(
             self,
             *args: Any,

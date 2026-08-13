@@ -34,6 +34,7 @@ from pynecore_capitalcom import (
 from pynecore_capitalcom.exceptions import HistoricalPricesNotFoundError
 from pynecore_capitalcom.helpers import _WS_VOLUME_BASELINE_BARS
 from pynecore_capitalcom.plugin import _activity_fingerprint
+from pynecore_capitalcom.rest import _RestSessionMixin
 
 
 def main():
@@ -56,12 +57,41 @@ class _FakeBroker(CapitalCom):
         self._responses: dict = responses or {}
         self._calls: list = []
 
-    async def _call(self, endpoint, *, data=None, method='post'):
+    def _fake_response(self, endpoint, *, data=None, method='post'):
         self._calls.append((endpoint, method, data))
         err = self._responses.get(('error', endpoint, method))
         if err is not None:
             raise err
-        return self._responses.get((endpoint, method), {})
+        value = self._responses.get((endpoint, method), {})
+        if isinstance(value, list):
+            if not value:
+                return {}
+            return value.pop(0)
+        return value
+
+    def _call_serialized_write(self, endpoint, *, data=None, method='post'):
+        return self._fake_response(endpoint, data=data, method=method)
+
+    async def _call(self, endpoint, *, data=None, method='post'):
+        return self._fake_response(endpoint, data=data, method=method)
+
+
+class _LockProbeBroker(CapitalCom):
+    def __init__(self, *, config=None):
+        super().__init__(config=config)
+        self.locked_calls: list[tuple[str, str, dict | None]] = []
+        self.raw_calls: list[tuple[str, str, dict | None]] = []
+
+    def _call_with_account_write_lock(
+            self, endpoint, *, data=None, method='post',
+    ):
+        self.locked_calls.append((endpoint, method, data))
+        return {'path': 'locked'}
+
+    def __call__(self, endpoint, *, data=None, method='post', _level=0):
+        del _level
+        self.raw_calls.append((endpoint, method, data))
+        return {'path': 'raw'}
 
 
 def _make_config(**overrides) -> CapitalComConfig:
@@ -92,6 +122,57 @@ def _open_store_ctx(tmp_path, broker: CapitalCom, *, account_id="test-account"):
     ctx = store.open_run(identity, script_source="// test")
     broker.store_ctx = ctx
     return store, ctx
+
+
+def __test_account_write_lock_identity_ignores_api_key__():
+    first = _FakeBroker(config=_make_config(api_key='first-key'))
+    second = _FakeBroker(config=_make_config(api_key='second-key'))
+    first._account_id = 'capitalcom-demo-shared-account'
+    second._account_id = 'capitalcom-demo-shared-account'
+
+    first_lock, first_path = first._account_write_lock()
+    second_lock, second_path = second._account_write_lock()
+
+    assert first_lock is second_lock
+    assert first_path == second_path
+
+
+def __test_account_write_lock_requires_resolved_identity__():
+    broker = _FakeBroker(config=_make_config())
+
+    with pytest.raises(AuthenticationError, match='identity must be resolved'):
+        broker._account_write_lock()
+
+
+def __test_position_mutations_share_account_write_lock__():
+    broker = _LockProbeBroker(config=_make_config())
+    broker._account_id = 'capitalcom-demo-account'
+
+    assert asyncio.run(
+        _RestSessionMixin._call(
+            broker, 'positions', data={'size': 1.0}, method='post',
+        )
+    ) == {'path': 'locked'}
+    assert asyncio.run(
+        _RestSessionMixin._call(
+            broker, 'positions/deal-1', data={'stopLevel': 1.0}, method='put',
+        )
+    ) == {'path': 'locked'}
+    assert asyncio.run(
+        _RestSessionMixin._call(
+            broker, 'positions/deal-1', method='delete',
+        )
+    ) == {'path': 'locked'}
+    assert asyncio.run(
+        _RestSessionMixin._call(broker, 'positions', method='get')
+    ) == {'path': 'raw'}
+
+    assert broker.locked_calls == [
+        ('positions', 'post', {'size': 1.0}),
+        ('positions/deal-1', 'put', {'stopLevel': 1.0}),
+        ('positions/deal-1', 'delete', None),
+    ]
+    assert broker.raw_calls == [('positions', 'get', None)]
 
 
 def __test_broker_capabilities_match_dossier__():
@@ -388,6 +469,7 @@ def _make_broker(tmp_path, *, responses=None, config=None):
     if responses:
         resp.update(responses)
     broker = _FakeBroker(config=config or _make_config(), responses=resp)
+    broker._account_id = 'capitalcom-demo-test-account'
     store, ctx = _open_store_ctx(tmp_path, broker)
     return broker, store, ctx
 
@@ -859,6 +941,7 @@ def __test_synthetic_partial_bracket_close_routes_through_execute_close__(tmp_pa
     env = DispatchEnvelope(
         intent=CloseIntent(
             pine_id=synthetic_pine_id, symbol='EURUSD', side='sell', qty=1.0,
+            synthetic_kind='partial_trigger', target_entry_id='Long',
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
@@ -1033,6 +1116,60 @@ def __test_reconcile_feeds_observed_trailing_stop__(tmp_path):
     store.close()
 
 
+def __test_reconcile_resolves_partial_close_exact_target_residual__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order(
+        'partial-cmd', symbol='EURUSD', side='sell', qty=1.0,
+        state='disposition_unknown', pine_entry_id='Long',
+        extras={
+            'kind': 'partial_close_emulated',
+            'target_deal_id': 'deal-L',
+            'target_direction': 'BUY',
+            'pre_target_units': 200,
+            'intent_units': 100,
+        },
+    )
+    ctx.record_park(coid='partial-cmd', key='Long', kind='new')
+
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {'deal-L': _live_position(size=1.0)}, {},
+    )))
+
+    row = ctx.get_order('partial-cmd')
+    assert row is not None and row.state == 'confirmed'
+    assert row.closed_ts_ms is not None
+    resolution = ctx.replay()[1]['partial-cmd']
+    assert resolution.resolution == 'attached'
+    store.close()
+
+
+def __test_reconcile_rejects_corrected_reverse_with_unchanged_target__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order(
+        'partial-cmd', symbol='EURUSD', side='sell', qty=1.0,
+        state='disposition_unknown', pine_entry_id='Long',
+        extras={
+            'kind': 'partial_close_emulated',
+            'target_deal_id': 'deal-L',
+            'target_direction': 'BUY',
+            'pre_target_units': 200,
+            'intent_units': 100,
+            'corrected_reverse_deal_id': 'reverse',
+        },
+    )
+    ctx.record_park(coid='partial-cmd', key='Long', kind='new')
+
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {'deal-L': _live_position(size=2.0)}, {},
+    )))
+
+    row = ctx.get_order('partial-cmd')
+    assert row is not None and row.state == 'rejected'
+    resolution = ctx.replay()[1]['partial-cmd']
+    assert resolution.resolution == 'rejected'
+    store.close()
+
+
 def __test_reconcile_skips_observed_for_working_only_row__(tmp_path):
     # A working order carries no position-level bracket yet (pos is None), so
     # the feed must not fire — guarding the engine against a phantom confirm.
@@ -1063,13 +1200,23 @@ def __test_execute_close_partial_race_outside_window_halts__(tmp_path):
     # Post-snapshot = 2 rows (original + fresh opposite) — expected 1 unit,
     # but createdDateUTC is stale (outside ±3s) → manual intervention.
     broker, store, ctx = _make_broker(tmp_path, responses={
-        ('positions', 'get'): {'positions': [
-            {'market': {'epic': 'EURUSD'},
-             'position': {'dealId': 'orig', 'direction': 'BUY', 'size': 2.0}},
-            {'market': {'epic': 'EURUSD'},
-             'position': {'dealId': 'fresh', 'direction': 'SELL', 'size': 1.0,
-                          'createdDateUTC': '1970-01-01T00:00:00.000'}},
-        ]},
+        ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY', 'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY', 'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY', 'size': 2.0}},
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'fresh', 'direction': 'SELL', 'size': 1.0,
+                              'createdDateUTC': '1970-01-01T00:00:00.000'}},
+            ]},
+        ],
         ('positions', 'post'): {'dealReference': 'x'},
         ('confirms/x', 'get'): {'dealStatus': 'ACCEPTED'},
     })
@@ -2221,6 +2368,7 @@ def __test_execute_exit_no_entry_row_but_open_position_raises_bracket_attach__(
             'positions': [{
                 'market': {'epic': 'EURUSD'},
                 'position': {
+                    'dealId': 'deal-orphan',
                     'direction': 'BUY', 'size': 1.0,
                     'level': 1.17600, 'upl': 0.0,
                 },
@@ -2246,7 +2394,7 @@ def __test_execute_exit_no_entry_row_but_open_position_raises_bracket_attach__(
     # Surrogate ids must be deterministic across retries so a follow-up
     # cycle converges on the same defensive CloseIntent envelope.
     assert err.position_coid == '__pyne_orphan__EURUSD__Long'
-    assert err.position_deal_id == '__pyne_orphan__EURUSD__Long'
+    assert err.position_deal_id == 'deal-orphan'
     store.close()
 
 

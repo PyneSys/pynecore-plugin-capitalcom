@@ -14,6 +14,7 @@ Imported by ``_base.py`` and many mix-ins; depends only on stdlib and
 ``exceptions.py``.
 """
 import json
+import math
 from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
 from datetime import UTC, datetime, time
 from decimal import Decimal
@@ -242,6 +243,44 @@ def _order_type_from_row(row: 'OrderRow', activity_type: str) -> OrderType:
     if activity_type == 'WORKING_ORDER':
         return OrderType.LIMIT
     return OrderType.MARKET
+
+
+def _wire_float(value: object, *, finite: bool = False) -> float | None:
+    """Parse an untyped wire value as a float.
+
+    Booleans are rejected even though :class:`bool` is an :class:`int`
+    subclass. When ``finite`` is true, NaN and infinities are rejected as
+    invalid monetary / price / size inputs.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (str, bytes, bytearray, int, float, Decimal)):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if finite and not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _wire_int(value: object) -> int | None:
+    """Parse an untyped wire value as an exact integer."""
+    parsed = _wire_float(value, finite=True)
+    if parsed is None or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _wire_id(value: object) -> str | None:
+    """Return a non-empty string identifier from an untyped wire value."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (str, int)):
+        parsed = str(value).strip()
+        return parsed or None
+    return None
 
 
 def _extract_numeric_value(exc: CapitalComError) -> float:

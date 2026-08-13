@@ -22,6 +22,7 @@ into:
 State touched: BrokerStore through ``self.store_ctx``,
 ``_current_poll_id`` (read), ``_disappearance`` (lazy build).
 """
+from abc import ABC
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator
 
@@ -42,17 +43,22 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.store_helpers import (
+    KIND_PARTIAL_CLOSE,
+    mark_close_completed,
+    mark_rejected,
+)
 
 from ._base import _CapitalComBase
 from .exceptions import OrderNotFoundError
-from .helpers import _POLL_INTERVAL_S
+from .helpers import _POLL_INTERVAL_S, _wire_float, _wire_id, _wire_int
 from .models import _compute_cumulative_fill
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
 
-class _ReconcileMixin(_CapitalComBase):
+class _ReconcileMixin(_CapitalComBase, ABC):
     """Snapshot reconcile + missing-pending tracker mix-in."""
 
     async def _reconcile_snapshot(
@@ -87,6 +93,7 @@ class _ReconcileMixin(_CapitalComBase):
         # ``iter_live_orders`` together because :meth:`execute_exit`
         # creates them atomically).
         bracket_resolutions: dict[str, bool] = {}
+        await self._resolve_partial_close_dispositions(positions_by_deal)
         # Mirror tracker for legs that ``_record_bracket_resolution`` flips
         # to ``confirmed`` in this batch — keyed on parent COID. Used by
         # the aggregate flush below to retire ``confirmed`` siblings when
@@ -455,6 +462,91 @@ class _ReconcileMixin(_CapitalComBase):
             now_ts,
         )
 
+    async def _resolve_partial_close_dispositions(
+            self, positions_by_deal: dict[str, dict],
+    ) -> None:
+        """Resolve parked partial closes from the exact target snapshot."""
+        assert self.store_ctx is not None
+        for row in list(self.store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            if (extras.get('kind') != KIND_PARTIAL_CLOSE
+                    or row.state != 'disposition_unknown'):
+                continue
+            target_deal_id = _wire_id(extras.get('target_deal_id'))
+            target_direction = str(extras.get('target_direction') or '').upper()
+            pre_units = _wire_int(extras.get('pre_target_units'))
+            close_units = _wire_int(extras.get('intent_units'))
+            if (target_deal_id is None
+                    or target_direction not in {'BUY', 'SELL'}
+                    or pre_units is None or close_units is None):
+                continue
+            try:
+                rules = await self._get_instrument_rules(row.symbol)
+            except BrokerError:
+                continue
+            if rules.lot_step <= 0:
+                continue
+
+            target_raw = positions_by_deal.get(target_deal_id)
+            target = (target_raw or {}).get('position') or {}
+            current_direction = (target.get('direction') or '').upper()
+            current_units = (
+                round(float(target.get('size', 0.0)) / rules.lot_step)
+                if target_raw is not None else None
+            )
+            opposite_direction = 'SELL' if target_direction == 'BUY' else 'BUY'
+            opposite_exists = any(
+                ((raw.get('position') or {}).get('direction') or '').upper()
+                == opposite_direction
+                for raw in positions_by_deal.values()
+                if (raw.get('market') or {}).get('epic') == row.symbol
+            )
+            expected_units = pre_units - close_units
+            if (current_direction == target_direction
+                    and current_units == expected_units
+                    and not opposite_exists):
+                mark_close_completed(
+                    self.store_ctx,
+                    coid=row.client_order_id,
+                    kind=KIND_PARTIAL_CLOSE,
+                    extra_payload={'recovery_path': 'partial_close_target_reconciled'},
+                )
+                self.store_ctx.close_order(row.client_order_id)
+                self.store_ctx.record_resolution(row.client_order_id, 'attached')
+                self.store_ctx.log_event(
+                    'partial_close_target_reconciled',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=target_deal_id,
+                    intent_key=row.intent_key,
+                    payload={
+                        'target_units': current_units,
+                        'expected_units': expected_units,
+                    },
+                )
+                continue
+            corrected_reverse = _wire_id(
+                extras.get('corrected_reverse_deal_id')
+            )
+            if corrected_reverse is None:
+                continue
+            if corrected_reverse in positions_by_deal:
+                continue
+            if (current_direction == target_direction
+                    and current_units == pre_units
+                    and not opposite_exists):
+                mark_rejected(self.store_ctx, coid=row.client_order_id)
+                self.store_ctx.record_resolution(row.client_order_id, 'rejected')
+                self.store_ctx.log_event(
+                    'partial_close_target_unchanged_after_correction',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=target_deal_id,
+                    intent_key=row.intent_key,
+                    payload={
+                        'corrected_reverse_deal_id': corrected_reverse,
+                        'target_units': current_units,
+                    },
+                )
+
     def _disappearance_tracker(self) -> DisappearanceTracker:
         """The lazily-built core disappearance tracker for this instance.
 
@@ -539,17 +631,14 @@ class _ReconcileMixin(_CapitalComBase):
         raw_profit = pos_data.get('profitLevel')
         raw_distance = pos_data.get('stopDistance')
         trailing_active = bool(pos_data.get('trailingStop'))
+        stop_level = _wire_float(raw_stop, finite=True)
+        profit_level = _wire_float(raw_profit, finite=True)
+        trailing_distance = _wire_float(raw_distance, finite=True)
         sink(
             parent_ref,
-            stop_level=(
-                float(raw_stop)
-                if raw_stop is not None and not trailing_active else None
-            ),
-            profit_level=float(raw_profit) if raw_profit is not None else None,
-            trailing_stop=(
-                float(raw_distance)
-                if trailing_active and raw_distance is not None else None
-            ),
+            stop_level=stop_level if not trailing_active else None,
+            profit_level=profit_level,
+            trailing_stop=trailing_distance if trailing_active else None,
         )
 
     async def _missing_pending_tracker(

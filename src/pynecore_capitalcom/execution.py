@@ -13,8 +13,9 @@ state transition is PERSIST-FIRST so a process crash mid-dispatch
 leaves an auditable row that ``_recover_in_flight_submissions`` can
 replay on restart).
 """
+from abc import ABC
 from time import time as epoch_time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, cast
 
 import httpx
 
@@ -58,8 +59,9 @@ from pynecore.core.broker.models import (
     PositionLeg,
 )
 from pynecore.core.plugin import override
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
-from ._base import _CapitalComBase
+from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import (
     CapitalComError,
     InvalidStopDistanceError,
@@ -71,19 +73,19 @@ from .helpers import (
     _is_funds_reject,
     _parse_iso_timestamp,
     _size_from_units,
+    _wire_float,
 )
 from .models import _InstrumentRules, _bracket_leg_id
 
 if TYPE_CHECKING:
     from pynecore.core.broker.journal import (
         ConfirmOutcome,
-        ResumeOutcome,
         SubmitOutcome,
     )
     from pynecore.core.broker.storage import OrderRow
 
 
-class _ExecutionMixin(_CapitalComBase):
+class _ExecutionMixin(_CapitalComBase, ABC):
     """Order execution mix-in: every ``execute_*`` and ``modify_*`` path."""
 
     @staticmethod
@@ -731,12 +733,14 @@ class _ExecutionMixin(_CapitalComBase):
             quantized_qty=quantized_qty,
         )
         journal = DispatchJournal(self.store_ctx)
+        from pynecore.core.broker.journal import EntryDispatchHooks
+
         return await journal.run_entry(
             coid=coid,
             intent=intent,
             qty=quantized_qty,
             kind=kind,
-            hooks=hooks,
+            hooks=cast(EntryDispatchHooks, hooks),
             audit_payload={'endpoint': endpoint, 'body': body},
         )
 
@@ -836,43 +840,45 @@ class _ExecutionMixin(_CapitalComBase):
                     has_sibling_position = True
                     break
             if not has_sibling_position:
-                open_pos = await self.get_position(intent.symbol)
-                # ``get_position`` returns the symbol-level aggregate, with no
-                # link to ``from_entry``. Only raise the defensive close when
-                # the aggregate side actually matches the side the exit intent
-                # would flatten — ``intent.side='sell'`` closes a long,
-                # ``='buy'`` closes a short. Otherwise the sync engine's
-                # follow-up :meth:`execute_close` would buy/sell against an
-                # unrelated opposite-direction position on the same symbol.
-                expected_pos_side = 'long' if intent.side == 'sell' else 'short'
-                if (open_pos is not None and open_pos.size > 0
-                        and open_pos.side == expected_pos_side):
-                    pos_side = (
-                        'buy' if open_pos.side == 'long' else 'sell'
-                    )
+                raw_positions = await self._call('positions', method='get')
+                candidates = [
+                    raw.get('position') or {}
+                    for raw in (raw_positions.get('positions') or [])
+                    if (raw.get('market') or {}).get('epic') == intent.symbol
+                    and (raw.get('position') or {}).get('dealId')
+                    and float((raw.get('position') or {}).get('size', 0.0)) > 0.0
+                ]
+                expected_direction = 'BUY' if intent.side == 'sell' else 'SELL'
+                if len(candidates) == 1:
+                    orphan = candidates[0]
+                    direction = (orphan.get('direction') or '').upper()
+                    if direction != expected_direction:
+                        candidates = []
+                if len(candidates) == 1:
+                    orphan = candidates[0]
+                    orphan_size = float(orphan.get('size', 0.0))
+                    orphan_side = 'long' if expected_direction == 'BUY' else 'short'
+                    pos_side = 'buy' if expected_direction == 'BUY' else 'sell'
                     # No real ``client_order_id`` exists for the orphan
                     # position; synthesise one that is stable across retries
-                    # (symbol + from_entry) so the defensive ``CloseIntent``'s
-                    # ``pine_id`` does not collide with a real Pine id and
-                    # repeated cycles converge on the same envelope.
+                    # (symbol + from_entry) so repeated defensive cycles converge
+                    # on the same envelope. The exact venue deal comes from this
+                    # same authoritative snapshot, avoiding a second-read race.
                     surrogate_coid = (
                         f"__pyne_orphan__{intent.symbol}__{intent.from_entry}"
                     )
-                    # The exchange-side deal id is only used for log
-                    # correlation in this branch; the defensive close routes
-                    # through ``execute_close`` which re-derives the dealId(s)
-                    # from a fresh ``positions`` snapshot.
+                    orphan_deal_id = str(orphan['dealId'])
                     raise BracketAttachAfterFillRejectedError(
                         f"Capital execute_exit: no confirmed entry row in "
                         f"BrokerStore for from_entry={intent.from_entry!r} "
-                        f"symbol={intent.symbol!r} but exchange reports an "
-                        f"open {open_pos.side} position of size "
-                        f"{open_pos.size} — defensive close required",
-                        position_deal_id=surrogate_coid,
+                        f"symbol={intent.symbol!r} but exchange reports one "
+                        f"exact open {orphan_side} deal of size {orphan_size} — "
+                        f"defensive close required",
+                        position_deal_id=orphan_deal_id,
                         position_coid=surrogate_coid,
                         symbol=intent.symbol,
                         position_side=pos_side,
-                        qty=float(open_pos.size),
+                        qty=orphan_size,
                         from_entry=intent.from_entry,
                     )
             raise ExchangeOrderRejectedError(
@@ -1240,12 +1246,10 @@ class _ExecutionMixin(_CapitalComBase):
         race window. *Partial close* is emulated via an opposite-direction
         ``POST /positions`` because Capital.com has no partial-close
         endpoint. The opposite POST is inherently racy against another
-        REST session opening a fresh opposite row in the same instant;
-        the plugin protects with a pre- + post-snapshot comparison and a
-        corrective ``DELETE`` *only* when the fresh row's
-        ``createdDateUTC`` falls within a ±3 s window of our POST. If the
-        race cannot be confidently resolved, the plugin raises
-        :class:`BrokerManualInterventionError` — the sync engine halts.
+        writer opening a fresh opposite row. The plugin reports a fill only
+        when the post-snapshot proves the exact target-deal residual, and it
+        deletes a reverse leg only when the venue confirm attributes that
+        exact ``dealId`` to this POST. Unproven ownership fails closed.
 
         Both branches run through the Core
         :class:`~pynecore.core.broker.journal.DispatchJournal` so a
@@ -1268,184 +1272,105 @@ class _ExecutionMixin(_CapitalComBase):
         coid = envelope.client_order_id(KIND_CLOSE)
         rules = await self._get_instrument_rules(intent.symbol)
 
-        targets: list['OrderRow'] = []
+        # A keyed ``strategy.close(id)`` owns only the position rows opened by
+        # that Pine entry id. Capital.com keeps same-direction entries as
+        # separate ``dealId`` rows, so symbol-wide targeting would turn a
+        # keyed close into a partial-close POST against the aggregate and could
+        # reduce another entry's exposure. Startup-adopted rows have no durable
+        # Pine id, so an otherwise unmatched keyed close may own those rows; the
+        # engine deliberately permits that fallback for reconstructed exposure.
+        # Synthetic close producers carry explicit target provenance on the
+        # intent; the Pine-controlled ``pine_id`` is never parsed for authority.
+        # Defensive closes target one exact position COID. Only ``close_all``
+        # (empty pine id) is intentionally symbol-wide.
+        live_position_rows: list['OrderRow'] = []
         if self.store_ctx is not None:
             for row in self.store_ctx.iter_live_orders(symbol=intent.symbol):
                 extras = row.extras or {}
-                # Skip rows already stamped as naturally closed (TP/SL hit
-                # or bracket-attach defensive close). The row stays in the
-                # live range (``closed_ts_ms IS NULL``) so ``find_by_ref``
-                # can still match the close-leg activity, but its
-                # ``exchange_order_id`` already refers to a deal the broker
-                # has dropped from ``/positions``. Treating it as a target
-                # would route the DELETE at a stale ``dealId`` (a 404 is
-                # then read as "already gone" by the close path) while the
-                # *actual* open orphan position the defensive close was
-                # meant to flatten never gets reconstructed below and stays
-                # open and unprotected. Same skip convention as
-                # :meth:`execute_exit`'s sibling-position scan and the
-                # reconciler's missing-pending grace-window logic.
                 if (row.state == 'confirmed'
                         and row.exchange_order_id
                         and extras.get('kind') == 'position'
                         and extras.get('natural_close_at') is None):
-                    targets.append(row)
+                    live_position_rows.append(row)
 
-        # Orphan-close fallback: when the sync engine issues a defensive
-        # ``CloseIntent`` (``pine_id`` starts with ``__pyne_defensive_close__``)
-        # for a position that has no persisted store row — typically a
-        # ``BracketAttachAfterFillRejectedError`` raised from
-        # :meth:`execute_exit` after a missing-entry-row detection on a
-        # live exchange position — the store-driven target derivation
-        # above yields nothing and a plain
-        # :class:`ExchangeOrderRejectedError` would halt the engine while
-        # the exchange position stays open AND unprotected. Reconstruct
-        # the missing target(s) from a fresh broker-side ``positions``
-        # snapshot, materialise a minimal ``position``-kind ``OrderRow``
-        # per matching exchange row so the journal's bookkeeping
-        # (``set_order_state('closing')``, ``mark_closing``, activity
-        # stream promotion to ``closed``) stays intact, and proceed with
-        # the normal DELETE chain. Filter by the close side
-        # (``CloseIntent.side='sell'`` flattens a long, ``='buy'``
-        # flattens a short) so a defensive close cannot accidentally
-        # sweep an opposite-direction unrelated position on the same
-        # symbol.
-        if (not targets
-                and self.store_ctx is not None
-                and intent.pine_id.startswith('__pyne_defensive_close__')):
+        target_entry_id: str | None = None
+        target_position_coid: str | None = None
+        target_exchange_id: str | None = None
+        defensive_close = intent.synthetic_kind == 'defensive_close'
+        if intent.synthetic_kind in {'partial_trigger', 'marketable_exit'}:
+            target_entry_id = intent.target_entry_id
+        elif defensive_close:
+            target_position_coid = intent.target_position_coid
+            target_exchange_id = intent.target_exchange_id
+        elif intent.pine_id:
+            target_entry_id = intent.pine_id
+
+        targets: list['OrderRow'] = []
+        adopted_targets: list['OrderRow'] = []
+        for row in live_position_rows:
+            extras = row.extras or {}
+            if target_entry_id is not None:
+                if row.pine_entry_id == target_entry_id:
+                    targets.append(row)
+                elif (extras.get(ADOPTED_STARTUP_EXTRA_KEY) is True
+                      and row.pine_entry_id is None):
+                    adopted_targets.append(row)
+            elif target_position_coid is not None:
+                if (row.client_order_id == target_position_coid
+                        and row.exchange_order_id == target_exchange_id):
+                    targets.append(row)
+            else:
+                targets.append(row)
+
+        if target_entry_id is not None and not targets:
+            targets = adopted_targets
+
+        # An orphan defensive close has no persisted position row, but the
+        # engine carries the exact venue deal id captured at the bracket-reject
+        # seam. Reconstruct only that deal from a fresh positions snapshot;
+        # symbol/direction/quantity similarity is never accepted as ownership.
+        if (not targets and self.store_ctx is not None and defensive_close
+                and target_exchange_id is not None):
             raw_snap = await self._call('positions', method='get')
             target_broker_dir = 'BUY' if intent.side == 'sell' else 'SELL'
-            # Recover the original Pine entry id from the defensive
-            # ``pine_id``. The sync engine builds the defensive close as
-            # ``__pyne_defensive_close__{position_coid}`` and in the
-            # missing-entry orphan path this plugin supplies
-            # ``position_coid = __pyne_orphan__{symbol}__{from_entry}``
-            # (see :meth:`execute_exit`'s ``BracketAttachAfterFillRejectedError``
-            # raise site). Carry that ``from_entry`` onto the synthetic
-            # row so that when the close-leg activity later builds
-            # ``OrderEvent.pine_id`` from ``row.pine_entry_id``, the
-            # engine's :meth:`_cleanup_closed_position` can drop the
-            # stale Pine entry/exit order book entries — without it the
-            # next sync would re-emit the same ``strategy.exit`` and
-            # spin through another orphan defensive-close cycle.
+            # Recover the original Pine entry id from the orphan position COID.
+            # Carrying it onto the synthetic row lets the close activity clean
+            # the stale parent entry/exit state after the exact deal closes.
             parent_from_entry: str | None = None
-            orphan_surrogate_prefix = (
-                f"__pyne_defensive_close____pyne_orphan__"
-                f"{intent.symbol}__"
-            )
-            if intent.pine_id.startswith(orphan_surrogate_prefix):
-                candidate = intent.pine_id[len(orphan_surrogate_prefix):]
+            orphan_surrogate_prefix = f"__pyne_orphan__{intent.symbol}__"
+            if (target_position_coid is not None
+                    and target_position_coid.startswith(orphan_surrogate_prefix)):
+                candidate = target_position_coid[len(orphan_surrogate_prefix):]
                 if candidate:
                     parent_from_entry = candidate
-            # Require an unambiguous snapshot before the defensive close can
-            # touch anything on the exchange. ``intent.qty`` was seeded from
-            # :meth:`get_position`'s symbol-level aggregate (see the
-            # ``BracketAttachAfterFillRejectedError`` raise site in
-            # :meth:`execute_exit`), so it is the *sum* of every same-side
-            # row, not the size of any one row. With two same-side rows of
-            # equal size (orphan + manual deal, or two bots on the same
-            # symbol), a unit-cap that only forbids overshoot would still
-            # accept the full snapshot — both rows together equal
-            # ``intent.qty`` exactly — and DELETE the unrelated row alongside
-            # ours. The only safe condition is exactly one matching
-            # same-side exchange row whose size also matches the aggregate;
-            # any other shape is inherently ambiguous and must halt so the
-            # operator can investigate, rather than guessing which deal we
-            # own.
-            intent_units = (
-                round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
-            )
-            # First pass: discover matching same-side rows without
-            # persisting anything. Persisting synthetic rows and only later
-            # clearing ``targets`` on an ambiguity breach would leave the
-            # earlier ``upsert_order`` writes in BrokerStore; on the next
-            # retry/restart the normal target scan above would pick them up,
-            # skip this orphan path entirely, and DELETE a subset of an
-            # ambiguous snapshot. Collect candidate rows here, reject on
-            # ambiguity, and only persist after the snapshot is proven safe.
-            candidates: list[tuple[str, str, float, int]] = []
+            planned: list[tuple[str, str, float]] = []
             for raw in (raw_snap.get('positions') or []):
                 market = raw.get('market') or {}
                 if market.get('epic') != intent.symbol:
                     continue
                 position = raw.get('position') or {}
-                direction = (position.get('direction') or '').upper()
-                if direction != target_broker_dir:
-                    continue
                 deal_id = position.get('dealId')
-                size = float(position.get('size', 0.0))
-                if not deal_id or size <= 0.0:
+                if str(deal_id) != target_exchange_id:
                     continue
-                row_units = (
-                    round(size / rules.lot_step) if rules.lot_step > 0 else 0
-                )
-                candidates.append((direction, str(deal_id), size, row_units))
+                direction = (position.get('direction') or '').upper()
+                size = float(position.get('size', 0.0))
+                if direction != target_broker_dir or size <= 0.0:
+                    break
+                planned.append((direction, str(deal_id), size))
+                break
 
-            # Ambiguity guard: only proceed when exactly one matching
-            # exchange row exists. Multiple same-side rows mean we cannot
-            # tell which deal is the bot's orphan vs. an unrelated position
-            # (manual deal, second bot, or a same-side row opened between
-            # the ``BracketAttachAfterFillRejectedError`` raise site and
-            # this snapshot). Log and abort; the post-loop empty-targets
-            # check escalates to ``ExchangeOrderRejectedError`` so the
-            # engine halts with no BrokerStore writes.
-            planned: list[tuple[str, str, float]] = []  # (direction, deal_id, size)
-            ambiguous = len(candidates) > 1
-            if ambiguous:
+            if not planned:
                 self.store_ctx.log_event(
-                    'orphan_close_ambiguous_snapshot',
+                    'orphan_close_exact_target_missing',
                     intent_key=intent.intent_key,
                     payload={
                         'symbol': intent.symbol,
                         'broker_direction': target_broker_dir,
+                        'target_deal_id': target_exchange_id,
                         'intent_qty': intent.qty,
-                        'candidate_count': len(candidates),
-                        'candidate_deal_ids': [c[1] for c in candidates],
-                        'candidate_sizes': [c[2] for c in candidates],
                     },
                 )
-            elif candidates:
-                direction, deal_id, size, row_units = candidates[0]
-                # Even with a single row, require an *exact* size match to
-                # ``intent.qty``. Any mismatch is ambiguous:
-                #   * ``row_units > intent_units`` — the row grew between
-                #     the raise site and this snapshot (unrelated deal
-                #     bundled into the same dealId, or a manual top-up);
-                #     DELETing it would over-close past the orphan.
-                #   * ``row_units < intent_units`` — the aggregate
-                #     captured at the raise site summed *multiple*
-                #     same-side rows, but only one survives by this
-                #     snapshot. The missing row(s) may have been the
-                #     bot's orphan (closed manually in the meantime),
-                #     leaving this lone survivor as an unrelated
-                #     position; DELETing it would close someone else's
-                #     deal.
-                # Only the exact-equality case proves the surviving row
-                # is the orphan we set out to flatten. Any other shape
-                # falls through to the empty-``planned`` path and the
-                # post-loop ``ExchangeOrderRejectedError`` so the
-                # operator can investigate.
-                if (intent_units and rules.lot_step > 0
-                        and row_units != intent_units):
-                    self.store_ctx.log_event(
-                        'orphan_close_qty_mismatch',
-                        intent_key=intent.intent_key,
-                        payload={
-                            'symbol': intent.symbol,
-                            'broker_direction': direction,
-                            'intent_qty': intent.qty,
-                            'intent_units': intent_units,
-                            'row_units': row_units,
-                            'deal_id': deal_id,
-                        },
-                    )
-                else:
-                    planned.append((direction, deal_id, size))
 
-            # Second pass: persist only after the snapshot proved safe.
-            # When the snapshot was ambiguous or capped, ``planned`` is
-            # empty and the post-loop ``ExchangeOrderRejectedError`` fires
-            # with no BrokerStore writes left behind.
             if planned:
                 for direction, deal_id, size in planned:
                     synthetic_coid = (
@@ -1562,27 +1487,54 @@ class _ExecutionMixin(_CapitalComBase):
             # on the opposite-POST path and routes the subsequent residual 100
             # through native DELETE.
             total_live_units = stored_live_units
+            unowned_same_side_deal_ids: set[str] = set()
             if intent_units != stored_live_units:
                 raw_positions = await self._call('positions', method='get')
                 target_deal_ids = {
                     row.exchange_order_id for row in targets
                     if row.exchange_order_id
                 }
+                symbol_positions = [
+                    raw.get('position') or {}
+                    for raw in (raw_positions.get('positions') or [])
+                    if (raw.get('market') or {}).get('epic') == intent.symbol
+                ]
                 total_live_units = sum(
                     round(float(position.get('size', 0.0)) / rules.lot_step)
                     if rules.lot_step > 0 else 0
-                    for raw in (raw_positions.get('positions') or [])
-                    if (raw.get('market') or {}).get('epic') == intent.symbol
-                    for position in [raw.get('position') or {}]
+                    for position in symbol_positions
                     if position.get('dealId') in target_deal_ids
                 )
+                target_broker_direction = 'BUY' if intent.side == 'sell' else 'SELL'
+                unowned_same_side_deal_ids = {
+                    str(position['dealId'])
+                    for position in symbol_positions
+                    if position.get('dealId')
+                    and position.get('dealId') not in target_deal_ids
+                    and (position.get('direction') or '').upper()
+                    == target_broker_direction
+                }
 
             kind = (
                 KIND_FULL_CLOSE if intent_units == total_live_units
                 else KIND_PARTIAL_CLOSE
             )
+            if (kind == KIND_PARTIAL_CLOSE
+                    and (len(targets) != 1 or unowned_same_side_deal_ids)):
+                raise ExchangeOrderRejectedError(
+                    "Capital execute_close: a partial close requires one "
+                    "exclusive owned position row because the venue reduction "
+                    "API cannot target a dealId"
+                )
 
-        hooks = _CapitalComCloseHooks(plugin=self, rules=rules)
+        hooks = _CapitalComCloseHooks(
+            plugin=self,
+            rules=rules,
+            target_deal_ids=frozenset(
+                row.exchange_order_id for row in targets
+                if row.exchange_order_id
+            ),
+        )
         journal = DispatchJournal(self.store_ctx)
         return await journal.run_close(
             coid=coid,
@@ -2161,7 +2113,6 @@ class _ExecutionMixin(_CapitalComBase):
         if not body and not needs_persist and not needs_pending_trail_retire:
             return []
 
-        deal_id = target_row.exchange_order_id
         tp_coid = new.client_order_id(KIND_EXIT_TP)
         sl_coid = new.client_order_id(KIND_EXIT_SL)
         # Existing leg rows for the parent — marked ``disposition_unknown``
@@ -2286,7 +2237,6 @@ class _ExecutionMixin(_CapitalComBase):
             ambiguous_sl_coid=ambiguous_sl_coid,
             sl_in_body=sl_in_body,
             sl_clears_broker_active=sl_clears_broker_active,
-            clears_broker_tp=clears_broker_tp,
         )
 
         if body:
@@ -2319,7 +2269,7 @@ class _ExecutionMixin(_CapitalComBase):
         # for the journal to state-machine. Apply the post-success mirror
         # directly so the leg rows and entry-row risk snapshot are
         # consistent with the new intent.
-        hooks._apply_mirror(target_row=target_row, new_intent=new_i)
+        hooks.apply_mirror(target_row=target_row, new_intent=new_i)
         return hooks.exchange_order_from_state(
             row=target_row, new_intent=new_i,
             outcome=ModifyExitOutcome(
@@ -2375,7 +2325,7 @@ class _CapitalComEntryHooks:
     def __init__(
             self,
             *,
-            plugin: '_ExecutionMixin',
+            plugin: CapitalComHookCollaborator,
             endpoint: str,
             body: dict,
             quantized_qty: float,
@@ -2397,10 +2347,19 @@ class _CapitalComEntryHooks:
         """
         from pynecore.core.broker.journal import SubmitOutcome
 
-        del qty  # captured at construction time as quantized_qty
+        if intent.symbol != self._body.get('epic'):
+            raise ValueError(
+                f"Entry hook symbol mismatch: body has {self._body.get('epic')!r}, "
+                f"intent has {intent.symbol!r}"
+            )
+        if abs(qty - self._quantized_qty) > 1e-9:
+            raise ValueError(
+                f"Entry hook quantity mismatch: captured "
+                f"{self._quantized_qty!r}, journal supplied {qty!r}"
+            )
         try:
-            resp = await self._plugin._call(  # type: ignore[attr-defined]
-                self._endpoint, data=self._body, method='post',
+            resp = await self._plugin.call_api(
+self._endpoint, data=self._body, method='post',
             )
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
@@ -2434,8 +2393,8 @@ class _CapitalComEntryHooks:
         from pynecore.core.broker.journal import ConfirmOutcome
 
         try:
-            confirm = await self._plugin._call(  # type: ignore[attr-defined]
-                f'confirms/{server_ref}', method='get',
+            confirm = await self._plugin.call_api(
+f'confirms/{server_ref}', method='get',
             )
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
@@ -2479,19 +2438,17 @@ class _CapitalComEntryHooks:
             raw=confirm,
         )
 
+    @staticmethod
     def exchange_order_from_state(
-            self, *, row: 'OrderRow', intent: EntryIntent,
+            *, row: 'OrderRow', intent: EntryIntent,
     ) -> ExchangeOrder:
         """Build the public :class:`ExchangeOrder` from the persisted row."""
         is_filled = row.filled_qty > 0.0
         extras = row.extras or {}
         confirm_level_raw = extras.get('confirm_level')
-        average_fill_price: float | None = None
-        if is_filled and confirm_level_raw is not None:
-            try:
-                average_fill_price = float(confirm_level_raw)
-            except (TypeError, ValueError):
-                average_fill_price = None
+        average_fill_price = (
+            _wire_float(confirm_level_raw, finite=True) if is_filled else None
+        )
         return ExchangeOrder(
             id=row.exchange_order_id or '',
             symbol=intent.symbol,
@@ -2509,26 +2466,4 @@ class _CapitalComEntryHooks:
             fee_currency='',
             reduce_only=False,
             client_order_id=row.client_order_id,
-        )
-
-    async def resume_pending_dispatch(
-            self, *, row: 'OrderRow', refs,
-    ) -> 'ResumeOutcome':
-        """Defensive raise — Capital.com recovery uses ``_CapitalComResumeHooks``.
-
-        The journal's :meth:`DispatchJournal.recover_pending` is called
-        from :meth:`_recover_in_flight_submissions` with a separate
-        ``hooks_for()`` provider that returns
-        :class:`_CapitalComResumeHooks` instances. This method exists
-        only to satisfy the :class:`EntryDispatchHooks` Protocol; it is
-        never invoked on the production code path. A reachable call
-        here means the recovery wiring was bypassed and must be
-        debugged before live trading resumes.
-        """
-        del row, refs
-        raise RuntimeError(
-            "_CapitalComEntryHooks.resume_pending_dispatch should not be "
-            "called: Capital.com recovery is routed through "
-            "_CapitalComResumeHooks. Check the hooks_for() provider in "
-            "_recover_in_flight_submissions."
         )

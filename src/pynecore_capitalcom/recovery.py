@@ -28,15 +28,18 @@ since the resolution depends on the parent position's live state.
 State touched: BrokerStore through ``self.store_ctx``,
 ``_activity_cursor`` (rebuilt).
 """
+from abc import ABC
 from collections.abc import Mapping
 from dataclasses import dataclass
 from time import time as epoch_time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 from pynecore.core.broker.journal import (
     DispatchJournal,
+    EntryDispatchHooks,
+    PendingHooksProvider,
     ResumeOutcome,
 )
 from pynecore.core.broker.store_helpers import (
@@ -48,16 +51,21 @@ from pynecore.core.broker.store_helpers import (
 )
 from pynecore.lib.log import broker_info
 
-from ._base import _CapitalComBase
+from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import OrderNotFoundError
-from .helpers import _extract_reject_reason, _parse_iso_timestamp
+from .helpers import (
+    _extract_reject_reason,
+    _parse_iso_timestamp,
+    _wire_float,
+    _wire_id,
+    _wire_int,
+)
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.models import EntryIntent
     from pynecore.core.broker.storage import OrderRow
 
 
-class _RecoveryMixin(_CapitalComBase):
+class _RecoveryMixin(_CapitalComBase, ABC):
     """Restart recovery mix-in — replays cursor + in-flight rows at connect."""
 
     async def _load_activity_cursor_from_events(self) -> None:
@@ -193,7 +201,7 @@ class _RecoveryMixin(_CapitalComBase):
             pos_by_deal_id=pos_by_deal_id,
         )
 
-        def hooks_for(row: 'OrderRow') -> '_CapitalComResumeHooks | None':
+        def hooks_for(pending_row: 'OrderRow') -> 'EntryDispatchHooks | None':
             # Bracket legs (``leg_kind in {'tp','sl'}``) are owned by
             # ``_resolve_bracket_leg_disposition``; everything else is
             # an entry row and goes through the journal. Filtering on
@@ -202,13 +210,15 @@ class _RecoveryMixin(_CapitalComBase):
             # row is recovered regardless of whether ``extras['kind']``
             # was explicitly stamped (older rows / test fixtures may
             # omit it).
-            leg_kind = (row.extras or {}).get('leg_kind')
+            leg_kind = (pending_row.extras or {}).get('leg_kind')
             if leg_kind in ('tp', 'sl'):
                 return None  # bracket legs — own resolution path
-            return resume_hooks
+            return cast(EntryDispatchHooks, resume_hooks)
 
         journal = DispatchJournal(self.store_ctx)
-        resolutions = await journal.recover_pending(hooks_for)
+        resolutions = await journal.recover_pending(
+            cast(PendingHooksProvider, hooks_for),
+        )
 
         # The ``pos_by_deal_id`` / ``wo_by_deal_id`` maps are snapshots
         # from *before* promotions; rows resolved via activity-heuristic
@@ -275,7 +285,7 @@ class _RecoveryMixin(_CapitalComBase):
             if row.exchange_order_id:
                 tracked_deal_ids.add(str(row.exchange_order_id))
         foreign_deal_ids = store_ctx.foreign_live_exchange_order_ids(
-            symbol=self.symbol,
+            symbol=self.symbol or '',
         )
 
         adopted_count = 0
@@ -475,12 +485,10 @@ class _CapitalComResumeHooks:
     three REST snapshots are captured as attributes so each verdict
     call resolves locally without re-fetching. The journal's
     :meth:`pynecore.core.broker.journal.DispatchJournal.recover_pending`
-    calls :meth:`resume_pending_dispatch` once per pending row; the
-    other :class:`pynecore.core.broker.journal.EntryDispatchHooks`
-    Protocol methods (``submit``, ``confirm_submission``,
-    ``exchange_order_from_state``) defensively raise — they exist only
-    to satisfy the Protocol and are never invoked on the recovery
-    code path.
+    calls :meth:`resume_pending_dispatch` once per pending row. Recovery
+    uses the journal's resume-only structural contract; fresh
+    submission and exchange-order construction methods are intentionally
+    not part of this collaborator.
 
     The ``submission_ambiguous`` branch is a deliberate side-channel:
     when the activity heuristic returns multiple candidates the hook
@@ -491,37 +499,12 @@ class _CapitalComResumeHooks:
     follow-up Core change is planned to canonicalise this status; M3
     keeps the current behaviour.
     """
-    plugin: _RecoveryMixin
+    plugin: CapitalComHookCollaborator
     activities: list[dict]
     pos_by_ref: dict[str, dict]
     wo_by_ref: dict[str, dict]
     wo_by_deal_id: dict[str, dict]
     pos_by_deal_id: dict[str, dict]
-
-    async def submit(
-            self, *, coid: str, intent: 'EntryIntent', qty: float,
-    ):  # pragma: no cover — Protocol-only
-        raise RuntimeError(
-            "_CapitalComResumeHooks.submit is not callable: recovery does "
-            "not dispatch fresh submissions"
-        )
-
-    async def confirm_submission(
-            self, *, coid: str, intent: 'EntryIntent', server_ref: str,
-    ):  # pragma: no cover — Protocol-only
-        raise RuntimeError(
-            "_CapitalComResumeHooks.confirm_submission is not callable: "
-            "recovery resolves via snapshots / /confirms GET inside "
-            "_verdict_server_ref_seen, not the dispatch confirm path"
-        )
-
-    def exchange_order_from_state(
-            self, *, row: 'OrderRow', intent: 'EntryIntent',
-    ):  # pragma: no cover — Protocol-only
-        raise RuntimeError(
-            "_CapitalComResumeHooks.exchange_order_from_state is not "
-            "callable: recovery does not synthesise ExchangeOrders"
-        )
 
     async def resume_pending_dispatch(
             self, *, row: 'OrderRow', refs: Mapping[str, str],
@@ -720,7 +703,7 @@ class _CapitalComResumeHooks:
                 recovery_path='missing_deal_reference',
             )
         try:
-            confirm = await self.plugin._call(
+            confirm = await self.plugin.call_api(
                 f'confirms/{ref}', method='get',
             )
         except OrderNotFoundError:
@@ -809,17 +792,14 @@ class _CapitalComResumeHooks:
         extras = row.extras or {}
         new_level_raw = extras.get('new_level')
         target_coid = extras.get('target_coid')
-        try:
-            new_level = float(new_level_raw) if new_level_raw is not None else None
-        except (TypeError, ValueError):
-            new_level = None
+        new_level = _wire_float(new_level_raw, finite=True)
 
         ref: str | None = (
             refs.get('deal_reference') or extras.get('deal_reference')
         )
         if ref:
             try:
-                confirm = await self.plugin._call(
+                confirm = await self.plugin.call_api(
                     f'confirms/{ref}', method='get',
                 )
             except OrderNotFoundError:
@@ -834,10 +814,7 @@ class _CapitalComResumeHooks:
                         recovery_context={'deal_reference': ref},
                     )
                 echoed_level_raw = confirm.get('level')
-                echoed_level = (
-                    float(echoed_level_raw)
-                    if echoed_level_raw is not None else None
-                )
+                echoed_level = _wire_float(echoed_level_raw, finite=True)
                 deal_id = confirm.get('dealId')
                 if (
                     new_level is not None
@@ -875,10 +852,7 @@ class _CapitalComResumeHooks:
             )
         wo_data = wo.get('workingOrderData') or {}
         wo_level_raw = wo_data.get('orderLevel')
-        try:
-            wo_level = float(wo_level_raw) if wo_level_raw is not None else None
-        except (TypeError, ValueError):
-            wo_level = None
+        wo_level = _wire_float(wo_level_raw, finite=True)
 
         if (
             new_level is not None
@@ -941,18 +915,12 @@ class _CapitalComResumeHooks:
         extras = row.extras or {}
         target_coid = extras.get('target_coid')
 
-        def _as_float(value):
-            if value is None:
-                return None
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-
-        new_tp = _as_float(extras.get('new_tp'))
-        new_sl = _as_float(extras.get('new_sl'))
-        new_trail = _as_float(extras.get('new_trail'))
-        new_trail_price = _as_float(extras.get('new_trail_price'))
+        new_tp = _wire_float(extras.get('new_tp'), finite=True)
+        new_sl = _wire_float(extras.get('new_sl'), finite=True)
+        new_trail = _wire_float(extras.get('new_trail'), finite=True)
+        new_trail_price = _wire_float(
+            extras.get('new_trail_price'), finite=True,
+        )
         # Pine pending trailing (``trail_price`` + ``trail_offset``) leaves
         # broker ``trailingStop`` off — the local activation monitor PUTs the
         # native stop only after price crosses ``new_trail_price``. Recovery
@@ -965,7 +933,7 @@ class _CapitalComResumeHooks:
         )
         if ref:
             try:
-                confirm = await self.plugin._call(
+                confirm = await self.plugin.call_api(
                     f'confirms/{ref}', method='get',
                 )
             except OrderNotFoundError:
@@ -1008,9 +976,9 @@ class _CapitalComResumeHooks:
                 recovery_path='modify_exit_target_vanished',
             )
         pos_data = pos.get('position') or {}
-        pos_profit_level: float | None = _as_float(pos_data.get('profitLevel'))
-        pos_stop_level: float | None = _as_float(pos_data.get('stopLevel'))
-        pos_stop_distance: float | None = _as_float(pos_data.get('stopDistance'))
+        pos_profit_level: float | None = _wire_float(pos_data.get('profitLevel'))
+        pos_stop_level: float | None = _wire_float(pos_data.get('stopLevel'))
+        pos_stop_distance: float | None = _wire_float(pos_data.get('stopDistance'))
         pos_trailing_stop = bool(pos_data.get('trailingStop'))
 
         def _matches_tp() -> bool:
@@ -1071,7 +1039,7 @@ class _CapitalComResumeHooks:
         )
 
     def _verdict_cancel(
-            self, row: 'OrderRow', refs: Mapping[str, str],
+            self, row: 'OrderRow', _refs: Mapping[str, str],
     ) -> ResumeOutcome:
         """Verdict for a ``cancel`` command row.
 
@@ -1095,7 +1063,6 @@ class _CapitalComResumeHooks:
         though the local persistence was interrupted mid-loop). Any
         target still alive → ``still_unknown``.
         """
-        del refs  # cancel rows do not carry deal_reference
         extras = row.extras or {}
         target_coids = list(extras.get('target_coids') or ())
         if self.plugin.store_ctx is None:
@@ -1169,7 +1136,7 @@ class _CapitalComResumeHooks:
         )
 
     def _verdict_full_close(
-            self, row: 'OrderRow', refs: Mapping[str, str],
+            self, row: 'OrderRow', _refs: Mapping[str, str],
     ) -> ResumeOutcome:
         """Verdict for a ``full_close`` command row.
 
@@ -1194,7 +1161,6 @@ class _CapitalComResumeHooks:
         matches a row in the same state the live dispatch would have
         left behind.
         """
-        del refs  # full_close has no deal_reference
         extras = row.extras or {}
         target_deal_ids = list(extras.get('targets') or ())
         if self.plugin.store_ctx is None:
@@ -1258,51 +1224,35 @@ class _CapitalComResumeHooks:
     ) -> ResumeOutcome:
         """Verdict for a ``partial_close_emulated`` command row.
 
-        Partial close is the emulated opposite-direction POST. Resolution
-        paths in priority order:
+        Partial close is the emulated opposite-direction POST. A rejected
+        confirm remains a normal reject. Every other path is confirmed only
+        when the current authoritative snapshot proves the persisted exact
+        target ``dealId`` in its original direction at
+        ``pre_target_units - intent_units``. Aggregate symbol quantity is not
+        ownership evidence: the target can disappear while an unrelated reverse
+        or replacement row preserves the same total.
 
-        1. **Stored ``deal_reference`` with live confirm** —
-           ``/confirms/{ref}`` GET. ``REJECTED`` → rejected. ``ACCEPTED``
-           — verify the POST actually netted by checking the live
-           positions delta against the persisted ``pre_total_units`` /
-           ``intent_units``: if the current symbol unit total matches the
-           expected post-POST value → confirmed; otherwise
-           ``still_unknown`` (the post-POST snapshot has not caught up or
-           a race remains unresolved — operator intervention or next
-           reconcile required). The corrective-DELETE time window (±3 s)
-           is intentionally NOT reproduced on recovery: it cannot be
-           reconstructed after the process boundary, so any race that
-           landed mid-dispatch must be resolved by the live reconciler
-           instead.
-
-        2. **Ref missing or confirm TTL expired** — fall back to the
-           persisted ``pre_total_units`` / ``intent_units`` versus the
-           live positions snapshot. If the symbol total matches the
-           expected post-POST value, the broker already netted the close
-           and a retry would over-reduce the position, so we confirm.
-           Without that delta context the verdict is ``still_unknown``
-           and the engine-side reconciler retries on next sync. We
-           deliberately do NOT re-issue an opposite POST from the
-           verdict-builder — a duplicate opposite leg would compound any
-           unresolved race.
+        Missing/expired confirms use the same exact-target verdict. Recovery
+        never repeats the opposite POST because a duplicate could open a reverse
+        position if the first request already netted.
         """
         extras = row.extras or {}
         ref: str | None = (
             refs.get('deal_reference') or extras.get('deal_reference')
         )
         if not ref:
-            return await self._verdict_partial_close_by_units(
+            return await self._verdict_partial_close_by_target(
                 row,
                 ref=None,
                 confirm=None,
                 fallback_path='partial_close_missing_deal_reference',
             )
         try:
-            confirm = await self.plugin._call(
+            confirm = await self.plugin.call_api(
                 f'confirms/{ref}', method='get',
             )
         except OrderNotFoundError:
-            return await self._verdict_partial_close_by_units(
+            return await self._verdict_partial_close_by_target(
                 row,
                 ref=ref,
                 confirm=None,
@@ -1318,14 +1268,14 @@ class _CapitalComResumeHooks:
                 recovery_context={'deal_reference': ref},
             )
 
-        return await self._verdict_partial_close_by_units(
+        return await self._verdict_partial_close_by_target(
             row,
             ref=ref,
             confirm=confirm,
             fallback_path='partial_close_units_mismatch',
         )
 
-    async def _verdict_partial_close_by_units(
+    async def _verdict_partial_close_by_target(
             self,
             row: 'OrderRow',
             *,
@@ -1333,49 +1283,30 @@ class _CapitalComResumeHooks:
             confirm: dict | None,
             fallback_path: str,
     ) -> ResumeOutcome:
-        """Resolve a partial-close verdict from the persisted unit delta.
-
-        Used in three situations:
-
-        * Confirm GET succeeded with ``ACCEPTED`` — we treat the broker's
-          acknowledgement as truth only after the live positions snapshot
-          shows the expected net.
-        * Confirm TTL expired (``ref`` set, ``confirm`` ``None``) — the
-          broker may have already netted before the crash; the unit
-          delta is the only durable signal left.
-        * No ``deal_reference`` was ever persisted (``ref`` ``None``,
-          ``confirm`` ``None``) — same risk: a POST that landed at the
-          broker but never made it back to local persistence would
-          otherwise be retried and over-close the position.
-
-        ``fallback_path`` names the ``still_unknown`` recovery path used
-        when we lack the delta context or the units do not match.
-        """
+        """Resolve a partial close from persisted exact-target provenance."""
         extras = row.extras or {}
-        pre_total_units = extras.get('pre_total_units')
-        intent_units = extras.get('intent_units')
+        target_deal_id = _wire_id(extras.get('target_deal_id'))
+        target_direction = str(extras.get('target_direction') or '').upper()
+        pre_units = _wire_int(extras.get('pre_target_units'))
+        close_units = _wire_int(extras.get('intent_units'))
         recovery_context: dict = {}
         if ref is not None:
             recovery_context['deal_reference'] = ref
-        if pre_total_units is None or intent_units is None:
+        if (target_deal_id is None
+                or target_direction not in {'BUY', 'SELL'}
+                or pre_units is None
+                or close_units is None):
             return ResumeOutcome(
                 status='still_unknown',
                 recovery_path=(
-                    'partial_close_missing_delta_context'
-                    if confirm is not None
-                    else fallback_path
+                    'partial_close_missing_target_context'
+                    if confirm is not None else fallback_path
                 ),
                 recovery_context=recovery_context or None,
             )
 
-        # Recovery runs during ``connect()`` before any execute path
-        # would populate ``_instrument_rules_cache``, so reading the
-        # cache directly leaves a fresh-restart recovery permanently
-        # ``still_unknown``. Fetch the rules instead; on failure fall
-        # back to ``still_unknown`` so the next sync / reconcile gets
-        # another chance rather than halting recovery.
         try:
-            rules = await self.plugin._get_instrument_rules(row.symbol)
+            rules = await self.plugin.instrument_rules(row.symbol)
         except Exception as fetch_err:
             return ResumeOutcome(
                 status='still_unknown',
@@ -1392,34 +1323,69 @@ class _CapitalComResumeHooks:
                 recovery_context=recovery_context or None,
             )
 
-        current_units = sum(
-            round(float((r.get('position') or {}).get('size', 0.0))
-                  / rules.lot_step)
-            for r in self.pos_by_deal_id.values()
-            if (r.get('market') or {}).get('epic') == row.symbol
+        expected_units = pre_units - close_units
+        target_raw = self.pos_by_deal_id.get(target_deal_id)
+        target = (target_raw or {}).get('position') or {}
+        current_direction = (target.get('direction') or '').upper() or None
+        current_units = (
+            round(float(target.get('size', 0.0)) / rules.lot_step)
+            if target_raw is not None else None
         )
-        expected = int(pre_total_units) - int(intent_units)
-        deal_id = (confirm or {}).get('dealId')
+        opposite_direction = 'SELL' if target_direction == 'BUY' else 'BUY'
+        opposite_deal_ids = [
+            str(position.get('dealId'))
+            for raw in self.pos_by_deal_id.values()
+            if (raw.get('market') or {}).get('epic') == row.symbol
+            for position in [raw.get('position') or {}]
+            if (position.get('direction') or '').upper() == opposite_direction
+            and position.get('dealId')
+        ]
+        corrected_reverse_id = _wire_id(
+            extras.get('corrected_reverse_deal_id')
+        )
+        corrected_reverse_present = (
+            corrected_reverse_id in self.pos_by_deal_id
+            if corrected_reverse_id is not None else False
+        )
         match_context = {
             **recovery_context,
-            'current_units': current_units,
-            'expected_units': expected,
+            'target_deal_id': target_deal_id,
+            'target_direction': current_direction,
+            'target_units': current_units,
+            'expected_units': expected_units,
+            'opposite_deal_ids': opposite_deal_ids,
+            'corrected_reverse_deal_id': corrected_reverse_id,
+            'corrected_reverse_present': corrected_reverse_present,
         }
-        if current_units == expected:
-            # Confirm GET succeeded → ACCEPTED + delta match.
-            # Confirm missing (TTL expired or no ref) but delta matches:
-            # the broker already netted the close, so retrying would
-            # over-reduce the position. Confirm it.
+        exact_match = (
+            current_direction == target_direction
+            and current_units == expected_units
+            and not opposite_deal_ids
+            and corrected_reverse_id is None
+        )
+        if exact_match:
             if confirm is not None:
-                path = 'partial_close_units_match'
+                path = 'partial_close_target_match'
             elif ref is not None:
-                path = 'partial_close_units_match_ttl_expired'
+                path = 'partial_close_target_match_ttl_expired'
             else:
-                path = 'partial_close_units_match_no_ref'
+                path = 'partial_close_target_match_no_ref'
+            confirm_deal_id = _wire_id((confirm or {}).get('dealId'))
             return ResumeOutcome(
                 status='confirmed',
-                exchange_id=str(deal_id) if deal_id else None,
+                exchange_id=confirm_deal_id,
                 recovery_path=path,
+                recovery_context=match_context,
+            )
+        if (corrected_reverse_id is not None
+                and not corrected_reverse_present
+                and current_direction == target_direction
+                and current_units == pre_units
+                and not opposite_deal_ids):
+            return ResumeOutcome(
+                status='rejected',
+                reject_reason='corrective reverse leg removed; target unchanged',
+                recovery_path='partial_close_correction_target_unchanged',
                 recovery_context=match_context,
             )
         return ResumeOutcome(

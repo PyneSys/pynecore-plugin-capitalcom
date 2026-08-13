@@ -43,13 +43,18 @@ from pynecore.core.broker.models import (
 )
 
 from .exceptions import CapitalComError, OrderNotFoundError
-from .helpers import _extract_reject_reason, _is_funds_reject, _parse_iso_timestamp
+from ._base import CapitalComHookCollaborator
+from .helpers import (
+    _extract_reject_reason,
+    _is_funds_reject,
+    _wire_float,
+    _wire_id,
+)
 from .models import _bracket_leg_id
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
-    from .execution import _ExecutionMixin
     from .models import _InstrumentRules
 
 
@@ -73,7 +78,7 @@ class _CapitalComModifyEntryHooks:
     def __init__(
             self,
             *,
-            plugin: '_ExecutionMixin',
+            plugin: CapitalComHookCollaborator,
             target_row: 'OrderRow',
             new_level: float,
             order_type: OrderType,
@@ -99,14 +104,33 @@ class _CapitalComModifyEntryHooks:
         :class:`OrderDispositionUnknownError` — recovery on next start
         re-evaluates against the broker's authoritative view.
         """
-        del old_intent  # captured at construction time as target_row + new_level
-        del target_coid
+        if target_coid != self._target_row.client_order_id:
+            raise ValueError(
+                f"Modify-entry target mismatch: hook has "
+                f"{self._target_row.client_order_id!r}, journal supplied "
+                f"{target_coid!r}"
+            )
+        if old_intent.order_type != self._order_type:
+            raise ValueError(
+                f"Modify-entry order type mismatch: hook has "
+                f"{self._order_type.value!r}, old intent has "
+                f"{old_intent.order_type.value!r}"
+            )
+        new_intent_level = (
+            new_intent.limit
+            if new_intent.order_type == OrderType.LIMIT else new_intent.stop
+        )
+        if new_intent_level is None or abs(new_intent_level - self._new_level) > 1e-9:
+            raise ValueError(
+                f"Modify-entry level mismatch: hook has {self._new_level!r}, "
+                f"new intent has {new_intent_level!r}"
+            )
 
         deal_id = self._target_row.exchange_order_id
         body = {'level': self._new_level}
 
         try:
-            put_resp = await self._plugin._call(  # type: ignore[attr-defined]
+            put_resp = await self._plugin.call_api(
                 f'workingorders/{deal_id}', data=body, method='put',
             )
         except (httpx.TimeoutException, httpx.RequestError,
@@ -128,8 +152,8 @@ class _CapitalComModifyEntryHooks:
             )
 
         try:
-            confirm = await self._plugin._call(  # type: ignore[attr-defined]
-                f'confirms/{deal_ref}', method='get',
+            confirm = await self._plugin.call_api(
+f'confirms/{deal_ref}', method='get',
             )
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
@@ -155,8 +179,9 @@ class _CapitalComModifyEntryHooks:
         echoed_level_raw = confirm.get('level')
         if echoed_level_raw is None:
             echoed_level_raw = put_resp.get('level')
-        echoed_level = float(echoed_level_raw) if echoed_level_raw is not None \
-            else self._new_level
+        echoed_level = _wire_float(echoed_level_raw, finite=True)
+        if echoed_level is None:
+            echoed_level = self._new_level
 
         # Mirror the new level onto the target row so the engine sees it
         # immediately. The target row lives outside the journal's
@@ -189,7 +214,16 @@ class _CapitalComModifyEntryHooks:
         the latest target row directly from the store so its echoed
         level (mirrored by :meth:`submit_amend`) is included.
         """
-        del row, outcome
+        if abs(outcome.new_level - self._new_level) > 1e-9:
+            raise RuntimeError(
+                f"Modify-entry outcome mismatch: expected {self._new_level!r}, "
+                f"got {outcome.new_level!r}"
+            )
+        if row.symbol != new_intent.symbol:
+            raise RuntimeError(
+                f"Modify-entry command symbol {row.symbol!r} does not match "
+                f"intent symbol {new_intent.symbol!r}"
+            )
         target = (
             self._plugin.store_ctx.get_order(self._target_row.client_order_id)
             if self._plugin.store_ctx is not None else self._target_row
@@ -256,7 +290,7 @@ class _CapitalComCancelHooks:
     def __init__(
             self,
             *,
-            plugin: '_ExecutionMixin',
+            plugin: CapitalComHookCollaborator,
     ) -> None:
         self._plugin = plugin
 
@@ -330,8 +364,8 @@ class _CapitalComCancelHooks:
                         body['trailingStop'] = False
                 target_already_gone = False
                 try:
-                    resp = await self._plugin._call(  # type: ignore[attr-defined]
-                        f'positions/{parent_deal_id}',
+                    resp = await self._plugin.call_api(
+        f'positions/{parent_deal_id}',
                         data=body, method='put',
                     )
                     # Mirror the confirm round-trip ``execute_exit`` /
@@ -341,8 +375,8 @@ class _CapitalComCancelHooks:
                     new_ref = (resp or {}).get('dealReference') \
                         if isinstance(resp, dict) else None
                     if new_ref:
-                        await self._plugin._call(  # type: ignore[attr-defined]
-                            f'confirms/{new_ref}', method='get',
+                        await self._plugin.call_api(
+            f'confirms/{new_ref}', method='get',
                         )
                 except (httpx.TimeoutException, httpx.RequestError,
                         ConnectionError, ExchangeConnectionError) as net:
@@ -419,8 +453,8 @@ class _CapitalComCancelHooks:
             # Working order: real DELETE.
             target_already_gone = False
             try:
-                await self._plugin._call(  # type: ignore[attr-defined]
-                    f'workingorders/{row.exchange_order_id}', method='delete',
+                await self._plugin.call_api(
+    f'workingorders/{row.exchange_order_id}', method='delete',
                 )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
@@ -473,8 +507,9 @@ class _CapitalComCancelHooks:
             applied_target_coids=applied,
         )
 
+    @staticmethod
     def exchange_order_from_state(
-            self, *, row: 'OrderRow', intent: CancelIntent,
+            *, row: 'OrderRow', intent: CancelIntent,
             outcome: CancelOutcome,
     ) -> ExchangeOrder:
         """Synthesise a :class:`ExchangeOrder` for the cancel command row.
@@ -484,7 +519,10 @@ class _CapitalComCancelHooks:
         through the journal — the orchestrator in ``execute_cancel``
         discards it and returns ``True``.
         """
-        del outcome
+        if outcome.reason_path not in ('deleted', 'already_gone', 'noop'):
+            raise RuntimeError(
+                f"Unsupported Capital.com cancel outcome: {outcome.reason_path!r}"
+            )
         return ExchangeOrder(
             id=row.client_order_id,
             symbol=intent.symbol,
@@ -519,15 +557,10 @@ class _CapitalComCloseHooks:
       the activity stream can later promote the row to ``closed``.
     * **Partial close** — Capital.com has no native partial-close
       endpoint, so the plugin emulates it by issuing an opposite-side
-      ``POST /positions``. The POST is inherently racy against any
-      unrelated opposite-side opener landing in the same instant; the
-      hook protects with a pre- + post-snapshot reconciliation and a
-      corrective ``DELETE`` only when the fresh row's ``createdDateUTC``
-      falls within a ±3 s window of our POST. If the race cannot be
-      confidently resolved the hook raises
-      :class:`BrokerManualInterventionError` — the journal does NOT
-      catch that (intentional: operator intervention required), so the
-      propagation matches the legacy execute_close semantics.
+      ``POST /positions``. A filled outcome requires an exact target-deal
+      residual in the authoritative post-snapshot. A reverse leg is deleted
+      only when the venue confirm explicitly attributes its ``dealId`` to
+      this POST; timestamp proximity is never treated as ownership proof.
 
     Only one of :meth:`submit_full_close` / :meth:`submit_partial_close`
     is invoked per dispatch — the orchestrator decides between them
@@ -539,11 +572,13 @@ class _CapitalComCloseHooks:
     def __init__(
             self,
             *,
-            plugin: '_ExecutionMixin',
+            plugin: CapitalComHookCollaborator,
             rules: '_InstrumentRules',
+            target_deal_ids: frozenset[str],
     ) -> None:
         self._plugin = plugin
         self._rules = rules
+        self._target_deal_ids = target_deal_ids
 
     async def submit_full_close(
             self, *, coid: str, intent: CloseIntent,
@@ -570,8 +605,8 @@ class _CapitalComCloseHooks:
         applied_targets: list[str] = []
         for row in targets:
             try:
-                await self._plugin._call(  # type: ignore[attr-defined]
-                    f'positions/{row.exchange_order_id}', method='delete',
+                await self._plugin.call_api(
+    f'positions/{row.exchange_order_id}', method='delete',
                 )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
@@ -624,102 +659,81 @@ class _CapitalComCloseHooks:
     ) -> CloseOutcome:
         """Emulated partial close via opposite-direction POST.
 
-        Pre-snapshot the positions list to capture the live unit total
-        and the set of ``dealId``\\ s that existed *before* the POST;
-        these are needed both to detect a race-opened fresh leg and to
-        give recovery on next start enough context to verify the dispatch
-        even when the corrective-DELETE time window has elapsed.
+        The account-serialized pre-snapshot persists the exact target deal,
+        direction, starting units, and requested reduction before sending the
+        non-targetable opposite POST. A filled outcome is returned only when an
+        authoritative post-snapshot proves that same deal in the same direction
+        at the exact expected residual.
 
-        On network ambiguity the hook raises
-        :class:`BrokerManualInterventionError`: the sync engine cannot
-        verify a parked emulated-partial-close in-session
-        (``get_open_orders`` does not see netted positions, and a
-        second POST could compound the exposure), so the safe contract
-        is to halt and let recovery on next start resolve the dispatch
-        via the persisted ``deal_reference`` / pre-snapshot context.
-        A post-snapshot with too many units is only an unresolvable race
-        when an *opposite-direction* row exists that cannot be attributed
-        to our POST (neither via the confirm's ``affectedDeals`` nor, when
-        the confirm is unavailable, via the POST-anchored
-        ``createdDateUTC`` band) — then it raises
-        :class:`BrokerManualInterventionError` and the journal does not
-        catch it, so operator intervention is required. When no
-        opposite-direction row exists and the confirm reports the deal
-        as accepted, the excess units are same-direction lots whose
-        netting reduction the snapshot has not settled yet (eventual
-        consistency on a one-way account); that is benign and returns
-        the normal partial outcome rather than halting. A confirm with
-        ``dealStatus == 'REJECTED'`` produces the same snapshot shape
-        (position unchanged, no fresh row) but means the reduce never
-        executed — it raises :class:`ExchangeOrderRejectedError`
-        (:class:`InsufficientMarginError` for funds rejects) so the
-        journal marks the command rejected and the engine keeps running
-        with its position intact. With no confirm verdict at all, an
-        un-settled snapshot without an opposite row is genuinely
-        ambiguous and halts.
+        An accepted confirm with an unchanged target is parked as
+        :class:`OrderDispositionUnknownError` for restart recovery; acceptance
+        alone is not proof that netting settled. A fresh reverse leg attributable
+        to this POST is deleted, then the close is likewise parked rather than
+        reported as filled. Unattributable opposite exposure or any other target
+        mismatch requires manual intervention. A rejected confirm follows the
+        normal exchange-reject path.
         """
         store_ctx = self._plugin.store_ctx
         rules = self._rules
 
-        pre_snap = await self._plugin._call('positions', method='get')  # type: ignore[attr-defined]
-        pre_rows = [
-            r for r in (pre_snap.get('positions') or [])
-            if (r.get('market') or {}).get('epic') == intent.symbol
-        ]
-        pre_deal_ids = {
-            (r.get('position') or {}).get('dealId') for r in pre_rows
-        }
-        pre_total_units = sum(
-            round(float((r.get('position') or {}).get('size', 0.0))
-                  / rules.lot_step) if rules.lot_step > 0 else 0
-            for r in pre_rows
-        )
-        intent_units = (
-            round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
-        )
-
         opposite_dir = 'SELL' if intent.side == 'sell' else 'BUY'
-        quantized_qty = self._plugin._quantize_size(intent.qty, rules)  # type: ignore[attr-defined]
+        expected_direction = 'BUY' if intent.side == 'sell' else 'SELL'
+        quantized_qty = self._plugin.quantize_size(intent.qty, rules)
         body = {
             'epic': intent.symbol,
             'direction': opposite_dir,
             'size': quantized_qty,
         }
 
-        # Persist the pre-POST snapshot delta context into the command
-        # row so recovery on next start can verify the dispatch even
-        # though the corrective-DELETE time window will have elapsed.
-        if store_ctx is not None:
-            existing = store_ctx.get_order(coid)
-            merged_extras = dict((existing.extras or {}) if existing else {})
-            merged_extras['pre_total_units'] = pre_total_units
-            merged_extras['intent_units'] = intent_units
-            store_ctx.upsert_order(coid, extras=merged_extras)
-
-        # Local-clock anchor for the corrective-DELETE fallback band:
-        # captured BEFORE the POST goes out so confirm/snapshot latency
-        # cannot shrink the window (the fresh leg's server-side
-        # ``createdDateUTC`` can never predate the POST dispatch).
-        post_sent_ts = epoch_time()
+        # The REST collaborator holds the account-scoped process/file lock
+        # across the final snapshot and POST. That closes the Pyne-controlled
+        # TOCTOU window between plugin instances/processes using this account.
+        # External manual/API writers remain outside our control; the
+        # post-snapshot ownership validation below still detects mismatches.
         try:
-            post_resp = await self._plugin._call(  # type: ignore[attr-defined]
-                'positions', data=body, method='post',
+            post_resp, pre_rows = await self._plugin.submit_exclusive_partial_close(
+                coid=coid,
+                symbol=intent.symbol,
+                expected_direction=expected_direction,
+                target_deal_ids=self._target_deal_ids,
+                body=body,
+                intent_qty=intent.qty,
+                lot_step=rules.lot_step,
             )
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
-            raise BrokerManualInterventionError(
-                f"Capital POST positions ambiguous during partial close: "
-                f"{net}",
-                intent_key=intent.intent_key,
-                context={
-                    'coid': coid,
-                    'symbol': intent.symbol,
-                    'qty': intent.qty,
-                    'error': str(net),
-                },
+            raise OrderDispositionUnknownError(
+                f"Capital POST positions ambiguous during partial close: {net}",
+                client_order_id=coid,
+                cause=net if isinstance(net, Exception) else None,
             ) from net
 
-        deal_ref: str | None = post_resp.get('dealReference')
+        pre_positions = [r.get('position') or {} for r in pre_rows]
+        pre_deal_ids = {
+            str(position['dealId'])
+            for position in pre_positions
+            if position.get('dealId')
+        }
+        target_deal_id = next(iter(self._target_deal_ids))
+        pre_target = next(
+            position for position in pre_positions
+            if _wire_id(position.get('dealId')) == target_deal_id
+        )
+        pre_target_units = (
+            round(float(pre_target.get('size', 0.0)) / rules.lot_step)
+            if rules.lot_step > 0 else 0
+        )
+        intent_units = (
+            round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
+        )
+        if intent_units <= 0 or intent_units >= pre_target_units:
+            raise ExchangeOrderRejectedError(
+                "Capital partial close quantity must be positive and smaller "
+                "than the target's current venue quantity immediately before "
+                "dispatch"
+            )
+
+        deal_ref = _wire_id(post_resp.get('dealReference'))
         # Mid-flow add_ref so recovery has the durable reference even if
         # this method raises between POST and journal return. The journal
         # will idempotently re-record the ref via ``record_close_server_ref``
@@ -731,29 +745,19 @@ class _CapitalComCloseHooks:
         # fresh reverse leg shows up here (``affectedDeals`` entry with
         # the new position's ``dealId``), giving a deterministic
         # discriminator for the corrective DELETE — no clock involved.
-        # ``confirm_accepted`` records that the confirm was fetched AND
-        # its ``dealStatus`` was not REJECTED — the only evidence strong
-        # enough to treat an un-settled post-snapshot as benign below.
         confirm_deal_ids: set[str] = set()
-        confirm_accepted = False
         if deal_ref:
             try:
-                confirm = await self._plugin._call(  # type: ignore[attr-defined]
-                    f'confirms/{deal_ref}', method='get',
+                confirm = await self._plugin.call_api(
+    f'confirms/{deal_ref}', method='get',
                 )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
-                raise BrokerManualInterventionError(
+                raise OrderDispositionUnknownError(
                     f"Capital GET confirms/{deal_ref} ambiguous after "
                     f"partial close POST: {net}",
-                    intent_key=intent.intent_key,
-                    context={
-                        'coid': coid,
-                        'deal_reference': deal_ref,
-                        'symbol': intent.symbol,
-                        'qty': intent.qty,
-                        'error': str(net),
-                    },
+                    client_order_id=coid,
+                    cause=net if isinstance(net, Exception) else None,
                 ) from net
             except OrderNotFoundError:
                 # Confirms TTL/lookup race: the POST landed and a
@@ -789,155 +793,176 @@ class _CapitalComCloseHooks:
                         f"Capital confirm REJECTED on partial close: "
                         f"{reason}",
                     )
-                confirm_accepted = True
                 for affected in (confirm.get('affectedDeals') or []):
-                    affected_id = affected.get('dealId')
-                    if affected_id:
+                    affected_id = _wire_id(affected.get('dealId'))
+                    if affected_id is not None:
                         confirm_deal_ids.add(affected_id)
-                top_deal_id = confirm.get('dealId')
-                if top_deal_id:
+                top_deal_id = _wire_id(confirm.get('dealId'))
+                if top_deal_id is not None:
                     confirm_deal_ids.add(top_deal_id)
 
-        post_snap = await self._plugin._call('positions', method='get')  # type: ignore[attr-defined]
-        post_rows = [
-            r for r in (post_snap.get('positions') or [])
-            if (r.get('market') or {}).get('epic') == intent.symbol
-        ]
-        post_total_units = sum(
-            round(float((r.get('position') or {}).get('size', 0.0))
-                  / rules.lot_step) if rules.lot_step > 0 else 0
-            for r in post_rows
-        )
-        expected_post_units = pre_total_units - intent_units
+        target_deal_id = next(iter(self._target_deal_ids))
+        expected_post_units = pre_target_units - intent_units
 
-        if post_total_units > expected_post_units:
-            # The post-snapshot still carries more units than the netted
-            # reduction should leave. Three distinct cases, resolved by
-            # whether an *opposite-direction* row exists and whether the
-            # confirm's verdict is in hand:
-            #
-            #   (a) Our opposite POST opened a fresh reverse leg instead of
-            #       netting (a genuine race, or a concurrent REST session).
-            #       Identify the freshly-opened leg among the new
-            #       opposite-direction rows and issue a corrective DELETE.
-            #       Primary discriminator: the confirm's ``affectedDeals``
-            #       ``dealId``s — deterministic, and it protects a fresh row
-            #       someone ELSE opened in the window from being deleted.
-            #       Fallback (confirm unavailable — TTL race or missing
-            #       ``dealReference``): ``createdDateUTC`` must fall between
-            #       the POST dispatch and now, with ±3 s clock-skew tolerance
-            #       on both ends. When an opposite-direction row exists but
-            #       cannot be confidently attributed to our POST, the race is
-            #       unresolvable — halt for operator intervention.
-            #
-            #   (b) No opposite-direction row exists at all AND the confirm
-            #       verdict is in hand (``dealStatus`` inspected above, not
-            #       REJECTED): the excess is purely same-direction lots
-            #       (Capital.com netting keeps one row per fill), and the
-            #       ``/positions`` snapshot simply has not settled the
-            #       reduction yet — eventual consistency on a one-way
-            #       account, where an opposite order always nets and never
-            #       persists as an independent leg. This is benign: the
-            #       venue accepted the deal and it will net. Halting here
-            #       would strand the bot on a fully recoverable path;
-            #       recovery / the periodic reconcile verify the dispatch
-            #       via the persisted ``deal_reference`` and the eventual
-            #       settled snapshot. Fall through to the normal partial
-            #       :class:`CloseOutcome`.
-            #
-            #   (c) No opposite-direction row AND no confirm verdict (no
-            #       ``dealReference``, or the confirms TTL expired): a
-            #       silently-rejected POST is observationally identical to
-            #       netting lag — position unchanged, no fresh row. Neither
-            #       success (silent desync if it was rejected) nor reject
-            #       (re-close of an already-netted reduction would OPEN a
-            #       reverse position on a netting venue) is safe to report,
-            #       so this genuinely ambiguous corner halts for operator
-            #       intervention, per this hook's documented contract.
-            fresh_opposite: dict | None = None
-            unresolved_opposite = False
-            now_ts = epoch_time()
-            for r in post_rows:
-                pos_data = r.get('position') or {}
-                if (pos_data.get('direction') or '').upper() != opposite_dir:
-                    continue
-                if pos_data.get('dealId') in pre_deal_ids:
-                    # Pre-existing opposite leg — not opened by our POST, so
-                    # it cannot be attributed to this close.
-                    unresolved_opposite = True
-                    continue
-                if confirm_deal_ids:
-                    if pos_data.get('dealId') in confirm_deal_ids:
-                        fresh_opposite = pos_data
-                        break
-                    unresolved_opposite = True
-                    continue
-                created_at = _parse_iso_timestamp(
-                    pos_data.get('createdDateUTC') or '',
-                )
-                if (created_at
-                        and post_sent_ts - 3.0 <= created_at <= now_ts + 3.0):
-                    fresh_opposite = pos_data
-                    break
+        async def position_snapshot() -> list[dict]:
+            snapshot = await self._plugin.call_api('positions', method='get')
+            return [
+                snapshot_row for snapshot_row in (snapshot.get('positions') or [])
+                if (snapshot_row.get('market') or {}).get('epic') == intent.symbol
+            ]
+
+        post_rows = await position_snapshot()
+        opposite_rows: list[dict] = []
+        attributed_reverse: dict | None = None
+        unresolved_opposite = False
+        for raw in post_rows:
+            position = raw.get('position') or {}
+            if (position.get('direction') or '').upper() != opposite_dir:
+                continue
+            opposite_rows.append(position)
+            deal_id = _wire_id(position.get('dealId'))
+            if deal_id is None or deal_id in pre_deal_ids:
                 unresolved_opposite = True
-            if fresh_opposite is not None:
-                fresh_id = fresh_opposite.get('dealId')
-                await self._plugin._call(  # type: ignore[attr-defined]
-                    f'positions/{fresh_id}', method='delete',
-                )
-                if store_ctx is not None:
-                    store_ctx.log_event(
-                        'partial_close_corrective_delete',
-                        client_order_id=coid,
-                        exchange_order_id=fresh_id,
-                        intent_key=intent.intent_key,
-                        payload={'reason': 'race_reverse_leg_corrected'},
-                    )
-            elif unresolved_opposite:
+                continue
+            if confirm_deal_ids and deal_id in confirm_deal_ids:
+                attributed_reverse = position
+                break
+            unresolved_opposite = True
+
+        corrected_reverse_id: str | None = None
+        if attributed_reverse is not None:
+            reverse_id = _wire_id(attributed_reverse.get('dealId'))
+            if reverse_id is None:
                 raise BrokerManualInterventionError(
-                    f"Partial close race detected but reverse leg cannot "
-                    f"be confidently identified (expected "
-                    f"{expected_post_units} units, have "
-                    f"{post_total_units})",
+                    "Partial close reverse leg has no valid dealId",
                     intent_key=intent.intent_key,
-                    context={
-                        'coid': coid,
-                        'pre_total_units': pre_total_units,
-                        'post_total_units': post_total_units,
+                )
+            corrected_reverse_id = reverse_id
+            if store_ctx is not None:
+                existing = store_ctx.get_order(coid)
+                merged_extras = dict((existing.extras or {}) if existing else {})
+                merged_extras['corrected_reverse_deal_id'] = reverse_id
+                merged_extras['corrective_delete_pending'] = True
+                store_ctx.upsert_order(coid, extras=merged_extras)
+                store_ctx.log_event(
+                    'partial_close_corrective_delete_dispatched',
+                    client_order_id=coid,
+                    exchange_order_id=reverse_id,
+                    intent_key=intent.intent_key,
+                )
+            try:
+                await self._plugin.call_api(
+                    f'positions/{reverse_id}', method='delete',
+                )
+            except OrderNotFoundError:
+                pass
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError) as net:
+                raise OrderDispositionUnknownError(
+                    "Capital corrective reverse-leg DELETE disposition is "
+                    f"unknown for deal {reverse_id}",
+                    client_order_id=coid,
+                    cause=net if isinstance(net, Exception) else None,
+                ) from net
+            if store_ctx is not None:
+                existing = store_ctx.get_order(coid)
+                merged_extras = dict((existing.extras or {}) if existing else {})
+                merged_extras['corrective_delete_pending'] = False
+                store_ctx.upsert_order(coid, extras=merged_extras)
+                store_ctx.log_event(
+                    'partial_close_corrective_delete',
+                    client_order_id=coid,
+                    exchange_order_id=reverse_id,
+                    intent_key=intent.intent_key,
+                    payload={'reason': 'race_reverse_leg_corrected'},
+                )
+            post_rows = await position_snapshot()
+            opposite_rows = [
+                raw.get('position') or {} for raw in post_rows
+                if ((raw.get('position') or {}).get('direction') or '').upper()
+                == opposite_dir
+            ]
+        elif unresolved_opposite:
+            raise BrokerManualInterventionError(
+                "Partial close race detected but reverse leg cannot be "
+                "confidently identified",
+                intent_key=intent.intent_key,
+                context={
+                    'coid': coid,
+                    'pre_target_units': pre_target_units,
+                    'intent_units': intent_units,
+                    'symbol': intent.symbol,
+                },
+            )
+
+        target_positions = [
+            raw.get('position') or {} for raw in post_rows
+            if _wire_id((raw.get('position') or {}).get('dealId'))
+            == target_deal_id
+        ]
+        target_units = 0
+        target_direction: str | None = None
+        if len(target_positions) == 1:
+            target = target_positions[0]
+            target_direction = (target.get('direction') or '').upper()
+            target_units = (
+                round(float(target.get('size', 0.0)) / rules.lot_step)
+                if rules.lot_step > 0 else 0
+            )
+
+        if (len(target_positions) == 1
+                and target_direction == expected_direction
+                and target_units == expected_post_units
+                and not opposite_rows
+                and corrected_reverse_id is None):
+            pass
+        elif (len(target_positions) == 1
+              and target_direction == expected_direction
+              and target_units == pre_target_units
+              and not opposite_rows):
+            if store_ctx is not None:
+                store_ctx.log_event(
+                    'partial_close_netting_pending',
+                    client_order_id=coid,
+                    intent_key=intent.intent_key,
+                    payload={
+                        'reason': 'target_reduction_unsettled',
+                        'pre_target_units': pre_target_units,
+                        'target_units': target_units,
                         'intent_units': intent_units,
+                        'corrected_reverse_deal_id': corrected_reverse_id,
                         'symbol': intent.symbol,
                     },
                 )
-            elif confirm_accepted:
-                if store_ctx is not None:
-                    store_ctx.log_event(
-                        'partial_close_netting_pending',
-                        client_order_id=coid,
-                        intent_key=intent.intent_key,
-                        payload={
-                            'reason': 'reduction_unsettled_no_reverse_leg',
-                            'pre_total_units': pre_total_units,
-                            'post_total_units': post_total_units,
-                            'intent_units': intent_units,
-                            'symbol': intent.symbol,
-                        },
-                    )
-            else:
-                raise BrokerManualInterventionError(
-                    f"Partial close disposition ambiguous: reduction not "
-                    f"reflected in positions snapshot (expected "
-                    f"{expected_post_units} units, have {post_total_units}) "
-                    f"and no confirm verdict is available",
-                    intent_key=intent.intent_key,
-                    context={
-                        'coid': coid,
-                        'deal_reference': deal_ref,
-                        'pre_total_units': pre_total_units,
-                        'post_total_units': post_total_units,
-                        'intent_units': intent_units,
-                        'symbol': intent.symbol,
-                    },
-                )
+            raise OrderDispositionUnknownError(
+                "Capital partial close was accepted but the exact target "
+                "deal has not reached the expected residual yet",
+                client_order_id=coid,
+            )
+        elif corrected_reverse_id is not None and not opposite_rows:
+            raise OrderDispositionUnknownError(
+                "Capital partial close corrected its reverse leg but the exact "
+                "target deal disposition remains unknown",
+                client_order_id=coid,
+            )
+        else:
+            raise BrokerManualInterventionError(
+                "Partial close did not prove the exact target deal at the "
+                "expected residual",
+                intent_key=intent.intent_key,
+                context={
+                    'coid': coid,
+                    'target_deal_id': target_deal_id,
+                    'target_direction': target_direction,
+                    'target_units': target_units,
+                    'expected_units': expected_post_units,
+                    'opposite_deal_ids': [
+                        _wire_id(position.get('dealId'))
+                        for position in opposite_rows
+                    ],
+                    'symbol': intent.symbol,
+                },
+            )
 
         return CloseOutcome(
             mode='partial',
@@ -948,8 +973,9 @@ class _CapitalComCloseHooks:
             raw=post_resp,
         )
 
+    @staticmethod
     def exchange_order_from_state(
-            self, *, row: 'OrderRow', intent: CloseIntent,
+            *, row: 'OrderRow', intent: CloseIntent,
             outcome: CloseOutcome,
     ) -> ExchangeOrder:
         """Build the engine-facing :class:`ExchangeOrder` for the close.
@@ -1007,14 +1033,14 @@ class _CapitalComModifyExitHooks:
 
     When the PUT body is empty (a pure pending-trail seed amend), the
     orchestrator bypasses the journal entirely and calls
-    :meth:`_apply_mirror` directly — there is no broker round-trip to
+    :meth:`apply_mirror` directly — there is no broker round-trip to
     journal in that case.
     """
 
     def __init__(
             self,
             *,
-            plugin: '_ExecutionMixin',
+            plugin: CapitalComHookCollaborator,
             target_row: 'OrderRow',
             body: dict,
             existing_tp: 'OrderRow | None',
@@ -1028,7 +1054,6 @@ class _CapitalComModifyExitHooks:
             ambiguous_sl_coid: str | None,
             sl_in_body: bool,
             sl_clears_broker_active: bool,
-            clears_broker_tp: bool,
     ) -> None:
         self._plugin = plugin
         self._target_row = target_row
@@ -1044,7 +1069,6 @@ class _CapitalComModifyExitHooks:
         self._ambiguous_sl_coid = ambiguous_sl_coid
         self._sl_in_body = sl_in_body
         self._sl_clears_broker_active = sl_clears_broker_active
-        self._clears_broker_tp = clears_broker_tp
 
     async def submit_amend(
             self, *, coid: str, target_coid: str,
@@ -1078,7 +1102,17 @@ class _CapitalComModifyExitHooks:
         ``target_row.client_order_id``; the argument is part of the
         Protocol contract.
         """
-        del target_coid
+        if target_coid != self._target_row.client_order_id:
+            raise ValueError(
+                f"Modify-exit target mismatch: hook has "
+                f"{self._target_row.client_order_id!r}, journal supplied "
+                f"{target_coid!r}"
+            )
+        if old_intent.symbol != new_intent.symbol:
+            raise ValueError(
+                f"Modify-exit symbol changed from {old_intent.symbol!r} to "
+                f"{new_intent.symbol!r}"
+            )
 
         deal_id = self._target_row.exchange_order_id
         if deal_id is None:
@@ -1088,8 +1122,8 @@ class _CapitalComModifyExitHooks:
             )
 
         try:
-            resp = await self._plugin._call(  # type: ignore[attr-defined]
-                f'positions/{deal_id}', data=self._body, method='put',
+            resp = await self._plugin.call_api(
+f'positions/{deal_id}', data=self._body, method='put',
             )
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
@@ -1100,8 +1134,8 @@ class _CapitalComModifyExitHooks:
             self._seed_added_legs_disposition_unknown(new_intent)
             self._mark_existing_sl_force_rejected_on_pending_trail()
             self._persist_existing_legs_attempted_target(new_intent)
-            self._plugin._mark_bracket_legs_disposition_unknown(  # type: ignore[attr-defined]
-                intent=new_intent,
+            self._plugin.mark_bracket_legs_disposition_unknown(
+intent=new_intent,
                 parent_coid=self._target_row.client_order_id,
                 deal_id=deal_id,
                 tp_coid=self._ambiguous_tp_coid,
@@ -1116,12 +1150,12 @@ class _CapitalComModifyExitHooks:
                 predecessor_cancel_ids=(),
             ) from net
 
-        new_ref = resp.get('dealReference')
+        new_ref = _wire_id(resp.get('dealReference'))
         post_put_state: dict = {}
         if new_ref:
             try:
-                modify_confirm = await self._plugin._call(  # type: ignore[attr-defined]
-                    f'confirms/{new_ref}', method='get',
+                modify_confirm = await self._plugin.call_api(
+    f'confirms/{new_ref}', method='get',
                 )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError,
@@ -1143,8 +1177,8 @@ class _CapitalComModifyExitHooks:
                 self._seed_added_legs_disposition_unknown(new_intent)
                 self._mark_existing_sl_force_rejected_on_pending_trail()
                 self._persist_existing_legs_attempted_target(new_intent)
-                self._plugin._mark_bracket_legs_disposition_unknown(  # type: ignore[attr-defined]
-                    intent=new_intent,
+                self._plugin.mark_bracket_legs_disposition_unknown(
+    intent=new_intent,
                     parent_coid=self._target_row.client_order_id,
                     deal_id=deal_id,
                     tp_coid=self._ambiguous_tp_coid,
@@ -1213,10 +1247,14 @@ class _CapitalComModifyExitHooks:
         * A ``modify_exit`` audit event tying the wire result back to
           the leg COIDs the engine sees.
         """
-        del outcome
-        self._apply_mirror(target_row=target_row, new_intent=new_intent)
+        if outcome.deal_status != 'ACCEPTED':
+            raise RuntimeError(
+                f"Cannot mirror bracket legs from outcome "
+                f"{outcome.deal_status!r}"
+            )
+        self.apply_mirror(target_row=target_row, new_intent=new_intent)
 
-    def _apply_mirror(
+    def apply_mirror(
             self, *, target_row: 'OrderRow', new_intent: ExitIntent,
     ) -> None:
         """Body of :meth:`mirror_bracket_legs` minus the outcome arg.
@@ -1225,6 +1263,12 @@ class _CapitalComModifyExitHooks:
         (pending-trail seed amend with no broker round-trip), and by
         :meth:`mirror_bracket_legs` on the journal-happy-path.
         """
+        if target_row.client_order_id != self._target_row.client_order_id:
+            raise ValueError(
+                f"Modify-exit mirror target mismatch: hook has "
+                f"{self._target_row.client_order_id!r}, journal supplied "
+                f"{target_row.client_order_id!r}"
+            )
         if self._plugin.store_ctx is None:
             return
 
@@ -1490,7 +1534,16 @@ class _CapitalComModifyExitHooks:
             outcome: ModifyExitOutcome,
     ) -> list[ExchangeOrder]:
         """Build the synthetic TP / SL leg list the engine expects."""
-        del row, outcome
+        if row.symbol != new_intent.symbol:
+            raise RuntimeError(
+                f"Modify-exit command symbol {row.symbol!r} does not match "
+                f"intent symbol {new_intent.symbol!r}"
+            )
+        if outcome.deal_status != 'ACCEPTED':
+            raise RuntimeError(
+                f"Cannot build bracket orders from outcome "
+                f"{outcome.deal_status!r}"
+            )
         new_i = new_intent
         target_row = self._target_row
         deal_id = target_row.exchange_order_id or ''

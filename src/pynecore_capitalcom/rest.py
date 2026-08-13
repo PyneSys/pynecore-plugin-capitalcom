@@ -14,8 +14,12 @@ State touched: ``security_token``, ``cst_token``, ``session_data``,
 """
 import asyncio
 import hashlib
+import os
 import threading
 from abc import ABC
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
 from json import JSONDecodeError
 from time import monotonic, sleep, time as epoch_time
 
@@ -75,6 +79,22 @@ _SESSION_CREATE_RETRY_COUNT = 1
 _SESSION_CREATE_GUARD = threading.Lock()
 _SESSION_CREATE_LOCKS: dict[bytes, threading.Lock] = {}
 _SESSION_CREATE_LAST_POST: dict[bytes, float] = {}
+_ACCOUNT_WRITE_GUARD = threading.Lock()
+_ACCOUNT_WRITE_LOCKS: dict[bytes, threading.Lock] = {}
+
+
+@contextmanager
+def _exclusive_account_file_lock(path: Path) -> Iterator[None]:
+    """Hold one process-shared account write lock on POSIX."""
+    import fcntl
+
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 # Bootstrap requests — must NOT trigger a proactive refresh (would
 # recurse into ``create_session`` itself), MUST go out without auth
 # headers, and MUST NOT trigger reactive retry on
@@ -382,6 +402,119 @@ class _RestSessionMixin(_CapitalComBase, ABC):
             mode = 'demo' if self._capital_config.demo else 'live'
             self._account_id = f"capitalcom-{mode}-{current_account_id}"
 
+    def _call_serialized_write(
+            self, endpoint: str, *, data: dict | None = None,
+            method: str = 'post',
+    ) -> dict:
+        """Call REST synchronously while the caller owns the account lock."""
+        return self(endpoint, data=data, method=method)
+
+    def _account_write_lock(self) -> tuple[threading.Lock, Path]:
+        """Return the shared thread lock and cross-process lock path."""
+        account_id = self._account_id
+        if not account_id or account_id == 'default':
+            raise AuthenticationError(
+                "Capital.com account identity must be resolved before a position write",
+                reason='account_identity_unresolved',
+            )
+        lock_key = hashlib.sha256(account_id.encode('utf-8')).digest()
+        with _ACCOUNT_WRITE_GUARD:
+            write_lock = _ACCOUNT_WRITE_LOCKS.setdefault(
+                lock_key, threading.Lock(),
+            )
+        lock_path = Path.home() / '.pynecore' / 'locks' / (
+            f"capitalcom-account-{lock_key.hex()}.lock"
+        )
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        return write_lock, lock_path
+
+    def _call_with_account_write_lock(
+            self, endpoint: str, *, data: dict | None = None,
+            method: str = 'post',
+    ) -> dict:
+        """Serialize one Pyne-controlled position mutation account-wide."""
+        write_lock, lock_path = self._account_write_lock()
+        with write_lock, _exclusive_account_file_lock(lock_path):
+            return self._call_serialized_write(
+                endpoint, data=data, method=method,
+            )
+
+    async def _submit_exclusive_partial_close(
+            self, *, coid: str, symbol: str, expected_direction: str,
+            target_deal_ids: frozenset[str], body: dict,
+            intent_qty: float, lot_step: float,
+    ) -> tuple[dict, list[dict]]:
+        """Serialize the final positions snapshot and non-targetable reduce POST.
+
+        The lock is keyed only by resolved account identity, so plugin instances
+        using different API keys for the same account share one critical section.
+        External manual/API writers remain outside this lock; callers therefore
+        reconcile the exact target deal after the POST.
+        """
+        write_lock, lock_path = self._account_write_lock()
+
+        def snapshot_and_post() -> tuple[dict, list[dict]]:
+            with write_lock, _exclusive_account_file_lock(lock_path):
+                snapshot = self._call_serialized_write('positions', method='get')
+                rows = [
+                    raw for raw in (snapshot.get('positions') or [])
+                    if (raw.get('market') or {}).get('epic') == symbol
+                ]
+                positions = [raw.get('position') or {} for raw in rows]
+                deal_ids = {
+                    str(position['dealId'])
+                    for position in positions
+                    if position.get('dealId')
+                }
+                exclusive_target = (
+                    len(target_deal_ids) == 1
+                    and len(positions) == 1
+                    and deal_ids == target_deal_ids
+                    and (positions[0].get('direction') or '').upper()
+                    == expected_direction
+                )
+                if not exclusive_target:
+                    raise ExchangeOrderRejectedError(
+                        "Capital partial close requires one exclusive owned "
+                        "venue position immediately before dispatch because "
+                        "the reduction POST cannot target a dealId"
+                    )
+                target = positions[0]
+                target_deal_id = str(target['dealId'])
+                target_direction = (target.get('direction') or '').upper()
+                live_size = float(target.get('size', 0.0))
+                intent_units = round(intent_qty / lot_step) if lot_step > 0 else 0
+                live_units = round(live_size / lot_step) if lot_step > 0 else 0
+                if intent_units <= 0 or intent_units >= live_units:
+                    raise ExchangeOrderRejectedError(
+                        "Capital partial close quantity must be positive and "
+                        "smaller than the target's current venue quantity "
+                        "immediately before dispatch"
+                    )
+                store_ctx = self.store_ctx
+                if store_ctx is not None:
+                    existing = store_ctx.get_order(coid)
+                    merged_extras = dict((existing.extras or {}) if existing else {})
+                    merged_extras.update({
+                        'target_deal_id': target_deal_id,
+                        'target_direction': target_direction,
+                        'pre_target_units': live_units,
+                        'intent_units': intent_units,
+                    })
+                    store_ctx.upsert_order(coid, extras=merged_extras)
+                response = self._call_serialized_write(
+                    'positions', data=body, method='post',
+                )
+                return response, rows
+
+        try:
+            return await asyncio.to_thread(snapshot_and_post)
+        except Exception as exc:
+            mapped = self._map_exception(exc)
+            if mapped is not None:
+                raise mapped from exc
+            raise
+
     async def _call(self, endpoint: str, *, data: dict | None = None,
                     method: str = 'post') -> dict:
         """Async wrapper around the sync REST helper.
@@ -394,8 +527,18 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         :func:`asyncio.to_thread` can sustain.
         """
         try:
+            method_lc = method.lower()
+            position_write = (
+                endpoint == 'positions' and method_lc == 'post'
+                or endpoint.startswith('positions/')
+                and method_lc in {'put', 'delete'}
+            )
+            caller = (
+                self._call_with_account_write_lock
+                if position_write else self
+            )
             return await asyncio.to_thread(
-                self, endpoint, data=data, method=method,
+                caller, endpoint, data=data, method=method,
             )
         except Exception as e:
             mapped = self._map_exception(e)

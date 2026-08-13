@@ -22,6 +22,7 @@ those wrapper rows:
 
 State touched: BrokerStore through ``self.store_ctx``.
 """
+from abc import ABC
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
@@ -30,14 +31,14 @@ from pynecore.core.broker.models import ExitIntent
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
-from .helpers import _extract_reject_reason
+from .helpers import _extract_reject_reason, _wire_float
 
 if TYPE_CHECKING:
     from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
     from pynecore.core.broker.storage import OrderRow
 
 
-class _BracketMixin(_CapitalComBase):
+class _BracketMixin(_CapitalComBase, ABC):
     """Bracket lifecycle mix-in: leg row transitions + trailing monitor."""
 
     def _close_bracket_after_natural_close(self, entry_row: 'OrderRow') -> None:
@@ -161,12 +162,11 @@ class _BracketMixin(_CapitalComBase):
         returns ``None`` for unset bracket legs). Returns ``False`` for any
         non-numeric or missing input.
         """
-        if expected is None or actual is None:
+        expected_level = _wire_float(expected, finite=True)
+        actual_level = _wire_float(actual, finite=True)
+        if expected_level is None or actual_level is None:
             return False
-        try:
-            return abs(float(actual) - float(expected)) < tol  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return False
+        return abs(actual_level - expected_level) < tol
 
     def _resolve_bracket_leg_disposition(
             self, row: 'OrderRow', leg_kind: str,
