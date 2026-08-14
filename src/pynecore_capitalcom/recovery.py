@@ -242,6 +242,8 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             pos_by_deal_id, wo_by_deal_id, promoted_coids,
         )
 
+        self._stamp_surviving_entry_fills(pos_by_deal_id)
+
         # Symmetric counterpart to orphan retirement: adopt live exchange
         # positions the BrokerStore is NOT tracking into confirmed
         # per-leg ``position`` rows. A fresh process (or a recovery run
@@ -255,6 +257,56 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         # leg into a confirmed row so the normal close/exit paths can
         # flatten it.
         self._adopt_untracked_positions(positions_resp)
+
+    def _stamp_surviving_entry_fills(
+            self, pos_by_deal_id: dict[str, dict],
+    ) -> None:
+        """Mark surviving entry rows as accounted so their fill cannot replay.
+
+        The engine's startup reconcile adopts the venue's net size, which
+        already contains every entry the previous process filled. The
+        activity loop suppresses a replayed entry fill on the
+        ``entry_filled_at`` stamp — but that stamp is written when the fill
+        is EMITTED, and Capital.com publishes an activity up to a minute
+        after the deal. A process that ends inside that window leaves the
+        row unstamped, so the next process books the very same exposure a
+        second time on top of the position it just adopted (the observed
+        200 -> 400 desync after a crash mid-reversal).
+
+        Only rows the venue still backs are stamped: a deal that is gone
+        was already retired by :meth:`_retire_startup_orphans`, and a
+        working order that has yet to execute must keep its fill.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return
+        stamped = 0
+        for row in store_ctx.iter_live_orders():
+            extras = dict(row.extras or {})
+            if extras.get('kind') != 'position' or extras.get('entry_filled_at'):
+                continue
+            if row.state != 'confirmed' or row.filled_qty <= 0.0:
+                continue
+            deal_id = str(row.exchange_order_id or '')
+            if not deal_id or deal_id not in pos_by_deal_id:
+                continue
+            extras['entry_filled_at'] = epoch_time()
+            store_ctx.upsert_order(row.client_order_id, extras=extras)
+            store_ctx.log_event(
+                'startup_entry_fill_accounted',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id,
+                payload={'filled_qty': row.filled_qty},
+            )
+            stamped += 1
+
+        if stamped:
+            broker_info(
+                "startup: %d entry row(s) whose fill activity never surfaced "
+                "before the restart marked as accounted — the adopted "
+                "position already carries their exposure",
+                stamped,
+            )
 
     def _adopt_untracked_positions(self, positions_resp: Mapping) -> None:
         """Seed confirmed ``position`` rows for untracked live venue legs.

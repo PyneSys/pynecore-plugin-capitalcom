@@ -55,6 +55,14 @@ from .helpers import (
 
 _OHLC_CLOSE_CLOCK_SKEW_TOLERANCE_S = 3.0
 
+#: ``_raw_ohlc_queue`` tag for a bar the OHLC watchdog recovered from REST.
+#: The payload already carries an authoritative ``_volume``, so the volume
+#: backfill worker forwards it verbatim (as a plain ``"ohlc"`` update) instead
+#: of resolving volume for it again. Routing recoveries through the raw queue
+#: is what keeps ``_update_queue`` single-writer: a recovered bar can never
+#: overtake an earlier bar the worker is still enriching.
+_RECOVERED_OHLC_EVENT = "ohlc-recovered"
+
 
 class StreamDisconnectOrigin(StrEnum):
     """Closed origin vocabulary for WebSocket disconnect evidence."""
@@ -667,10 +675,17 @@ class _StreamingMixin(_CapitalComBase, ABC):
         2. Query Capital.com REST for the missing bar (capped by
            ``REST_FETCH_TIMEOUT_S`` so a stalled httpx roundtrip cannot
            block the watchdog past the framework's synth grace).
-        3. If REST returns the bar - inject it into ``_update_queue``
-           as if it had come from WS; ``watch_ohlcv`` then returns a
-           real closed bar and the framework's ``wait_for`` never
-           times out.
+        3. If REST returns the bar - inject it into
+           ``_raw_ohlc_queue`` as if it had come from WS;
+           ``watch_ohlcv`` then returns a real closed bar and the
+           framework's ``wait_for`` never times out. The injection
+           goes through the raw queue (tagged
+           :data:`_RECOVERED_OHLC_EVENT`) rather than straight into
+           ``_update_queue`` so the volume backfill worker stays the
+           single writer of the consumer queue and its FIFO order
+           holds: a bar still waiting on its REST volume lookup is
+           emitted before this later recovered slot instead of being
+           dropped by the consumer's monotonicity filter.
         4. If REST has no exact-slot bar after ``MAX_REST_WAIT_S``, retain
            the WebSocket and move only the private probe cursor to the next
            slot. REST absence does not prove subscription degradation.
@@ -869,8 +884,23 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
                         last_rest_absent_slot_ts = None
-                        assert self._update_queue is not None
-                        await self._update_queue.put(("ohlc", payload))
+                        # Publish through the raw queue, NOT straight into
+                        # ``_update_queue``: the volume backfill worker is the
+                        # single writer of the consumer queue, and it is FIFO.
+                        # A bar the WS already delivered but whose REST volume
+                        # lookup is still in flight therefore reaches the
+                        # runner BEFORE this later recovered slot. Writing the
+                        # consumer queue here instead would let this bar
+                        # overtake that one, and ``_on_ohlc_event``'s strict
+                        # monotonicity filter would then silently drop the
+                        # earlier bar - genuine bar loss, not just a reorder.
+                        raw_queue = self._raw_ohlc_queue
+                        if raw_queue is None:
+                            # Connection is being torn down; there is no
+                            # pipeline left to carry the bar in order. The
+                            # reconnect path re-reads this slot from REST.
+                            continue
+                        await raw_queue.put((_RECOVERED_OHLC_EVENT, payload))
                         if (consecutive_rest_recoveries
                                 >= rest_recovery_reconnect_threshold):
                             quote_silent_for = (
@@ -1080,6 +1110,14 @@ class _StreamingMixin(_CapitalComBase, ABC):
                     # bar has been delivered, then stop.
                     out_q.put_nowait(None)
                     return
+                if event_type == _RECOVERED_OHLC_EVENT:
+                    # OHLC watchdog recovery. ``_fetch_bar_payload`` already
+                    # resolved ``_volume`` from REST, so there is nothing to
+                    # enrich — the only reason it travels this queue is
+                    # ordering: it must leave behind every earlier bar still
+                    # parked here or in flight above.
+                    await out_q.put(("ohlc", payload))
+                    continue
                 if event_type != "ohlc":
                     # The listener already froze this frame's bar, cumulative
                     # count and prices. Forward the immutable snapshot verbatim
@@ -1323,10 +1361,11 @@ class _StreamingMixin(_CapitalComBase, ABC):
         field, so the existing :meth:`_on_ohlc_event` path consumes it
         identically to a real WS event that has already been enriched
         by :meth:`_volume_backfill_worker_loop`. The watchdog inject
-        path is allowed to bypass the worker (and the FIFO ordering of
-        :attr:`_raw_ohlc_queue`) because it puts directly into
-        :attr:`_update_queue`; pre-resolving volume here keeps the
-        consumer path REST-free in both code paths.
+        path travels the same :attr:`_raw_ohlc_queue` as WS bars (see
+        :data:`_RECOVERED_OHLC_EVENT`) so ordering is preserved, but
+        pre-resolving volume here means the worker forwards it without
+        a second REST roundtrip - the consumer path stays REST-free in
+        both code paths.
 
         Returns ``None`` only after a successful empty/wrong-slot response or
         the venue's explicit ``error.prices.not-found`` empty-range response.
@@ -1473,6 +1512,16 @@ class _StreamingMixin(_CapitalComBase, ABC):
         payloads = await asyncio.to_thread(
             self._fetch_reconnect_gap_payloads, None, since_ms // 1000,
         )
+        if payloads:
+            # ``connect()`` already read this very window into the update
+            # queue on its own, and the framework splices the bars returned
+            # here in ahead of the live stream — so without advancing the
+            # emitted-bar cursor every startup-gap bar would reach the runner
+            # twice, the second time behind a newer one. Never backwards: the
+            # stream may have closed a newer bar while this query ran.
+            newest = int(payloads[-1]["t"]) // 1000
+            if self._last_bar_timestamp is None or self._last_bar_timestamp < newest:
+                self._last_bar_timestamp = newest
         return [
             OHLCV(
                 timestamp=int(payload["t"]),

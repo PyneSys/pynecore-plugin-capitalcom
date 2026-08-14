@@ -179,10 +179,11 @@ class CapitalCom(
         # listener path and enqueues bars in FIFO order on
         # ``_update_queue``. See :meth:`_volume_backfill_worker_loop`.
         self._volume_backfill_task: asyncio.Task | None = None
-        # Internal queue between ``_listen_loop`` (producer of raw
-        # bid-side ``ohlc.event`` payloads) and the backfill worker
-        # (consumer that adds REST volume and forwards to
-        # ``_update_queue``).
+        # Internal queue between the producers of raw bid-side
+        # ``ohlc.event`` payloads (``_listen_loop`` for WS frames,
+        # ``_ohlc_watchdog_loop`` for REST-recovered slots) and the
+        # backfill worker (sole consumer; adds REST volume where it is
+        # missing and forwards to ``_update_queue`` in FIFO order).
         self._raw_ohlc_queue: asyncio.Queue | None = None
         # Latest tick quote snapshot, updated by each ``quote`` event and
         # attached to every OHLCV emitted by ``watch_ohlcv`` so the spinner

@@ -597,20 +597,87 @@ def __test_execute_exit_full_bracket_returns_two_legs__(tmp_path):
     store.close()
 
 
+def _venue_positions(*rows):
+    return {'positions': [
+        {'market': {'epic': 'EURUSD'}, 'position': dict(row)} for row in rows
+    ]}
+
+
 def __test_execute_exit_partial_qty_runtime_rejects__(tmp_path):
-    broker, store, ctx = _make_broker(tmp_path)
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): _venue_positions(
+            {'dealId': 'deal-L', 'size': 2.0, 'direction': 'BUY'},
+        ),
+    })
     ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
                      state='confirmed', pine_entry_id='Long',
                      exchange_order_id='deal-L', extras={'kind': 'position'})
     env = DispatchEnvelope(
         intent=ExitIntent(
             pine_id='Partial', from_entry='Long', symbol='EURUSD',
-            side='sell', qty=1.0, tp_price=1.2,  # qty < row.qty
+            side='sell', qty=1.0, tp_price=1.2,  # qty < live row size
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
     with pytest.raises(ExchangeCapabilityError):
         asyncio.run(broker.execute_exit(env))
+    store.close()
+
+
+def __test_execute_exit_after_a_netting_reversal_attaches_the_bracket__(tmp_path):
+    """A reversal's order size is not the size the venue kept.
+
+    Flipping long 2.0 to short 1.0 posts one ``SELL 3.0``; the netting
+    account closes the old row and opens a 1.0-unit one. The exit that
+    protects it covers the whole row, so it must go out — comparing it
+    against the submitted 3.0 halted the bot on a script core had cleared.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): _venue_positions(
+            {'dealId': 'deal-S', 'size': 1.0, 'direction': 'SELL'},
+        ),
+        ('positions/deal-S', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='sell', qty=3.0,
+                     state='confirmed', pine_entry_id='Short',
+                     exchange_order_id='deal-S', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Short-X', from_entry='Short', symbol='EURUSD',
+            side='buy', qty=1.0, tp_price=1.05, sl_price=1.2,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    legs = asyncio.run(broker.execute_exit(env))
+    assert len(legs) == 2
+    assert [call for call in broker._calls
+            if call[0] == 'positions/deal-S' and call[1] == 'put']
+    store.close()
+
+
+def __test_execute_exit_does_not_reject_when_the_venue_lost_the_row__(tmp_path):
+    """An absent row proves nothing about partiality.
+
+    Halting here would turn a stale dealId — which the PUT reports as a
+    not-found with its own recovery — into a manual-intervention stop.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): _venue_positions(),
+        ('positions/deal-L', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Long-X', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.2, sl_price=1.05,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    assert len(asyncio.run(broker.execute_exit(env))) == 2
     store.close()
 
 
@@ -5160,11 +5227,18 @@ def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypa
         )
     )
 
+    # Recovered bars enter the raw queue, not the consumer queue: the volume
+    # backfill worker is the single writer of ``_update_queue``, so a bar it
+    # is still enriching cannot be overtaken by a later recovered slot.
+    assert broker._update_queue.empty()
     recovered = []
-    while not broker._update_queue.empty():
-        event_type, payload = broker._update_queue.get_nowait()
+    while not broker._raw_ohlc_queue.empty():
+        event_type, payload = broker._raw_ohlc_queue.get_nowait()
         recovered.append((event_type, payload["t"]))
-    assert recovered == [("ohlc", 1_060_000), ("ohlc", 1_120_000)]
+    assert recovered == [
+        (streaming_module._RECOVERED_OHLC_EVENT, 1_060_000),
+        (streaming_module._RECOVERED_OHLC_EVENT, 1_120_000),
+    ]
 
 
 def __test_ohlc_watchdog_keeps_socket_after_exact_rest_absent_slot__(monkeypatch):
@@ -5242,7 +5316,7 @@ def __test_ohlc_watchdog_keeps_socket_after_exact_rest_absent_slot__(monkeypatch
         try:
             for _ in range(20):
                 await original_sleep(0)
-                if not broker._update_queue.empty():
+                if not broker._raw_ohlc_queue.empty():
                     break
         finally:
             task.cancel()
@@ -5252,8 +5326,8 @@ def __test_ohlc_watchdog_keeps_socket_after_exact_rest_absent_slot__(monkeypatch
 
     assert fetches == [1_060, 1_060, 1_120]
     assert ws.close_calls == []
-    event_type, payload = broker._update_queue.get_nowait()
-    assert event_type == "ohlc"
+    event_type, payload = broker._raw_ohlc_queue.get_nowait()
+    assert event_type == streaming_module._RECOVERED_OHLC_EVENT
     assert payload["t"] == 1_120_000
     assert broker._last_bar_open_ts == 1_120.0
 
@@ -7058,6 +7132,130 @@ def __test_process_activity_reversal_fold_entry_fill_uses_full_order_qty__(tmp_p
     )
     assert ev.order.filled_qty == 200.0
     assert ev.order.remaining_qty == 0.0
+    store.close()
+
+
+def __test_reversal_netting_close_rebases_the_journal_to_retained_exposure__(tmp_path):
+    """The journal's live-row signed sum must equal the venue net after a fold.
+
+    The folded reversal's confirm records the EXECUTED volume (the 200-unit
+    BUY), but the venue only retains the 100-unit residual. Left alone, the
+    live rows sum to +200 once the netted short is torn down — the startup
+    adoption clamp and the cycle-end reconciliation both over-state the run's
+    exposure by the netted amount (measured live 2026-08-14 as ``venue holds
+    -200, the run's journal owns -400``). Processing the short's netting
+    close must therefore (1) zero the short row's cursor — the venue holds
+    none of it — and (2) rebase the fold row's cursor to the retained
+    residual, leaving the signed sum at exactly the venue net. ``row.qty``
+    stays untouched: it is the authoritative traded volume for the fold-size
+    substitution on the ENTRY fill.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    short_coid = _seed_reversal_short_leg(ctx)
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        state='confirmed', pine_entry_id='LAB-CAP-REV-L',
+        exchange_order_id='deal-long', filled_qty=200.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162,
+                'entry_filled_at': 1700000001.0},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert events == []  # netting close suppressed (covered elsewhere)
+
+    short_row = ctx.get_order(short_coid)
+    assert short_row is not None
+    assert short_row.filled_qty == 0.0, (
+        "the netted short's journal cursor must drop to zero — the venue "
+        f"holds none of it; got {short_row.filled_qty!r}"
+    )
+    long_row = ctx.get_order('coid-long')
+    assert long_row is not None
+    assert long_row.qty == 200.0, "the traded volume must never change"
+    assert long_row.filled_qty == 100.0, (
+        "the fold row's cursor must land on the venue-retained residual "
+        f"(200 executed - 100 netted); got {long_row.filled_qty!r}"
+    )
+    assert (long_row.extras or {}).get('fold_rebased_filled_at') is not None
+
+    # The exact computation the startup adoption clamp and the cycle-end
+    # checker run: signed sum of live rows' cursors. It must equal the
+    # venue net (+100 residual long) so a restart adopts the right size
+    # and a reversal cycle passes the end-of-cycle comparison.
+    owned = 0.0
+    for r in ctx.iter_live_orders():
+        if r.filled_qty == 0.0 or (r.extras or {}).get('adopted_startup'):
+            continue
+        owned += r.filled_qty if r.side == 'buy' else -r.filled_qty
+    assert owned == 100.0, (
+        f"journal owned sum must equal the venue net after the fold; got {owned!r}"
+    )
+
+    kinds = [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE run_instance_id = ?",
+        (ctx.run_instance_id,),
+    )]
+    assert 'journal_exposure_retired' in kinds
+    assert 'reversal_fold_filled_qty_rebased' in kinds
+    store.close()
+
+
+def __test_natural_close_zeroes_the_journal_cursor_without_a_reversal__(tmp_path):
+    """A genuine full close (no reversal) must also retire the row's cursor.
+
+    The naturally-closed row deliberately stays live as the ``modify_exit``
+    lookup anchor, so without the zeroing its dead exposure would keep
+    counting in the journal's signed sum until the row is physically retired
+    on a later restart — a flat venue against a non-zero journal at cycle
+    end. The reducing fill itself must still be yielded (no reversal leg to
+    have booked it), and no fold rebase may fire (there is no opposite row).
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    short_coid = _seed_reversal_short_leg(ctx)
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert len(events) == 1 and events[0].leg_type == LegType.CLOSE, (
+        f"a genuine close must still yield its reducing fill; got {events!r}"
+    )
+    short_row = ctx.get_order(short_coid)
+    assert short_row is not None
+    assert short_row.filled_qty == 0.0, (
+        "the closed row's cursor must drop to zero so the journal sum "
+        f"matches the flat venue; got {short_row.filled_qty!r}"
+    )
+    kinds = [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE run_instance_id = ?",
+        (ctx.run_instance_id,),
+    )]
+    assert 'journal_exposure_retired' in kinds
+    assert 'reversal_fold_filled_qty_rebased' not in kinds
     store.close()
 
 
@@ -10805,6 +11003,75 @@ def __test_recover_does_not_retire_when_position_still_present__(tmp_path):
             "WHERE kind = 'startup_orphan_retired'",
         ).fetchone()['n']
         assert n_retired == 0
+    finally:
+        ctx.close()
+        store.close()
+
+
+def _recovery_broker(*, positions):
+    return _FakeBroker(config=_make_config(), responses={
+        ('positions', 'get'): {'positions': positions},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+    })
+
+
+def __test_restart_marks_an_unstamped_surviving_entry_fill_as_accounted__(tmp_path):
+    """A fill the venue published after the crash must not be booked twice.
+
+    The activity feed lags the deal by up to a minute, so a process that
+    ends inside that window leaves the entry row without its
+    ``entry_filled_at`` stamp. The next process adopts the venue position
+    — which already carries that exposure — and would then apply the
+    replayed activity on top of it.
+    """
+    broker = _recovery_broker(positions=[{
+        'position': {'dealId': 'deal-S', 'dealReference': 'ref-S', 'size': 1.0},
+    }])
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order(
+            'entry-coid', symbol='EURUSD', side='sell', qty=3.0,
+            filled_qty=3.0, state='confirmed',
+            intent_key='Short', pine_entry_id='Short',
+            extras={'kind': 'position', 'order_type': 'market'},
+        )
+        ctx.set_exchange_id('entry-coid', 'deal-S')
+        ctx.add_ref('entry-coid', 'deal_id', 'deal-S')
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        row = ctx.get_order('entry-coid')
+        assert row is not None and row.closed_ts_ms is None
+        assert (row.extras or {}).get('entry_filled_at')
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_restart_leaves_a_not_yet_executed_working_order_unstamped__(tmp_path):
+    """Only rows the venue backs as a position are already accounted.
+
+    A resting order still owes its fill; stamping it would swallow the
+    exposure when it finally executes.
+    """
+    broker = _recovery_broker(positions=[])
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order(
+            'wo-coid', symbol='EURUSD', side='buy', qty=1.0,
+            filled_qty=0.0, state='confirmed',
+            intent_key='Long', pine_entry_id='Long',
+            extras={'kind': 'working', 'order_type': 'limit'},
+        )
+        ctx.set_exchange_id('wo-coid', 'deal-W')
+        ctx.add_ref('wo-coid', 'deal_id', 'deal-W')
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        row = ctx.get_order('wo-coid')
+        assert row is not None
+        assert not (row.extras or {}).get('entry_filled_at')
     finally:
         ctx.close()
         store.close()

@@ -760,9 +760,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         :meth:`get_capabilities`, so core validation rejects
         ``strategy.exit(qty=N, from_entry='L')`` with ``N < row qty`` at
         startup. A runtime-safety-net assertion here stays as a
-        belt-and-braces check — the unit count comparison uses the
+        belt-and-braces check: the unit count comparison uses the
         instrument's ``lot_step`` so rounding noise does not falsely trip
-        it.
+        it, and a stored quantity that disagrees is re-resolved against
+        the live position row before anything is rejected.
 
         Trailing with an activation threshold (Pine ``trail_price``) is
         *deferred*: the plugin sets an ``activating`` state and lets the
@@ -888,14 +889,35 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         deal_id = target_row.exchange_order_id
 
         # Partial-qty runtime safety net (core validation is authoritative).
+        #
+        # ``OrderRow.qty`` is the size that was SUBMITTED, which is not the
+        # size the venue ended up holding. A one-way reversal posts a single
+        # order covering the old exposure plus the new one — long 200 becomes
+        # ``SELL 400`` — and the netting account answers it by closing the old
+        # row and opening a 200-unit one. The bracket attaches to that
+        # 200-unit row, so a perfectly valid full-row exit disagrees with the
+        # stored quantity and would halt the bot on a script core already
+        # cleared. Escalate to the authoritative positions seam exactly as
+        # :meth:`execute_close` does, and reject only on a size difference the
+        # venue itself confirms. A row the venue no longer lists proves
+        # nothing about partiality — let the PUT surface the not-found.
         row_units = round(target_row.qty / rules.lot_step) if rules.lot_step > 0 else 0
         intent_units = round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
         if row_units and intent_units and row_units != intent_units:
-            raise ExchangeCapabilityError(
-                f"Capital.com bracket is full-row only (row_qty={target_row.qty}, "
-                f"intent_qty={intent.qty}). Core validation should have "
-                f"rejected this script at startup.",
-            )
+            raw_positions = await self._call('positions', method='get')
+            live_size: float | None = None
+            for raw in (raw_positions.get('positions') or []):
+                position = raw.get('position') or {}
+                if str(position.get('dealId') or '') == deal_id:
+                    live_size = float(position.get('size', 0.0))
+                    break
+            if (live_size is not None and rules.lot_step > 0
+                    and round(live_size / rules.lot_step) != intent_units):
+                raise ExchangeCapabilityError(
+                    f"Capital.com bracket is full-row only (deal {deal_id} "
+                    f"holds {live_size}, intent_qty={intent.qty}). Core "
+                    f"validation should have rejected this script at startup.",
+                )
 
         # --- Pre-validate bracket distances before assembling the body ---
         # Capital.com checks distance against the live mid quote, not the

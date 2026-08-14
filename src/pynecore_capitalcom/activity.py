@@ -563,7 +563,11 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     # :class:`UnexpectedCancelError`.
                     if (deal_remaining is None or deal_remaining <= 0.0
                             or reversal_netted):
+                        retired_exposure = row.filled_qty
                         self._close_bracket_after_natural_close(row)
+                        self._retire_netted_journal_exposure(
+                            row, retired_exposure,
+                        )
                         if reversal_netted:
                             suppress_fill = True
                             if self.store_ctx is not None:
@@ -956,6 +960,101 @@ class _ActivityMixin(_CapitalComBase, ABC):
             # reconcile emissions carry no fingerprint and stay ``None``,
             # relying on the ``filled_qty`` cursor watermark instead.
             fill_id=_activity_fingerprint(activity),
+        )
+
+    def _retire_netted_journal_exposure(
+            self, closed_row: 'OrderRow', retired_exposure: float,
+    ) -> None:
+        """Drop a fully-closed position row's journal exposure to zero, and
+        rebase the reversal fold that consumed it to the venue-retained size.
+
+        The journal's ``filled_qty`` doubles as the run-owned exposure cursor:
+        the startup adoption clamp (``_durable_owned_signed_size``) and the
+        cycle-end reconciliation both compute the run's net as the signed sum
+        of live rows' ``filled_qty``. Two facts break that sum on a netting
+        account if left alone:
+
+        * A naturally-closed entry row is deliberately NOT physically closed
+          (:meth:`_close_bracket_after_natural_close` keeps it live as the
+          ``modify_exit`` lookup anchor), so its dead exposure keeps counting.
+        * A folded reversal's confirm records the EXECUTED volume (long 200
+          becomes ``SELL 400`` and the row says 400) while the venue only
+          retains the 200-unit residual — the journal over-states the run's
+          net by the netted amount for as long as the fold row lives (the
+          measured cycle-end mismatch: ``venue holds -200, the run's journal
+          owns -400``).
+
+        Called from the natural-close teardown, i.e. AFTER the closing fill
+        (or its reversal-netting suppression) has been emitted, so no event
+        payload is derived from the values written here. Two writes, in this
+        order — a crash between them leaves the journal OVER-stating, which
+        the adoption clamp absorbs (it takes the smaller magnitude), whereas
+        the reverse order would transiently UNDER-state and adopt a wrong 0:
+
+        1. The closed row's cursor drops to zero: the venue holds none of it.
+        2. If a live opposite-direction position row exists, this close was
+           the venue netting our own folded reversal (on a netting account
+           long and short cannot coexist; a TP / SL / manual / margin close
+           leaves the book flat and no such row). That row's cursor drops by
+           the exposure just retired, landing on the residual the venue kept.
+           The row is flagged so the snapshot reconciler's partial-fill
+           detector never mistakes ``filled_qty < qty`` for an unfinished
+           fill. ``row.qty`` is never touched — it is the authoritative
+           traded volume for the fold-size substitution above.
+        """
+        if self.store_ctx is None:
+            return
+        refreshed = self.store_ctx.get_order(closed_row.client_order_id)
+        if refreshed is not None and refreshed.filled_qty != 0.0:
+            self.store_ctx.upsert_order(
+                closed_row.client_order_id, filled_qty=0.0,
+            )
+            self.store_ctx.log_event(
+                'journal_exposure_retired',
+                client_order_id=closed_row.client_order_id,
+                exchange_order_id=closed_row.exchange_order_id,
+                payload={'retired_exposure': retired_exposure},
+            )
+        if retired_exposure <= 0.0:
+            return
+        opposite = 'sell' if closed_row.side == 'buy' else 'buy'
+        fold_row: 'OrderRow | None' = None
+        for r in self.store_ctx.iter_live_orders(symbol=closed_row.symbol):
+            if r.client_order_id == closed_row.client_order_id:
+                continue
+            rextras = r.extras or {}
+            if rextras.get('kind') != 'position':
+                continue
+            if rextras.get('leg_kind') in ('tp', 'sl'):
+                continue
+            if r.side != opposite:
+                continue
+            if not r.exchange_order_id:
+                continue
+            if rextras.get('natural_close_at') is not None:
+                continue
+            # Newest opposite live entry = the fold that netted this row.
+            # No created-order condition: an engine-side envelope reuse can
+            # re-dispatch the fold under a coid whose row predates the
+            # closed one (measured live 2026-08-14), and missing the rebase
+            # there would leave the over-count in place.
+            if fold_row is None or r.created_ts_ms > fold_row.created_ts_ms:
+                fold_row = r
+        if fold_row is None or fold_row.filled_qty <= 0.0:
+            return
+        rebased = max(0.0, fold_row.filled_qty - retired_exposure)
+        extras = dict(fold_row.extras or {})
+        extras['fold_rebased_filled_at'] = epoch_time()
+        self.store_ctx.upsert_order(
+            fold_row.client_order_id, filled_qty=rebased, extras=extras,
+        )
+        self.store_ctx.log_event(
+            'reversal_fold_filled_qty_rebased',
+            client_order_id=fold_row.client_order_id,
+            exchange_order_id=fold_row.exchange_order_id,
+            payload={'executed': fold_row.filled_qty,
+                     'netted': retired_exposure,
+                     'retained': rebased},
         )
 
     def _is_reversal_netting_close(self, entry_row: 'OrderRow') -> bool:
