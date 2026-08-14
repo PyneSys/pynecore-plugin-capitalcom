@@ -5406,6 +5406,51 @@ def __test_late_ws_bar_after_watchdog_rest_recovery_is_deduplicated__():
     assert duplicate is None
 
 
+def __test_quote_synth_opens_the_next_slot_not_the_closed_bar__():
+    """Quote ticks after a close open the NEXT bar instead of rewriting it.
+
+    Capital.com pushes ``ohlc.event`` only at bar close and keeps streaming
+    quotes in between. Those quotes carry their own bucketed slot, so once a
+    bar has closed they belong to the following period: stamping them with the
+    closed bar's timestamp would re-execute that settled bar downstream and
+    overwrite its committed OHLC.
+    """
+    from pynecore_capitalcom._base import _QuoteSnapshot
+
+    broker = _FakeBroker(
+        symbol="EURUSD",
+        timeframe="1",
+        config=_make_config(),
+    )
+    closed = broker._on_ohlc_event({
+        "priceType": "bid",
+        "t": 1_800_000,
+        "o": 1.10, "h": 1.12, "l": 1.09, "c": 1.11,
+        "_volume": 100.0,
+    })
+    assert closed is not None and closed.is_closed and closed.timestamp == 1_800_000
+
+    # A late frame for the slot that just closed is dropped, not applied.
+    assert broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1800, cumulative_volume=7, bid=1.50, ask=1.51,
+    )) is None
+
+    # The first tick of the next slot OPENS that bar at its own price.
+    opened = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1860, cumulative_volume=1, bid=1.20, ask=1.21,
+    ))
+    assert opened is not None and not opened.is_closed
+    assert opened.timestamp == 1_860_000
+    assert (opened.open, opened.high, opened.low, opened.close) == (1.20, 1.20, 1.20, 1.20)
+
+    # A later tick in the same slot widens it without moving the timestamp.
+    widened = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1860, cumulative_volume=2, bid=1.25, ask=1.26,
+    ))
+    assert widened is not None and widened.timestamp == 1_860_000
+    assert (widened.open, widened.high, widened.low, widened.close) == (1.20, 1.25, 1.20, 1.25)
+
+
 def __test_reopen_drops_stale_previous_session_ws_bar__(monkeypatch):
     """Capital.com can replay the previous session's close on reopen."""
     broker = _FakeBroker(

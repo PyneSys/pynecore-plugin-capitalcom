@@ -1944,10 +1944,22 @@ class _StreamingMixin(_CapitalComBase, ABC):
         queued ticks preserve spikes, retracements and volume even when REST or
         consumer work delays them.
 
-        Returns ``None`` if no OHLC baseline or bid has been received yet — the
+        The synth is stamped with the quote's OWN bar slot
+        (``_QuoteSnapshot.bar_open_s``, bucketed from the frame timestamp),
+        never with the last closed bar's. Once a slot has closed, the ticks
+        that follow belong to the next period: emitting them under the closed
+        bar's timestamp would re-execute that settled bar and overwrite its
+        committed OHLC, so every series derived from it — an EMA, an ATR, the
+        ``close[1]`` a crossover compares against — would be computed from a
+        price belonging to the following bar. The first tick of a fresh slot
+        therefore OPENS that bar (O=H=L=C=bid) instead of inheriting the
+        previous bar's levels; later ticks in the same slot widen H/L.
+
+        Returns ``None`` if no OHLC baseline or bid has been received yet, or
+        if the quote belongs to a slot the feed has already closed — the
         caller then waits for the next event. The snapshot still updates the
-        latest quote state before that gate so the first later close can expose
-        bid/ask fields even if no forming baseline existed yet.
+        latest quote state before those gates so the first later close can
+        expose bid/ask fields even if no forming baseline existed yet.
         """
         if quote.bid is not None:
             self._last_bid = quote.bid
@@ -1955,16 +1967,36 @@ class _StreamingMixin(_CapitalComBase, ABC):
             self._last_ask = quote.ask
         if self._last_bar_ohlcv is None or quote.bid is None:
             return None
+        bar_open_s = quote.bar_open_s
+        if bar_open_s is None:
+            # No timeframe to bucket by: the slot this tick belongs to is
+            # unknowable, and guessing it is what corrupts closed bars.
+            return None
+        if (self._last_bar_timestamp is not None
+                and bar_open_s <= self._last_bar_timestamp):
+            # ``_last_bar_timestamp`` holds the open time of the most recent
+            # CLOSED bar — this tick is a late frame for a settled slot.
+            return None
         new_close = quote.bid
-        new_high = max(self._last_bar_ohlcv.high, new_close)
-        new_low = min(self._last_bar_ohlcv.low, new_close)
-        synth = self._last_bar_ohlcv._replace(
-            high=new_high,
-            low=new_low,
-            close=new_close,
-            volume=float(quote.cumulative_volume),
-            extra_fields=self._extra_fields(),
-            is_closed=False,
-        )
+        if bar_open_s * 1000 != self._last_bar_ohlcv.timestamp:
+            synth = OHLCV(
+                timestamp=bar_open_s * 1000,
+                open=new_close,
+                high=new_close,
+                low=new_close,
+                close=new_close,
+                volume=float(quote.cumulative_volume),
+                extra_fields=self._extra_fields(),
+                is_closed=False,
+            )
+        else:
+            synth = self._last_bar_ohlcv._replace(
+                high=max(self._last_bar_ohlcv.high, new_close),
+                low=min(self._last_bar_ohlcv.low, new_close),
+                close=new_close,
+                volume=float(quote.cumulative_volume),
+                extra_fields=self._extra_fields(),
+                is_closed=False,
+            )
         self._last_bar_ohlcv = synth
         return synth
