@@ -1371,6 +1371,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
     def _fetch_reconnect_gap_payloads(
         self,
         current_bar_open: int | None = None,
+        since: int | None = None,
     ) -> list[dict]:
         """Fetch real closed bars missed since the last emitted bar.
 
@@ -1380,13 +1381,20 @@ class _StreamingMixin(_CapitalComBase, ABC):
         Pages advance by one full timeframe past the last returned row,
         matching the inclusive ``from`` semantics used by historical
         downloads.
+
+        :param current_bar_open: Opening second of the bar still forming;
+            defaults to the current wall-clock slot.
+        :param since: Opening second to walk forward from, overriding the
+            plugin's own emitted-bar cursor. Startup recovery needs this: no
+            bar has been emitted yet, so the cursor is still unset.
         """
-        if self._last_bar_timestamp is None or self.timeframe is None:
+        anchor = self._last_bar_timestamp if since is None else since
+        if anchor is None or self.timeframe is None:
             return []
         tf_seconds = int(in_seconds(self.timeframe))
         if current_bar_open is None:
             current_bar_open = int(epoch_time() // tf_seconds * tf_seconds)
-        cursor = self._last_bar_timestamp + tf_seconds
+        cursor = anchor + tf_seconds
         if cursor >= current_bar_open:
             return []
 
@@ -1428,8 +1436,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         "Capital.com reconnect history page is not strictly ordered"
                     )
                 last_returned_ts = timestamp
-                if not (self._last_bar_timestamp < timestamp
-                        < current_bar_open):
+                if not anchor < timestamp < current_bar_open:
                     continue
                 payloads[timestamp] = {
                     "priceType": "bid",
@@ -1444,6 +1451,40 @@ class _StreamingMixin(_CapitalComBase, ABC):
                 raise ValueError("Capital.com reconnect history page was not consumed")
             cursor = last_returned_ts + tf_seconds
         return [payloads[timestamp] for timestamp in sorted(payloads)]
+
+    @override
+    async def backfill_closed_bars(
+        self, symbol: str, timeframe: str, since_ms: int,
+    ) -> list[OHLCV]:
+        """Fetch bars that closed between the warmup history and the stream.
+
+        Reuses the reconnect gap reader with an explicit anchor, since no bar
+        has been emitted yet at startup. ``extra_fields`` is deliberately left
+        empty: the bid/ask snapshot describes the current instant, not the
+        instant these bars closed at.
+
+        :param symbol: Provider-format symbol (unused; the plugin is bound to
+            its own instrument).
+        :param timeframe: Timeframe in TradingView format (unused; the plugin
+            is bound to its own resolution).
+        :param since_ms: Opening of the last bar the framework already holds.
+        :return: Closed bars strictly after ``since_ms``, ascending.
+        """
+        payloads = await asyncio.to_thread(
+            self._fetch_reconnect_gap_payloads, None, since_ms // 1000,
+        )
+        return [
+            OHLCV(
+                timestamp=int(payload["t"]),
+                open=float(payload["o"]),
+                high=float(payload["h"]),
+                low=float(payload["l"]),
+                close=float(payload["c"]),
+                volume=float(payload.get("_volume", 0.0)),
+                is_closed=True,
+            )
+            for payload in payloads
+        ]
 
     @override
     async def connect(self) -> None:
