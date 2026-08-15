@@ -2423,17 +2423,16 @@ def __test_execute_exit_skips_natural_close_flagged_row_picks_new_entry__(tmp_pa
     store.close()
 
 
-def __test_execute_exit_rejects_when_only_flagged_entry_exists__(tmp_path):
+def __test_execute_exit_skips_when_only_flagged_entry_exists__(tmp_path):
     """Counterpart to the re-entry test: when the ONLY entry row for
     the requested ``pine_entry_id`` is flagged with ``natural_close_at``
     (the position closed on the broker, no new entry yet), the plugin
-    must reject the exit dispatch — PUT'ing against a closed dealId
-    would 404 with ``error.not-found.dealId`` and crash the engine.
-
-    The sync engine's ``_cleanup_closed_position`` normally clears
-    the matching exit intent before this state is observable, but
-    a same-bar race could still feed an exit dispatch through; this
-    test pins the fail-loud behaviour.
+    must NOT PUT against the closed dealId — and must not raise a raw
+    reject either: on the engine's exit contract that is a fatal halt,
+    while this state is just a same-bar race (the sync engine's
+    ``_cleanup_closed_position`` normally clears the exit intent first).
+    Nothing is open on the venue, so the exit skips and the next bar
+    re-evaluates against the cleaned book.
     """
     broker, store, ctx = _make_broker(tmp_path)
     _seed_bracket_setup(ctx)
@@ -2456,8 +2455,9 @@ def __test_execute_exit_rejects_when_only_flagged_entry_exists__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(ExchangeOrderRejectedError):
+    with pytest.raises(OrderSkippedByPlugin) as exc:
         asyncio.run(broker.execute_exit(new_env))
+    assert exc.value.reason == 'no_position_to_protect'
     store.close()
 
 
@@ -2512,13 +2512,20 @@ def __test_execute_exit_no_entry_row_but_open_position_raises_bracket_attach__(
     store.close()
 
 
-def __test_execute_exit_no_entry_row_no_open_position_raises_plain_reject__(
+def __test_execute_exit_no_entry_row_no_open_position_skips__(
         tmp_path,
 ):
-    """Symmetric guard: with NO entry row AND NO open position, the
-    plugin must keep raising :class:`ExchangeOrderRejectedError`
-    (not the bracket-attach variant). Nothing is exposed on the
-    exchange, so the defensive-close path would only do harm.
+    """With NO entry row AND NO open position the exit must SKIP, not reject.
+
+    Nothing is exposed on the exchange, so there is nothing to protect —
+    and the engine's exit contract treats a raw
+    :class:`ExchangeOrderRejectedError` as a fatal halt. The live incident
+    (2026-08-15, trend bot): the pre-check reject triggered a defensive
+    close, the script re-dispatched the exit on the next bar before the
+    close fill was booked, and the raw reject killed the run — the venue
+    was flat while the journal still owned -0.01 (K3 MISMATCH). A
+    non-halting :class:`OrderSkippedByPlugin` lets the next sync book the
+    close and re-evaluate freely.
     """
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions', 'get'): {'positions': []},
@@ -2530,9 +2537,41 @@ def __test_execute_exit_no_entry_row_no_open_position_raises_plain_reject__(
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(ExchangeOrderRejectedError) as exc:
+    with pytest.raises(OrderSkippedByPlugin) as exc:
         asyncio.run(broker.execute_exit(env))
-    assert not isinstance(exc.value, BracketAttachAfterFillRejectedError)
+    assert exc.value.reason == 'no_position_to_protect'
+    store.close()
+
+
+def __test_execute_exit_skips_while_own_close_is_in_flight__(tmp_path):
+    """An exit re-dispatched while its entry row is ``closing`` must skip.
+
+    The defensive close (or a ``strategy.close``) moved the entry row to
+    ``closing``; until its fill is booked the Pine book still shows the
+    position and the script legitimately re-sends the exit. The plugin
+    must answer with a non-halting skip — no venue call — instead of the
+    raw reject that killed the live run.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='sell', qty=1.0,
+                     state='closing', pine_entry_id='S',
+                     exchange_order_id='deal-S', filled_qty=1.0,
+                     extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='S-X', from_entry='S', symbol='EURUSD',
+            side='buy', qty=1.0, tp_price=1.17000, sl_price=1.18000,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_exit(env))
+    assert exc.value.reason == 'close_in_flight'
+    # The instrument-rules fetch may run before the target lookup; no
+    # order-path call (positions read/PUT) may be made though.
+    assert not any(c[0].startswith('positions') for c in broker._calls), (
+        "no positions call while the close is in flight"
+    )
     store.close()
 
 

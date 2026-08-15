@@ -774,6 +774,36 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             intent.symbol, intent.from_entry,
         )
         if target_row is None or not target_row.exchange_order_id:
+            # Close-in-flight: the entry row exists but is ``closing`` — a
+            # defensive close or a ``strategy.close`` is on its way to the
+            # venue and its fill is not booked yet, so the Pine book still
+            # shows the position and the script legitimately re-sends the
+            # exit. Nothing to protect once the close lands; a raw reject
+            # here is fatal on the engine's exit contract (measured live
+            # 2026-08-15: the re-dispatched exit killed the run one bar
+            # after the defensive close). Skip without a venue call — the
+            # next sync books the close and re-evaluates freely.
+            if self.store_ctx is not None:
+                for row in self.store_ctx.iter_live_orders(
+                        symbol=intent.symbol,
+                ):
+                    extras = row.extras or {}
+                    if extras.get('kind') != 'position':
+                        continue
+                    if row.pine_entry_id != intent.from_entry:
+                        continue
+                    if row.state != 'confirmed':
+                        raise OrderSkippedByPlugin(
+                            f"Exit {intent.intent_key} skipped: entry "
+                            f"{intent.from_entry!r} is being closed "
+                            f"(row state {row.state!r}); re-evaluating "
+                            f"next bar.",
+                            intent_key=intent.intent_key,
+                            reason="close_in_flight",
+                            context={'symbol': intent.symbol,
+                                     'from_entry': intent.from_entry,
+                                     'row_state': row.state},
+                        )
             # Defense-in-depth: an open exchange-side position with no
             # findable BrokerStore entry row is structurally identical to
             # "bracket attach rejected after parent fill" — the fill is on
@@ -818,13 +848,29 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     break
             if not has_sibling_position:
                 raw_positions = await self._call('positions', method='get')
-                candidates = [
+                symbol_positions = [
                     raw.get('position') or {}
                     for raw in (raw_positions.get('positions') or [])
                     if (raw.get('market') or {}).get('epic') == intent.symbol
                     and (raw.get('position') or {}).get('dealId')
                     and float((raw.get('position') or {}).get('size', 0.0)) > 0.0
                 ]
+                if not symbol_positions:
+                    # The venue holds NOTHING on this symbol: no entry row,
+                    # no sibling, no exposure — there is nothing an exit
+                    # could protect. A raw reject would halt the engine
+                    # (exit contract); skip instead, the next bar
+                    # re-evaluates against fresh book state.
+                    raise OrderSkippedByPlugin(
+                        f"Exit {intent.intent_key} skipped: no entry row "
+                        f"and the venue holds no open position on "
+                        f"{intent.symbol!r}; re-evaluating next bar.",
+                        intent_key=intent.intent_key,
+                        reason="no_position_to_protect",
+                        context={'symbol': intent.symbol,
+                                 'from_entry': intent.from_entry},
+                    )
+                candidates = list(symbol_positions)
                 expected_direction = 'BUY' if intent.side == 'sell' else 'SELL'
                 if len(candidates) == 1:
                     orphan = candidates[0]
