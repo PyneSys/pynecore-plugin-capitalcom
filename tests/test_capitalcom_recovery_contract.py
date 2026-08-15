@@ -470,3 +470,37 @@ def __test_recovery_contract_idempotency__(tmp_path):
     assert row_first.state == row_second.state
     assert row_first.exchange_order_id == row_second.exchange_order_id
     store.close()
+
+
+def __test_startup_adoption_skips_other_instruments__(tmp_path):
+    """The account-wide positions snapshot must not seed foreign-symbol rows.
+
+    This run trades ONE epic; a leg on any other instrument is not ours to
+    route closes for, and an adopted foreign row is copied into every later
+    cycle by same-``run_id`` adoption (observed live: a lane switched from
+    EURUSD to BTCUSD adopted the old instrument's orphaned short into the
+    fresh run's journal).
+    """
+    broker, store, ctx = _open_broker(tmp_path)
+    broker.symbol = "BTCUSD"
+
+    broker._adopt_untracked_positions({
+        "positions": [
+            {
+                "market": {"epic": "EURUSD"},
+                "position": {"dealId": "deal-foreign", "direction": "SELL",
+                             "size": 200.0},
+            },
+            {
+                "market": {"epic": "BTCUSD"},
+                "position": {"dealId": "deal-own", "direction": "BUY",
+                             "size": 0.01},
+            },
+        ],
+    })
+
+    assert ctx.get_order("__pyne_adopted__EURUSD__deal-foreign") is None
+    own = ctx.get_order("__pyne_adopted__BTCUSD__deal-own")
+    assert own is not None and own.state == "confirmed"
+    assert own.qty == 0.01 and own.side == "buy"
+    store.close()

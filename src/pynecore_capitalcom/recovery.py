@@ -351,6 +351,14 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             if (not symbol or not deal_id
                     or direction not in ('BUY', 'SELL') or size <= 0.0):
                 continue
+            # The positions endpoint is account-wide but this run trades ONE
+            # epic: a leg on any other instrument is not ours to route closes
+            # for — adopting it plants a foreign-symbol row in the journal
+            # that same-run_id adoption then copies into every later cycle
+            # (observed live: a lane switched from EURUSD to BTCUSD adopted
+            # the old instrument's orphaned short into the fresh run).
+            if symbol != (self.symbol or ''):
+                continue
             deal_id = str(deal_id)
             if deal_id in tracked_deal_ids:
                 continue

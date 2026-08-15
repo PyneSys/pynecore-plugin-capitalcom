@@ -181,6 +181,9 @@ def _make_broker(tmp_path, *, responses=None, broker_type=_FakeBroker):
         api_password='p',
     )
     broker = broker_type(config=config, responses=resp)
+    # A live plugin always carries its provider symbol; startup adoption is
+    # scoped to it, so the fixture must set it the way ``pyne run`` does.
+    broker.symbol = 'EURUSD'
     broker._account_id = 'capitalcom-demo-test-account'
     store = BrokerStore(tmp_path / 'broker.sqlite', plugin_name=broker.plugin_name)
     identity = RunIdentity(
