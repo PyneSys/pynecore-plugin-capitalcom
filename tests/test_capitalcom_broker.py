@@ -755,9 +755,15 @@ def __test_execute_exit_pre_validates_sl_distance__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(InvalidStopDistanceError) as exc:
+    # The parent position is already open, so the pre-check reject must
+    # surface as a bracket-attach reject (defensive-close contract), not a
+    # raw distance error which the engine treats as fatal on the exit path.
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
         asyncio.run(broker.execute_exit(env))
-    assert abs(exc.value.min_distance - 0.0001) < 1e-9
+    assert exc.value.position_deal_id == 'deal-L'
+    cause = exc.value.__cause__
+    assert isinstance(cause, InvalidStopDistanceError)
+    assert abs(cause.min_distance - 0.0001) < 1e-9
     assert not any(
         c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
     ), "PUT must not be issued when pre-check rejects"
@@ -783,9 +789,12 @@ def __test_execute_exit_pre_validates_tp_distance__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(InvalidTakeProfitDistanceError) as exc:
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
         asyncio.run(broker.execute_exit(env))
-    assert abs(exc.value.min_distance - 0.0001) < 1e-9
+    assert exc.value.position_deal_id == 'deal-L'
+    cause = exc.value.__cause__
+    assert isinstance(cause, InvalidTakeProfitDistanceError)
+    assert abs(cause.min_distance - 0.0001) < 1e-9
     assert not any(
         c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
     )
@@ -848,8 +857,9 @@ def __test_modify_exit_pre_validates_distance__(tmp_path):
     new_env = DispatchEnvelope(
         intent=new_intent, run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(InvalidStopDistanceError):
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
         asyncio.run(broker.modify_exit(old_env, new_env))
+    assert isinstance(exc.value.__cause__, InvalidStopDistanceError)
     assert not any(
         c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
     )
@@ -955,9 +965,11 @@ def __test_execute_exit_pre_validates_percentage_distance__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(InvalidStopDistanceError) as exc:
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
         asyncio.run(broker.execute_exit(env))
-    assert abs(exc.value.min_distance - 10.0) < 1e-9
+    cause = exc.value.__cause__
+    assert isinstance(cause, InvalidStopDistanceError)
+    assert abs(cause.min_distance - 10.0) < 1e-9
     assert not any(
         c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
     ), "PUT must not be issued when the percentage pre-check rejects"

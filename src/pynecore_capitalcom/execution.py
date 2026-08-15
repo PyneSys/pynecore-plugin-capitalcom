@@ -899,14 +899,31 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # Capital.com checks distance against the live mid quote, not the
         # entry's fill price — using ``confirm_level`` would falsely reject
         # a valid bracket whenever price has drifted away from the entry.
-        if intent.sl_price is not None:
-            self._validate_sl_distance(
-                rules, mid_price, float(intent.sl_price),
-            )
-        if intent.tp_price is not None:
-            self._validate_tp_distance(
-                rules, mid_price, float(intent.tp_price),
-            )
+        # The parent entry is already FILLED here, so a level the venue
+        # would refuse leaves the position open and unprotected — exactly
+        # the venue-side attach-reject case below. Classify it identically
+        # (the sync engine dispatches a defensive close instead of halting;
+        # Pine-wise a level inside the minimum band is at-market anyway).
+        try:
+            if intent.sl_price is not None:
+                self._validate_sl_distance(
+                    rules, mid_price, float(intent.sl_price),
+                )
+            if intent.tp_price is not None:
+                self._validate_tp_distance(
+                    rules, mid_price, float(intent.tp_price),
+                )
+        except ExchangeOrderRejectedError as exc:
+            raise BracketAttachAfterFillRejectedError(
+                f"Capital bracket attach rejected after entry fill "
+                f"(deal_id={deal_id}): {exc}",
+                position_deal_id=deal_id,
+                position_coid=target_row.client_order_id,
+                symbol=intent.symbol,
+                position_side=target_row.side,
+                qty=target_row.qty,
+                from_entry=intent.from_entry,
+            ) from exc
 
         # --- Build body + decide trailing deferral ---
         trail_pending = (
@@ -1981,14 +1998,31 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # current quote, not the entry's confirmed level.
         mid_price = await self._get_current_mid_price(new_i.symbol)
         rules = await self._get_instrument_rules(new_i.symbol)
-        if new_i.sl_price is not None:
-            self._validate_sl_distance(
-                rules, mid_price, float(new_i.sl_price),
-            )
-        if new_i.tp_price is not None:
-            self._validate_tp_distance(
-                rules, mid_price, float(new_i.tp_price),
-            )
+        # The parent position is already open — a min-distance reject here is
+        # equivalent to the venue rejecting the amend, so it must surface as a
+        # bracket-attach reject (defensive close path), never as a raw
+        # ``ExchangeOrderRejectedError`` which the engine treats as a fatal
+        # contract violation on the exit path.
+        try:
+            if new_i.sl_price is not None:
+                self._validate_sl_distance(
+                    rules, mid_price, float(new_i.sl_price),
+                )
+            if new_i.tp_price is not None:
+                self._validate_tp_distance(
+                    rules, mid_price, float(new_i.tp_price),
+                )
+        except ExchangeOrderRejectedError as exc:
+            raise BracketAttachAfterFillRejectedError(
+                f"Capital bracket amend rejected on an open position "
+                f"(deal_id={target_row.exchange_order_id}): {exc}",
+                position_deal_id=target_row.exchange_order_id,
+                position_coid=target_row.client_order_id,
+                symbol=new_i.symbol,
+                position_side=target_row.side,
+                qty=target_row.qty,
+                from_entry=new_i.from_entry,
+            ) from exc
 
         # Pine ``trail_price`` + ``trail_offset`` defers native trailing
         # until the activation monitor sees the threshold crossed. The
