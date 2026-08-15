@@ -16,6 +16,7 @@ Imported by ``_base.py`` and many mix-ins; depends only on stdlib and
 import json
 import math
 from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
+from collections.abc import Mapping
 from datetime import UTC, datetime, time
 from decimal import Decimal
 from time import time as epoch_time
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
-from pynecore.core.broker.models import OrderType
+from pynecore.core.broker.models import OrderType, PositionLeg
 
 from .exceptions import CapitalComError
 
@@ -356,6 +357,52 @@ def _parse_iso_timestamp(value: str) -> float:
         return dt.timestamp()
     except ValueError:
         return 0.0
+
+
+def _position_legs_from_payload(
+        payload: Mapping, symbol: str,
+) -> list[PositionLeg]:
+    """Parse a ``/positions`` payload into symbol-scoped :class:`PositionLeg`\\ s.
+
+    Shared by ``fetch_raw_positions`` (fresh GET) and the startup
+    adoption pass (already-fetched snapshot): one leg per Capital.com
+    position row on ``symbol`` with ZERO aggregation. Rows on any other
+    epic are dropped — the endpoint is account-wide but a run trades ONE
+    epic, and a foreign instrument's leg must never reach a store-row
+    seeding path. Sorted by ``(open_time, leg_id)`` so the FIFO close
+    order is deterministic and replay-stable across polls
+    (``createdDateUTC`` has millisecond resolution; the dealId tiebreak
+    covers same-millisecond fills).
+    """
+    legs: list[PositionLeg] = []
+    for row in payload.get('positions') or []:
+        market = row.get('market') or {}
+        if market.get('epic') != symbol:
+            continue
+        position = row.get('position') or {}
+        direction = (position.get('direction') or '').upper()
+        if direction not in ('BUY', 'SELL'):
+            continue
+        deal_id = position.get('dealId')
+        if not deal_id:
+            continue
+        legs.append(PositionLeg(
+            leg_id=str(deal_id),
+            # Post-filter the epic IS ``symbol``; stamping the leg from the
+            # wire value (not the parameter) keeps the core seeding
+            # helper's foreign-symbol guard armed should the filter above
+            # ever regress.
+            symbol=str(market.get('epic')),
+            side='buy' if direction == 'BUY' else 'sell',
+            qty=float(position.get('size', 0.0)),
+            entry_price=float(position.get('level', 0.0)),
+            open_time=_parse_iso_timestamp(
+                position.get('createdDateUTC') or '',
+            ),
+            unrealized_pnl=float(position.get('upl', 0.0)),
+        ))
+    legs.sort(key=lambda leg: (leg.open_time, leg.leg_id))
+    return legs
 
 
 def _size_from_units(units: int, lot_step: float) -> float:

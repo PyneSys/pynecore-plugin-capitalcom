@@ -35,7 +35,6 @@ from time import time as epoch_time
 from typing import TYPE_CHECKING, cast
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
-from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 from pynecore.core.broker.journal import (
     DispatchJournal,
     EntryDispatchHooks,
@@ -48,6 +47,7 @@ from pynecore.core.broker.store_helpers import (
     KIND_MODIFY_ENTRY,
     KIND_MODIFY_EXIT,
     KIND_PARTIAL_CLOSE,
+    adopt_untracked_position_legs,
 )
 from pynecore.lib.log import broker_info
 
@@ -56,6 +56,7 @@ from .exceptions import OrderNotFoundError
 from .helpers import (
     _extract_reject_reason,
     _parse_iso_timestamp,
+    _position_legs_from_payload,
     _wire_float,
     _wire_id,
     _wire_int,
@@ -311,90 +312,31 @@ class _RecoveryMixin(_CapitalComBase, ABC):
     def _adopt_untracked_positions(self, positions_resp: Mapping) -> None:
         """Seed confirmed ``position`` rows for untracked live venue legs.
 
+        Thin wrapper over the core
+        :func:`~pynecore.core.broker.store_helpers.adopt_untracked_position_legs`
+        seeding pass. The account-wide ``/positions`` snapshot is
+        narrowed to this run's epic by the same symbol-scoped parse
+        :meth:`fetch_raw_positions` uses, so a foreign instrument's leg
+        structurally never reaches the seeding path (observed live: a
+        lane switched from EURUSD to BTCUSD adopted the old instrument's
+        orphaned short into the fresh run before the parse was shared).
+
         Netting-account only: on a hedging account the core one-way
         emulator closes per leg via ``close_leg`` reading
         :meth:`fetch_raw_positions` directly, so no store row is needed
         and seeding would double-count against the emulator's virtual
         FIFO. On a one-way account the DELETE-per-``dealId`` close path
         needs a confirmed ``position`` row per live leg.
-
-        Idempotent: a leg already tracked by a live store row (matched by
-        ``exchange_order_id`` or a ``deal_id`` ref — e.g. an entry row
-        adopted across a same-``run_id`` restart, or a row just promoted
-        by the in-flight recovery pass) is skipped, so no duplicate row is
-        created. Rows are seeded ``filled_qty == qty`` with
-        ``kind='position'`` + ``entry_filled_at`` so activity
-        classification treats the eventual close leg as a reduction, and a
-        ``deal_id`` ref mirrors the normal entry path so the activity loop
-        can route the close-leg activity back to the row.
         """
         store_ctx = self.store_ctx
         if store_ctx is None or self._hedging_enabled:
             return
-
-        tracked_deal_ids: set[str] = set()
-        for row in store_ctx.iter_live_orders():
-            if row.exchange_order_id:
-                tracked_deal_ids.add(str(row.exchange_order_id))
-        foreign_deal_ids = store_ctx.foreign_live_exchange_order_ids(
-            symbol=self.symbol or '',
+        symbol = self.symbol or ''
+        adopted_count = adopt_untracked_position_legs(
+            store_ctx,
+            _position_legs_from_payload(positions_resp, symbol),
+            symbol=symbol,
         )
-
-        adopted_count = 0
-        for raw in positions_resp.get('positions') or []:
-            market = raw.get('market') or {}
-            symbol = market.get('epic')
-            position = raw.get('position') or {}
-            direction = (position.get('direction') or '').upper()
-            deal_id = position.get('dealId')
-            size = float(position.get('size', 0.0))
-            if (not symbol or not deal_id
-                    or direction not in ('BUY', 'SELL') or size <= 0.0):
-                continue
-            # The positions endpoint is account-wide but this run trades ONE
-            # epic: a leg on any other instrument is not ours to route closes
-            # for — adopting it plants a foreign-symbol row in the journal
-            # that same-run_id adoption then copies into every later cycle
-            # (observed live: a lane switched from EURUSD to BTCUSD adopted
-            # the old instrument's orphaned short into the fresh run).
-            if symbol != (self.symbol or ''):
-                continue
-            deal_id = str(deal_id)
-            if deal_id in tracked_deal_ids:
-                continue
-            if deal_id in foreign_deal_ids:
-                continue
-            if store_ctx.find_by_ref('deal_id', deal_id) is not None:
-                continue
-            synthetic_coid = f"__pyne_adopted__{symbol}__{deal_id}"
-            store_ctx.upsert_order(
-                synthetic_coid,
-                symbol=symbol,
-                side='buy' if direction == 'BUY' else 'sell',
-                qty=size,
-                filled_qty=size,
-                state='confirmed',
-                exchange_order_id=deal_id,
-                extras={
-                    'kind': 'position',
-                    'entry_filled_at': epoch_time(),
-                    ADOPTED_STARTUP_EXTRA_KEY: True,
-                },
-            )
-            store_ctx.add_ref(synthetic_coid, 'deal_id', deal_id)
-            store_ctx.log_event(
-                'startup_position_adopted',
-                client_order_id=synthetic_coid,
-                exchange_order_id=deal_id,
-                payload={
-                    'symbol': symbol,
-                    'direction': direction,
-                    'size': size,
-                },
-            )
-            tracked_deal_ids.add(deal_id)
-            adopted_count += 1
-
         if adopted_count:
             broker_info(
                 "startup: adopted %d untracked exchange position leg(s) "

@@ -72,6 +72,7 @@ from .helpers import (
     _extract_reject_reason,
     _is_funds_reject,
     _parse_iso_timestamp,
+    _position_legs_from_payload,
     _size_from_units,
     _wire_float,
 )
@@ -252,38 +253,13 @@ class _ExecutionMixin(_CapitalComBase, ABC):
 
         :class:`~pynecore.core.plugin.broker.PositionPort` transport
         primitive: one :class:`PositionLeg` per Capital.com position row
-        with ZERO aggregation — the core emulator nets them. Sorted by
-        ``(open_time, leg_id)`` so the FIFO close order is deterministic
-        and replay-stable across polls (``createdDateUTC`` has millisecond
-        resolution; the dealId tiebreak covers same-millisecond fills).
+        with ZERO aggregation — the core emulator nets them. Parsing and
+        the deterministic ``(open_time, leg_id)`` FIFO ordering live in
+        :func:`~pynecore_capitalcom.helpers._position_legs_from_payload`,
+        shared with the startup adoption pass.
         """
         res = await self._call('positions', method='get')
-        rows = res.get('positions') or []
-        legs: list[PositionLeg] = []
-        for row in rows:
-            market = row.get('market') or {}
-            if market.get('epic') != symbol:
-                continue
-            position = row.get('position') or {}
-            direction = (position.get('direction') or '').upper()
-            if direction not in ('BUY', 'SELL'):
-                continue
-            deal_id = position.get('dealId')
-            if not deal_id:
-                continue
-            legs.append(PositionLeg(
-                leg_id=str(deal_id),
-                symbol=symbol,
-                side='buy' if direction == 'BUY' else 'sell',
-                qty=float(position.get('size', 0.0)),
-                entry_price=float(position.get('level', 0.0)),
-                open_time=_parse_iso_timestamp(
-                    position.get('createdDateUTC') or '',
-                ),
-                unrealized_pnl=float(position.get('upl', 0.0)),
-            ))
-        legs.sort(key=lambda leg: (leg.open_time, leg.leg_id))
-        return legs
+        return _position_legs_from_payload(res, symbol)
 
     async def get_volume_quantizer(self, symbol: str) -> 'Callable[[float], int]':
         """Return a sync Pine-units -> lot-step-grid quantizer for ``symbol``.

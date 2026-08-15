@@ -499,7 +499,16 @@ def __test_startup_adoption_skips_other_instruments__(tmp_path):
         ],
     })
 
+    # The foreign deal must be absent in ANY shape — not just under its
+    # own-epic coid. A regressed epic filter would seed it under the
+    # run's epic (``__pyne_adopted__BTCUSD__deal-foreign``), so assert on
+    # the deal identity, not on one coid spelling.
     assert ctx.get_order("__pyne_adopted__EURUSD__deal-foreign") is None
+    assert ctx.find_by_ref("deal_id", "deal-foreign") is None
+    assert not any(
+        row.exchange_order_id == "deal-foreign"
+        for row in ctx.iter_live_orders()
+    )
     own = ctx.get_order("__pyne_adopted__BTCUSD__deal-own")
     assert own is not None and own.state == "confirmed"
     assert own.qty == 0.01 and own.side == "buy"
