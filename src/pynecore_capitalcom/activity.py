@@ -1056,6 +1056,22 @@ class _ActivityMixin(_CapitalComBase, ABC):
                      'netted': retired_exposure,
                      'retained': rebased},
         )
+        if rebased <= 1e-9:
+            # Every executed unit went into netting opposite deals — the
+            # venue retained NO deal under the fold's deal id, so its
+            # absence from the poll snapshot is proven, not suspicious.
+            # Left live, the disappearance tracker finds no counterpart in
+            # either namespace and after its grace the 'stop' policy
+            # quarantines the engine (measured live 2026-08-15: a 0.02 BUY
+            # fold netting the aggregate 0.02 short exactly). Close the row
+            # in the same teardown so the tracker never watches it.
+            self.store_ctx.close_order(fold_row.client_order_id)
+            self.store_ctx.log_event(
+                'reversal_fold_fully_netted',
+                client_order_id=fold_row.client_order_id,
+                exchange_order_id=fold_row.exchange_order_id,
+                payload={'netted': retired_exposure},
+            )
 
     def _is_reversal_netting_close(self, entry_row: 'OrderRow') -> bool:
         """True when ``entry_row``'s close is our own reversal netting it.

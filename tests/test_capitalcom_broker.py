@@ -2132,6 +2132,41 @@ def __test_missing_pending_tracker_stop_with_sink_quarantines__(tmp_path):
     store.close()
 
 
+def __test_presence_diff_exempts_a_zero_retained_fold_row__(tmp_path):
+    """A zero-retained fold row must never be stamped as missing.
+
+    Covers the crash window between the fold rebase (cursor -> 0.0) and the
+    row's close: the deal provably no longer exists on the venue (its whole
+    volume netted opposite deals), so its absence from both namespaces is
+    expected. A normal position row missing from both namespaces must still
+    be stamped — the exemption is scoped to the proven case only.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('fold-flat', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='deal-fold', filled_qty=0.0,
+                     extras={'kind': 'position',
+                             'fold_rebased_filled_at': 1700000000.0})
+    ctx.upsert_order('lost', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='gone',
+                     filled_qty=1.0, extras={'kind': 'position'})
+    broker._disappearance_tracker().observe_presence(
+        {'positions': set(), 'working': set()}, 1700000100.0,
+    )
+    fold_row = ctx.get_order('fold-flat')
+    assert fold_row is not None
+    assert 'missing_pending_since' not in (fold_row.extras or {}), (
+        "a zero-retained fold row is exempt from the disappearance stamp"
+    )
+    lost_row = ctx.get_order('lost')
+    assert lost_row is not None
+    assert 'missing_pending_since' in (lost_row.extras or {}), (
+        "a genuinely missing position row must still be stamped"
+    )
+    store.close()
+
+
 def __test_missing_pending_tracker_ignore_policy_suppresses__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path)
     # The CLI normally injects the runtime policy from brokers.toml; in tests
@@ -7223,6 +7258,67 @@ def __test_reversal_netting_close_rebases_the_journal_to_retained_exposure__(tmp
     )]
     assert 'journal_exposure_retired' in kinds
     assert 'reversal_fold_filled_qty_rebased' in kinds
+    store.close()
+
+
+def __test_fully_netted_fold_row_is_closed_not_left_for_the_tracker__(tmp_path):
+    """A fold whose whole executed volume netted opposite deals must close.
+
+    The live incident (2026-08-15, BTCUSD flat bot): a 0.02 BUY fold netted
+    the account's 0.02 aggregate short exactly, so the venue retained NO
+    residual deal for the fold's deal id. The rebase landed the fold row's
+    cursor on 0.0 but left the row live — the disappearance tracker then
+    found no venue counterpart in either namespace, and after its grace the
+    'stop' policy quarantined the engine for the rest of the cycle. A
+    zero-retained rebase is a PROVEN venue absence, not a disappearance:
+    the row must be closed in the same teardown so the tracker never
+    watches it.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    short_coid = _seed_reversal_short_leg(ctx, qty=200.0)
+    ctx.upsert_order(
+        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        state='confirmed', pine_entry_id='LAB-CAP-REV-L',
+        exchange_order_id='deal-long', filled_qty=200.0,
+        extras={'kind': 'position', 'confirm_level': 1.14162,
+                'entry_filled_at': 1700000001.0},
+    )
+    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
+
+    activity = {
+        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'EURUSD', 'size': 200.0, 'level': 1.14162,
+        'details': {'direction': 'BUY', 'size': 200.0, 'level': 1.14162},
+    }
+
+    async def drain():
+        out = []
+        async for ev in broker._process_activity([activity]):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert events == []  # netting close suppressed
+
+    short_row = ctx.get_order(short_coid)
+    assert short_row is not None and short_row.filled_qty == 0.0
+    long_row = ctx.get_order('coid-long')
+    assert long_row is not None
+    assert long_row.filled_qty == 0.0, (
+        "the fold retained nothing on the venue; got "
+        f"{long_row.filled_qty!r}"
+    )
+    live_coids = {r.client_order_id for r in ctx.iter_live_orders()}
+    assert 'coid-long' not in live_coids, (
+        "a fully-netted fold row must be closed, not left live for the "
+        "disappearance tracker to quarantine on"
+    )
+    kinds = [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE run_instance_id = ?",
+        (ctx.run_instance_id,),
+    )]
+    assert 'reversal_fold_fully_netted' in kinds
     store.close()
 
 

@@ -592,6 +592,15 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 confirm_missing=self._confirm_missing_cancelled,
                 is_exempt=lambda row: (
                     (row.extras or {}).get('natural_close_at') is not None
+                    # A fully-netted fold row is closed in the same
+                    # teardown that rebased it to zero; this exemption
+                    # covers the crash window between the two writes — a
+                    # zero-retained fold's deal provably no longer exists,
+                    # so its absence must never be read as an external
+                    # cancel. A fold with a retained residual stays
+                    # tracked (its deal is live on the venue).
+                    or ((row.extras or {}).get('fold_rebased_filled_at')
+                        is not None and row.filled_qty <= 1e-9)
                 ),
                 cancel_siblings=self._cancel_sibling_orders,
                 request_quarantine=self.quarantine_sink,
