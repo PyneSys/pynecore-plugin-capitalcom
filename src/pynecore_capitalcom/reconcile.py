@@ -173,7 +173,20 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     # covers, just one poll later. Promote to teardown
                     # here so the missing-pending grace tracker does
                     # not raise a false ``UnexpectedCancelError``.
+                    # Retire the journal exposure too — the eager
+                    # teardown does both, and this deferred twin must
+                    # not differ: a stamped-but-unretired row keeps its
+                    # ``filled_qty`` counting as run-owned exposure
+                    # forever, and the cycle-end reconciliation reads a
+                    # false "journal owns more than the venue" mismatch
+                    # (measured on the Capital.com lane, 2026-08-16: a
+                    # ``strategy.close`` fill 78s before the cycle-end
+                    # stop landed on this branch and stopped the lane).
+                    retired_exposure = row.filled_qty
                     self._close_bracket_after_natural_close(row)
+                    self._retire_netted_journal_exposure(
+                        row, retired_exposure,
+                    )
                 # No breadcrumb: the disappearance is the core tracker's
                 # concern — ``observe_presence`` below stamps it.
                 continue

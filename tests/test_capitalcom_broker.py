@@ -5912,6 +5912,56 @@ def __test_reconcile_clears_stale_close_event_yielded_breadcrumb__(tmp_path):
     store.close()
 
 
+def __test_deferred_breadcrumb_teardown_retires_the_journal_exposure__(tmp_path):
+    """The deferred (breadcrumb) teardown must retire exposure like the eager one.
+
+    ``_process_activity`` defers a full-close teardown when the same
+    poll's ``/positions`` snapshot still carries the deal (stale), leaving
+    a ``close_event_yielded_at`` breadcrumb. The next reconcile pass sees
+    the deal gone and promotes to teardown — but stamping
+    ``natural_close_at`` alone leaves the entry row's ``filled_qty``
+    counting as run-owned exposure forever: the row is deliberately never
+    physically closed, so the cycle-end reconciliation reads a false
+    "journal owns 0.01, venue holds 0" mismatch and stops the lane
+    (measured 2026-08-16: a ``strategy.close`` fill 78 seconds before the
+    cycle-end stop landed exactly here).
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx, qty=1.0)
+    entry_row = ctx.get_order(e_coid)
+    assert entry_row is not None
+    base_extras = dict(entry_row.extras or {})
+    base_extras['entry_filled_at'] = 1700000000.0
+    base_extras['close_event_yielded_at'] = 1700000005.0
+    base_extras['close_event_yielded_at_poll_id'] = 1
+    ctx.upsert_order(e_coid, filled_qty=1.0, extras=base_extras)
+
+    # A later poll: the deal has vanished from both /positions and
+    # /workingorders — the deferred teardown branch must fire.
+    broker._current_poll_id = 2
+
+    async def run_reconcile(pos, work):
+        out = []
+        async for ev in broker._reconcile_snapshot(pos, work):
+            out.append(ev)
+        return out
+
+    asyncio.run(run_reconcile({}, {}))
+
+    refreshed = ctx.get_order(e_coid)
+    assert refreshed is not None
+    assert (refreshed.extras or {}).get('natural_close_at') is not None, (
+        "the deferred teardown must stamp natural_close_at"
+    )
+    assert refreshed.filled_qty == 0.0, (
+        f"the deferred teardown must retire the journal exposure — a "
+        f"stamped-but-unretired row keeps counting as run-owned exposure "
+        f"and fails the cycle-end reconciliation against a flat venue. "
+        f"Got filled_qty={refreshed.filled_qty!r}"
+    )
+    store.close()
+
+
 def __test_close_event_yielded_breadcrumb_survives_same_poll_reconcile__(tmp_path):
     """The breadcrumb-clear in :meth:`_reconcile_snapshot` must NOT fire
     against the same-poll snapshot that caused :meth:`_process_activity`

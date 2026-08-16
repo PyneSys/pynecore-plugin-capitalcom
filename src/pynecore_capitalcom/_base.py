@@ -389,6 +389,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _find_bracket_leg_row(self, *args: Any, **kwargs: Any) -> 'OrderRow | None': ...
 
+    def _retire_netted_journal_exposure(
+            self, closed_row: 'OrderRow', retired_exposure: float,
+    ) -> None: ...
+
     # --- Bracket lifecycle (bracket.py) ---
     def _close_bracket_after_natural_close(self, entry_row: 'OrderRow') -> None: ...
 
