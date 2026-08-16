@@ -36,6 +36,7 @@ from pynecore.core.broker.exceptions import (
 
 from ._base import _CapitalComBase
 from .exceptions import (
+    CapitalComApiError,
     CapitalComError,
     HistoricalPricesNotFoundError,
     InvalidStopDistanceError,
@@ -213,7 +214,10 @@ class _RestSessionMixin(_CapitalComBase, ABC):
                     expected_generation=req_generation,
                 )
                 return self(endpoint=endpoint, data=data, method=method, _level=_level + 1)
-            raise CapitalComError(f"API error occured: {error_code or 'unknown-error'}")
+            raise CapitalComApiError(
+                f"API error occured: {error_code or 'unknown-error'}",
+                error_code=error_code or 'unknown-error',
+            )
 
         # Apply rotation under the session lock so a concurrent refresh
         # cannot interleave with this update. If a fresh session was
@@ -678,5 +682,16 @@ class _RestSessionMixin(_CapitalComBase, ABC):
             if code and code.startswith('error.invalid.') and 'margin' in code:
                 return InsufficientMarginError(str(raw))
             if code and code.startswith('error.invalid.'):
+                return ExchangeOrderRejectedError(str(raw))
+            # ``error.validation.*`` is the venue's synchronous request-
+            # validation family (``error.validation.stop.price`` on a stop
+            # entry whose trigger sits inside the min distance, size /
+            # level variants alike) — a definitive refusal of the order,
+            # exactly like ``error.invalid.*``. Left unmapped it escaped as
+            # a raw provider error and the engine's generic dispatch net
+            # killed the whole run over one rejected entry signal.
+            if code and code.startswith('error.validation.') and 'margin' in code:
+                return InsufficientMarginError(str(raw))
+            if code and code.startswith('error.validation.'):
                 return ExchangeOrderRejectedError(str(raw))
         return super()._map_exception(raw)

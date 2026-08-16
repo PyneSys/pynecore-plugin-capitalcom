@@ -377,6 +377,27 @@ def __test_broker_map_exception_classifies_codes__():
 
 
 # noinspection PyProtectedMember
+def __test_map_exception_validation_codes_are_order_rejections__():
+    """``error.validation.*`` must classify as an order rejection.
+
+    The venue's synchronous request-validation family (live incident:
+    ``error.validation.stop.price`` on a stop entry inside the min
+    distance) is a definitive refusal exactly like ``error.invalid.*``.
+    Unmapped it escaped as a raw provider error and the engine's generic
+    dispatch net killed the whole run over one rejected entry signal.
+    """
+    broker = _FakeBroker(config=_make_config())
+    mapped = broker._map_exception(
+        CapitalComError("API error occured: error.validation.stop.price"),
+    )
+    assert isinstance(mapped, ExchangeOrderRejectedError)
+    margin = broker._map_exception(
+        CapitalComError("API error occured: error.validation.margin"),
+    )
+    assert isinstance(margin, InsufficientMarginError)
+
+
+# noinspection PyProtectedMember
 def __test_map_exception_session_token_routes_to_connection_error__():
     """``error.invalid.session.token`` must NOT surface as an order rejection.
 
@@ -555,6 +576,72 @@ def __test_execute_entry_rejected_margin_maps_to_margin_error__(tmp_path):
     rows = [r for r in ctx.iter_live_orders() if r.state == 'rejected']
     # rejected rows are still "live" until closed; we just verify state flipped.
     assert len(rows) == 1
+    store.close()
+
+
+def __test_execute_entry_synchronous_api_reject_is_not_a_crash__(tmp_path):
+    """A parsed API error on the entry POST is a definitive reject.
+
+    The venue evaluated and refused the request synchronously — nothing
+    landed — so the hook must surface :class:`ExchangeOrderRejectedError`
+    (the engine turns an ENTRY reject into a non-halting skip) instead of
+    letting the raw provider error escape into the generic dispatch net,
+    which kills the run.
+    """
+    from pynecore_capitalcom.exceptions import CapitalComApiError
+
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('error', 'workingorders', 'post'): CapitalComApiError(
+            "API error occured: error.validation.stop.price",
+            error_code='error.validation.stop.price',
+        ),
+    })
+    env = _entry_envelope(order_type=OrderType.STOP, stop=1.2050)
+    with pytest.raises(ExchangeOrderRejectedError) as exc:
+        asyncio.run(broker.execute_entry(env))
+    assert isinstance(exc.value.__cause__, CapitalComApiError)
+    store.close()
+
+
+def __test_execute_entry_unparseable_response_parks_as_unknown__(tmp_path):
+    """An unparseable POST response body leaves the disposition unknown.
+
+    The request may have landed (only the body was unreadable), so the hook
+    must park the dispatch for recovery, never classify it as a reject.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions', 'post'): CapitalComError(
+            "JSON Error: <html>gateway hiccup</html>",
+        ),
+    })
+    env = _entry_envelope()
+    with pytest.raises(OrderDispositionUnknownError) as exc:
+        asyncio.run(broker.execute_entry(env))
+    row = ctx.get_order(exc.value.client_order_id)
+    assert row is not None and row.state == 'disposition_unknown'
+    store.close()
+
+
+def __test_execute_entry_confirms_api_error_parks_as_unknown__(tmp_path):
+    """A provider error on the confirms READ must not crash the run.
+
+    The POST already went out, so the outcome is unverified — park for
+    recovery exactly like a transport failure on the same read.
+    """
+    from pynecore_capitalcom.exceptions import CapitalComApiError
+
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'post'): {'dealReference': 'ref-x'},
+        ('error', 'confirms/ref-x', 'get'): CapitalComApiError(
+            "API error occured: error.service.unavailable",
+            error_code='error.service.unavailable',
+        ),
+    })
+    env = _entry_envelope()
+    with pytest.raises(OrderDispositionUnknownError) as exc:
+        asyncio.run(broker.execute_entry(env))
+    row = ctx.get_order(exc.value.client_order_id)
+    assert row is not None and row.state == 'disposition_unknown'
     store.close()
 
 

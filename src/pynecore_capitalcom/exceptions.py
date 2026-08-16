@@ -20,6 +20,25 @@ class CapitalComError(ProviderError):
     """
 
 
+class CapitalComApiError(CapitalComError):
+    """The venue received the request and answered with an API error code.
+
+    Raised only for a parsed error RESPONSE (``errorCode`` present), never
+    for transport trouble or an unparseable body — so on a write path it is
+    a DEFINITIVE refusal of that request: nothing landed on the venue. The
+    dispatch layers rely on this to classify a synchronous entry reject
+    (e.g. ``error.validation.stop.price``) as
+    :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`
+    instead of an ambiguous disposition.
+
+    :ivar error_code: The ``errorCode`` string the venue returned.
+    """
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class HistoricalPricesNotFoundError(CapitalComError):
     """The venue confirmed that a requested historical price range is empty."""
 

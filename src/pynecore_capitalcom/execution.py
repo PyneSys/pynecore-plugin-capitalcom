@@ -63,6 +63,7 @@ from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import (
+    CapitalComApiError,
     CapitalComError,
     InvalidStopDistanceError,
     InvalidTakeProfitDistanceError,
@@ -2446,6 +2447,27 @@ self._endpoint, data=self._body, method='post',
                 client_order_id=coid,
                 cause=net if isinstance(net, Exception) else None,
             ) from net
+        except CapitalComApiError as exc:
+            # A parsed error response: the venue evaluated and synchronously
+            # refused the POST — nothing landed, so this is a definitive
+            # reject. The engine converts an ENTRY reject into a non-halting
+            # skip (signal dropped, next bar re-evaluates); letting the raw
+            # provider error escape instead killed the whole run through the
+            # generic dispatch net (live incident:
+            # ``error.validation.stop.price`` on a stop entry).
+            raise ExchangeOrderRejectedError(
+                f"Capital POST {self._endpoint} rejected (coid={coid}): {exc}",
+            ) from exc
+        except CapitalComError as exc:
+            # A response arrived but could not be parsed (JSON error /
+            # schema drift) — the order may have landed, so park the
+            # dispatch as unknown for recovery instead of guessing.
+            raise OrderDispositionUnknownError(
+                f"Capital POST {self._endpoint} ambiguous (unparseable "
+                f"response): {exc}",
+                client_order_id=coid,
+                cause=exc,
+            ) from exc
 
         deal_ref = resp.get('dealReference')
         if not deal_ref:
@@ -2481,6 +2503,16 @@ f'confirms/{server_ref}', method='get',
                 client_order_id=coid,
                 cause=net if isinstance(net, Exception) else None,
             ) from net
+        except CapitalComError as exc:
+            # API error / unparseable body on the confirms READ: the POST
+            # already went out, so its outcome stays unverified — park the
+            # dispatch for recovery rather than crashing the run on a raw
+            # provider error.
+            raise OrderDispositionUnknownError(
+                f"Capital GET confirms/{server_ref} ambiguous: {exc}",
+                client_order_id=coid,
+                cause=exc,
+            ) from exc
 
         deal_status = (confirm.get('dealStatus') or '').upper()
         if deal_status == 'REJECTED':
