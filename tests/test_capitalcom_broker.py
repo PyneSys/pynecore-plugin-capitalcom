@@ -1996,6 +1996,166 @@ def __test_process_activity_fingerprint_dedups_in_session__(tmp_path):
     store.close()
 
 
+def _seed_working_order_row(ctx, *, coid='coid-wo', deal_id='wo-1'):
+    """A confirmed stop-entry working order awaiting its trigger."""
+    ctx.upsert_order(coid, symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id=deal_id,
+                     extras={'kind': 'working',
+                             'missing_pending_since': 123.0})
+    ctx.add_ref(coid, 'deal_id', deal_id)
+    return coid
+
+
+def _wo_fill_activities():
+    """The measured working-order fill pair (2026-08-16, order ...c2ab ->
+    position ...c471): a POSITION activity under the NEW dealId whose
+    ``details.workingOrderId`` back-links the order, plus the
+    WORKING_ORDER EXECUTED activity under the OLD dealId — same instant.
+    """
+    position_act = {
+        'dateUTC': '2026-08-16T22:15:11.350', 'dealId': 'pos-1',
+        'epic': 'BTCUSD', 'type': 'POSITION', 'status': 'ACCEPTED',
+        'source': 'USER',
+        'details': {'workingOrderId': 'wo-1', 'size': 1.0,
+                    'direction': 'BUY', 'level': 62895.55},
+    }
+    executed_act = {
+        'dateUTC': '2026-08-16T22:15:11.350', 'dealId': 'wo-1',
+        'epic': 'BTCUSD', 'type': 'WORKING_ORDER', 'status': 'EXECUTED',
+        'source': 'USER',
+        'details': {'size': 1.0, 'direction': 'BUY', 'level': 62894.3},
+    }
+    return position_act, executed_act
+
+
+def _assert_promoted(ctx, coid, new_deal_id):
+    row = ctx.get_order(coid)
+    assert row is not None
+    assert row.exchange_order_id == new_deal_id, (
+        f"the row must follow the position's dealId — a stale "
+        f"working-order ref is invisible to the disappearance tracker "
+        f"and ends in a false unexpected-cancel quarantine. "
+        f"Got {row.exchange_order_id!r}"
+    )
+    by_ref = ctx.find_by_ref('deal_id', new_deal_id)
+    assert by_ref is not None and by_ref.client_order_id == coid
+    extras = row.extras or {}
+    assert extras.get('kind') == 'position'
+    assert extras.get('promoted_from_working_order_id') == 'wo-1'
+    assert extras.get('entry_filled_at') is not None
+    assert extras.get('missing_pending_since') is None, (
+        "the fill disproves the missing-pending premise; a surviving "
+        "stamp lets the grace-expiry pass confirm a false cancel on a "
+        "filled entry"
+    )
+
+
+def __test_working_order_fill_migrates_the_row_to_the_position_deal__(tmp_path):
+    """The measured pair (POSITION first, as the venue returns it) yields
+    exactly ONE entry fill and migrates the row onto the new dealId.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    coid = _seed_working_order_row(ctx)
+    position_act, executed_act = _wo_fill_activities()
+
+    async def drain(acts, snap=None):
+        out = []
+        async for ev in broker._process_activity(acts, snap):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain([position_act, executed_act]))
+    fills = [e for e in events if e.event_type == 'filled']
+    assert len(fills) == 1, (
+        f"the working-order fill must be booked exactly once — got "
+        f"{[(e.event_type, e.leg_type) for e in events]!r}"
+    )
+    assert fills[0].pine_id == 'L'
+    _assert_promoted(ctx, coid, 'pos-1')
+
+    # Replays of either activity must not re-emit the fill.
+    assert asyncio.run(drain([position_act, executed_act])) == []
+    store.close()
+
+
+def __test_working_order_fill_migrates_when_executed_arrives_first__(tmp_path):
+    """Same pair, WORKING_ORDER EXECUTED sorted first: the promotion runs
+    on the executed branch (batch lookup) and the POSITION activity's own
+    entry fill is suppressed as a replay.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    coid = _seed_working_order_row(ctx)
+    position_act, executed_act = _wo_fill_activities()
+    executed_act = dict(executed_act, dateUTC='2026-08-16T22:15:11.100')
+    position_act = dict(position_act, dateUTC='2026-08-16T22:15:11.200')
+
+    async def drain(acts):
+        out = []
+        async for ev in broker._process_activity(acts):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain([executed_act, position_act]))
+    fills = [e for e in events if e.event_type == 'filled']
+    assert len(fills) == 1
+    _assert_promoted(ctx, coid, 'pos-1')
+    store.close()
+
+
+def __test_working_order_fill_migrates_from_the_positions_snapshot__(tmp_path):
+    """No POSITION activity in the batch (rolled out of the 60s window):
+    the same-poll ``/positions`` snapshot's ``workingOrderId`` back-link
+    still completes the migration.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    coid = _seed_working_order_row(ctx)
+    _position_act, executed_act = _wo_fill_activities()
+    snapshot = {
+        'pos-1': {'position': {'dealId': 'pos-1', 'workingOrderId': 'wo-1',
+                               'size': 1.0, 'direction': 'BUY',
+                               'level': 62895.55}},
+    }
+
+    async def drain(acts, snap):
+        out = []
+        async for ev in broker._process_activity(acts, snap):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain([executed_act], snapshot))
+    fills = [e for e in events if e.event_type == 'filled']
+    assert len(fills) == 1
+    _assert_promoted(ctx, coid, 'pos-1')
+    store.close()
+
+
+def __test_position_bridge_alone_emits_the_fill_and_migrates__(tmp_path):
+    """Only the POSITION activity survives (the EXECUTED one rolled out of
+    the window before the poll): the ``details.workingOrderId`` bridge
+    must both migrate the row AND emit the entry fill itself.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    coid = _seed_working_order_row(ctx)
+    position_act, _executed_act = _wo_fill_activities()
+
+    async def drain(acts):
+        out = []
+        async for ev in broker._process_activity(acts):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain([position_act]))
+    fills = [e for e in events if e.event_type == 'filled']
+    assert len(fills) == 1, (
+        f"with only the POSITION activity available, the bridge must "
+        f"still emit the fill — got {events!r}"
+    )
+    assert fills[0].pine_id == 'L'
+    _assert_promoted(ctx, coid, 'pos-1')
+    store.close()
+
+
 def __test_recover_submitted_row_single_activity_match_promotes__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions', 'get'): {'positions': []},

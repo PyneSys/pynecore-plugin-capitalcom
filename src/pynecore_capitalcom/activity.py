@@ -206,6 +206,29 @@ class _ActivityMixin(_CapitalComBase, ABC):
             if deal_id and self.store_ctx is not None:
                 row = self.store_ctx.find_by_ref('deal_id', deal_id)
 
+            if (row is None and deal_id and self.store_ctx is not None
+                    and str(a.get('type') or '') == 'POSITION'):
+                # Working-order → position bridge. A stop/limit entry's
+                # fill opens the position under a NEW dealId; the POSITION
+                # activity announces it with a ``details.workingOrderId``
+                # back-link to the order's old dealId (measured 2026-08-16:
+                # order ...c2ab filled into position ...c471). Without the
+                # bridge this activity reads as external, the row keeps its
+                # old ref — absent from both /workingorders and /positions
+                # — and the disappearance tracker confirms a FALSE
+                # unexpected cancel on a filled entry after the grace
+                # window (quarantine + orphaned venue position).
+                wo_id = str((a.get('details') or {}).get('workingOrderId') or '')
+                if wo_id and wo_id != deal_id:
+                    wo_row = self.store_ctx.find_by_ref('deal_id', wo_id)
+                    if wo_row is not None:
+                        if (wo_row.extras or {}).get('kind') == 'working':
+                            self._promote_working_row_to_position(
+                                wo_row, deal_id, stamp_entry_filled=False,
+                            )
+                        row = (self.store_ctx.find_by_ref('deal_id', deal_id)
+                               or wo_row)
+
             if row is None:
                 # Two cases land here:
                 #   (a) Genuinely external activity (manual broker action,
@@ -440,6 +463,40 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     and event.leg_type == LegType.ENTRY
                     and (row.extras or {}).get('entry_filled_at') is not None
                 )
+                # Working-order fill (WORKING_ORDER EXECUTED): promote the
+                # row to its position identity BEFORE yielding the fill.
+                # The new dealId comes from the same-instant POSITION
+                # activity in this batch, or from the same-poll
+                # ``/positions`` snapshot (the position payload carries
+                # ``workingOrderId``). ``stamp_entry_filled=True`` marks
+                # the fill as accounted so the POSITION activity's own
+                # ENTRY-fill replay is suppressed by the guard above on a
+                # later poll. When neither source shows the new deal yet,
+                # still clear the missing-pending premise and stamp the
+                # fill — the bridge branch or the next poll's snapshot
+                # completes the ref migration within the grace window.
+                if (event.event_type == 'filled'
+                        and event.leg_type == LegType.ENTRY
+                        and not entry_fill_already_recorded
+                        and (row.extras or {}).get('kind') == 'working'
+                        and self.store_ctx is not None):
+                    promoted_deal_id = self._find_promoted_deal_id(
+                        row, activities_sorted, positions_by_deal,
+                    )
+                    if promoted_deal_id:
+                        self._promote_working_row_to_position(
+                            row, promoted_deal_id, stamp_entry_filled=True,
+                        )
+                    else:
+                        refreshed = self.store_ctx.get_order(
+                            row.client_order_id,
+                        )
+                        base_extras = dict((refreshed or row).extras or {})
+                        base_extras['entry_filled_at'] = epoch_time()
+                        base_extras.pop('missing_pending_since', None)
+                        self.store_ctx.upsert_order(
+                            row.client_order_id, extras=base_extras,
+                        )
                 # Stamp the entry row before yielding its first
                 # filled-as-ENTRY activity so :meth:`_activity_to_event`
                 # can recognise subsequent ``USER`` / ``DEALER`` activities
@@ -960,6 +1017,83 @@ class _ActivityMixin(_CapitalComBase, ABC):
             # reconcile emissions carry no fingerprint and stay ``None``,
             # relying on the ``filled_qty`` cursor watermark instead.
             fill_id=_activity_fingerprint(activity),
+        )
+
+    @staticmethod
+    def _find_promoted_deal_id(
+            row: 'OrderRow',
+            activities: list[dict],
+            positions_by_deal: dict[str, dict] | None,
+    ) -> str | None:
+        """The NEW position dealId a filled working order promoted into.
+
+        Two sources, in evidence order: the batch's POSITION activity
+        whose ``details.workingOrderId`` back-links to the row's old
+        dealId, then the same-poll ``/positions`` snapshot (the position
+        payload carries ``workingOrderId`` directly).
+        """
+        old_id = row.exchange_order_id or ''
+        if not old_id:
+            return None
+        for a in activities:
+            if (str(a.get('type') or '') == 'POSITION'
+                    and str((a.get('details') or {}).get('workingOrderId')
+                            or '') == old_id):
+                new_id = str(a.get('dealId') or '')
+                if new_id and new_id != old_id:
+                    return new_id
+        for deal_id, raw in (positions_by_deal or {}).items():
+            pos = raw.get('position') or {}
+            if (str(pos.get('workingOrderId') or '') == old_id
+                    and deal_id != old_id):
+                return deal_id
+        return None
+
+    def _promote_working_row_to_position(
+            self, wo_row: 'OrderRow', new_deal_id: str, *,
+            stamp_entry_filled: bool,
+    ) -> None:
+        """Migrate a filled working-order row onto its position dealId.
+
+        Adds the new ``deal_id`` ref (the old ref stays, so in-window
+        WORKING_ORDER activity replays still resolve to this row),
+        rewrites ``exchange_order_id`` so the disappearance tracker and
+        every deal-targeting call follow the live position, flips the
+        row's kind to ``position``, and drops any ``missing_pending_since``
+        stamp — the fill disproves the missing premise, and the tracker's
+        stamp-version guard then discards an in-flight grace-expiry
+        cancel verdict. ``stamp_entry_filled`` marks the entry fill as
+        accounted (the caller is about to yield it, or already has);
+        the bridge path leaves it unset so the POSITION activity's own
+        ENTRY fill still emits when the WORKING_ORDER EXECUTED activity
+        was never seen.
+        """
+        assert self.store_ctx is not None
+        old_deal_id = wo_row.exchange_order_id
+        refreshed = self.store_ctx.get_order(wo_row.client_order_id)
+        base_extras = dict((refreshed or wo_row).extras or {})
+        base_extras['kind'] = 'position'
+        base_extras['promoted_from_working_order_id'] = old_deal_id
+        base_extras.pop('missing_pending_since', None)
+        if stamp_entry_filled and not base_extras.get('entry_filled_at'):
+            base_extras['entry_filled_at'] = epoch_time()
+        self.store_ctx.add_ref(
+            wo_row.client_order_id, 'deal_id', new_deal_id,
+        )
+        self.store_ctx.upsert_order(
+            wo_row.client_order_id,
+            exchange_order_id=new_deal_id,
+            extras=base_extras,
+        )
+        self.store_ctx.log_event(
+            'working_order_promoted_to_position',
+            client_order_id=wo_row.client_order_id,
+            exchange_order_id=new_deal_id,
+            payload={
+                'working_order_deal_id': old_deal_id,
+                'position_deal_id': new_deal_id,
+                'stamp_entry_filled': stamp_entry_filled,
+            },
         )
 
     def _retire_netted_journal_exposure(
