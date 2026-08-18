@@ -1598,7 +1598,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             ),
         )
         journal = DispatchJournal(self.store_ctx)
-        return await journal.run_close(
+        exch_order = await journal.run_close(
             coid=coid,
             intent=intent,
             kind=kind,
@@ -1606,6 +1606,40 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             hooks=hooks,
             audit_payload={'pine_id': intent.pine_id},
         )
+        if kind == KIND_PARTIAL_CLOSE and targets:
+            # The journal's ``filled_qty`` doubles as the run-owned exposure
+            # cursor (K3 cycle-end book, adoption clamp, and the fold-netting
+            # ``retired_exposure`` all read it). The emulated partial close
+            # reduced the venue deal, so the target row's cursor must drop by
+            # the closed amount or every later consumer sees the pre-partial
+            # exposure — measured live on cycle 32: the inflated cursor made
+            # the next reversal fold over-net, close the fold row at
+            # retained=0, orphan its own entry activity (ignored as external,
+            # fill lost) and end the cycle at venue 0.01 vs journal 0.
+            # ``row.qty`` stays the original traded volume (the full-vs-
+            # partial router above resolves live size at the venue seam).
+            target = targets[0]
+            refreshed = self.store_ctx.get_order(target.client_order_id)
+            if refreshed is not None:
+                closed_qty = float(exch_order.filled_qty)
+                reduced = max(0.0, refreshed.filled_qty - closed_qty)
+                extras = dict(refreshed.extras or {})
+                extras['partial_close_retired_at'] = epoch_time()
+                self.store_ctx.upsert_order(
+                    target.client_order_id,
+                    filled_qty=reduced,
+                    extras=extras,
+                )
+                self.store_ctx.log_event(
+                    'partial_close_journal_retired',
+                    client_order_id=target.client_order_id,
+                    exchange_order_id=target.exchange_order_id,
+                    payload={
+                        'retired_exposure': closed_qty,
+                        'remaining_exposure': reduced,
+                    },
+                )
+        return exch_order
 
     async def execute_cancel(
             self, envelope: DispatchEnvelope,

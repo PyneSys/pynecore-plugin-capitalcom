@@ -741,6 +741,69 @@ def __test_execute_close_partial_happy_path_routes_through_journal__(tmp_path):
     store.close()
 
 
+def __test_execute_close_partial_retires_journal_exposure_cursor__(tmp_path):
+    """Partial close reduces the target row's ``filled_qty`` cursor.
+
+    The journal's ``filled_qty`` doubles as the run-owned exposure cursor
+    (K3 cycle-end book, adoption clamp, fold-netting ``retired_exposure``).
+    Measured live on cycle 32: without this retirement the next reversal
+    fold over-netted against the stale pre-partial cursor, closed the fold
+    row at retained=0, orphaned its own entry activity and ended the cycle
+    at venue 0.01 vs journal 0. ``qty`` must stay the original volume.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): [
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 2.0}},
+            ]},
+            {'positions': [
+                {'market': {'epic': 'EURUSD'},
+                 'position': {'dealId': 'orig', 'direction': 'BUY',
+                              'size': 1.0}},
+            ]},
+        ],
+        ('positions', 'post'): {'dealReference': 'dr-1'},
+        ('confirms/dr-1', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     filled_qty=2.0, state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='orig', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    asyncio.run(broker.execute_close(env))
+
+    target_row = ctx.get_order('coid-entry')
+    assert target_row is not None
+    assert abs(target_row.filled_qty - 1.0) < 1e-9, (
+        "the exposure cursor must drop by the closed amount"
+    )
+    assert abs(target_row.qty - 2.0) < 1e-9, (
+        "qty stays the original traded volume"
+    )
+    extras = target_row.extras or {}
+    assert extras.get('partial_close_retired_at') is not None
+
+    events = _events_for(ctx, 'coid-entry')
+    retired = [p for k, p in events if k == 'partial_close_journal_retired']
+    assert len(retired) == 1
+    assert abs(retired[0]['retired_exposure'] - 1.0) < 1e-9
+    assert abs(retired[0]['remaining_exposure'] - 1.0) < 1e-9
+
+    store.close()
+
+
 def __test_execute_close_partial_target_disappears_reverse_is_not_fill__(tmp_path):
     """A same-total reverse row is corrected but never reported as a fill."""
     broker, store, ctx = _make_broker(tmp_path, responses={

@@ -304,18 +304,20 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             # otherwise overwrite that state back to ``confirmed`` and
             # resurrect a row that is on its way out.
             # Rows whose cursor was deliberately lowered below ``qty`` are
-            # excluded: a naturally-closed row (cursor zeroed at teardown)
-            # or a rebased reversal fold (cursor = venue-retained residual,
-            # ``fold_rebased_filled_at``) would otherwise read as an
-            # unfinished fill here, and any later size change of the deal —
-            # or a stale snapshot still showing a torn-down one — would
-            # fabricate a partial ENTRY fill on exposure the venue never
-            # added.
+            # excluded: a naturally-closed row (cursor zeroed at teardown),
+            # a rebased reversal fold (cursor = venue-retained residual,
+            # ``fold_rebased_filled_at``) or a partially-closed position
+            # (cursor = remaining exposure, ``partial_close_retired_at``)
+            # would otherwise read as an unfinished fill here, and any later
+            # size change of the deal — or a stale snapshot still showing a
+            # torn-down one — would fabricate a partial ENTRY fill on
+            # exposure the venue never added.
             if (pos is not None
                     and (row.extras or {}).get('kind') == 'position'
                     and row.state == 'confirmed'
                     and (row.extras or {}).get('natural_close_at') is None
-                    and (row.extras or {}).get('fold_rebased_filled_at') is None):
+                    and (row.extras or {}).get('fold_rebased_filled_at') is None
+                    and (row.extras or {}).get('partial_close_retired_at') is None):
                 pos_data = pos.get('position') or {}
                 current_size = float(pos_data.get('size') or 0.0)
                 cumulative = _compute_cumulative_fill(row.qty, current_size)

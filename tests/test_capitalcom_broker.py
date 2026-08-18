@@ -2414,6 +2414,45 @@ def __test_presence_diff_exempts_a_zero_retained_fold_row__(tmp_path):
     store.close()
 
 
+def __test_partial_fill_detector_skips_partial_close_retired_row__(tmp_path):
+    """A partially-closed row's lowered cursor is not an unfinished fill.
+
+    After an emulated partial close the row's ``filled_qty`` is the
+    remaining exposure (< ``qty``, ``partial_close_retired_at`` stamped).
+    A later size change of the deal — here a further reduction to 0.5 —
+    makes ``qty - size`` exceed the cursor; without the exclusion the
+    snapshot reconcile would fabricate a partial ENTRY fill on exposure
+    the venue never added.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('partial-entry', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-P', filled_qty=1.0,
+                     extras={'kind': 'position',
+                             'partial_close_retired_at': 1700000000.0})
+    positions = {'deal-P': {
+        'market': {'epic': 'EURUSD'},
+        'position': {'dealId': 'deal-P', 'direction': 'BUY', 'size': 0.5},
+    }}
+
+    async def drain():
+        out = []
+        async for ev in broker._reconcile_snapshot(positions, {}):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(drain())
+    assert events == [], (
+        "no partial-fill event may be fabricated for a retired cursor"
+    )
+    row = ctx.get_order('partial-entry')
+    assert row is not None
+    assert abs(row.filled_qty - 1.0) < 1e-9, (
+        "the retired exposure cursor must stay untouched"
+    )
+    store.close()
+
+
 def __test_missing_pending_tracker_ignore_policy_suppresses__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path)
     # The CLI normally injects the runtime policy from brokers.toml; in tests
