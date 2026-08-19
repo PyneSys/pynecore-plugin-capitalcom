@@ -1359,11 +1359,23 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         target_position_coid: str | None = None
         target_exchange_id: str | None = None
         defensive_close = intent.synthetic_kind == 'defensive_close'
+        reversal_close = intent.synthetic_kind == 'reversal_close'
         if intent.synthetic_kind in {'partial_trigger', 'marketable_exit'}:
             target_entry_id = intent.target_entry_id
         elif defensive_close:
             target_position_coid = intent.target_position_coid
             target_exchange_id = intent.target_exchange_id
+        elif reversal_close:
+            # Symbol-wide by contract: the engine flattens the WHOLE book
+            # before dispatching the raw reversing entry, and its synthetic
+            # ``__pyne_reversal_close__*`` pine id matches no position row —
+            # keyed targeting would reject a close the engine sized against
+            # the full position. Leaving every target var None selects all
+            # live rows below, and the kind is pinned to the native
+            # per-``dealId`` DELETE so this close can never take the
+            # opposite-POST partial path (which could open opposite
+            # exposure against a racing protective fill).
+            pass
         elif intent.pine_id:
             target_entry_id = intent.pine_id
 
@@ -1520,7 +1532,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             (row.extras or {}).get('orphan_close_synthetic') is True
             for row in targets
         )
-        if has_orphan_synthetic:
+        if has_orphan_synthetic or reversal_close:
             kind = KIND_FULL_CLOSE
         else:
             # ``kind='position'`` rows represent live venue exposure. Their

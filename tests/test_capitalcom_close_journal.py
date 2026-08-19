@@ -327,6 +327,84 @@ def __test_execute_close_all_targets_every_owned_entry__(tmp_path):
     store.close()
 
 
+def __test_execute_close_reversal_close_is_symbol_wide_full_delete__(tmp_path):
+    """A ``reversal_close`` targets every owned row despite its synthetic id.
+
+    The engine's stop-and-reverse close leg carries the synthetic
+    ``__pyne_reversal_close__*`` pine id, which matches no position row —
+    keyed targeting would reject it. The synthetic kind routes it
+    symbol-wide (the engine flattens the whole book before the raw
+    reversing entry) through the native per-dealId DELETE.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-A', 'delete'): {},
+        ('positions/deal-B', 'delete'): {},
+    })
+    ctx.upsert_order('coid-entry-a', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='A',
+                     exchange_order_id='deal-A', extras={'kind': 'position'})
+    ctx.upsert_order('coid-entry-b', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='B',
+                     exchange_order_id='deal-B', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='__pyne_reversal_close__S', symbol='EURUSD', side='sell',
+            qty=2.0, immediately=True, synthetic_kind='reversal_close',
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'deal-A'
+    assert [call for call in broker._calls if call[1] in {'delete', 'post'}] == [
+        ('positions/deal-A', 'delete', None),
+        ('positions/deal-B', 'delete', None),
+    ]
+
+    cmd_row = ctx.get_order(env.client_order_id(KIND_CLOSE))
+    assert cmd_row is not None
+    assert (cmd_row.extras or {}).get('kind') == KIND_FULL_CLOSE
+    assert (cmd_row.extras or {}).get('targets') == ['deal-A', 'deal-B']
+    store.close()
+
+
+def __test_execute_close_reversal_close_never_takes_the_partial_post_path__(tmp_path):
+    """A quantity mismatch must not push a ``reversal_close`` onto the POST.
+
+    The opposite-direction partial-close POST could open opposite exposure
+    against a protective fill racing the reversal — exactly what the
+    close-then-open protocol exists to prevent. Even when the intent
+    quantity is smaller than the live row (the venue book moved after the
+    engine sized the close), the reversal close stays on the per-dealId
+    DELETE: the reversal wants the book flat, and the DELETE cannot
+    over-open.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-A', 'delete'): {},
+    })
+    ctx.upsert_order('coid-entry-a', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='A',
+                     exchange_order_id='deal-A', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='__pyne_reversal_close__S', symbol='EURUSD', side='sell',
+            qty=1.0, immediately=True, synthetic_kind='reversal_close',
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'deal-A'
+    assert [call for call in broker._calls if call[1] in {'delete', 'post'}] == [
+        ('positions/deal-A', 'delete', None),
+    ]
+
+    cmd_row = ctx.get_order(env.client_order_id(KIND_CLOSE))
+    assert cmd_row is not None
+    assert (cmd_row.extras or {}).get('kind') == KIND_FULL_CLOSE
+    store.close()
+
+
 def __test_execute_close_unknown_key_does_not_fall_back_symbol_wide__(tmp_path):
     """An unknown keyed close cannot reduce another entry on the symbol."""
     broker, store, ctx = _make_broker(tmp_path)
