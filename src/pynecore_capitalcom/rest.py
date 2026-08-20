@@ -679,6 +679,15 @@ class _RestSessionMixin(_CapitalComBase, ABC):
             # through to ``ExchangeOrderRejectedError``.
             if code in _RETRYABLE_CODES:
                 return ExchangeConnectionError(str(raw))
+            # The venue's gateway sometimes leaks a raw Java exception class
+            # name as the errorCode when its own backend times out (live
+            # incident: ``java.util.concurrent.TimeoutException`` on GET
+            # /positions). A backend timeout is a transient venue fault, not
+            # a verdict on the request — classify it as retryable so the
+            # read/reconcile paths degrade to a warning instead of the raw
+            # provider error crashing the whole run.
+            if code and code.endswith('TimeoutException'):
+                return ExchangeConnectionError(str(raw))
             if code and code.startswith('error.invalid.') and 'margin' in code:
                 return InsufficientMarginError(str(raw))
             if code and code.startswith('error.invalid.'):

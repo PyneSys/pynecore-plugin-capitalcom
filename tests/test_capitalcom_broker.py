@@ -421,6 +421,29 @@ def __test_map_exception_session_token_routes_to_connection_error__():
 
 
 # noinspection PyProtectedMember
+def __test_map_exception_venue_backend_timeout_is_a_connection_error__():
+    """A leaked Java timeout errorCode must classify as retryable.
+
+    The venue's gateway sometimes surfaces its own backend timeout as a
+    raw Java exception class in the errorCode field (live incident:
+    ``java.util.concurrent.TimeoutException`` on GET /positions during a
+    periodic reconcile). Unmapped it escaped as a raw provider error the
+    engine's ``except ExchangeConnectionError`` reconcile guard could not
+    catch — one slow venue read crashed the whole run.
+    """
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+
+    broker = _FakeBroker(config=_make_config())
+    mapped = broker._map_exception(
+        CapitalComError(
+            "API error occured: java.util.concurrent.TimeoutException",
+        ),
+    )
+    assert isinstance(mapped, ExchangeConnectionError)
+    assert not isinstance(mapped, ExchangeOrderRejectedError)
+
+
+# noinspection PyProtectedMember
 def __test_broker_map_exception_falls_through_to_broker_base__():
     """Stdlib ``ConnectionError`` must be mapped by ``BrokerPlugin._map_exception``.
 
