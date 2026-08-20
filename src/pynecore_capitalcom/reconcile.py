@@ -305,8 +305,10 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             # resurrect a row that is on its way out.
             # Rows whose cursor was deliberately lowered below ``qty`` are
             # excluded: a naturally-closed row (cursor zeroed at teardown),
-            # a rebased reversal fold (cursor = venue-retained residual,
-            # ``fold_rebased_filled_at``) or a partially-closed position
+            # a reversal-fold row rebased by a PRIOR process run's fold
+            # protocol (cursor = venue-retained residual,
+            # ``fold_rebased_filled_at`` — new runs never write the flag)
+            # or a partially-closed position
             # (cursor = remaining exposure, ``partial_close_retired_at``)
             # would otherwise read as an unfinished fill here, and any later
             # size change of the deal — or a stale snapshot still showing a
@@ -607,13 +609,15 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 confirm_missing=self._confirm_missing_cancelled,
                 is_exempt=lambda row: (
                     (row.extras or {}).get('natural_close_at') is not None
-                    # A fully-netted fold row is closed in the same
-                    # teardown that rebased it to zero; this exemption
-                    # covers the crash window between the two writes — a
-                    # zero-retained fold's deal provably no longer exists,
-                    # so its absence must never be read as an external
-                    # cancel. A fold with a retained residual stays
-                    # tracked (its deal is live on the venue).
+                    # ``fold_rebased_filled_at`` is only ever present on a
+                    # row persisted by a PRIOR process run's fold protocol
+                    # (new runs never write it). A zero-retained fold row
+                    # was closed in the same teardown that rebased it; the
+                    # exemption covers the crash window between the two
+                    # writes — that deal provably no longer exists, so its
+                    # absence must never be read as an external cancel. A
+                    # fold with a retained residual stays tracked (its
+                    # deal is live on the venue).
                     or ((row.extras or {}).get('fold_rebased_filled_at')
                         is not None and row.filled_qty <= 1e-9)
                 ),

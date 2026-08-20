@@ -7306,32 +7306,28 @@ def _seed_reversal_short_leg(ctx, *, coid='coid-short', deal_id='deal-short',
     return coid
 
 
-def __test_process_activity_reversal_netting_close_is_suppressed__(tmp_path):
-    """Regression: a short→long reversal on a one-way (netting) account
-    must not double-count the venue's netting-close of the old short.
+def __test_process_activity_close_is_yielded_with_a_live_opposite_row__(tmp_path):
+    """A confirmed row's close activity must reach the engine even when a
+    newer opposite live entry row exists.
 
-    The Order Sync Engine folds the Pine reversal into a single 200-unit
-    BUY dispatched through ``execute_entry``; the venue closes the 100-unit
-    short and opens a fresh 100-unit long. The engine already booked the
-    whole flip via the folded ENTRY fill, so the short's netting-close must
-    NOT be surfaced as a second ``LegType.CLOSE`` fill — routing it would
-    add a buy-100 onto the freshly-opened long (``record_fill``'s opening
-    branch), leaving the engine long by 200 and stranding the strategy's
-    position-size-gated final close (observed live 2026-07-20 as
-    ``position=100`` at shutdown with no close dispatched).
-
-    With the fresh opposite (long) entry row present, the short's
-    netting-close activity must be SUPPRESSED (no event yielded) while the
-    natural-close teardown still stamps the row.
+    Under the close-then-open reversal protocol every dispatched entry is a
+    pure add into a flat book — the venue never nets our own entries — so a
+    close on a confirmed row is always a genuine reducing fill the engine
+    must book. The fold-era suppression read the live opposite row as proof
+    of a netting close and dropped the fill (measured live: the old short's
+    SL close was ignored, the engine kept a phantom short book and looped
+    ``no confirmed position rows`` rejects until the external-flatten
+    detector cleared it). The natural-close teardown must still stamp the
+    closed row.
     """
     broker, store, ctx = _make_broker(tmp_path)
     short_coid = _seed_reversal_short_leg(ctx)
-    # The folded reversal entry: a fresh, still-live LONG on the same
-    # symbol, opposite the short, created after it.
+    # The reversal entry that opened AFTER the book settled flat: a fresh,
+    # still-live LONG on the same symbol (pure add, no netting involved).
     ctx.upsert_order(
-        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        'coid-long', symbol='EURUSD', side='buy', qty=100.0,
         state='confirmed', pine_entry_id='LAB-CAP-REV-L',
-        exchange_order_id='deal-long', filled_qty=200.0,
+        exchange_order_id='deal-long', filled_qty=100.0,
         extras={'kind': 'position', 'confirm_level': 1.14162,
                 'entry_filled_at': 1700000001.0},
     )
@@ -7347,52 +7343,52 @@ def __test_process_activity_reversal_netting_close_is_suppressed__(tmp_path):
 
     async def drain():
         out = []
-        # No positions snapshot → the netted deal is absent → full close.
+        # No positions snapshot -> the closed deal is absent -> full close.
         async for ev in broker._process_activity([activity]):
             out.append(ev)
         return out
 
     events = asyncio.run(drain())
-    assert events == [], (
-        "the short's reversal-netting close must be suppressed (the engine "
-        "already booked the flip via the folded reversal entry); yielding "
-        f"it double-counts. Got {events!r}"
+    assert len(events) == 1, (
+        f"the close fill must reach the engine; got {events!r}"
     )
-    # Teardown still ran so reconcile does not later stamp missing_pending.
+    ev = events[0]
+    assert ev.event_type == 'filled'
+    assert ev.fill_qty == 100.0
+    assert ev.fill_price == 1.14162
     short_row = ctx.get_order(short_coid)
     assert short_row is not None
     assert (short_row.extras or {}).get('natural_close_at') is not None, (
-        "the suppressed close must still stamp natural_close_at so the "
+        "the yielded close must still stamp natural_close_at so the "
         "missing-pending watchdog does not raise a false UnexpectedCancel"
     )
     kinds = [r['kind'] for r in ctx._store._conn.execute(
         "SELECT kind FROM events WHERE run_instance_id = ?",
         (ctx.run_instance_id,),
     )]
-    assert 'reversal_netting_close_suppressed' in kinds
+    assert 'reversal_netting_close_suppressed' not in kinds
     store.close()
 
 
-def __test_process_activity_reversal_netting_close_suppressed_lagging_snapshot__(tmp_path):
-    """Regression: the reversal-netting suppression must not depend on the
-    same-poll ``/positions`` snapshot.
+def __test_process_activity_close_with_stale_snapshot_takes_the_breadcrumb_path__(tmp_path):
+    """With ``/positions`` still showing the deal alive, the close is
+    yielded and the row gets the ``close_event_yielded_at`` breadcrumb
+    instead of an immediate teardown.
 
-    In the "/history/activity ahead of /positions" race the snapshot can
-    still show the netted short deal alive (size > 0) while the venue has
-    already closed it. Routing the netting-close through the
-    partial-close breadcrumb path in that window would yield the
-    double-counting CLOSE fill and reproduce the stranded-position bug
-    (engine long 200 instead of 100, final close never dispatched). The
-    live opposite entry row proves the netting on a one-way account, so
-    the close must be suppressed and torn down regardless of the stale
-    snapshot.
+    This is the "/history/activity ahead of /positions" race: the fill is
+    genuine (the engine needs it), but the same-poll snapshot cannot prove
+    the deal retired — a later poll either sees the deal gone (the
+    breadcrumb upgrades to a teardown) or a live remainder (partial
+    reduction). The fold-era shortcut that tore the row down on the
+    live-opposite-row signal is gone: a live opposite row is a normal
+    state under close-then-open and proves nothing about this deal.
     """
     broker, store, ctx = _make_broker(tmp_path)
     short_coid = _seed_reversal_short_leg(ctx)
     ctx.upsert_order(
-        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        'coid-long', symbol='EURUSD', side='buy', qty=100.0,
         state='confirmed', pine_entry_id='LAB-CAP-REV-L',
-        exchange_order_id='deal-long', filled_qty=200.0,
+        exchange_order_id='deal-long', filled_qty=100.0,
         extras={'kind': 'position', 'confirm_level': 1.14162,
                 'entry_filled_at': 1700000001.0},
     )
@@ -7404,9 +7400,8 @@ def __test_process_activity_reversal_netting_close_suppressed_lagging_snapshot__
         'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
         'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
     }
-    # STALE snapshot: /positions still carries the netted short at full
-    # size — exactly the lag race the breadcrumb machinery elsewhere in
-    # ``_process_activity`` exists for.
+    # STALE snapshot: /positions still carries the closed short at full
+    # size — the lag race the breadcrumb machinery exists for.
     positions_by_deal = {
         'deal-short': {'position': {'dealId': 'deal-short',
                                     'size': 100.0, 'level': 1.14156}},
@@ -7421,47 +7416,40 @@ def __test_process_activity_reversal_netting_close_suppressed_lagging_snapshot__
         return out
 
     events = asyncio.run(drain())
-    assert events == [], (
-        "the netting close must be suppressed even while the same-poll "
-        "/positions snapshot still shows the netted deal alive; got "
-        f"{events!r}"
+    assert len(events) == 1, (
+        f"the close fill must be yielded in the lag race too; got {events!r}"
     )
     short_row = ctx.get_order(short_coid)
     assert short_row is not None
     short_extras = short_row.extras or {}
-    assert short_extras.get('natural_close_at') is not None, (
-        "the stale-snapshot suppression must still tear the row down — "
-        "the breadcrumb path would let a two-poll lag clear the "
-        "breadcrumb and end in a false UnexpectedCancelError"
+    assert short_extras.get('close_event_yielded_at') is not None, (
+        "the still-alive snapshot must route through the breadcrumb path "
+        "so a later poll can resolve full-close vs partial reduction"
     )
-    assert 'close_event_yielded_at' not in short_extras, (
-        "the reversal netting close must take the teardown path, not the "
-        "partial-close breadcrumb path"
+    assert short_extras.get('natural_close_at') is None, (
+        "no teardown while the snapshot still shows live exposure — "
+        "stamping it would orphan a genuine partial remainder"
     )
-    kinds = [r['kind'] for r in ctx._store._conn.execute(
-        "SELECT kind FROM events WHERE run_instance_id = ?",
-        (ctx.run_instance_id,),
-    )]
-    assert 'reversal_netting_close_suppressed' in kinds
     store.close()
 
 
-def __test_process_activity_reversal_netting_close_priceless_not_deferred__(tmp_path):
-    """Regression: a PRICELESS reversal netting-close (Capital.com left
-    ``level`` empty) must be suppressed immediately, not deferred.
+def __test_process_activity_priceless_close_is_deferred_not_suppressed__(tmp_path):
+    """A close with no resolvable price defers to the next poll even when
+    a newer opposite live entry row exists.
 
-    The defer guard exists to avoid yielding ``fill_price=0`` closes, but
-    a reversal netting-close is never yielded at all — deferring it would
-    loop until the activity rolls out of the 60s window, leaving the row
-    without its ``natural_close_at`` teardown and eventually tripping a
-    false unexpected-cancel on a perfectly healthy reversal.
+    The fold-era exemption suppressed such closes outright (their fill was
+    dropped anyway, so the price was irrelevant); now the fill is needed by
+    the engine, so the generic defer guard holds the activity back until a
+    price surfaces — yielding ``fill_price=0`` would make ``record_fill``
+    skip the reduction while the teardown stamp suppressed reconcile
+    recovery.
     """
     broker, store, ctx = _make_broker(tmp_path)
     short_coid = _seed_reversal_short_leg(ctx)
     ctx.upsert_order(
-        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        'coid-long', symbol='EURUSD', side='buy', qty=100.0,
         state='confirmed', pine_entry_id='LAB-CAP-REV-L',
-        exchange_order_id='deal-long', filled_qty=200.0,
+        exchange_order_id='deal-long', filled_qty=100.0,
         extras={'kind': 'position', 'confirm_level': 1.14162,
                 'entry_filled_at': 1700000001.0},
     )
@@ -7483,42 +7471,33 @@ def __test_process_activity_reversal_netting_close_priceless_not_deferred__(tmp_
 
     events = asyncio.run(drain())
     assert events == [], (
-        f"the priceless netting close must be suppressed; got {events!r}"
+        f"a priceless close must defer, not yield fill_price=0; got {events!r}"
     )
     short_row = ctx.get_order(short_coid)
     assert short_row is not None
-    assert (short_row.extras or {}).get('natural_close_at') is not None
+    assert (short_row.extras or {}).get('natural_close_at') is None, (
+        "a deferred close must not stamp the teardown — the fill has not "
+        "reached the engine yet"
+    )
     kinds = [r['kind'] for r in ctx._store._conn.execute(
         "SELECT kind FROM events WHERE run_instance_id = ?",
         (ctx.run_instance_id,),
     )]
-    assert 'reversal_netting_close_suppressed' in kinds
-    assert 'activity_close_deferred_no_price' not in kinds, (
-        "a suppressed netting close needs no price — deferring it would "
-        "strand the teardown past the 60s activity window"
-    )
+    assert 'activity_close_deferred_no_price' in kinds
     store.close()
 
 
-def __test_process_activity_reversal_fold_entry_fill_uses_full_order_qty__(tmp_path):
-    """Regression: the folded reversal ENTRY fill must carry the full traded
-    quantity, not the venue's netted residual.
+def __test_process_activity_entry_fill_size_is_the_activity_size__(tmp_path):
+    """An ENTRY fill reports the venue activity's size — never ``row.qty``.
 
-    On a one-way (netting) account the Order Sync Engine folds a short→long
-    reversal into a single 200-unit BUY (``new_qty + |short|``). The venue
-    nets the 100-unit short and opens only the 100-unit residual long, so the
-    residual deal's POSITION activity reports ``details.size == 100``. Feeding
-    that to ``BrokerPosition.record_fill`` closes the short to flat and never
-    flips to long, stranding the strategy's position-size-gated final close
-    (observed live 2026-07-20 as an intermediate flat with a residual long
-    left on the venue). The plugin must substitute the dispatched order qty
-    (200) so ``record_fill`` FIFO-closes the short AND opens the residual
-    long.
+    Under the close-then-open protocol every dispatched entry is a pure
+    add, so the POSITION activity's ``details.size`` IS the traded volume.
+    The fold-era substitution promoted it to ``row.qty`` whenever an
+    opposite live row existed, which would over-report a partial entry
+    fill as full the moment any opposite row lingered in the store.
     """
     broker, store, ctx = _make_broker(tmp_path)
     _seed_reversal_short_leg(ctx)
-    # The folded reversal entry row: dispatched 200 (100 residual + 100 to
-    # net the short), fully filled on the wire.
     ctx.upsert_order(
         'coid-long', symbol='EURUSD', side='buy', qty=200.0,
         state='confirmed', pine_entry_id='LAB-CAP-REV-L',
@@ -7527,8 +7506,6 @@ def __test_process_activity_reversal_fold_entry_fill_uses_full_order_qty__(tmp_p
     )
     ctx.add_ref('coid-long', 'deal_id', 'deal-long')
 
-    # The residual long's POSITION activity — venue reports the netted
-    # residual size (100), same direction as the entry row (BUY).
     activity = {
         'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-long',
         'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
@@ -7543,41 +7520,36 @@ def __test_process_activity_reversal_fold_entry_fill_uses_full_order_qty__(tmp_p
         return out
 
     events = asyncio.run(drain())
-    assert len(events) == 1, f"the folded entry fill must be yielded; got {events!r}"
+    assert len(events) == 1, f"the entry fill must be yielded; got {events!r}"
     ev = events[0]
     assert ev.leg_type == LegType.ENTRY
     assert ev.order.side == 'buy'
-    assert ev.fill_qty == 200.0, (
-        "the folded reversal entry fill must carry the full dispatched order "
-        f"qty (200) so record_fill flips short→long, not the netted residual; "
-        f"got fill_qty={ev.fill_qty!r}"
+    assert ev.fill_qty == 100.0, (
+        "the activity's own size is the traded volume of a pure-add entry; "
+        f"substituting row.qty would fabricate exposure; got {ev.fill_qty!r}"
     )
-    assert ev.order.filled_qty == 200.0
-    assert ev.order.remaining_qty == 0.0
     store.close()
 
 
-def __test_reversal_netting_close_rebases_the_journal_to_retained_exposure__(tmp_path):
-    """The journal's live-row signed sum must equal the venue net after a fold.
+def __test_natural_close_retires_only_the_closed_rows_exposure__(tmp_path):
+    """The natural-close teardown must not touch any other live row.
 
-    The folded reversal's confirm records the EXECUTED volume (the 200-unit
-    BUY), but the venue only retains the 100-unit residual. Left alone, the
-    live rows sum to +200 once the netted short is torn down — the startup
-    adoption clamp and the cycle-end reconciliation both over-state the run's
-    exposure by the netted amount (measured live 2026-08-14 as ``venue holds
-    -200, the run's journal owns -400``). Processing the short's netting
-    close must therefore (1) zero the short row's cursor — the venue holds
-    none of it — and (2) rebase the fold row's cursor to the retained
-    residual, leaving the signed sum at exactly the venue net. ``row.qty``
-    stays untouched: it is the authoritative traded volume for the fold-size
-    substitution on the ENTRY fill.
+    The fold-era rebase dropped the newest opposite live entry row's
+    cursor by the retired exposure and CLOSED the row when the cursor hit
+    zero. Under close-then-open that row is a genuine pure-add entry —
+    zeroing and closing it at birth is what broke the live reversal: the
+    engine's ``reversal_close`` could no longer target the deal
+    ("no confirmed position rows" reject loop) and the deal's own SL fill
+    was classified external and ignored, leaving a phantom book position.
     """
     broker, store, ctx = _make_broker(tmp_path)
     short_coid = _seed_reversal_short_leg(ctx)
+    # Equal-size fresh opposite entry — the exact shape the fold rebase
+    # used to zero AND close in the same teardown.
     ctx.upsert_order(
-        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
+        'coid-long', symbol='EURUSD', side='buy', qty=100.0,
         state='confirmed', pine_entry_id='LAB-CAP-REV-L',
-        exchange_order_id='deal-long', filled_qty=200.0,
+        exchange_order_id='deal-long', filled_qty=100.0,
         extras={'kind': 'position', 'confirm_level': 1.14162,
                 'entry_filled_at': 1700000001.0},
     )
@@ -7597,34 +7569,37 @@ def __test_reversal_netting_close_rebases_the_journal_to_retained_exposure__(tmp
         return out
 
     events = asyncio.run(drain())
-    assert events == []  # netting close suppressed (covered elsewhere)
+    assert len(events) == 1
 
     short_row = ctx.get_order(short_coid)
     assert short_row is not None
     assert short_row.filled_qty == 0.0, (
-        "the netted short's journal cursor must drop to zero — the venue "
+        "the closed short's journal cursor must drop to zero — the venue "
         f"holds none of it; got {short_row.filled_qty!r}"
     )
     long_row = ctx.get_order('coid-long')
     assert long_row is not None
-    assert long_row.qty == 200.0, "the traded volume must never change"
     assert long_row.filled_qty == 100.0, (
-        "the fold row's cursor must land on the venue-retained residual "
-        f"(200 executed - 100 netted); got {long_row.filled_qty!r}"
+        "the fresh opposite entry row's cursor must be untouched; got "
+        f"{long_row.filled_qty!r}"
     )
-    assert (long_row.extras or {}).get('fold_rebased_filled_at') is not None
+    assert (long_row.extras or {}).get('fold_rebased_filled_at') is None
+    live_coids = {r.client_order_id for r in ctx.iter_live_orders()}
+    assert 'coid-long' in live_coids, (
+        "the fresh opposite entry row must stay live and targetable — "
+        "closing it at birth is the measured reject-loop incident"
+    )
 
-    # The exact computation the startup adoption clamp and the cycle-end
-    # checker run: signed sum of live rows' cursors. It must equal the
-    # venue net (+100 residual long) so a restart adopts the right size
-    # and a reversal cycle passes the end-of-cycle comparison.
+    # The computation the startup adoption clamp and the cycle-end checker
+    # run: signed sum of live rows' cursors must equal the venue net
+    # (+100, the fresh long).
     owned = 0.0
     for r in ctx.iter_live_orders():
         if r.filled_qty == 0.0 or (r.extras or {}).get('adopted_startup'):
             continue
         owned += r.filled_qty if r.side == 'buy' else -r.filled_qty
     assert owned == 100.0, (
-        f"journal owned sum must equal the venue net after the fold; got {owned!r}"
+        f"journal owned sum must equal the venue net; got {owned!r}"
     )
 
     kinds = [r['kind'] for r in ctx._store._conn.execute(
@@ -7632,68 +7607,8 @@ def __test_reversal_netting_close_rebases_the_journal_to_retained_exposure__(tmp
         (ctx.run_instance_id,),
     )]
     assert 'journal_exposure_retired' in kinds
-    assert 'reversal_fold_filled_qty_rebased' in kinds
-    store.close()
-
-
-def __test_fully_netted_fold_row_is_closed_not_left_for_the_tracker__(tmp_path):
-    """A fold whose whole executed volume netted opposite deals must close.
-
-    The live incident (2026-08-15, BTCUSD flat bot): a 0.02 BUY fold netted
-    the account's 0.02 aggregate short exactly, so the venue retained NO
-    residual deal for the fold's deal id. The rebase landed the fold row's
-    cursor on 0.0 but left the row live — the disappearance tracker then
-    found no venue counterpart in either namespace, and after its grace the
-    'stop' policy quarantined the engine for the rest of the cycle. A
-    zero-retained rebase is a PROVEN venue absence, not a disappearance:
-    the row must be closed in the same teardown so the tracker never
-    watches it.
-    """
-    broker, store, ctx = _make_broker(tmp_path)
-    short_coid = _seed_reversal_short_leg(ctx, qty=200.0)
-    ctx.upsert_order(
-        'coid-long', symbol='EURUSD', side='buy', qty=200.0,
-        state='confirmed', pine_entry_id='LAB-CAP-REV-L',
-        exchange_order_id='deal-long', filled_qty=200.0,
-        extras={'kind': 'position', 'confirm_level': 1.14162,
-                'entry_filled_at': 1700000001.0},
-    )
-    ctx.add_ref('coid-long', 'deal_id', 'deal-long')
-
-    activity = {
-        'dateUTC': '2026-07-20T19:38:40.373', 'dealId': 'deal-short',
-        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
-        'epic': 'EURUSD', 'size': 200.0, 'level': 1.14162,
-        'details': {'direction': 'BUY', 'size': 200.0, 'level': 1.14162},
-    }
-
-    async def drain():
-        out = []
-        async for ev in broker._process_activity([activity]):
-            out.append(ev)
-        return out
-
-    events = asyncio.run(drain())
-    assert events == []  # netting close suppressed
-
-    short_row = ctx.get_order(short_coid)
-    assert short_row is not None and short_row.filled_qty == 0.0
-    long_row = ctx.get_order('coid-long')
-    assert long_row is not None
-    assert long_row.filled_qty == 0.0, (
-        "the fold retained nothing on the venue; got "
-        f"{long_row.filled_qty!r}"
-    )
-    live_coids = {r.client_order_id for r in ctx.iter_live_orders()}
-    assert 'coid-long' not in live_coids, (
-        "a fully-netted fold row must be closed, not left live for the "
-        "disappearance tracker to quarantine on"
-    )
-    kinds = [r['kind'] for r in ctx._store._conn.execute(
-        "SELECT kind FROM events WHERE run_instance_id = ?",
-        (ctx.run_instance_id,),
-    )]
-    assert 'reversal_fold_fully_netted' in kinds
+    assert 'reversal_fold_filled_qty_rebased' not in kinds
+    assert 'reversal_fold_fully_netted' not in kinds
     store.close()
 
 
