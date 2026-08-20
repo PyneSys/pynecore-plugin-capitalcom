@@ -1084,6 +1084,56 @@ def __test_execute_close_full_deletes_position__(tmp_path):
     store.close()
 
 
+def __test_execute_close_over_an_in_flight_delete_is_a_skip_not_a_reject__(tmp_path):
+    """A close finding only ``closing`` rows declines instead of rejecting.
+
+    A DELETE mirrors its target row to ``closing`` until the activity
+    confirm lands (~a minute on Capital.com). A close re-issued inside
+    that window (the engine's stale-sync reversal redispatch, or a keyed
+    close racing the settle) must not report a venue reject — the whole
+    owned exposure is already being flattened, so the plugin declines
+    with a non-counting skip and no venue call.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={})
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='closing', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='__pyne_reversal_close__S', symbol='EURUSD',
+            side='sell', qty=1.0, synthetic_kind='reversal_close',
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_close(env))
+    assert exc.value.reason == 'close_already_in_flight'
+    assert not any(c[1] == 'delete' for c in broker._calls)
+    store.close()
+
+
+def __test_execute_close_scoped_to_another_entry_still_rejects__(tmp_path):
+    """The in-flight decline honours keyed-close ownership scope.
+
+    A ``closing`` row belonging to a DIFFERENT Pine entry must not
+    satisfy a keyed close: that close owns no exposure at all, which
+    stays a real reject.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={})
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='closing', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Other', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_close(env))
+    store.close()
+
+
 def __test_synthetic_partial_bracket_close_routes_through_execute_close__(tmp_path):
     """The engine's synthetic partial-bracket close key survives execute_close.
 

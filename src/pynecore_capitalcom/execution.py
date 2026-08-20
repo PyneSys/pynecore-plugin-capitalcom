@@ -1508,6 +1508,36 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     )
 
         if not targets:
+            # A DELETE mirrors its target row to ``closing`` until the venue's
+            # activity confirm lands (~a minute on Capital.com), so a re-issued
+            # close inside that window finds no ``confirmed`` row even though
+            # the whole owned exposure is already being flattened. That is not
+            # an anomaly to reject — the close intent is satisfied by the
+            # in-flight DELETE; declining lets the engine re-evaluate against
+            # the settled book next sync without a counting error.
+            closing_rows: list['OrderRow'] = []
+            if self.store_ctx is not None:
+                for row in self.store_ctx.iter_live_orders(symbol=intent.symbol):
+                    extras = row.extras or {}
+                    if (row.state == 'closing'
+                            and extras.get('kind') == 'position'
+                            and (target_entry_id is None
+                                 or row.pine_entry_id == target_entry_id)):
+                        closing_rows.append(row)
+            if closing_rows:
+                raise OrderSkippedByPlugin(
+                    f"Capital execute_close: every owned position row for "
+                    f"symbol={intent.symbol!r} is already closing "
+                    f"({len(closing_rows)} in-flight DELETE(s)); nothing to "
+                    f"dispatch",
+                    intent_key=intent.intent_key,
+                    reason='close_already_in_flight',
+                    context={
+                        'symbol': intent.symbol,
+                        'closing_deal_ids': [
+                            row.exchange_order_id for row in closing_rows],
+                    },
+                )
             raise ExchangeOrderRejectedError(
                 f"Capital execute_close: no confirmed position rows for "
                 f"symbol={intent.symbol!r}",
