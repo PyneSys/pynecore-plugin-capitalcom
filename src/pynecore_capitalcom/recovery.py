@@ -685,11 +685,17 @@ class _CapitalComResumeHooks:
     ) -> ResumeOutcome:
         """Verdict for a ``server_ref_seen`` row.
 
-        Direct ``/confirms/{ref}`` GET first
-        (``recovery_path='confirm_get_direct'``); on
-        :class:`OrderNotFoundError` (TTL expiry) the verdict falls back
-        to the snapshot map (``recovery_path='ttl_fallback_snapshot'``).
-        Without a usable ``deal_id`` the verdict is ``still_unknown``.
+        Direct ``/confirms/{ref}`` GET first: ``dealStatus=REJECTED``
+        → rejected; an accepted deal still present in a position or
+        working-order snapshot → confirmed unfilled
+        (``recovery_path='confirm_get_direct'``); an accepted deal
+        absent from both snapshots → rejected
+        (``recovery_path='confirm_get_stale_deal'``) — the confirms
+        cache outlives the deal itself, so a stale confirm must not
+        fabricate a live order. On :class:`OrderNotFoundError` (TTL
+        expiry) the verdict falls back to the snapshot map
+        (``recovery_path='ttl_fallback_snapshot'``). Without a usable
+        ``deal_id`` the verdict is ``still_unknown``.
 
         The ``deal_reference`` is sourced from ``refs`` first and from
         ``extras`` only as a fallback: the alias is committed to
@@ -740,6 +746,14 @@ class _CapitalComResumeHooks:
                 },
             )
 
+        deal_status = (confirm.get('dealStatus') or '').upper()
+        if deal_status == 'REJECTED':
+            return ResumeOutcome(
+                status='rejected',
+                reject_reason=_extract_reject_reason(confirm),
+                recovery_path='confirm_get_rejected',
+                recovery_context={'deal_reference': ref},
+            )
         deal_id = None
         affected = confirm.get('affectedDeals') or []
         if affected:
@@ -751,14 +765,33 @@ class _CapitalComResumeHooks:
                 status='still_unknown',
                 recovery_path='confirm_get_no_deal_id',
             )
+        deal_id = str(deal_id)
+        # An accepted confirm alone does not prove the deal is still
+        # alive: the confirms cache outlives the deal (a market entry
+        # from a long-dead session confirms "accepted" hours later).
+        # The account snapshots were taken at recovery start, after any
+        # resubmission POST — a live deal is necessarily present in one
+        # of them, so absence from both is conclusive. Only then do we
+        # confirm an unfilled order; fill stamping stays with the
+        # surviving-entry sweep / engine reconcile.
+        if deal_id in self.pos_by_deal_id or deal_id in self.wo_by_deal_id:
+            return ResumeOutcome(
+                status='confirmed',
+                exchange_id=deal_id,
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
+                recovery_path='confirm_get_direct',
+                recovery_context={'deal_reference': ref},
+            )
         return ResumeOutcome(
-            status='confirmed',
-            exchange_id=str(deal_id),
-            is_filled=False,
-            filled_qty=0.0,
-            fill_price=0.0,
-            recovery_path='confirm_get_direct',
-            recovery_context={'deal_reference': ref},
+            status='rejected',
+            reject_reason=(
+                'accepted deal no longer present in any account snapshot '
+                '(stale confirm for a dead deal)'
+            ),
+            recovery_path='confirm_get_stale_deal',
+            recovery_context={'deal_reference': ref, 'deal_id': deal_id},
         )
 
     async def _verdict_modify_entry(

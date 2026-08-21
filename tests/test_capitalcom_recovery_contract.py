@@ -218,7 +218,12 @@ def __test_recovery_contract_confirm_get_direct__(tmp_path):
     Pins ``recovery.py:320-339``.
     """
     broker, store, ctx = _open_broker(tmp_path, responses={
-        ('positions', 'get'): {'positions': []},
+        # The confirmed deal must be alive in a snapshot — a confirm
+        # whose deal is absent from both snapshots is stale (the
+        # confirms cache outlives the deal) and resolves to rejected.
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'DEAL-4'}},
+        ]},
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': []},
         ('confirms/REF-4', 'get'): {
@@ -238,6 +243,92 @@ def __test_recovery_contract_confirm_get_direct__(tmp_path):
 
     _assert_confirmed_contract(
         ctx, coid='coid-confirm', deal_id='DEAL-4',
+    )
+    store.close()
+
+
+def _assert_rejected_contract(ctx, *, coid: str, recovery_path: str) -> None:
+    """Assert the row was terminally rejected with the given path."""
+    import json as _json
+    row = ctx.get_order(coid)
+    assert row is not None, f"Order row {coid!r} missing after recovery"
+    assert row.state == 'rejected', (
+        f"Expected state='rejected' after recovery, got {row.state!r}"
+    )
+    cur = ctx._store._conn.execute(
+        "SELECT payload FROM events "
+        "WHERE kind = 'recovered_rejected' AND client_order_id = ?",
+        (coid,),
+    )
+    rows = cur.fetchall()
+    assert len(rows) == 1, (
+        f"Expected exactly one recovered_rejected event for {coid!r}, "
+        f"got {len(rows)}"
+    )
+    payload = _json.loads(rows[0][0]) if rows[0][0] else {}
+    assert payload.get('recovery_path') == recovery_path, (
+        f"Expected recovery_path={recovery_path!r}, "
+        f"got {payload.get('recovery_path')!r}"
+    )
+
+
+def __test_recovery_contract_confirm_get_rejected__(tmp_path):
+    """``server_ref_seen`` row, direct ``/confirms`` GET reports
+    ``dealStatus=REJECTED`` — terminal rejection, no live order row.
+    """
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+        ('confirms/REF-RJ', 'get'): {
+            'dealStatus': 'REJECTED', 'status': 'REJECTED',
+            'reason': 'INSUFFICIENT_FUNDS',
+        },
+    })
+    ctx.upsert_order(
+        'coid-rej', symbol='EURUSD', side='buy', qty=1.0,
+        state='server_ref_seen', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'position', 'order_type': 'market',
+                'deal_reference': 'REF-RJ'},
+    )
+    ctx.add_ref('coid-rej', 'deal_reference', 'REF-RJ')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    _assert_rejected_contract(
+        ctx, coid='coid-rej', recovery_path='confirm_get_rejected',
+    )
+    store.close()
+
+
+def __test_recovery_contract_confirm_get_stale_deal_rejects__(tmp_path):
+    """``server_ref_seen`` row whose accepted confirm points at a deal
+    absent from both account snapshots — the confirms cache outlives
+    the deal, so a stale confirm from a long-dead submission must not
+    fabricate a live unfilled order (which would trip the
+    unexpected-cancel quarantine seconds later). Terminal rejection.
+    """
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+        ('confirms/REF-ST', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'OPEN',
+            'dealId': 'DEAL-STALE', 'level': 1.1, 'size': 1.0,
+        },
+    })
+    ctx.upsert_order(
+        'coid-stale', symbol='EURUSD', side='buy', qty=1.0,
+        state='server_ref_seen', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'position', 'order_type': 'market',
+                'deal_reference': 'REF-ST'},
+    )
+    ctx.add_ref('coid-stale', 'deal_reference', 'REF-ST')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    _assert_rejected_contract(
+        ctx, coid='coid-stale', recovery_path='confirm_get_stale_deal',
     )
     store.close()
 
@@ -264,6 +355,9 @@ def __test_recovery_contract_journal_resolutions__(tmp_path):
             {'position': {'dealReference': 'REF-A', 'dealId': 'DEAL-A'}},
             # row 3 ttl-fallback hit
             {'position': {'dealReference': 'REF-C', 'dealId': 'DEAL-C'}},
+            # row 4 confirm-get hit — the deal must be alive in a
+            # snapshot for the direct confirm to count.
+            {'position': {'dealId': 'DEAL-D'}},
         ]},
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': [
