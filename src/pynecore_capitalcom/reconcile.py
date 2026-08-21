@@ -26,12 +26,14 @@ from abc import ABC
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator
 
+import httpx
+
 from pynecore.core.broker.disappearance import (
     DisappearanceTracker,
     MissingConfirmation,
     MissingResolution,
 )
-from pynecore.core.broker.exceptions import BrokerError
+from pynecore.core.broker.exceptions import BrokerError, ExchangeConnectionError
 from pynecore.core.broker.journal import (
     DispatchJournal,
     ReconcileOutcome,
@@ -44,14 +46,23 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
     KIND_PARTIAL_CLOSE,
     mark_close_completed,
+    mark_confirmed_with_fill,
     mark_rejected,
 )
 
 from ._base import _CapitalComBase
-from .exceptions import OrderNotFoundError
-from .helpers import _POLL_INTERVAL_S, _wire_float, _wire_id, _wire_int
+from .exceptions import CapitalComError, OrderNotFoundError
+from .helpers import (
+    _POLL_INTERVAL_S,
+    _extract_reject_reason,
+    _wire_float,
+    _wire_id,
+    _wire_int,
+)
 from .models import _compute_cumulative_fill
 
 if TYPE_CHECKING:
@@ -94,6 +105,9 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         # creates them atomically).
         bracket_resolutions: dict[str, bool] = {}
         await self._resolve_partial_close_dispositions(positions_by_deal)
+        async for parked_event in self._resolve_parked_submission_dispositions(
+                positions_by_deal):
+            yield parked_event
         # Mirror tracker for legs that ``_record_bracket_resolution`` flips
         # to ``confirmed`` in this batch — keyed on parent COID. Used by
         # the aggregate flush below to retire ``confirmed`` siblings when
@@ -488,6 +502,175 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             },
             now_ts,
         )
+
+    async def _resolve_parked_submission_dispositions(
+            self, positions_by_deal: dict[str, dict],
+    ) -> AsyncIterator[OrderEvent]:
+        """Retry the confirms lookup for parked NEW entry submissions.
+
+        ``confirm_submission`` parks a dispatch as
+        ``disposition_unknown`` when ``GET confirms/{dealReference}``
+        fails (transport error, or the venue's transient
+        ``error.not-found.dealReference`` glitch on a reference its own
+        POST just allocated). Such a row carries only the
+        ``deal_reference`` alias — no ``dealId`` — so it is invisible to
+        every other recovery path: ``get_open_orders`` maps venue rows
+        back to COIDs through the ``deal_id`` alias, and the snapshot
+        loop skips rows without ``exchange_order_id``. Without this
+        resolver the park never clears; if the POST actually landed, the
+        live venue order survives the run untracked (measured on the
+        Capital.com lane, 2026-08-21: a limit entry POSTed during a
+        confirms glitch stayed working on the venue after the cycle-end
+        flat sweep, because the engine-side cancel had no order id to
+        target).
+
+        Each poll retries the confirms GET for every live entry row in
+        ``disposition_unknown`` that has a ``deal_reference`` but no
+        ``exchange_order_id``:
+
+        * confirm ``REJECTED`` → the POST executed nothing; mark the row
+          rejected and write a ``'rejected'`` resolution so the engine
+          re-dispatches the Pine intent.
+        * confirm accepted with a ``dealId`` → the dispatch is live.
+          Persist the id (``deal_id`` alias + ``exchange_order_id``) so
+          the ordinary machinery takes over: a working order now maps in
+          ``get_open_orders`` (the engine promotes the park and can
+          cancel/amend it), and a market fill is emitted right here from
+          the poll's own ``/positions`` snapshot — the fill activity is
+          long past Capital.com's 60s history window by recovery time,
+          so no other path would ever deliver it. A market confirm whose
+          deal is not in the snapshot stays parked: fill-then-close
+          within the glitch window is indistinguishable from a
+          confirms/positions race, and a later poll (or the cycle-end
+          verdict) resolves it honestly.
+        * transport error / still not found → stay parked; the next
+          poll retries. The glitch windows measured on this venue span
+          minutes, the confirms ledger indexes the reference eventually.
+        """
+        if self.store_ctx is None:
+            return
+        now_ts = epoch_time()
+        for row in list(self.store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            if (row.state != 'disposition_unknown'
+                    or row.exchange_order_id
+                    or extras.get('kind') not in (ENTRY_KIND_POSITION,
+                                                  ENTRY_KIND_WORKING)):
+                continue
+            deal_ref = _wire_id(extras.get('deal_reference'))
+            if deal_ref is None:
+                continue
+            try:
+                confirm = await self.call_api(
+                    f'confirms/{deal_ref}', method='get',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError,
+                    OrderNotFoundError, CapitalComError):
+                continue
+
+            coid = row.client_order_id
+            deal_status = (confirm.get('dealStatus') or '').upper()
+            if deal_status == 'REJECTED':
+                mark_rejected(self.store_ctx, coid=coid)
+                self.store_ctx.record_resolution(coid, 'rejected')
+                self.store_ctx.log_event(
+                    'parked_submission_rejected_on_retry',
+                    client_order_id=coid,
+                    intent_key=row.intent_key,
+                    payload={
+                        'deal_reference': deal_ref,
+                        'reason': _extract_reject_reason(confirm),
+                    },
+                )
+                continue
+
+            deal_id: str | None = None
+            affected = confirm.get('affectedDeals') or []
+            if affected:
+                deal_id = _wire_id(affected[0].get('dealId'))
+            if deal_id is None:
+                deal_id = _wire_id(confirm.get('dealId'))
+            if deal_id is None:
+                continue
+
+            if extras.get('kind') == ENTRY_KIND_POSITION:
+                pos_data = (positions_by_deal.get(deal_id) or {}) \
+                    .get('position') or {}
+                if not pos_data:
+                    continue
+                filled = float(pos_data.get('size') or row.qty)
+                fill_level = float(pos_data.get('level') or 0.0)
+                # mark_confirmed_with_fill owns the deal_id alias +
+                # exchange_order_id + state + fill in one transaction;
+                # apply_reconcile_outcome would only audit the id, not
+                # persist it. entry_filled_at is patched separately so
+                # manual-close detection treats the row as a live filled
+                # position.
+                mark_confirmed_with_fill(
+                    self.store_ctx,
+                    coid=coid,
+                    exchange_id=deal_id,
+                    is_filled=True,
+                    filled_qty=filled,
+                    fill_price=fill_level,
+                )
+                refreshed = self.store_ctx.get_order(coid)
+                merged = dict((refreshed.extras or {})
+                              if refreshed is not None else extras)
+                merged['entry_filled_at'] = now_ts
+                self.store_ctx.upsert_order(coid, extras=merged)
+                self.store_ctx.record_resolution(coid, 'attached')
+                self.store_ctx.log_event(
+                    'parked_submission_confirmed_on_retry',
+                    client_order_id=coid,
+                    exchange_order_id=deal_id,
+                    intent_key=row.intent_key,
+                    payload={'deal_reference': deal_ref, 'filled': filled},
+                )
+                yield OrderEvent(
+                    order=ExchangeOrder(
+                        id=deal_id, symbol=row.symbol, side=row.side,
+                        order_type=OrderType.MARKET,
+                        qty=row.qty, filled_qty=filled,
+                        remaining_qty=max(0.0, row.qty - filled),
+                        price=None, stop_price=None,
+                        average_fill_price=fill_level,
+                        status=OrderStatus.FILLED,
+                        timestamp=now_ts, fee=0.0, fee_currency='',
+                        reduce_only=False, client_order_id=coid,
+                    ),
+                    event_type='filled',
+                    fill_price=fill_level,
+                    fill_qty=filled,
+                    timestamp=now_ts,
+                    pine_id=row.pine_entry_id,
+                    from_entry=row.from_entry,
+                    leg_type=LegType.ENTRY,
+                )
+                continue
+
+            # Working order (limit/stop): learning the deal id is
+            # enough. ``get_open_orders`` resolves it back to the COID
+            # on the engine's next ``_verify_pending_dispatches`` pass,
+            # which promotes the parked envelope into ``_order_mapping``
+            # — no plugin-side resolution write, so the engine also
+            # learns the order id it needs for later cancel/amend.
+            mark_confirmed_with_fill(
+                self.store_ctx,
+                coid=coid,
+                exchange_id=deal_id,
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=None,
+            )
+            self.store_ctx.log_event(
+                'parked_submission_confirmed_on_retry',
+                client_order_id=coid,
+                exchange_order_id=deal_id,
+                intent_key=row.intent_key,
+                payload={'deal_reference': deal_ref},
+            )
 
     async def _resolve_partial_close_dispositions(
             self, positions_by_deal: dict[str, dict],

@@ -1433,6 +1433,145 @@ def __test_reconcile_rejects_corrected_reverse_with_unchanged_target__(tmp_path)
     store.close()
 
 
+def __test_parked_limit_submission_learns_its_deal_id_on_confirms_retry__(tmp_path):
+    # confirm_submission parked the limit entry on a confirms glitch: the
+    # row has a deal_reference but no dealId, so get_open_orders cannot map
+    # it back and the engine's park would never clear. The reconcile pass
+    # must retry the confirms GET and persist the learned deal id.
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-1', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-W1'}],
+        },
+    })
+    ctx.upsert_order('coid-limit', symbol='EURUSD', side='sell', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='S-OCA',
+                     extras={'kind': 'working', 'order_type': 'limit',
+                             'deal_reference': 'o-ref-1'})
+    ctx.add_ref('coid-limit', 'deal_reference', 'o-ref-1')
+    ctx.record_park(coid='coid-limit', key='S-OCA', kind='new')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {}, {'deal-W1': {'workingOrderData': {'dealId': 'deal-W1'}}},
+    )))
+
+    assert events == []
+    row = ctx.get_order('coid-limit')
+    assert row is not None and row.state == 'confirmed'
+    assert row.exchange_order_id == 'deal-W1'
+    mapped = ctx.find_by_ref('deal_id', 'deal-W1')
+    assert mapped is not None and mapped.client_order_id == 'coid-limit'
+    store.close()
+
+
+def __test_parked_market_submission_emits_the_fill_from_the_snapshot__(tmp_path):
+    # A parked MARKET entry that actually executed: by recovery time the
+    # fill activity is past Capital.com's 60s history window, so the
+    # resolver itself must emit the ENTRY fill from the /positions snapshot
+    # and write the 'attached' resolution that clears the engine's park.
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-2', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-M1'}],
+        },
+    })
+    ctx.upsert_order('coid-mkt', symbol='EURUSD', side='buy', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='L',
+                     extras={'kind': 'position', 'order_type': 'market',
+                             'deal_reference': 'o-ref-2'})
+    ctx.record_park(coid='coid-mkt', key='L', kind='new')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {'deal-M1': {'market': {'epic': 'EURUSD'},
+                     'position': {'dealId': 'deal-M1', 'direction': 'BUY',
+                                  'size': 1.0, 'level': 1.1}}}, {},
+    )))
+
+    fills = [ev for ev in events if ev.event_type == 'filled'
+             and ev.order.client_order_id == 'coid-mkt']
+    assert len(fills) == 1
+    assert fills[0].fill_qty == 1.0 and fills[0].fill_price == 1.1
+    row = ctx.get_order('coid-mkt')
+    assert row is not None and row.state == 'confirmed'
+    assert row.exchange_order_id == 'deal-M1' and row.filled_qty == 1.0
+    assert ctx.replay()[1]['coid-mkt'].resolution == 'attached'
+    store.close()
+
+
+def __test_parked_market_submission_without_its_position_stays_parked__(tmp_path):
+    # Accepted confirm but the deal is absent from the snapshot: fill-then-
+    # close inside the glitch window is indistinguishable from a
+    # confirms/positions race, so the row must stay parked for a later poll.
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-3', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-M2'}],
+        },
+    })
+    ctx.upsert_order('coid-race', symbol='EURUSD', side='buy', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='L',
+                     extras={'kind': 'position', 'order_type': 'market',
+                             'deal_reference': 'o-ref-3'})
+    ctx.record_park(coid='coid-race', key='L', kind='new')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+
+    assert events == []
+    row = ctx.get_order('coid-race')
+    assert row is not None and row.state == 'disposition_unknown'
+    assert row.exchange_order_id is None
+    assert ctx.replay()[1]['coid-race'].resolution is None
+    store.close()
+
+
+def __test_parked_submission_still_not_found_stays_parked__(tmp_path):
+    # The confirms glitch persists: no state change, no resolution — the
+    # next poll retries.
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'confirms/o-ref-4', 'get'): OrderNotFoundError(
+            'API error occured: error.not-found.dealReference',
+            ref_type='deal_reference'),
+    })
+    ctx.upsert_order('coid-nf', symbol='EURUSD', side='sell', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='S',
+                     extras={'kind': 'working', 'order_type': 'limit',
+                             'deal_reference': 'o-ref-4'})
+    ctx.record_park(coid='coid-nf', key='S', kind='new')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+
+    assert events == []
+    row = ctx.get_order('coid-nf')
+    assert row is not None and row.state == 'disposition_unknown'
+    assert row.exchange_order_id is None
+    assert ctx.replay()[1]['coid-nf'].resolution is None
+    store.close()
+
+
+def __test_parked_submission_rejected_on_retry_redispatches__(tmp_path):
+    # A definitive REJECTED confirm on the retry: terminal row + 'rejected'
+    # resolution so the engine re-dispatches the Pine intent.
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-5', 'get'): {
+            'dealStatus': 'REJECTED',
+            'rejectReason': 'RISK_CHECK',
+        },
+    })
+    ctx.upsert_order('coid-rej', symbol='EURUSD', side='sell', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='S',
+                     extras={'kind': 'working', 'order_type': 'limit',
+                             'deal_reference': 'o-ref-5'})
+    ctx.record_park(coid='coid-rej', key='S', kind='new')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+
+    assert events == []
+    row = ctx.get_order('coid-rej')
+    assert row is not None and row.state == 'rejected'
+    assert ctx.replay()[1]['coid-rej'].resolution == 'rejected'
+    store.close()
+
+
 def __test_reconcile_skips_observed_for_working_only_row__(tmp_path):
     # A working order carries no position-level bracket yet (pos is None), so
     # the feed must not fire — guarding the engine against a phantom confirm.
