@@ -2579,6 +2579,19 @@ f'confirms/{server_ref}', method='get',
                 client_order_id=coid,
                 cause=net if isinstance(net, Exception) else None,
             ) from net
+        except OrderNotFoundError as exc:
+            # ``error.not-found.dealReference`` on the confirms READ: the
+            # POST already went out and the venue may well have executed
+            # it — the confirm ledger just has not indexed the reference
+            # yet (observed live: the deal filled while the GET 404ed, and
+            # treating the miss as a terminal reject duplicated the entry).
+            # Park the dispatch as unknown so pending-verification recovery
+            # judges it from activity/positions instead of retrying blind.
+            raise OrderDispositionUnknownError(
+                f"Capital GET confirms/{server_ref} ambiguous: {exc}",
+                client_order_id=coid,
+                cause=exc,
+            ) from exc
         except CapitalComError as exc:
             # API error / unparseable body on the confirms READ: the POST
             # already went out, so its outcome stays unverified — park the

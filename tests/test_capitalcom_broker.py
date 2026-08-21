@@ -668,6 +668,30 @@ def __test_execute_entry_confirms_api_error_parks_as_unknown__(tmp_path):
     store.close()
 
 
+def __test_execute_entry_confirms_not_found_parks_as_unknown__(tmp_path):
+    """A 404 dealReference on the confirms READ is ambiguous, not a reject.
+
+    The POST already went out and the venue may well have executed it —
+    the confirm ledger just has not indexed the reference yet (observed
+    live: the deal filled while the GET 404ed, and treating the miss as a
+    terminal reject retried the entry into a duplicate). Park for
+    recovery like every other ambiguous confirms READ.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'post'): {'dealReference': 'ref-nf'},
+        ('error', 'confirms/ref-nf', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealReference",
+            ref_type='deal_reference',
+        ),
+    })
+    env = _entry_envelope()
+    with pytest.raises(OrderDispositionUnknownError) as exc:
+        asyncio.run(broker.execute_entry(env))
+    row = ctx.get_order(exc.value.client_order_id)
+    assert row is not None and row.state == 'disposition_unknown'
+    store.close()
+
+
 def __test_execute_entry_quantizes_qty_to_lot_step__(tmp_path):
     broker, store, _ = _make_broker(tmp_path, responses={
         ('positions', 'post'): {'dealReference': 'r'},
