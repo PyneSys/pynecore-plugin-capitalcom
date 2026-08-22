@@ -485,6 +485,32 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     self.store_ctx.upsert_order(
                         row.client_order_id, extras=base_extras,
                     )
+                # The journal ``filled_qty`` doubles as the run-owned
+                # exposure cursor (K3 cycle-end book + startup adoption
+                # clamp read the signed sum of live rows' cursors), and the
+                # activity stream is the ONLY fill source for a working
+                # entry whose promote raced ahead of the snapshot pass:
+                # once the row is ``kind='position'`` the snapshot's
+                # working→position stamp can never run, and a FULL fill is
+                # excluded from the partial-fill detector by design — so
+                # without this write the cursor would stay at zero forever
+                # (measured 2026-08-21, cycle 51: engine and venue both
+                # -0.01, journal owned 0 → K3 MISMATCH).
+                if (event.event_type == 'filled'
+                        and event.leg_type == LegType.ENTRY
+                        and not entry_fill_already_recorded
+                        and self.store_ctx is not None):
+                    refreshed = self.store_ctx.get_order(row.client_order_id)
+                    if refreshed is not None:
+                        cursor_fill = min(
+                            refreshed.qty,
+                            max(refreshed.filled_qty,
+                                float(event.fill_qty or 0.0)),
+                        )
+                        if cursor_fill > refreshed.filled_qty:
+                            self.store_ctx.upsert_order(
+                                row.client_order_id, filled_qty=cursor_fill,
+                            )
                 # Stamp the close-event breadcrumb / natural-close teardown
                 # BEFORE yielding, for the same reason as the entry stamp
                 # above: the ``activity_processed`` log + cursor advance

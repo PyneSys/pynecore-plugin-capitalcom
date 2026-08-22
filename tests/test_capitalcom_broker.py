@@ -2285,6 +2285,14 @@ def _assert_promoted(ctx, coid, new_deal_id):
         "stamp lets the grace-expiry pass confirm a false cancel on a "
         "filled entry"
     )
+    assert row.filled_qty == pytest.approx(1.0), (
+        "the activity-path entry fill must stamp the journal exposure "
+        "cursor — once the row is kind='position' the snapshot's "
+        "working→position stamp can never run and a full fill is "
+        "excluded from the partial-fill detector, so a zero cursor "
+        "would understate the cycle-end book forever (cycle 51: "
+        f"venue -0.01 vs journal 0). Got {row.filled_qty!r}"
+    )
 
 
 def __test_working_order_fill_migrates_the_row_to_the_position_deal__(tmp_path):
