@@ -178,6 +178,29 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 self._feed_native_failsafe_observed(row.client_order_id, pos)
 
             if pos is None and work is None:
+                if ((row.extras or {}).get('kind') == 'working'
+                        and (row.extras or {}).get('entry_filled_at')
+                        is not None):
+                    # Deferred working→position ref migration: the fill was
+                    # already booked from the EXECUTED activity, but the
+                    # promotion found no clean position dealId in that poll
+                    # (the batch candidate was another row's deal — venue
+                    # noise, see ``_find_promoted_deal_id`` — and the
+                    # position had not surfaced in ``/positions`` yet).
+                    # The EXECUTED activity is fingerprint-deduped, so no
+                    # later activity pass can finish the job; complete it
+                    # here from the fresh snapshot's ``workingOrderId``
+                    # back-link. Until the position surfaces the row keeps
+                    # its old ref and the missing-pending grace below
+                    # keeps re-evaluating (measured 2026-08-23, cycle 61).
+                    promoted = self._find_promoted_deal_id(
+                        row, [], positions_by_deal,
+                    )
+                    if promoted:
+                        self._promote_working_row_to_position(
+                            row, promoted, stamp_entry_filled=True,
+                        )
+                        continue
                 if (row.extras or {}).get('close_event_yielded_at') is not None:
                     # Race resolved: an earlier poll yielded a close
                     # fill on this row while ``/positions`` still

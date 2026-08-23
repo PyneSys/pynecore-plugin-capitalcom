@@ -393,6 +393,14 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             self, closed_row: 'OrderRow', retired_exposure: float,
     ) -> None: ...
 
+    def _find_promoted_deal_id(
+            self, *args: Any, **kwargs: Any,
+    ) -> str | None: ...
+
+    def _promote_working_row_to_position(
+            self, *args: Any, **kwargs: Any,
+    ) -> None: ...
+
     # --- Bracket lifecycle (bracket.py) ---
     def _close_bracket_after_natural_close(self, entry_row: 'OrderRow') -> None: ...
 

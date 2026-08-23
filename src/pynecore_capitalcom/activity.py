@@ -945,8 +945,8 @@ class _ActivityMixin(_CapitalComBase, ABC):
             fill_id=_activity_fingerprint(activity),
         )
 
-    @staticmethod
     def _find_promoted_deal_id(
+            self,
             row: 'OrderRow',
             activities: list[dict],
             positions_by_deal: dict[str, dict] | None,
@@ -957,21 +957,43 @@ class _ActivityMixin(_CapitalComBase, ABC):
         whose ``details.workingOrderId`` back-links to the row's old
         dealId, then the same-poll ``/positions`` snapshot (the position
         payload carries ``workingOrderId`` directly).
+
+        A candidate already owned by a DIFFERENT row is rejected:
+        Capital.com opens a fresh dealId for every entry, so a matching
+        activity that carries another row's deal is venue noise, not the
+        promotion target (measured 2026-08-23, cycle 61: the same-instant
+        POSITION activity of an unrelated TP-closed deal matched the
+        back-link and the promote rewrote the working row onto the DEAD
+        dealId — never present in ``/positions`` again, so the
+        disappearance tracker confirmed a false unexpected cancel and
+        quarantined the run). With no clean candidate the caller defers;
+        the next poll's snapshot back-link completes the migration
+        within the grace window.
         """
         old_id = row.exchange_order_id or ''
         if not old_id:
             return None
+
+        def owned_by_other(candidate: str) -> bool:
+            if self.store_ctx is None:
+                return False
+            owner = self.store_ctx.find_by_ref('deal_id', candidate)
+            return (owner is not None
+                    and owner.client_order_id != row.client_order_id)
+
         for a in activities:
             if (str(a.get('type') or '') == 'POSITION'
                     and str((a.get('details') or {}).get('workingOrderId')
                             or '') == old_id):
                 new_id = str(a.get('dealId') or '')
-                if new_id and new_id != old_id:
+                if (new_id and new_id != old_id
+                        and not owned_by_other(new_id)):
                     return new_id
         for deal_id, raw in (positions_by_deal or {}).items():
             pos = raw.get('position') or {}
             if (str(pos.get('workingOrderId') or '') == old_id
-                    and deal_id != old_id):
+                    and deal_id != old_id
+                    and not owned_by_other(deal_id)):
                 return deal_id
         return None
 

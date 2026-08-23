@@ -1352,7 +1352,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 if (row.state == 'confirmed'
                         and row.exchange_order_id
                         and extras.get('kind') == 'position'
-                        and extras.get('natural_close_at') is None):
+                        and extras.get('natural_close_at') is None
+                        and row.side != intent.side):
+                    # A close order REDUCES opposite-side exposure: a buy
+                    # close flattens sell rows and vice versa. A same-side
+                    # row can never be this close's target — without the
+                    # filter a symbol-wide close_all whose sell book was
+                    # just flattened by in-flight DELETEs would grab a
+                    # freshly filled BUY entry as its target and route a
+                    # mis-directed reduction through the opposite-POST
+                    # partial path (measured 2026-08-23, cycle 60).
                     live_position_rows.append(row)
 
         target_entry_id: str | None = None
@@ -1521,6 +1530,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     extras = row.extras or {}
                     if (row.state == 'closing'
                             and extras.get('kind') == 'position'
+                            and row.side != intent.side
                             and (target_entry_id is None
                                  or row.pine_entry_id == target_entry_id)):
                         closing_rows.append(row)
@@ -1537,6 +1547,24 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                         'closing_deal_ids': [
                             row.exchange_order_id for row in closing_rows],
                     },
+                )
+            if intent.synthetic_kind is None:
+                # A script-emitted close (keyed or close_all) that finds no
+                # owned exposure on its reducing side is already satisfied —
+                # the book is flat there (typically the prior close's DELETEs
+                # settled between the script's re-emission and this dispatch).
+                # Declining lets the engine re-evaluate against the settled
+                # book next bar; raising here escapes the dispatch site as a
+                # fatal run-crash (measured 2026-08-23, cycle 60). Synthetic
+                # closes (defensive / reversal) keep the loud reject — their
+                # producers own dedicated recovery contracts.
+                raise OrderSkippedByPlugin(
+                    f"Capital execute_close: no owned position rows on the "
+                    f"reducing side for symbol={intent.symbol!r}; nothing to "
+                    f"close",
+                    intent_key=intent.intent_key,
+                    reason='nothing_to_close',
+                    context={'symbol': intent.symbol, 'side': intent.side},
                 )
             raise ExchangeOrderRejectedError(
                 f"Capital execute_close: no confirmed position rows for "

@@ -54,6 +54,7 @@ from pynecore.core.broker.exceptions import (
     BrokerManualInterventionError,
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
+    OrderSkippedByPlugin,
 )
 from pynecore.core.broker.idempotency import KIND_CLOSE
 from pynecore.core.broker.models import CloseIntent, DispatchEnvelope
@@ -421,8 +422,11 @@ def __test_execute_close_unknown_key_does_not_fall_back_symbol_wide__(tmp_path):
         run_tag='test', bar_ts_ms=1700000000000,
     )
 
-    with pytest.raises(ExchangeOrderRejectedError,
-                       match='no confirmed position rows'):
+    # A script-emitted close with no owned rows on its reducing side is a
+    # non-halting decline (the book is already flat there), never a fatal
+    # reject — but it must still touch nothing on the symbol.
+    with pytest.raises(OrderSkippedByPlugin,
+                       match='nothing to close'):
         asyncio.run(broker.execute_close(env))
 
     assert not any(call[1] in {'delete', 'post'} for call in broker._calls)
@@ -430,6 +434,65 @@ def __test_execute_close_unknown_key_does_not_fall_back_symbol_wide__(tmp_path):
     entry_b = ctx.get_order('coid-entry-b')
     assert entry_a is not None and entry_a.state == 'confirmed'
     assert entry_b is not None and entry_b.state == 'confirmed'
+    store.close()
+
+
+def __test_close_all_skips_when_reducing_side_already_flat__(tmp_path):
+    """Incident shape (cycle 60, 2026-08-23): a stale symbol-wide close_all
+    whose sell book was already flattened must DECLINE, not grab the fresh
+    opposite-direction entry as a target and crash on the partial path."""
+    broker, store, ctx = _make_broker(tmp_path)
+    # Only a freshly filled LONG row is live — the shorts the close_all was
+    # sized for are gone (their DELETEs settled between re-emissions).
+    ctx.upsert_order('coid-fresh-long', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='', symbol='EURUSD', side='buy', qty=0.5,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    with pytest.raises(OrderSkippedByPlugin, match='nothing to close') as exc:
+        asyncio.run(broker.execute_close(env))
+    assert exc.value.reason == 'nothing_to_close'
+
+    # No wire write went out and the long row is untouched.
+    assert not any(call[1] in {'delete', 'post'} for call in broker._calls)
+    fresh = ctx.get_order('coid-fresh-long')
+    assert fresh is not None and fresh.state == 'confirmed'
+    store.close()
+
+
+def __test_close_all_targets_only_opposite_side_rows__(tmp_path):
+    """A buy-side close_all reduces the SELL rows only — a same-direction BUY
+    row on the symbol can never become its target."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-S', 'delete'): {},
+    })
+    ctx.upsert_order('coid-short', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='S',
+                     exchange_order_id='deal-S', extras={'kind': 'position'})
+    ctx.upsert_order('coid-long', symbol='EURUSD', side='buy', qty=2.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='', symbol='EURUSD', side='buy', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    result = asyncio.run(broker.execute_close(env))
+    assert result.id == 'deal-S'
+
+    # Exactly one DELETE, aimed at the short; the long was never touched.
+    deletes = [c for c in broker._calls if c[1] == 'delete']
+    assert [c[0] for c in deletes] == ['positions/deal-S']
+    assert not any(call[1] == 'post' for call in broker._calls)
+    long_row = ctx.get_order('coid-long')
+    assert long_row is not None and long_row.state == 'confirmed'
     store.close()
 
 

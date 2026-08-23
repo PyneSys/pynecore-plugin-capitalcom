@@ -1163,8 +1163,10 @@ def __test_execute_close_scoped_to_another_entry_still_rejects__(tmp_path):
     """The in-flight decline honours keyed-close ownership scope.
 
     A ``closing`` row belonging to a DIFFERENT Pine entry must not
-    satisfy a keyed close: that close owns no exposure at all, which
-    stays a real reject.
+    satisfy a keyed close: that close owns no exposure at all. It
+    declines as ``nothing_to_close`` (non-halting; the book is flat for
+    that key) — the scope property is that the other entry's row is
+    never touched.
     """
     broker, store, ctx = _make_broker(tmp_path, responses={})
     ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
@@ -1176,8 +1178,11 @@ def __test_execute_close_scoped_to_another_entry_still_rejects__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(ExchangeOrderRejectedError):
+    with pytest.raises(OrderSkippedByPlugin, match='nothing to close'):
         asyncio.run(broker.execute_close(env))
+    assert not any(call[1] in {'delete', 'post'} for call in broker._calls)
+    other = ctx.get_order('coid-entry')
+    assert other is not None and other.state == 'closing'
     store.close()
 
 
@@ -2371,6 +2376,65 @@ def __test_working_order_fill_migrates_from_the_positions_snapshot__(tmp_path):
     fills = [e for e in events if e.event_type == 'filled']
     assert len(fills) == 1
     _assert_promoted(ctx, coid, 'pos-1')
+    store.close()
+
+
+def __test_working_order_promotion_rejects_another_rows_deal__(tmp_path):
+    """A promotion candidate owned by ANOTHER row is venue noise.
+
+    Measured 2026-08-23 (cycle 61): a same-instant POSITION activity of an
+    unrelated, just-TP-closed deal matched the ``workingOrderId`` back-link
+    and the promote rewrote the working row onto that DEAD dealId — never
+    present in ``/positions`` again, so the disappearance tracker
+    confirmed a false unexpected cancel and quarantined the run. The
+    promote must defer instead, and the next poll's snapshot back-link
+    (the REAL position dealId) completes the migration.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    coid = _seed_working_order_row(ctx)
+    # The unrelated row that owns the poison dealId (the just-closed 'S').
+    ctx.upsert_order('coid-s', symbol='BTCUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='S',
+                     exchange_order_id='dead-1',
+                     extras={'kind': 'position', 'entry_filled_at': 123.0})
+    ctx.add_ref('coid-s', 'deal_id', 'dead-1')
+    _position_act, executed_act = _wo_fill_activities()
+    poison_act = {
+        'dateUTC': '2026-08-16T22:15:11.350', 'dealId': 'dead-1',
+        'epic': 'BTCUSD', 'type': 'POSITION', 'status': 'ACCEPTED',
+        'source': 'USER',
+        'details': {'workingOrderId': 'wo-1', 'size': 1.0,
+                    'direction': 'BUY', 'level': 62895.55},
+    }
+
+    async def drain(acts, snap=None):
+        out = []
+        async for ev in broker._process_activity(acts, snap):
+            out.append(ev)
+        return out
+
+    asyncio.run(drain([poison_act, executed_act]))
+    row = ctx.get_order(coid)
+    assert row is not None
+    assert row.exchange_order_id == 'wo-1', (
+        f"the promote must never steal another row's dealId — got "
+        f"{row.exchange_order_id!r}"
+    )
+    extras = row.extras or {}
+    assert extras.get('entry_filled_at') is not None
+    assert extras.get('missing_pending_since') is None
+    other = ctx.find_by_ref('deal_id', 'dead-1')
+    assert other is not None and other.client_order_id == 'coid-s'
+
+    # Next poll: the REAL position surfaces in /positions with the
+    # back-link; the snapshot pass completes the deferred migration.
+    snapshot = {
+        'pos-2': {'position': {'dealId': 'pos-2', 'workingOrderId': 'wo-1',
+                               'size': 1.0, 'direction': 'BUY',
+                               'level': 62895.55}},
+    }
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(snapshot, {})))
+    _assert_promoted(ctx, coid, 'pos-2')
     store.close()
 
 
