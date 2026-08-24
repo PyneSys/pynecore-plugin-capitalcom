@@ -3444,6 +3444,113 @@ def __test_execute_exit_bracket_attach_mapped_reject_rolls_back_legs__(tmp_path)
     store.close()
 
 
+def __test_execute_exit_bracket_put_stale_notfound_retries_once__(tmp_path):
+    """A stale ``error.not-found.dealId`` on the bracket PUT must NOT cost
+    the position: when the follow-up ``/positions`` read proves the deal is
+    live, the PUT is retried once and the bracket attaches normally.
+
+    Measured (cycle 65, pyramid, 3 events): the PUT issued immediately
+    after the entry fill 404'd while the deal demonstrably existed — the
+    defensive close's DELETE on the same id landed seconds later. The
+    eventual-consistency 404 is venue noise, not a missing position.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'attach-ok'},
+        ('confirms/attach-ok', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'OPEN', 'dealId': 'deal-L',
+        },
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'deal-L', 'size': 1.0,
+                          'direction': 'BUY', 'level': 1.17500}},
+        ]},
+    })
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+        state='confirmed', pine_entry_id='Long',
+        exchange_order_id='deal-L',
+        extras={'kind': 'position', 'confirm_level': 1.17500},
+    )
+    original_call = broker._call
+    state = {'first_put': True}
+
+    async def flaky_call(endpoint, *, data=None, method='post'):
+        if (endpoint == 'positions/deal-L' and method == 'put'
+                and state['first_put']):
+            state['first_put'] = False
+            broker._calls.append((endpoint, method, data))
+            raise OrderNotFoundError("error.not-found.dealId", ref_type='deal_id')
+        return await original_call(endpoint, data=data, method=method)
+
+    broker._call = flaky_call
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.17900, sl_price=1.17400,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    tp_coid = env.client_order_id('t')
+    sl_coid = env.client_order_id('s')
+
+    asyncio.run(broker.execute_exit(env))
+
+    # The retried PUT attached the bracket — both legs live and confirmed.
+    tp_row = ctx.get_order(tp_coid)
+    sl_row = ctx.get_order(sl_coid)
+    assert tp_row is not None and tp_row.closed_ts_ms is None
+    assert sl_row is not None and sl_row.closed_ts_ms is None
+    assert tp_row.state == 'confirmed' and sl_row.state == 'confirmed'
+    # Two PUT attempts hit the venue and the retry left an audit trail.
+    puts = [c for c in broker._calls
+            if c[0] == 'positions/deal-L' and c[1] == 'put']
+    assert len(puts) == 2
+    event_kinds = [
+        r['kind'] for r in ctx._store._conn.execute(
+            "SELECT kind FROM events WHERE run_instance_id = ?",
+            (ctx.run_instance_id,),
+        )
+    ]
+    assert 'bracket_put_notfound_retried' in event_kinds
+    store.close()
+
+
+def __test_execute_exit_bracket_put_notfound_with_absent_deal_still_rejects__(tmp_path):
+    """The not-found retry is gated on the deal being LISTED in the fresh
+    ``/positions`` snapshot. When the venue genuinely does not hold the
+    position, the 404 is authoritative: no retry, legs rolled back, and
+    the defensive-close contract
+    (:class:`BracketAttachAfterFillRejectedError`) fires as before.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/deal-L', 'put'):
+            OrderNotFoundError("error.not-found.dealId", ref_type='deal_id'),
+        ('positions', 'get'): {'positions': []},
+    })
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+        state='confirmed', pine_entry_id='Long',
+        exchange_order_id='deal-L',
+        extras={'kind': 'position', 'confirm_level': 1.17500},
+    )
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.17900, sl_price=1.17400,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(broker.execute_exit(env))
+
+    assert isinstance(exc.value.__cause__, OrderNotFoundError)
+    # Exactly ONE PUT attempt — an absent deal earns no retry.
+    puts = [c for c in broker._calls
+            if c[0] == 'positions/deal-L' and c[1] == 'put']
+    assert len(puts) == 1
+    store.close()
+
+
 def __test_execute_exit_bracket_put_timeout_flips_legs_to_unknown__(tmp_path):
     """A timeout on the bracket PUT leaves the bracket state opaque on
     the exchange — neither rolled back nor confirmed. The leg rows

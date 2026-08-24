@@ -721,6 +721,46 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             audit_payload={'endpoint': endpoint, 'body': body},
         )
 
+    async def _put_bracket_with_notfound_retry(
+            self, deal_id: str, body: dict,
+    ) -> dict:
+        """PUT the bracket, retrying ONCE when a not-found races the fill.
+
+        Measured (cycle 65, pyramid, 3 events): the ``positions/{deal_id}``
+        PUT issued immediately after the entry fill 404'd with
+        ``error.not-found.dealId`` while the deal demonstrably existed — the
+        defensive close's DELETE on the very same id landed seconds later.
+        The confirm→positions materialisation is eventually consistent
+        across backend routes, so one verification read decides: if the
+        deal IS listed in ``/positions`` the 404 was stale routing and the
+        PUT is retried once; if it is absent (or the retry fails too) the
+        error propagates to the defensive-close path unchanged. A network
+        failure during the verify read escapes as a connection error and
+        lands in the caller's ambiguous-PUT branch (disposition-unknown
+        park), which the reconcile machinery resolves.
+        """
+        try:
+            return await self._call(
+                f'positions/{deal_id}', data=body, method='put',
+            )
+        except OrderNotFoundError:
+            raw_positions = await self._call('positions', method='get')
+            listed = any(
+                str((raw.get('position') or {}).get('dealId') or '') == deal_id
+                for raw in (raw_positions.get('positions') or [])
+            )
+            if not listed:
+                raise
+            if self.store_ctx is not None:
+                self.store_ctx.log_event(
+                    'bracket_put_notfound_retried',
+                    exchange_order_id=deal_id,
+                    payload={'body': body},
+                )
+            return await self._call(
+                f'positions/{deal_id}', data=body, method='put',
+            )
+
     async def execute_exit(
             self, envelope: DispatchEnvelope,
     ) -> list[ExchangeOrder]:
@@ -1088,8 +1128,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         )
         if body:
             try:
-                resp = await self._call(
-                    f'positions/{deal_id}', data=body, method='put',
+                resp = await self._put_bracket_with_notfound_retry(
+                    deal_id, body,
                 )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
