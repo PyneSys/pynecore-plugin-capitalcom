@@ -2722,6 +2722,86 @@ def __test_presence_diff_exempts_a_zero_retained_fold_row__(tmp_path):
     store.close()
 
 
+def __test_natural_close_exemption_is_time_bounded__(tmp_path):
+    """The ``natural_close_at`` disappearance exemption expires.
+
+    Within :data:`_NATURAL_CLOSE_RETIRE_AFTER_S` the activity-poll close
+    ingestion owns the row's retirement, so the tracker must not stamp
+    it. AFTER the window the row re-enters tracking: a close activity
+    that never arrives (a deal netted into an opposite entry is reported
+    on the consuming deal only) would otherwise leave the row live
+    forever and the run's closing reconcile counting phantom
+    journal-owned exposure (cycle 70 K3 MISMATCH).
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    now = __import__('time').time()
+    ctx.upsert_order('fresh-nc', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-fresh', filled_qty=1.0,
+                     extras={'kind': 'position',
+                             'natural_close_at': now - 5.0})
+    ctx.upsert_order('stale-nc', symbol='EURUSD', side='buy', qty=1.0,
+                     state='closing', pine_entry_id='Long2',
+                     exchange_order_id='deal-stale', filled_qty=1.0,
+                     extras={'kind': 'position',
+                             'natural_close_at': now - 120.0})
+    broker._disappearance_tracker().observe_presence(
+        {'positions': set(), 'working': set()}, now,
+    )
+    fresh = ctx.get_order('fresh-nc')
+    assert fresh is not None
+    assert 'missing_pending_since' not in (fresh.extras or {}), (
+        "a freshly natural-closed row stays exempt — the activity poll "
+        "owns its retirement"
+    )
+    stale = ctx.get_order('stale-nc')
+    assert stale is not None
+    assert 'missing_pending_since' in (stale.extras or {}), (
+        "past the follow-up window the row must re-enter tracking"
+    )
+    store.close()
+
+
+def __test_stale_natural_close_row_retired_as_closed_without_policy__(tmp_path):
+    """Grace expiry on a ``natural_close_at`` row is a confirmed natural
+    close, never an external cancel: the row is journal-retired as
+    ``closed`` with NO cancelled event and NO quarantine. This is the
+    cycle 70 residual — an entry deal netted into an opposite deal's
+    close gets no close activity of its own, so without the retire the
+    ``closing`` row survives to the run's final reconcile as phantom
+    book-owned exposure (venue 0 vs journal 0.01, lane stop).
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    latched = []
+    broker.quarantine_sink = lambda reason, context: latched.append(reason)
+    now = __import__('time').time()
+    ctx.upsert_order('stuck', symbol='EURUSD', side='buy', qty=0.01,
+                     state='closing', pine_entry_id='Long',
+                     exchange_order_id='deal-gone', filled_qty=0.01,
+                     extras={'kind': 'position',
+                             'natural_close_at': now - 120.0,
+                             'missing_pending_since': now - 60.0})
+
+    async def drain():
+        return [ev async for ev in broker._missing_pending_tracker({}, {})]
+
+    events = asyncio.run(drain())
+    assert events == [], "a confirmed natural close must not synthesise a cancelled event"
+    assert latched == [], "no quarantine for a confirmed natural close"
+    row = ctx.get_order('stuck')
+    assert row is not None
+    assert row.closed_ts_ms is not None, "the residual row must be journal-retired"
+    assert row.state == 'closed'
+    # The verdict must be the natural-close follow-up (CLOSED), not the
+    # core's generic fully-filled cancel fallback: the audit trail has to
+    # say WHY the row was retired.
+    kinds = [r['kind'] for r in ctx._store._conn.execute(  # noqa: SLF001
+        "SELECT kind FROM events WHERE client_order_id = ?", ('stuck',),
+    ).fetchall()]
+    assert 'reconcile_filled_then_closed_retired' in kinds, kinds
+    store.close()
+
+
 def __test_partial_fill_detector_skips_partial_close_retired_row__(tmp_path):
     """A partially-closed row's lowered cursor is not an unfinished fill.
 

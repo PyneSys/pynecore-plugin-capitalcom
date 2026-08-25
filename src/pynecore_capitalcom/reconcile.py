@@ -68,6 +68,15 @@ from .models import _compute_cumulative_fill
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
+#: How long a ``natural_close_at``-stamped row stays exempt from the
+#: disappearance tracker. Within the window the activity-poll close
+#: ingestion owns the row's physical retirement; after it the row
+#: re-enters tracking so a close activity that never arrives (e.g. a
+#: netted deal, which Capital.com reports on the CONSUMING deal only)
+#: cannot leave a permanent journal residual — the grace-expiry verdict
+#: then retires it as a confirmed natural close.
+_NATURAL_CLOSE_RETIRE_AFTER_S = 60.0
+
 
 class _ReconcileMixin(_CapitalComBase, ABC):
     """Snapshot reconcile + missing-pending tracker mix-in."""
@@ -793,12 +802,15 @@ class _ReconcileMixin(_CapitalComBase, ABC):
           visible when either carries it. Bracket-leg rows have no deal
           id of their own → empty ref set → never tracked.
         * Rows flagged ``natural_close_at`` are known-closed on the
-          exchange — exempt, otherwise the grace window would raise a
-          false unexpected-cancel for an expected disappearance.
+          exchange — exempt for :data:`_NATURAL_CLOSE_RETIRE_AFTER_S`
+          (the activity-poll close ingestion owns their retirement),
+          then tracked again so a close activity that never arrives
+          cannot strand the row as a permanent journal residual.
         * ``confirm_missing`` is the simple venue behavior: the poll
           snapshot is authoritative and phase 1 already cleared any row
           that came back, so a grace-expired stamp IS the confirmed
-          external cancel.
+          disappearance — an external cancel for a working row, a
+          natural close for a ``natural_close_at``-stamped one.
         """
         tracker = self._disappearance
         if tracker is None:
@@ -813,20 +825,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     if row.exchange_order_id else set()
                 ),
                 confirm_missing=self._confirm_missing_cancelled,
-                is_exempt=lambda row: (
-                    (row.extras or {}).get('natural_close_at') is not None
-                    # ``fold_rebased_filled_at`` is only ever present on a
-                    # row persisted by a PRIOR process run's fold protocol
-                    # (new runs never write it). A zero-retained fold row
-                    # was closed in the same teardown that rebased it; the
-                    # exemption covers the crash window between the two
-                    # writes — that deal provably no longer exists, so its
-                    # absence must never be read as an external cancel. A
-                    # fold with a retained residual stays tracked (its
-                    # deal is live on the venue).
-                    or ((row.extras or {}).get('fold_rebased_filled_at')
-                        is not None and row.filled_qty <= 1e-9)
-                ),
+                is_exempt=self._is_disappearance_exempt,
                 cancel_siblings=self._cancel_sibling_orders,
                 request_quarantine=self.quarantine_sink,
                 cancelled_event_factory=self._missing_pending_cancelled_event,
@@ -835,17 +834,54 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         return tracker
 
     @staticmethod
+    def _is_disappearance_exempt(row: 'OrderRow') -> bool:
+        """Whether a live row is exempt from the disappearance tracker.
+
+        * A ``natural_close_at``-stamped row is known-closed on the
+          exchange; the activity-poll close ingestion owns its physical
+          retirement. The exemption is TIME-BOUNDED
+          (:data:`_NATURAL_CLOSE_RETIRE_AFTER_S`): a close activity that
+          never arrives — a deal netted into an opposite entry is
+          reported on the consuming deal only — would otherwise leave the
+          row live forever and the run's closing reconcile counting it as
+          journal-owned exposure the venue no longer holds. After the
+          window the row re-enters tracking and the grace-expiry verdict
+          retires it as a confirmed natural close.
+        * ``fold_rebased_filled_at`` is only ever present on a row
+          persisted by a PRIOR process run's fold protocol (new runs
+          never write it). A zero-retained fold row was closed in the
+          same teardown that rebased it; the exemption covers the crash
+          window between the two writes — that deal provably no longer
+          exists, so its absence must never be read as an external
+          cancel. A fold with a retained residual stays tracked (its
+          deal is live on the venue).
+        """
+        extras = row.extras or {}
+        natural_close_at = extras.get('natural_close_at')
+        if isinstance(natural_close_at, (int, float)):
+            return (epoch_time() - float(natural_close_at)
+                    < _NATURAL_CLOSE_RETIRE_AFTER_S)
+        return (extras.get('fold_rebased_filled_at') is not None
+                and row.filled_qty <= 1e-9)
+
+    @staticmethod
     async def _confirm_missing_cancelled(
-            _row: 'OrderRow',
+            row: 'OrderRow',
     ) -> MissingConfirmation:
-        """Grace-expiry verdict: a still-stamped row is an external cancel.
+        """Grace-expiry verdict: a still-stamped row is a confirmed gone.
 
         Capital.com has no deal-history bridge to re-verify against — the
         per-poll snapshot is the authority, the tracker's phase 1 clears
         any row whose deal reappeared, and the stamp-version guard drops
         a verdict that raced a concurrent clear. What is left after the
-        grace window is the genuine disappearance.
+        grace window is the genuine disappearance. A
+        ``natural_close_at``-stamped row was already known-closed on the
+        exchange when the stamp landed, so its disappearance confirms
+        that natural close (benign terminal retire, no policy); anything
+        else is an external cancel.
         """
+        if (row.extras or {}).get('natural_close_at') is not None:
+            return MissingConfirmation(MissingResolution.CLOSED)
         return MissingConfirmation(MissingResolution.CANCELLED)
 
     def _feed_native_failsafe_observed(
