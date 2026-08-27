@@ -70,6 +70,17 @@ from .helpers import (
 # trading loop never sees ``error.invalid.session.token``.
 _SESSION_REFRESH_FALLBACK_S = 50 * 60
 _SESSION_REFRESH_SAFETY_S = 5 * 60
+# Hard ceiling on one engine-visible GET read. The sync REST helper can
+# chain several 50s-per-phase HTTP calls inside a single read (proactive
+# session refresh, re-login retries), and the sync engine serializes
+# reads behind the in-flight one: a read that outlives the engine's
+# read-stuck grace therefore forces a manual-intervention halt even
+# after connectivity returns (measured live: capitalcom cycle 76 — a WS
+# keepalive stall left one positions GET in flight for 75s while the
+# feed itself recovered after 45s). Reads are idempotent, so abandoning
+# the wait and letting the engine park-and-retry is always safe. Must
+# stay well below the engine's 30s execute timeout.
+_READ_DEADLINE_S = 20.0
 # Capital.com permits one ``POST /session`` per second per API key. Broker and
 # provider instances can start concurrently in one process, so their instance
 # locks are insufficient: coordinate bootstrap POSTs across all instances that
@@ -541,9 +552,21 @@ class _RestSessionMixin(_CapitalComBase, ABC):
                 self._call_with_account_write_lock
                 if position_write else self
             )
-            return await asyncio.to_thread(
+            worker = asyncio.to_thread(
                 caller, endpoint, data=data, method=method,
             )
+            if method_lc != 'get':
+                return await worker
+            # Bound the WHOLE read chain (see ``_READ_DEADLINE_S``): the
+            # orphaned worker thread finishes on its own — token rotation
+            # is lock-protected and a concurrent fresh GET is safe.
+            try:
+                return await asyncio.wait_for(worker, _READ_DEADLINE_S)
+            except TimeoutError:
+                raise ExchangeConnectionError(
+                    f"Capital.com read '{endpoint}' did not complete "
+                    f"within {_READ_DEADLINE_S:.0f}s",
+                )
         except Exception as e:
             mapped = self._map_exception(e)
             if mapped is not None:

@@ -2937,6 +2937,66 @@ def __test_call_maps_httpx_connect_error_to_exchange_connection_error__(monkeypa
         asyncio.run(broker._call('positions', method='get'))
 
 
+def __test_hung_read_resolves_as_connection_error_within_deadline__(monkeypatch):
+    """A transport-hung GET must resolve as a retryable connection error.
+
+    The sync engine serializes reads behind the in-flight one, so a read
+    that outlives the read-stuck grace forces a manual-intervention halt
+    even after connectivity returns (measured live: capitalcom cycle 76 —
+    a WS keepalive stall left one positions GET in flight for 75s while
+    the feed recovered after 45s). The ``_READ_DEADLINE_S`` bound must
+    abandon the wait and surface :class:`ExchangeConnectionError` so the
+    engine parks the cycle and retries with a fresh read.
+    """
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+    from pynecore_capitalcom import rest as rest_mod
+
+    broker = CapitalCom(config=_make_config())
+    release = threading.Event()
+
+    def hung_get(_url, **_kwargs):
+        release.wait(1.0)
+        raise httpx.ConnectError("released after the deadline fired")
+
+    monkeypatch.setattr(httpx, 'get', hung_get)
+    monkeypatch.setattr(rest_mod, '_READ_DEADLINE_S', 0.1)
+    try:
+        with pytest.raises(ExchangeConnectionError,
+                           match="did not complete"):
+            asyncio.run(broker._call('positions', method='get'))
+    finally:
+        release.set()
+
+
+def __test_write_call_is_not_deadline_bounded__(monkeypatch):
+    """Writes must NOT inherit the read deadline.
+
+    Abandoning a slow POST mid-flight manufactures disposition-unknown
+    ambiguity; the dispatch sites own write timeouts. A POST slower than
+    ``_READ_DEADLINE_S`` must still complete normally.
+    """
+    from pynecore_capitalcom import rest as rest_mod
+
+    broker = CapitalCom(config=_make_config())
+
+    class _Res:
+        is_error = False
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json():
+            return {'dealReference': 'ref-1'}
+
+    def slow_post(_url, **_kwargs):
+        time.sleep(0.3)
+        return _Res()
+
+    monkeypatch.setattr(httpx, 'post', slow_post)
+    monkeypatch.setattr(rest_mod, '_READ_DEADLINE_S', 0.05)
+    res = asyncio.run(broker._call('workingorders', method='post'))
+    assert res == {'dealReference': 'ref-1'}
+
+
 # =======================================================================
 # Natural-close regression tests — TP/SL fill on a bracket-attached entry.
 # Three structural bugs are covered:
