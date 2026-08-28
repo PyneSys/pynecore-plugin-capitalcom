@@ -864,9 +864,8 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         return (extras.get('fold_rebased_filled_at') is not None
                 and row.filled_qty <= 1e-9)
 
-    @staticmethod
     async def _confirm_missing_cancelled(
-            row: 'OrderRow',
+            self, row: 'OrderRow',
     ) -> MissingConfirmation:
         """Grace-expiry verdict: a still-stamped row is a confirmed gone.
 
@@ -879,8 +878,33 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         exchange when the stamp landed, so its disappearance confirms
         that natural close (benign terminal retire, no policy); anything
         else is an external cancel.
+
+        Exception: a live POSITION row gets a direct authoritative probe
+        before any terminal verdict. The bulk ``/positions`` snapshot can
+        omit a freshly created position for well past the grace window
+        (measured live: cycle 81 — a STOP entry executed into position
+        deal ``…b486``, the snapshot lagged it, and the absence-only
+        verdict retired the just-promoted row 9 seconds after the
+        promotion; the engine then external-cleared the book and the
+        live venue position ended the run unowned, K3 MISMATCH). Only a
+        definitive ``error.not-found.dealId`` from
+        ``GET /positions/{dealId}`` confirms a position row's
+        disappearance; a transport fault keeps the stamp and defers.
         """
-        if (row.extras or {}).get('natural_close_at') is not None:
+        extras = row.extras or {}
+        deal_id = row.exchange_order_id
+        if extras.get('kind') == ENTRY_KIND_POSITION and deal_id:
+            try:
+                await self.call_api(f'positions/{deal_id}', method='get')
+            except OrderNotFoundError:
+                pass  # definitive not-exists — fall through to the verdict
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError,
+                    CapitalComError):
+                return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+            else:
+                return MissingConfirmation(MissingResolution.STILL_PRESENT)
+        if extras.get('natural_close_at') is not None:
             return MissingConfirmation(MissingResolution.CLOSED)
         return MissingConfirmation(MissingResolution.CANCELLED)
 

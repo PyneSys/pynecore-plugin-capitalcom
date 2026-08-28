@@ -397,6 +397,24 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 continue
             did = row.exchange_order_id
             if not did:
+                # A rejected row with no exchange id exists on no venue by
+                # definition — pure local residue of a failed dispatch.
+                # Left live, it lingers across runs and its state shadows
+                # the exit path's close-in-flight probe (measured live:
+                # rejected rows from five days earlier still matched the
+                # cycle-81 exit lookup). Retire it here; anything else
+                # without an id stays untouched (an in-flight dispatch may
+                # still be waiting for its confirm).
+                if row.state != 'rejected':
+                    continue
+                self.store_ctx.log_event(
+                    'startup_rejected_residue_retired',
+                    client_order_id=row.client_order_id,
+                    payload={'state': row.state,
+                             'pine_entry_id': row.pine_entry_id},
+                )
+                self.store_ctx.close_order(row.client_order_id)
+                retired_count += 1
                 continue
             if row.state not in ('confirmed', 'closing', 'rejected'):
                 continue

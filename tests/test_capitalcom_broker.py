@@ -2634,7 +2634,13 @@ def __test_trailing_monitor_activating_to_active_on_snapshot__(tmp_path):
 
 def __test_missing_pending_tracker_fires_unexpected_cancel__(tmp_path):
     # stop policy (BrokerPlugin default) → UnexpectedCancelError bubbles up.
-    broker, store, ctx = _make_broker(tmp_path)
+    # The grace-expiry verdict probes the deal directly; the venue answers
+    # not-found for the vanished position, confirming the cancel.
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/gone', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+    })
     # 120s in the past easily exceeds the internal grace window
     # (max(5s, _POLL_INTERVAL_S * 5) = 7.5s).
     old_ts = epoch_time_compat = __import__('time').time() - 120.0
@@ -2659,7 +2665,11 @@ def __test_missing_pending_tracker_stop_with_sink_quarantines__(tmp_path):
     # With the runner-wired quarantine sink present, the default 'stop' policy
     # latches the engine quarantine instead of raising: the poll loop (and the
     # process) stays alive while trading is stopped engine-side.
-    broker, store, ctx = _make_broker(tmp_path)
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/gone', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+    })
     latched = []
     broker.quarantine_sink = lambda reason, context: latched.append(
         (reason, context))
@@ -2771,7 +2781,11 @@ def __test_stale_natural_close_row_retired_as_closed_without_policy__(tmp_path):
     ``closing`` row survives to the run's final reconcile as phantom
     book-owned exposure (venue 0 vs journal 0.01, lane stop).
     """
-    broker, store, ctx = _make_broker(tmp_path)
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/deal-gone', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+    })
     latched = []
     broker.quarantine_sink = lambda reason, context: latched.append(reason)
     now = __import__('time').time()
@@ -2842,7 +2856,11 @@ def __test_partial_fill_detector_skips_partial_close_retired_row__(tmp_path):
 
 
 def __test_missing_pending_tracker_ignore_policy_suppresses__(tmp_path):
-    broker, store, ctx = _make_broker(tmp_path)
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/gone', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+    })
     # The CLI normally injects the runtime policy from brokers.toml; in tests
     # we set it directly on the plugin instance, which is what reconcile reads.
     broker.on_unexpected_cancel = 'ignore'
@@ -13177,4 +13195,128 @@ def __test_opposite_direction_close_without_stamp_routes_as_close__(tmp_path):
     assert len(events) == 1
     assert events[0].leg_type == LegType.CLOSE
     assert events[0].order.side == 'sell'
+    store.close()
+
+
+# === Position-row disappearance probe & promotion-window exit wait ===
+
+from pynecore.core.broker.disappearance import MissingResolution  # noqa: E402
+from pynecore.core.broker.exceptions import OrderSkippedByPlugin  # noqa: E402
+
+
+def _exit_envelope_for(from_entry='Long'):
+    return DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='TP_SL', from_entry=from_entry, symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.2, sl_price=1.05,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+
+def __test_execute_exit_waits_for_working_to_position_promotion__(tmp_path):
+    """A confirmed working row for the entry means the promotion is in flight.
+
+    A STOP/LIMIT working order that just executed leaves a window where the
+    fill is booked but the activity poll has not yet rewritten the row to
+    the position deal. With no position-kind row findable, the exit path
+    used to fall through to the bracket-attach-reject shape and issue a
+    defensive market close against a healthy just-filled position (the
+    hole was masked live only by stale rejected residue rows shadowing the
+    lookup — cycle 81). The exit must wait for the promotion instead.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-wo', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='wo-1', extras={'kind': 'working'})
+    with pytest.raises(OrderSkippedByPlugin, match='mid promotion'):
+        asyncio.run(broker.execute_exit(_exit_envelope_for()))
+    store.close()
+
+
+def __test_missing_position_row_probe_still_present_keeps_the_row__(tmp_path):
+    """A live ``GET /positions/{dealId}`` answer overrides the stale snapshot.
+
+    The bulk ``/positions`` snapshot omitted a freshly promoted position
+    for well past the grace window (cycle 81): the absence-only verdict
+    retired the just-promoted row and the engine external-cleared a live
+    venue position out of the book. A position row's grace-expiry verdict
+    must probe the deal directly and keep the row when the deal exists.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/pos-1', 'get'): {'position': {'dealId': 'pos-1'}},
+    })
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='pos-1', extras={'kind': 'position'})
+    row = ctx.get_order('coid-p')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.STILL_PRESENT
+    store.close()
+
+
+def __test_missing_position_row_probe_not_found_confirms_the_cancel__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/pos-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+    })
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='pos-1', extras={'kind': 'position'})
+    row = ctx.get_order('coid-p')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.CANCELLED
+    store.close()
+
+
+def __test_missing_position_row_probe_transport_fault_defers__(tmp_path):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/pos-1', 'get'): httpx.ConnectError('boom'),
+    })
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='pos-1', extras={'kind': 'position'})
+    row = ctx.get_order('coid-p')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.INCONCLUSIVE
+    store.close()
+
+
+def __test_missing_working_row_verdict_stays_probe_free__(tmp_path):
+    """Working-order rows keep the snapshot-authoritative verdict."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-w', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='wo-1', extras={'kind': 'working'})
+    row = ctx.get_order('coid-w')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.CANCELLED
+    assert not any(c[0].startswith('positions/') for c in broker._calls)
+    store.close()
+
+
+def __test_startup_pass_retires_rejected_residue_without_exchange_id__(tmp_path):
+    """A rejected row with no exchange id exists on no venue — retire it.
+
+    Such residue lingered live across runs for days and its state shadowed
+    the exit path's close-in-flight probe (cycle 81's skip storm printed a
+    five-day-old rejected row's state).
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-rej', symbol='EURUSD', side='buy', qty=1.0,
+                     state='rejected', pine_entry_id='Long',
+                     extras={'kind': 'position'})
+    ctx.upsert_order('coid-live', symbol='EURUSD', side='buy', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='Short',
+                     extras={'kind': 'position'})
+    broker._retire_startup_orphans({}, {})
+    live = {r.client_order_id for r in ctx.iter_live_orders()}
+    assert 'coid-rej' not in live
+    # A no-id row in any OTHER state is an in-flight dispatch — untouched.
+    assert 'coid-live' in live
     store.close()

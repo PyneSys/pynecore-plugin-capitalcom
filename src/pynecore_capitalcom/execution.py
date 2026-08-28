@@ -829,9 +829,31 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                         symbol=intent.symbol,
                 ):
                     extras = row.extras or {}
-                    if extras.get('kind') != 'position':
-                        continue
                     if row.pine_entry_id != intent.from_entry:
+                        continue
+                    if (extras.get('kind') == ENTRY_KIND_WORKING
+                            and row.state == 'confirmed'):
+                        # Working->position promotion window: the STOP /
+                        # LIMIT working order executed (the engine booked
+                        # its fill, which is why an exit is being asked
+                        # for), but the activity poll has not yet rewritten
+                        # the row to a position deal. The venue-side
+                        # position exists — a defensive close here would
+                        # flatten a healthy just-filled entry. Wait; the
+                        # promotion lands within the next polls and the
+                        # re-sent exit finds the position row.
+                        raise OrderSkippedByPlugin(
+                            f"Exit {intent.intent_key} skipped: entry "
+                            f"{intent.from_entry!r} is mid promotion from "
+                            f"working order to position; re-evaluating "
+                            f"next bar.",
+                            intent_key=intent.intent_key,
+                            reason="close_in_flight",
+                            context={'symbol': intent.symbol,
+                                     'from_entry': intent.from_entry,
+                                     'row_state': row.state},
+                        )
+                    if extras.get('kind') != 'position':
                         continue
                     if row.state != 'confirmed':
                         raise OrderSkippedByPlugin(
