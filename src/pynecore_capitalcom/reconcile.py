@@ -187,9 +187,12 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 self._feed_native_failsafe_observed(row.client_order_id, pos)
 
             if pos is None and work is None:
-                if ((row.extras or {}).get('kind') == 'working'
-                        and (row.extras or {}).get('entry_filled_at')
-                        is not None):
+                row_kind = (row.extras or {}).get('kind')
+                if ((row_kind == 'working'
+                     and (row.extras or {}).get('entry_filled_at')
+                     is not None)
+                        or (row_kind == ENTRY_KIND_POSITION
+                            and row.filled_qty > 0.0)):
                     # Deferred working→position ref migration: the fill was
                     # already booked from the EXECUTED activity, but the
                     # promotion found no clean position dealId in that poll
@@ -202,6 +205,16 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     # back-link. Until the position surfaces the row keeps
                     # its old ref and the missing-pending grace below
                     # keeps re-evaluating (measured 2026-08-23, cycle 61).
+                    # A filled POSITION-kind row takes the same route: the
+                    # venue can run even a MARKET entry through its
+                    # working-order machinery, executing the confirm's
+                    # dealId as a working order and opening the position
+                    # under a FRESH dealId whose payload back-links the
+                    # old one in ``workingOrderId`` (measured 2026-08-28,
+                    # cycle 84: confirm dealId ...5578 EXECUTED as
+                    # WORKING_ORDER, position materialized as ...557b —
+                    # the un-migrated row was retired by the grace-expiry
+                    # verdict and the live long went unowned).
                     promoted = self._find_promoted_deal_id(
                         row, [], positions_by_deal,
                     )
@@ -897,7 +910,41 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             try:
                 await self.call_api(f'positions/{deal_id}', method='get')
             except OrderNotFoundError:
-                pass  # definitive not-exists — fall through to the verdict
+                # Definitive not-exists for THIS dealId — but the deal may
+                # have been re-keyed rather than closed: the venue can run
+                # even a MARKET entry through its working-order machinery,
+                # executing the confirm's dealId as a working order and
+                # opening the position under a FRESH dealId that back-links
+                # the old one in ``workingOrderId`` (measured 2026-08-28,
+                # cycle 84). Probe the account positions for that back-link
+                # before conceding the cancel; a hit migrates the row onto
+                # the live deal (the snapshot-pass twin of this migration
+                # can miss entirely when the bulk ``/positions`` snapshot
+                # lags past the whole grace window — cycle 81's shape).
+                if row.filled_qty > 0.0:
+                    try:
+                        snapshot = await self.call_api(
+                            'positions', method='get')
+                    except (httpx.TimeoutException, httpx.RequestError,
+                            ConnectionError, ExchangeConnectionError,
+                            CapitalComError):
+                        return MissingConfirmation(
+                            MissingResolution.INCONCLUSIVE)
+                    positions_by_deal = {
+                        str((raw.get('position') or {}).get('dealId') or ''):
+                            raw
+                        for raw in (snapshot.get('positions') or [])
+                    }
+                    promoted = self._find_promoted_deal_id(
+                        row, [], positions_by_deal,
+                    )
+                    if promoted:
+                        self._promote_working_row_to_position(
+                            row, promoted, stamp_entry_filled=True,
+                        )
+                        return MissingConfirmation(
+                            MissingResolution.STILL_PRESENT)
+                # fall through to the verdict below
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError,
                     CapitalComError):

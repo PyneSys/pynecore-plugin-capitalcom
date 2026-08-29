@@ -13320,3 +13320,80 @@ def __test_startup_pass_retires_rejected_residue_without_exchange_id__(tmp_path)
     # A no-id row in any OTHER state is an in-flight dispatch — untouched.
     assert 'coid-live' in live
     store.close()
+
+
+# === Re-keyed market entry: workingOrderId back-link migration ===
+
+def __test_missing_position_probe_follows_the_workingorder_backlink__(tmp_path):
+    """A not-found dealId with a live back-linked position is a re-key.
+
+    The venue can run even a MARKET entry through its working-order
+    machinery: the confirm's dealId executes as a working order and the
+    position opens under a FRESH dealId whose payload back-links the old
+    one in ``workingOrderId`` (cycle 84). The grace-expiry verdict must
+    migrate the row onto the live deal instead of conceding the cancel.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/old-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                          'size': 1.0, 'direction': 'BUY', 'level': 77573.65},
+             'market': {'epic': 'BTCUSD'}},
+        ]},
+    })
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='old-1', filled_qty=1.0,
+                     extras={'kind': 'position', 'entry_filled_at': 123.0})
+    ctx.add_ref('coid-m', 'deal_id', 'old-1')
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.STILL_PRESENT
+    migrated = ctx.get_order('coid-m')
+    assert migrated is not None and migrated.exchange_order_id == 'new-1'
+    assert (migrated.extras or {}).get('missing_pending_since') is None
+    store.close()
+
+
+def __test_missing_position_probe_no_backlink_confirms_cancel__(tmp_path):
+    """A filled row whose deal is gone AND unlinked is a real cancel."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/old-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+        ('positions', 'get'): {'positions': []},
+    })
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='old-1', filled_qty=1.0,
+                     extras={'kind': 'position'})
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.CANCELLED
+    store.close()
+
+
+def __test_snapshot_pass_migrates_a_rekeyed_market_entry_row__(tmp_path):
+    """The per-poll snapshot pass migrates a filled position-kind row whose
+    dealId vanished but back-links from a live position — well before the
+    missing grace can expire."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='old-1', filled_qty=1.0,
+                     extras={'kind': 'position', 'entry_filled_at': 123.0})
+    ctx.add_ref('coid-m', 'deal_id', 'old-1')
+    snapshot = {
+        'new-1': {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                               'size': 1.0, 'direction': 'BUY',
+                               'level': 77573.65},
+                  'market': {'epic': 'BTCUSD'}},
+    }
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(snapshot, {})))
+    migrated = ctx.get_order('coid-m')
+    assert migrated is not None and migrated.exchange_order_id == 'new-1'
+    store.close()
