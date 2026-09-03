@@ -2999,6 +2999,7 @@ def __test_write_call_is_not_deadline_bounded__(monkeypatch):
 
     class _Res:
         is_error = False
+        status_code = 200
         headers: dict[str, str] = {}
 
         @staticmethod
@@ -10868,6 +10869,7 @@ def __test_partial_opaque_rotation_preserves_unchanged_deadline__(monkeypatch):
 
     class _StubResponse:
         is_error = False
+        status_code = 200
 
         def __init__(self, headers: dict):
             self.headers = headers
@@ -10920,6 +10922,7 @@ def __test_concurrent_refresh_response_does_not_roll_back_fresh_tokens__(monkeyp
 
     class _StubResponse:
         is_error = False
+        status_code = 200
         headers = {
             'X-SECURITY-TOKEN': 'sec-server-rotated',
             'CST': 'cst-server-rotated',
@@ -10980,6 +10983,7 @@ def __test_concurrent_normal_request_rotation_is_not_discarded__(monkeypatch):
 
     class _StubResponse:
         is_error = False
+        status_code = 200
         headers = {
             'X-SECURITY-TOKEN': 'sec-Z',
             'CST': 'cst-Z',
@@ -11032,6 +11036,7 @@ def __test_create_session_keeps_old_tokens_visible_during_login__(monkeypatch):
 
     class _EncryptionKeyResponse:
         is_error = False
+        status_code = 200
         headers: dict = {}
 
         def json(self):
@@ -11039,6 +11044,7 @@ def __test_create_session_keeps_old_tokens_visible_during_login__(monkeypatch):
 
     class _SessionResponse:
         is_error = False
+        status_code = 200
         headers = {'X-SECURITY-TOKEN': 'sec-NEW', 'CST': 'cst-NEW'}
 
         def json(self):
@@ -11102,6 +11108,7 @@ def __test_concurrent_login_paths_coalesce_without_deadlock__(monkeypatch, first
 
     class _EncryptionKeyResponse:
         is_error = False
+        status_code = 200
         headers: dict = {}
 
         @staticmethod
@@ -11110,6 +11117,7 @@ def __test_concurrent_login_paths_coalesce_without_deadlock__(monkeypatch, first
 
     class _SessionResponse:
         is_error = False
+        status_code = 200
         headers = {'X-SECURITY-TOKEN': 'sec-new', 'CST': 'cst-new'}
 
         @staticmethod
@@ -11370,6 +11378,7 @@ def __test_call_does_not_recurse_when_bootstrap_returns_session_token_error__(mo
 
     class _StubResponse:
         is_error = True
+        status_code = 400
         headers: dict = {}
 
         def json(self):
@@ -13397,3 +13406,82 @@ def __test_snapshot_pass_migrates_a_rekeyed_market_entry_row__(tmp_path):
     migrated = ctx.get_order('coid-m')
     assert migrated is not None and migrated.exchange_order_id == 'new-1'
     store.close()
+
+
+class _GatewayResponse:
+    """An httpx-shaped response whose body is not JSON (a proxy error page)."""
+
+    headers: dict = {}
+
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+        self.is_error = status_code >= 400
+
+    def json(self):
+        raise json.JSONDecodeError("Expecting value", self.text, 0)
+
+
+_NGINX_504 = (
+    "<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n"
+    "<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx</center>"
+    "\r\n</body>\r\n</html>\r\n"
+)
+
+
+def __test_gateway_error_page_is_a_retryable_transport_error__(monkeypatch):
+    """A 5xx / non-JSON body is a transport fault, never an API verdict.
+
+    Measured live (capitalcom cycle 111): the venue's nginx answered GET
+    /positions with a 504 HTML page; raised as a plain ``CapitalComError`` it
+    bypassed the sync engine's connection-error handling and crashed the run,
+    and the same page on the next start's OHLCV download aborted the cycle
+    instead of waiting for the venue.
+    """
+    from pynecore.core.plugin import is_retryable_provider_error
+    from pynecore_capitalcom.exceptions import CapitalComTransportError
+
+    broker = CapitalCom(config=_make_config())
+    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _GatewayResponse(504, _NGINX_504))
+    with pytest.raises(CapitalComTransportError, match="HTTP 504"):
+        broker('positions', method='get')
+    try:
+        broker('positions', method='get')
+    except CapitalComTransportError as exc:
+        assert is_retryable_provider_error(exc)
+        assert "\r\n" not in str(exc)
+
+    # A 200 with a non-JSON body (interstitial) is the same fault.
+    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _GatewayResponse(200, "<html>x</html>"))
+    with pytest.raises(CapitalComTransportError, match="non-JSON"):
+        broker('positions', method='get')
+
+
+def __test_gateway_error_page_reaches_the_engine_as_a_connection_error__(monkeypatch):
+    """On the async broker path the transport error maps to ``ExchangeConnectionError``."""
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+    from pynecore_capitalcom.exceptions import CapitalComTransportError
+
+    broker = CapitalCom(config=_make_config())
+    assert isinstance(
+        broker._map_exception(CapitalComTransportError("gateway")),
+        ExchangeConnectionError,
+    )
+    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _GatewayResponse(504, _NGINX_504))
+    with pytest.raises(ExchangeConnectionError, match="HTTP 504"):
+        asyncio.run(broker._call('positions', method='get'))
+
+
+def __test_gateway_5xx_with_a_json_body_is_still_a_transport_error__(monkeypatch):
+    """A 5xx is a transport fault even when the gateway happens to emit JSON."""
+    from pynecore_capitalcom.exceptions import CapitalComApiError, CapitalComTransportError
+
+    class _JsonGateway(_GatewayResponse):
+        def json(self):
+            return {'errorCode': 'error.gateway.unavailable'}
+
+    broker = CapitalCom(config=_make_config())
+    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _JsonGateway(503, '{}'))
+    with pytest.raises(CapitalComTransportError, match="HTTP 503") as info:
+        broker('positions', method='get')
+    assert not isinstance(info.value, CapitalComApiError)

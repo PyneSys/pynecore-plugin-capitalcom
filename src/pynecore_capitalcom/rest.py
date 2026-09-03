@@ -38,6 +38,7 @@ from ._base import _CapitalComBase
 from .exceptions import (
     CapitalComApiError,
     CapitalComError,
+    CapitalComTransportError,
     HistoricalPricesNotFoundError,
     InvalidStopDistanceError,
     InvalidStopMaxValueError,
@@ -126,6 +127,12 @@ _SESSION_RECREATE_CODES = frozenset({
 })
 
 
+def _body_excerpt(text: str, limit: int = 160) -> str:
+    """Whitespace-collapsed head of a response body for an error message."""
+    collapsed = ' '.join(text.split())
+    return collapsed if len(collapsed) <= limit else collapsed[:limit] + '...'
+
+
 class _RestSessionMixin(_CapitalComBase, ABC):
     """REST/auth surface: dispatcher, session, balance probe, exception mapper."""
 
@@ -195,10 +202,25 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         url += ENDPOINT_PREFIX + endpoint
 
         res: httpx.Response = getattr(httpx, method_lc)(url, **params)
+        # A 5xx or a non-JSON body never carries an API verdict: the venue's
+        # gateway answered for a backend that did not (measured live: nginx
+        # ``504 Gateway Time-out`` HTML on GET /positions during a venue
+        # outage — surfaced as a raw provider error, it escaped the sync
+        # engine's connection-error handling and killed the run; the same
+        # page on the OHLCV download aborted the next start instead of
+        # waiting for the venue to come back).
+        if res.status_code >= 500:
+            raise CapitalComTransportError(
+                f"Capital.com gateway error HTTP {res.status_code} on "
+                f"{endpoint}: {_body_excerpt(res.text)}"
+            )
         try:
             dict_res = res.json()
         except JSONDecodeError:
-            raise CapitalComError(f"JSON Error: {res.text}")
+            raise CapitalComTransportError(
+                f"Capital.com returned a non-JSON body (HTTP {res.status_code}) "
+                f"on {endpoint}: {_body_excerpt(res.text)}"
+            )
         if not isinstance(dict_res, dict):
             raise CapitalComError("REST response root schema changed")
 
@@ -667,6 +689,9 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         """
         if isinstance(raw, (httpx.TimeoutException, httpx.RequestError)):
             return ExchangeConnectionError(str(raw) or "Capital.com HTTP transport error")
+
+        if isinstance(raw, CapitalComTransportError):
+            return ExchangeConnectionError(str(raw))
 
         if isinstance(raw, CapitalComError):
             code = _extract_error_code(raw)

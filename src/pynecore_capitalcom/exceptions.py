@@ -20,6 +20,21 @@ class CapitalComError(ProviderError):
     """
 
 
+class CapitalComTransportError(CapitalComError):
+    """The request never reached a Capital.com API verdict.
+
+    A 5xx from the venue's gateway or a body that is not JSON (the nginx
+    ``504 Gateway Time-out`` page, a CDN interstitial) — the transport
+    failed between the client and the API, nothing about the request was
+    judged, and the same call can succeed a moment later. Retryable on the
+    provider path (``pyne run`` waits and re-downloads) and mapped to
+    :class:`~pynecore.core.broker.exceptions.ExchangeConnectionError` on
+    the broker path, where the sync engine parks the cycle and re-reads.
+    """
+
+    retryable: bool = True
+
+
 class CapitalComApiError(CapitalComError):
     """The venue received the request and answered with an API error code.
 
