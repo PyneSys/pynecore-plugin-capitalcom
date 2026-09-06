@@ -586,13 +586,17 @@ class _CapitalComCloseHooks:
     ) -> CloseOutcome:
         """DELETE every target position synchronously.
 
-        Capital.com's ``DELETE /positions/{dealId}`` returns no
-        ``dealReference`` and no confirm step is required — the broker
-        echoes a 200 with no body once the position has been queued for
-        closure. The hook mirrors each target row's state to ``closing``
-        and emits a per-target ``close_dispatched`` audit event so the
-        activity stream's subsequent ``CLOSED`` event can match the
-        local row.
+        No confirm step gates the dispatch: the broker's 200 means the
+        position has been queued for closure. The hook mirrors each
+        target row's state to ``closing`` and emits a per-target
+        ``close_dispatched`` audit event so the activity stream's
+        subsequent close activity can match the local row. The
+        ``dealReference`` the DELETE returns is persisted on the target
+        row (``extras['close_deal_reference']``): the close fill normally
+        arrives through the activity stream, but the venue does not
+        always publish that activity, and the snapshot reconcile then
+        prices the vanished ``closing`` row's fill from
+        ``GET /confirms/{dealReference}`` instead.
 
         Network errors raise :class:`OrderDispositionUnknownError`. The
         persist-first close command retains every target ``dealId`` and restart
@@ -604,10 +608,13 @@ class _CapitalComCloseHooks:
         store_ctx = self._plugin.store_ctx
         applied_targets: list[str] = []
         for row in targets:
+            close_ref: str | None = None
             try:
-                await self._plugin.call_api(
-    f'positions/{row.exchange_order_id}', method='delete',
+                resp = await self._plugin.call_api(
+                    f'positions/{row.exchange_order_id}', method='delete',
                 )
+                if isinstance(resp, dict):
+                    close_ref = _wire_id(resp.get('dealReference'))
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
                 raise OrderDispositionUnknownError(
@@ -637,11 +644,20 @@ class _CapitalComCloseHooks:
                     )
             if store_ctx is not None:
                 store_ctx.set_order_state(row.client_order_id, 'closing')
+                if close_ref is not None:
+                    refreshed = store_ctx.get_order(row.client_order_id)
+                    extras = dict((refreshed or row).extras or {})
+                    extras['close_deal_reference'] = close_ref
+                    store_ctx.upsert_order(row.client_order_id, extras=extras)
                 store_ctx.log_event(
                     'close_dispatched',
                     client_order_id=row.client_order_id,
                     exchange_order_id=row.exchange_order_id,
                     intent_key=intent.intent_key,
+                    payload=(
+                        {'close_deal_reference': close_ref}
+                        if close_ref is not None else None
+                    ),
                 )
             applied_targets.append(row.exchange_order_id or '')
 

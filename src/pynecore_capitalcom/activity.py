@@ -428,6 +428,26 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     and event.leg_type == LegType.ENTRY
                     and (row.extras or {}).get('entry_filled_at') is not None
                 )
+                # Closing-leg twin of the guard above. A row stamped
+                # ``natural_close_at`` with its exposure cursor retired
+                # already delivered its close fill — either from an
+                # earlier activity or from the snapshot reconcile's
+                # vanished-``closing``-row path, which prices the fill
+                # from the DELETE's confirm when the venue publishes the
+                # close activity late or not at all. Capital.com never
+                # reuses a dealId, so a later closing activity on such a
+                # row can only be that same close surfacing again;
+                # yielding it would walk the engine's flat book into a
+                # phantom opposite position.
+                close_fill_already_recorded = (
+                    event.event_type == 'filled'
+                    and event.leg_type in (
+                        LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                        LegType.TRAILING_STOP, LegType.CLOSE,
+                    )
+                    and (row.extras or {}).get('natural_close_at') is not None
+                    and row.filled_qty <= 0.0
+                )
                 # Working-order fill (WORKING_ORDER EXECUTED): promote the
                 # row to its position identity BEFORE yielding the fill.
                 # The new dealId comes from the same-instant POSITION
@@ -534,6 +554,22 @@ class _ActivityMixin(_CapitalComBase, ABC):
                             exchange_order_id=deal_id,
                             payload={
                                 'reason': 'entry_already_accounted',
+                                'fingerprint': fingerprint,
+                                'dateUTC': date_utc,
+                                'deal_id': deal_id,
+                                'symbol': row.symbol,
+                                'side': row.side,
+                            },
+                        )
+                elif close_fill_already_recorded:
+                    suppress_fill = True
+                    if self.store_ctx is not None:
+                        self.store_ctx.log_event(
+                            'close_fill_replay_suppressed',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=deal_id,
+                            payload={
+                                'reason': 'close_already_accounted',
                                 'fingerprint': fingerprint,
                                 'dateUTC': date_utc,
                                 'deal_id': deal_id,

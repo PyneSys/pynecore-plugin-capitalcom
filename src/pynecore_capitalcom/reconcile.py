@@ -246,6 +246,34 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     self._retire_netted_journal_exposure(
                         row, retired_exposure,
                     )
+                    continue
+                if (row.state == 'closing'
+                        and row_kind == ENTRY_KIND_POSITION
+                        and row.filled_qty > 0.0):
+                    # Our own DELETE was accepted (``close_dispatched``)
+                    # and the deal is gone from the venue: the
+                    # disappearance IS the close confirmation. The close
+                    # fill normally reaches the engine through the
+                    # activity stream, but the venue does not always
+                    # publish that activity (measured 2026-09-05, cycle
+                    # 122: the DELETE landed, the deal vanished, no
+                    # POSITION activity ever followed) — without this
+                    # branch the grace tracker retires the row silently,
+                    # the engine keeps the position open until its own
+                    # venue-flat detector clears it minutes later, and
+                    # meanwhile every reversal close re-dispatch is
+                    # rejected against the retired row.
+                    close_event = await self._vanished_closing_row_fill(
+                        row, now_ts,
+                    )
+                    if close_event is not None:
+                        retired_exposure = row.filled_qty
+                        self._close_bracket_after_natural_close(row)
+                        self._retire_netted_journal_exposure(
+                            row, retired_exposure,
+                        )
+                        yield close_event
+                    continue
                 # No breadcrumb: the disappearance is the core tracker's
                 # concern — ``observe_presence`` below stamps it.
                 continue
@@ -546,6 +574,88 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 'working': set(working_by_deal),
             },
             now_ts,
+        )
+
+    async def _vanished_closing_row_fill(
+            self, row: 'OrderRow', now_ts: float,
+    ) -> OrderEvent | None:
+        """Build the close fill for a ``closing`` position row whose deal vanished.
+
+        The fill is priced from ``GET /confirms/{close_deal_reference}``
+        (the reference the DELETE returned) when the venue still serves
+        it, otherwise from the live mid quote — the venue exposes no
+        other post-hoc record of the close price, and the same proxy
+        already prices a manual partial close whose activity carries no
+        level. Returns ``None`` when neither source yields a price: the
+        row is left to the disappearance tracker rather than booked at
+        a price the engine would drop.
+        """
+        assert self.store_ctx is not None
+        extras = row.extras or {}
+        deal_id = row.exchange_order_id or ''
+        close_ref = _wire_id(extras.get('close_deal_reference'))
+        price = 0.0
+        price_source = ''
+        if close_ref is not None:
+            try:
+                confirm = await self.call_api(
+                    f'confirms/{close_ref}', method='get',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError,
+                    OrderNotFoundError, CapitalComError):
+                confirm = {}
+            if (confirm.get('dealStatus') or '').upper() != 'REJECTED':
+                price = float(confirm.get('level') or 0.0)
+                if price > 0.0:
+                    price_source = 'close_confirm'
+        if price <= 0.0:
+            try:
+                mid = await self._get_current_mid_price(row.symbol)
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError,
+                    CapitalComError, BrokerError):
+                mid = None
+            if mid is not None and mid > 0.0:
+                price = mid
+                price_source = 'mid_proxy'
+        if price <= 0.0:
+            self.store_ctx.log_event(
+                'closing_row_vanished_unpriced',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id or None,
+                payload={'close_deal_reference': close_ref},
+            )
+            return None
+        fill_qty = row.filled_qty
+        self.store_ctx.log_event(
+            'closing_row_vanished_close_yielded',
+            client_order_id=row.client_order_id,
+            exchange_order_id=deal_id or None,
+            payload={'close_deal_reference': close_ref,
+                     'price_source': price_source,
+                     'fill_price': price, 'fill_qty': fill_qty},
+        )
+        close_side = 'sell' if row.side == 'buy' else 'buy'
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=deal_id, symbol=row.symbol, side=close_side,
+                order_type=OrderType.MARKET,
+                qty=fill_qty, filled_qty=fill_qty, remaining_qty=0.0,
+                price=None, stop_price=None,
+                average_fill_price=price,
+                status=OrderStatus.FILLED,
+                timestamp=now_ts, fee=0.0, fee_currency='',
+                reduce_only=True, client_order_id=row.client_order_id,
+            ),
+            event_type='filled',
+            fill_price=price,
+            fill_qty=fill_qty,
+            timestamp=now_ts,
+            pine_id=row.pine_entry_id,
+            from_entry=row.from_entry,
+            leg_type=LegType.CLOSE,
+            fill_id=close_ref or f'{deal_id}:close',
         )
 
     async def _resolve_parked_submission_dispositions(

@@ -1750,3 +1750,29 @@ def __test_recovery_skips_tracked_position_no_duplicate_adopt__(tmp_path):
     assert adopted == []
     assert any(r.client_order_id == 'coid-entry' for r in live)
     store.close()
+
+
+def __test_full_close_persists_the_delete_deal_reference_on_the_target__(tmp_path):
+    """The DELETE's ``dealReference`` lands on the closing row for later pricing."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'delete'): {'dealReference': 'p_close-ref'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     filled_qty=1.0, state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    asyncio.run(broker.execute_close(env))
+
+    target = ctx.get_order('coid-entry')
+    assert target is not None
+    assert target.state == 'closing'
+    assert (target.extras or {}).get('close_deal_reference') == 'p_close-ref'
+    kinds = [(k, p) for k, p in _events_for(ctx, 'coid-entry') if k == 'close_dispatched']
+    assert kinds == [('close_dispatched', {'close_deal_reference': 'p_close-ref'})]
+    store.close()

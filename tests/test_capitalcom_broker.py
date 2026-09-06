@@ -1384,6 +1384,153 @@ def __test_reconcile_feeds_observed_trailing_stop__(tmp_path):
     store.close()
 
 
+def _seed_closing_position(ctx, *, close_ref=None, side='buy', state='closing',
+                           extras_patch=None):
+    """A filled position row whose full-close DELETE already landed."""
+    extras: dict = {'kind': 'position', 'entry_filled_at': 1.0}
+    if close_ref is not None:
+        extras['close_deal_reference'] = close_ref
+    if extras_patch:
+        extras.update(extras_patch)
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side=side, qty=2.0,
+                     filled_qty=2.0, state=state, pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras=extras)
+    ctx.add_ref('coid-entry', 'deal_id', 'deal-L')
+
+
+def _event_payloads(ctx, kind: str) -> list[dict]:
+    import json as _json
+    rows = ctx._store._conn.execute(
+        "SELECT payload FROM events WHERE run_instance_id = ? AND kind = ? "
+        "ORDER BY id", (ctx.run_instance_id, kind),
+    ).fetchall()
+    return [_json.loads(r['payload'] or '{}') for r in rows]
+
+
+def __test_vanished_closing_row_yields_the_close_fill_priced_from_the_confirm__(tmp_path):
+    """A ``closing`` row gone from ``/positions`` IS the close confirmation.
+
+    The venue does not always publish the POSITION activity for a DELETE
+    (measured 2026-09-05, cycle 122); the snapshot reconcile must deliver
+    the close fill itself — priced from the DELETE's confirm — and tear
+    the row down like the activity path would, instead of leaving it to
+    the grace tracker's silent retire.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/c-ref', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'CLOSED', 'level': 1.2345,
+            'size': 2.0, 'direction': 'SELL',
+            'affectedDeals': [{'dealId': 'deal-L', 'status': 'CLOSED'}],
+        },
+    })
+    _seed_closing_position(ctx, close_ref='c-ref')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.event_type == 'filled'
+    assert ev.leg_type == LegType.CLOSE
+    assert ev.order.side == 'sell'
+    assert ev.fill_qty == 2.0
+    assert ev.fill_price == 1.2345
+    assert ev.fill_id == 'c-ref'
+    assert ev.pine_id == 'Long'
+    assert ev.order.id == 'deal-L'
+
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    assert row.filled_qty == 0.0
+    assert (row.extras or {}).get('natural_close_at') is not None
+    assert (row.extras or {}).get('missing_pending_since') is None
+    payloads = _event_payloads(ctx, 'closing_row_vanished_close_yielded')
+    assert payloads == [{'close_deal_reference': 'c-ref',
+                         'price_source': 'close_confirm',
+                         'fill_price': 1.2345, 'fill_qty': 2.0}]
+    store.close()
+
+
+def __test_vanished_closing_row_falls_back_to_the_live_mid_without_a_confirm__(tmp_path):
+    """No usable confirm (reference missing or expired) → live mid proxy."""
+    market = dict(_RULES_RESP)
+    market['snapshot'] = {'bid': 1.2000, 'offer': 1.2002}
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): market,
+        ('error', 'confirms/c-ref', 'get'): OrderNotFoundError('expired', ref_type='deal_reference'),
+    })
+    _seed_closing_position(ctx, close_ref='c-ref')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.CLOSE
+    assert events[0].fill_price == pytest.approx(1.2001)
+    assert events[0].fill_id == 'c-ref'
+    payloads = _event_payloads(ctx, 'closing_row_vanished_close_yielded')
+    assert len(payloads) == 1
+    assert payloads[0]['price_source'] == 'mid_proxy'
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    assert row.filled_qty == 0.0
+    assert (row.extras or {}).get('natural_close_at') is not None
+    store.close()
+
+
+def __test_vanished_closing_row_without_any_price_is_left_to_the_tracker__(tmp_path):
+    """Unpriceable → no fill is fabricated; the row keeps its tracker path."""
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_closing_position(ctx)
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert events == []
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    assert row.state == 'closing'
+    assert row.filled_qty == 2.0
+    assert (row.extras or {}).get('natural_close_at') is None
+    assert len(_event_payloads(ctx, 'closing_row_vanished_unpriced')) == 1
+    store.close()
+
+
+def __test_vanished_confirmed_row_is_not_treated_as_a_close__(tmp_path):
+    """Only a row whose DELETE landed reads its disappearance as a close."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/c-ref', 'get'): {'dealStatus': 'ACCEPTED', 'level': 1.2345},
+    })
+    _seed_closing_position(ctx, close_ref='c-ref', state='confirmed')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert events == []
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    assert row.filled_qty == 2.0
+    assert (row.extras or {}).get('natural_close_at') is None
+    assert _event_payloads(ctx, 'closing_row_vanished_close_yielded') == []
+    store.close()
+
+
+def __test_late_close_activity_on_a_retired_row_is_suppressed__(tmp_path):
+    """The venue's late close activity must not double the delivered fill."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/c-ref', 'get'): {'dealStatus': 'ACCEPTED', 'level': 1.2345},
+    })
+    _seed_closing_position(ctx, close_ref='c-ref')
+    first = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert len(first) == 1
+
+    late_close = {
+        'dateUTC': '2026-09-05T19:28:30.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER',
+        'details': {'direction': 'SELL', 'size': 2.0, 'level': 1.2340},
+    }
+    replay = asyncio.run(_drain_agen(broker._process_activity([late_close])))
+    assert replay == []
+    payloads = _event_payloads(ctx, 'close_fill_replay_suppressed')
+    assert len(payloads) == 1
+    assert payloads[0]['reason'] == 'close_already_accounted'
+    # Durable: the replayed activity is deduped, not re-evaluated next poll.
+    assert _activity_fingerprint(late_close) in broker._activity_cursor.seen_fingerprints
+    store.close()
+
+
 def __test_reconcile_resolves_partial_close_exact_target_residual__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path)
     ctx.upsert_order(
