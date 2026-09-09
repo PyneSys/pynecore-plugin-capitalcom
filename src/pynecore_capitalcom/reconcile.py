@@ -57,6 +57,7 @@ from pynecore.core.broker.store_helpers import (
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import (
+    EXTRAS_KEY_CANCEL_REQUESTED,
     _POLL_INTERVAL_S,
     _extract_reject_reason,
     _wire_float,
@@ -783,6 +784,20 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     intent_key=row.intent_key,
                     payload={'deal_reference': deal_ref, 'filled': filled},
                 )
+                if extras.get(EXTRAS_KEY_CANCEL_REQUESTED) is not None:
+                    # The cancel reached the row while it was parked; the
+                    # market entry had already executed, so — as after
+                    # any fill — the cancel is a no-op and the fill below
+                    # is the honest outcome.
+                    self.store_ctx.log_event(
+                        'cancel_noop',
+                        client_order_id=coid,
+                        exchange_order_id=deal_id,
+                        intent_key=row.intent_key,
+                        payload={'reason': 'already_filled',
+                                 'pine_id': row.pine_entry_id,
+                                 'from_entry': row.from_entry},
+                    )
                 yield OrderEvent(
                     order=ExchangeOrder(
                         id=deal_id, symbol=row.symbol, side=row.side,
@@ -804,6 +819,57 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     leg_type=LegType.ENTRY,
                 )
                 continue
+
+            if extras.get(EXTRAS_KEY_CANCEL_REQUESTED) is not None:
+                # Pine cancelled this entry while it was parked (see
+                # ``_CapitalComCancelHooks.submit_cancel``): the id is
+                # the first thing the DELETE could target, so it goes
+                # out now, before the row is promoted to a live working
+                # order the engine would otherwise adopt.
+                try:
+                    await self.call_api(
+                        f'workingorders/{deal_id}', method='delete',
+                    )
+                except (httpx.TimeoutException, httpx.RequestError,
+                        ConnectionError, ExchangeConnectionError):
+                    # Stay parked: the next poll repeats the (idempotent)
+                    # confirm lookup and this DELETE.
+                    continue
+                except OrderNotFoundError:
+                    # Already gone — filled or cancelled venue-side. Fall
+                    # through to persist the id: a fill promotes through
+                    # the activity stream, a vanished order retires
+                    # through the snapshot loop's missing-pending path.
+                    self.store_ctx.log_event(
+                        'cancel_already_gone',
+                        client_order_id=coid,
+                        exchange_order_id=deal_id,
+                        intent_key=row.intent_key,
+                    )
+                else:
+                    mark_confirmed_with_fill(
+                        self.store_ctx,
+                        coid=coid,
+                        exchange_id=deal_id,
+                        is_filled=False,
+                        filled_qty=0.0,
+                        fill_price=None,
+                    )
+                    self.store_ctx.close_order(coid)
+                    # Pine no longer emits the cancelled entry, so the
+                    # ``'rejected'`` resolution only clears the engine's
+                    # park (a still-armed active intent would already
+                    # have been dropped by the cancel itself).
+                    self.store_ctx.record_resolution(coid, 'rejected')
+                    self.store_ctx.log_event(
+                        'cancelled',
+                        client_order_id=coid,
+                        exchange_order_id=deal_id,
+                        intent_key=row.intent_key,
+                        payload={'cleared_via': 'parked_confirm',
+                                 'deal_reference': deal_ref},
+                    )
+                    continue
 
             # Working order (limit/stop): learning the deal id is
             # enough. ``get_open_orders`` resolves it back to the COID

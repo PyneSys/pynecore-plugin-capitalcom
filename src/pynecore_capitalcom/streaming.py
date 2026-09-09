@@ -2026,6 +2026,28 @@ class _StreamingMixin(_CapitalComBase, ABC):
             # ``_last_bar_timestamp`` holds the open time of the most recent
             # CLOSED bar — this tick is a late frame for a settled slot.
             return None
+        tf_seconds = (int(in_seconds(self.timeframe))
+                      if self.timeframe is not None else 0)
+        if tf_seconds > 0:
+            last_slot = self._last_bar_ohlcv.timestamp // 1000
+            open_slot = (last_slot if not self._last_bar_ohlcv.is_closed
+                         else last_slot + tf_seconds)
+            if bar_open_s > open_slot:
+                # The tick is ahead of the slot the feed may open next: the
+                # bar before it is still forming, its ``ohlc.event`` not yet
+                # here. Quotes reach the FIFO the instant they arrive while
+                # the close is forwarded only at the bar boundary (or later,
+                # when the venue publishes late), so at every boundary the
+                # first tick of the new period races the close of the old
+                # one. Opening the new slot from that tick would hand the
+                # runner a forming bar for T+1 ahead of the closed bar for
+                # T; the closed bar then executes with the clock running
+                # backwards (measured live: Capital.com lane, 2-30 such
+                # inversions per cycle). Hold the spinner instead — the
+                # close (or the watchdog's REST recovery of a genuinely
+                # missed slot) settles the bar, and the next tick opens
+                # the period behind it.
+                return None
         new_close = quote.bid
         if bar_open_s * 1000 != self._last_bar_ohlcv.timestamp:
             synth = OHLCV(

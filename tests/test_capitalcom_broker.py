@@ -1585,6 +1585,180 @@ def __test_reconcile_rejects_corrected_reverse_with_unchanged_target__(tmp_path)
     store.close()
 
 
+def _parked_working_row(ctx, coid='coid-parked', *, deal_ref='o-ref-p',
+                        cancel_requested=False):
+    """Seed a parked (``disposition_unknown``) stop entry with only a deal reference."""
+    from pynecore_capitalcom.helpers import EXTRAS_KEY_CANCEL_REQUESTED
+    extras = {'kind': 'working', 'order_type': 'stop', 'deal_reference': deal_ref}
+    if cancel_requested:
+        extras[EXTRAS_KEY_CANCEL_REQUESTED] = {'cancel_coid': 'x0', 'intent_key': 'L'}
+    ctx.upsert_order(coid, symbol='EURUSD', side='buy', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='L', extras=extras)
+    ctx.add_ref(coid, 'deal_reference', deal_ref)
+    ctx.record_park(coid=coid, key='L', kind='new')
+
+
+def _event_kinds(ctx, coid):
+    return [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE client_order_id = ? ORDER BY id", (coid,),
+    )]
+
+
+def __test_cancel_of_a_parked_submission_is_deferred_not_lost__(tmp_path):
+    """A cancel reaching a parked entry is stamped on the row, not dropped.
+
+    Measured live (Capital.com resting lane, cycle 136): a stop entry POSTed
+    into a 504 outage stayed ``disposition_unknown`` (no deal id); Pine's
+    cancel three bars later found nothing to DELETE and resolved ``noop``,
+    the confirm retry then learned the id and the order filled anyway.
+    """
+    from pynecore.core.broker.models import CancelIntent
+    from pynecore_capitalcom.helpers import EXTRAS_KEY_CANCEL_REQUESTED
+
+    broker, store, ctx = _make_broker(tmp_path)
+    _parked_working_row(ctx)
+    env = DispatchEnvelope(
+        intent=CancelIntent(pine_id='L', symbol='EURUSD'),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    assert asyncio.run(broker.execute_cancel(env)) is True
+
+    assert not any(c[1] == 'delete' for c in broker._calls), \
+        "nothing to DELETE yet — the row has no deal id"
+    row = ctx.get_order('coid-parked')
+    assert row is not None and row.state == 'disposition_unknown'
+    assert row.exchange_order_id is None
+    requested = (row.extras or {})[EXTRAS_KEY_CANCEL_REQUESTED]
+    assert requested['cancel_coid'] == env.client_order_id('x')
+    assert requested['intent_key'] == 'L'
+    assert 'cancel_deferred_parked' in _event_kinds(ctx, 'coid-parked')
+    store.close()
+
+
+def __test_parked_working_order_with_a_deferred_cancel_is_deleted_when_its_id_lands__(tmp_path):
+    """The confirm retry DELETEs the order instead of promoting it live."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-p', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-P1'}],
+        },
+        ('workingorders/deal-P1', 'delete'): {},
+    })
+    _parked_working_row(ctx, cancel_requested=True)
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {}, {'deal-P1': {'workingOrderData': {'dealId': 'deal-P1'}}},
+    )))
+
+    assert events == []
+    assert any(c[0] == 'workingorders/deal-P1' and c[1] == 'delete'
+               for c in broker._calls)
+    row = ctx.get_order('coid-parked')
+    assert row is not None and row.closed_ts_ms is not None
+    assert row.exchange_order_id == 'deal-P1'
+    assert not any(r.client_order_id == 'coid-parked'
+                   for r in ctx.iter_live_orders())
+    assert ctx.replay()[1]['coid-parked'].resolution == 'rejected'
+    kinds = _event_kinds(ctx, 'coid-parked')
+    assert 'cancelled' in kinds
+    assert 'parked_submission_confirmed_on_retry' not in kinds
+    store.close()
+
+
+def __test_parked_working_order_deferred_cancel_already_gone_promotes_the_id__(tmp_path):
+    """A 404 on the deferred DELETE means filled or cancelled venue-side.
+
+    The id is still persisted so the ordinary machinery settles the row:
+    a fill promotes through the activity stream, a vanished order retires
+    through the snapshot loop.
+    """
+    from pynecore_capitalcom.exceptions import OrderNotFoundError
+
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-p', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-P2'}],
+        },
+        ('error', 'workingorders/deal-P2', 'delete'): OrderNotFoundError(
+            'API error occured: error.not-found.dealId', ref_type='deal_id'),
+    })
+    _parked_working_row(ctx, cancel_requested=True)
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+
+    assert events == []
+    row = ctx.get_order('coid-parked')
+    assert row is not None and row.state == 'confirmed'
+    assert row.exchange_order_id == 'deal-P2'
+    assert ctx.replay()[1]['coid-parked'].resolution is None
+    kinds = _event_kinds(ctx, 'coid-parked')
+    assert 'cancel_already_gone' in kinds
+    assert 'parked_submission_confirmed_on_retry' in kinds
+    store.close()
+
+
+def __test_parked_working_order_deferred_cancel_retries_after_a_transport_error__(tmp_path):
+    """A DELETE that cannot reach the venue leaves the row parked for the next poll."""
+    from pynecore.core.broker.exceptions import ExchangeConnectionError
+
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-p', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-P3'}],
+        },
+        ('error', 'workingorders/deal-P3', 'delete'): ExchangeConnectionError(
+            'gateway timeout'),
+    })
+    _parked_working_row(ctx, cancel_requested=True)
+
+    assert asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {}))) == []
+    row = ctx.get_order('coid-parked')
+    assert row is not None and row.state == 'disposition_unknown'
+    assert row.exchange_order_id is None
+
+    # The venue is back: the same poll path confirms and DELETEs.
+    del broker._responses[('error', 'workingorders/deal-P3', 'delete')]
+    broker._responses[('workingorders/deal-P3', 'delete')] = {}
+    assert asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {}))) == []
+    row = ctx.get_order('coid-parked')
+    assert row is not None and row.closed_ts_ms is not None
+    assert 'cancelled' in _event_kinds(ctx, 'coid-parked')
+    store.close()
+
+
+def __test_parked_market_entry_with_a_deferred_cancel_still_reports_its_fill__(tmp_path):
+    """A market entry that executed while parked: the cancel is a no-op, the fill is real."""
+    from pynecore_capitalcom.helpers import EXTRAS_KEY_CANCEL_REQUESTED
+
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-m', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-M9'}],
+        },
+    })
+    ctx.upsert_order('coid-mkt', symbol='EURUSD', side='buy', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='L',
+                     extras={'kind': 'position', 'order_type': 'market',
+                             'deal_reference': 'o-ref-m',
+                             EXTRAS_KEY_CANCEL_REQUESTED: {
+                                 'cancel_coid': 'x0', 'intent_key': 'L'}})
+    ctx.record_park(coid='coid-mkt', key='L', kind='new')
+
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot(
+        {'deal-M9': {'market': {'epic': 'EURUSD'},
+                     'position': {'dealId': 'deal-M9', 'direction': 'BUY',
+                                  'size': 1.0, 'level': 1.1}}}, {},
+    )))
+
+    fills = [ev for ev in events if ev.event_type == 'filled'
+             and ev.order.client_order_id == 'coid-mkt']
+    assert len(fills) == 1
+    assert not any(c[1] == 'delete' for c in broker._calls)
+    assert 'cancel_noop' in _event_kinds(ctx, 'coid-mkt')
+    assert ctx.replay()[1]['coid-mkt'].resolution == 'attached'
+    store.close()
+
+
 def __test_parked_limit_submission_learns_its_deal_id_on_confirms_retry__(tmp_path):
     # confirm_submission parked the limit entry on a confirms glitch: the
     # row has a deal_reference but no dealId, so get_open_orders cannot map
@@ -6616,6 +6790,61 @@ def __test_quote_synth_opens_the_next_slot_not_the_closed_bar__():
     ))
     assert widened is not None and widened.timestamp == 1_860_000
     assert (widened.open, widened.high, widened.low, widened.close) == (1.20, 1.25, 1.20, 1.25)
+
+
+def __test_quote_synth_never_opens_a_slot_ahead_of_the_forming_bar__():
+    """A tick for T+1 must not open that bar while T is still forming.
+
+    Quotes reach the FIFO the instant they arrive; the close of the old
+    period is forwarded only at the bar boundary (or later, when the venue
+    publishes late), so at every boundary the first tick of the new period
+    races the close of the old one. Opening T+1 from that tick hands the
+    runner a forming bar ahead of the closed bar for T, which then executes
+    with the clock running backwards (measured live: Capital.com lane, 2-30
+    inversions per cycle). The spinner holds until the close lands.
+    """
+    from pynecore_capitalcom._base import _QuoteSnapshot
+
+    broker = _FakeBroker(symbol="EURUSD", timeframe="1", config=_make_config())
+    closed = broker._on_ohlc_event({
+        "priceType": "bid", "t": 1_800_000,
+        "o": 1.10, "h": 1.12, "l": 1.09, "c": 1.11, "_volume": 100.0,
+    })
+    assert closed is not None and closed.is_closed
+
+    # Two slots ahead of the last close: the slot in between has not
+    # closed — held.
+    assert broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=1, bid=1.30, ask=1.31,
+    )) is None
+
+    # The very next slot opens as usual.
+    opened = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1860, cumulative_volume=1, bid=1.20, ask=1.21,
+    ))
+    assert opened is not None and opened.timestamp == 1_860_000
+
+    # While 1860 is forming, a tick for 1920 is held — its close has not
+    # landed yet.
+    assert broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=1, bid=1.30, ask=1.31,
+    )) is None
+    # ...and the forming bar itself still widens.
+    widened = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1860, cumulative_volume=2, bid=1.25, ask=1.26,
+    ))
+    assert widened is not None and widened.timestamp == 1_860_000
+
+    # The close of 1860 lands; the next tick opens 1920.
+    assert broker._on_ohlc_event({
+        "priceType": "bid", "t": 1_860_000,
+        "o": 1.20, "h": 1.25, "l": 1.20, "c": 1.24, "_volume": 2.0,
+    }) is not None
+    reopened = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=1, bid=1.30, ask=1.31,
+    ))
+    assert reopened is not None and reopened.timestamp == 1_920_000
+    assert (reopened.open, reopened.close) == (1.30, 1.30)
 
 
 def __test_reopen_drops_stale_previous_session_ws_bar__(monkeypatch):

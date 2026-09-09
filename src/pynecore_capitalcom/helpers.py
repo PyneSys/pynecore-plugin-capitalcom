@@ -105,6 +105,13 @@ _FUNDS_REJECT_REASON_SUBSTRINGS = ('MARGIN', 'LEVERAGE', 'FUND', 'RISK', 'BALANC
 # calls the sync engine issues.
 _POLL_INTERVAL_S = 1.5
 
+#: ``orders.extras`` key stamped on a parked (``disposition_unknown``) entry
+#: row when a cancel intent reached it before the venue handed back a deal
+#: id. The parked-submission resolver honours it the moment the id lands:
+#: a working order is DELETEd right away, a filled market entry makes the
+#: cancel a no-op. Value: ``{'cancel_coid': ..., 'intent_key': ...}``.
+EXTRAS_KEY_CANCEL_REQUESTED = 'cancel_requested'
+
 # TTL on cached ``_InstrumentRules`` entries. Capital.com widens the
 # bracket-distance minimum during volatile sessions; unbounded
 # caching would silently disable the pre-check. Five minutes bounds the

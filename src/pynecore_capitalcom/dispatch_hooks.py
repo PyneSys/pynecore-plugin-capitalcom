@@ -32,6 +32,10 @@ from pynecore.core.broker.journal import (
     ModifyEntryOutcome,
     ModifyExitOutcome,
 )
+from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
+)
 from pynecore.core.broker.models import (
     CancelIntent,
     CloseIntent,
@@ -45,6 +49,7 @@ from pynecore.core.broker.models import (
 from .exceptions import CapitalComError, OrderNotFoundError
 from ._base import CapitalComHookCollaborator
 from .helpers import (
+    EXTRAS_KEY_CANCEL_REQUESTED,
     _extract_reject_reason,
     _is_funds_reject,
     _wire_float,
@@ -322,10 +327,40 @@ class _CapitalComCancelHooks:
             )
 
         for row in targets:
+            extras = row.extras or {}
+            if (row.state == 'disposition_unknown'
+                    and not row.exchange_order_id
+                    and extras.get('kind') in (ENTRY_KIND_WORKING,
+                                               ENTRY_KIND_POSITION)):
+                # A parked submission: the POST may well have landed, but
+                # the confirms glitch left the row without a deal id, so
+                # there is nothing to DELETE yet. Skipping it would LOSE
+                # the cancel — the parked-submission resolver later learns
+                # the id and the order goes live although Pine already
+                # cancelled it (measured live: Capital.com resting lane,
+                # cycle 136 — a stop entry POSTed into a 504 outage was
+                # cancelled three bars later as ``noop``, confirmed on the
+                # retry and filled). Stamp the request on the row; the
+                # resolver DELETEs the working order the moment the id
+                # lands (a market entry that turns out filled makes the
+                # cancel a no-op, as after any other fill).
+                if store_ctx is not None:
+                    merged = dict(extras)
+                    merged[EXTRAS_KEY_CANCEL_REQUESTED] = {
+                        'cancel_coid': coid,
+                        'intent_key': intent.intent_key,
+                    }
+                    store_ctx.upsert_order(row.client_order_id, extras=merged)
+                    store_ctx.log_event(
+                        'cancel_deferred_parked',
+                        client_order_id=row.client_order_id,
+                        intent_key=intent.intent_key,
+                        payload={'deal_reference': extras.get('deal_reference')},
+                    )
+                continue
             if row.state not in ('submitted', 'server_ref_seen', 'confirmed'):
                 continue
 
-            extras = row.extras or {}
             leg_kind = extras.get('leg_kind')
 
             # Bracket leg: ``execute_exit`` stamps ``leg_kind`` ('tp'/'sl')
