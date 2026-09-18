@@ -636,3 +636,42 @@ def __test_capitalcom_clean_stream_never_replays__(monkeypatch):
         assert provider.price_calls == []
 
     _run(scenario, monkeypatch)
+
+
+def __test_capitalcom_startup_seam_bar_published_late_is_still_recovered__(monkeypatch):
+    """A seam bar REST publishes only after the startup backfill is not lost.
+
+    Replays capitalcom cycle 174 (2026-09-18): the process started one
+    second before a minute boundary, the warmup tail was bar 0, the bar
+    that closed while the subscription came up (bar 1) was not yet in REST
+    when the framework asked for the seam, and the WS only delivered from
+    bar 2 on — bar 1 reached the strategy as a DATA_GAP. The empty backfill
+    must arm the watchdog on the warmup tail so it probes bar 1 and injects
+    it once the venue publishes it.
+    """
+    monkeypatch.setattr(streaming_module.asyncio, 'sleep', _fast_sleep)
+
+    async def scenario(provider, runner):
+        provider.fill_book(1)
+        provider.advance_to(2, offset_s=11.0)
+        await provider.connect()
+        assert provider._last_bar_open_ts == 0.0
+        recovered = await provider.backfill_closed_bars("EURUSD", "1", _bar(0) * 1000)
+        assert recovered == []
+        assert provider._last_bar_timestamp == _bar(0)
+        assert provider._last_bar_open_ts == float(_bar(0))
+
+        # The venue publishes bar 1 a moment later; the watchdog probes it.
+        provider.fill_book(2)
+        raw = provider._raw_ohlc_queue
+        queue = provider._update_queue
+        assert raw is not None and queue is not None
+        await _until(lambda: raw.qsize() >= 1 or not queue.empty(),
+                     what="the watchdog recovery of the seam bar")
+        raw.put_nowait(("disconnect", None))
+        await _consume_until_death(provider, runner)
+
+        assert runner.closed == [_bar(1) * 1000]
+        assert runner.dropped == []
+
+    _run(scenario, monkeypatch)

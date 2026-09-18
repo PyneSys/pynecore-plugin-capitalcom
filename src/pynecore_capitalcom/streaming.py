@@ -1509,19 +1509,34 @@ class _StreamingMixin(_CapitalComBase, ABC):
         :param since_ms: Opening of the last bar the framework already holds.
         :return: Closed bars strictly after ``since_ms``, ascending.
         """
+        since_s = since_ms // 1000
         payloads = await asyncio.to_thread(
-            self._fetch_reconnect_gap_payloads, None, since_ms // 1000,
+            self._fetch_reconnect_gap_payloads, None, since_s,
         )
-        if payloads:
-            # ``connect()`` already read this very window into the update
-            # queue on its own, and the framework splices the bars returned
-            # here in ahead of the live stream — so without advancing the
-            # emitted-bar cursor every startup-gap bar would reach the runner
-            # twice, the second time behind a newer one. Never backwards: the
-            # stream may have closed a newer bar while this query ran.
-            newest = int(payloads[-1]["t"]) // 1000
-            if self._last_bar_timestamp is None or self._last_bar_timestamp < newest:
-                self._last_bar_timestamp = newest
+        # ``connect()`` already read this very window into the update queue
+        # on its own, and the framework splices the bars returned here in
+        # ahead of the live stream — so without advancing the emitted-bar
+        # cursor every startup-gap bar would reach the runner twice, the
+        # second time behind a newer one. Never backwards: the stream may
+        # have closed a newer bar while this query ran. With nothing
+        # returned the warmup tail itself is the newest bar anyone holds.
+        newest = int(payloads[-1]["t"]) // 1000 if payloads else since_s
+        if self._last_bar_timestamp is None or self._last_bar_timestamp < newest:
+            self._last_bar_timestamp = newest
+        if self._last_bar_open_ts == 0.0:
+            # ``connect()`` ran before the framework handed over the warmup
+            # tail, so its watchdog seed saw no baseline and stayed
+            # disarmed. A bar that closed in the seconds around connect is
+            # published by REST only a little later — this query can
+            # legitimately come back empty for it — and the WS delivers
+            # closes only from the subscription onwards, so nobody would
+            # ever fetch that bar (measured live: capitalcom cycle 174,
+            # started 14:18:59 UTC, warmup tail 14:17, first WS bar 14:19,
+            # the 14:18 bar reached the strategy as a DATA_GAP). Arming the
+            # watchdog on the tail makes it probe the next slot and inject
+            # the bar from REST once the venue publishes it.
+            self._last_bar_open_ts = float(self._last_bar_timestamp)
+            self._last_ohlc_event_ts = epoch_time()
         return [
             OHLCV(
                 timestamp=int(payload["t"]),
