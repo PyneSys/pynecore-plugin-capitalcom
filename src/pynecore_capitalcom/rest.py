@@ -48,8 +48,6 @@ from .exceptions import (
 )
 from .helpers import (
     ENDPOINT_PREFIX,
-    URL,
-    URL_DEMO,
     _AUTH_ERROR_CODES,
     _INVALID_LEVERAGE_CODE,
     _INVALID_STOP_MAX_PREFIX,
@@ -63,6 +61,7 @@ from .helpers import (
     _extract_jwt_expiry,
     _extract_numeric_value,
     encrypt_password,
+    rest_url,
 )
 
 # Capital.com session tokens expire ~1h after creation despite the
@@ -198,7 +197,7 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         elif method_lc in ('post', 'put'):
             params['json'] = data
 
-        url = URL_DEMO if self._capital_config.demo else URL
+        url = rest_url(self._capital_config.demo, self._capital_config.rest_url)
         url += ENDPOINT_PREFIX + endpoint
 
         res: httpx.Response = getattr(httpx, method_lc)(url, **params)

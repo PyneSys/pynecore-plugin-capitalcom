@@ -45,11 +45,11 @@ from ._base import _CapitalComBase, _QuoteSnapshot
 from .exceptions import CapitalComError, HistoricalPricesNotFoundError
 from .rest import _SESSION_RECREATE_CODES
 from .helpers import (
-    WS_URL,
     _WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD,
     _WS_VOLUME_BASELINE_BARS,
     _WS_VOLUME_LOW_RATIO,
     _WS_VOLUME_MIN_BASELINE_BARS,
+    ws_url,
 )
 
 
@@ -1590,7 +1590,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
         # strategy that is too coarse — tighten to 5s/5s (≤10s detect)
         # so a TCP-level outage propagates inside one bar.
         self._ws = await websockets.connect(
-            WS_URL, ping_interval=5, ping_timeout=5,
+            ws_url(self._capital_config.ws_url), ping_interval=5, ping_timeout=5,
         )
         self._connection_generation += 1
         self._last_disconnect_evidence = None

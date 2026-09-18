@@ -32,3 +32,12 @@ class CapitalComConfig(LiveProviderConfig):
 
     api_password: str = ""
     """API password for authentication."""
+
+    rest_url: str = ""
+    """Optional REST base URL override (a proxy in front of the venue). Leave
+    empty to use the live or demo host. ``PYNE_CAPITALCOM_REST_URL`` in the
+    environment wins over this field."""
+
+    ws_url: str = ""
+    """Optional streaming URL override (``wss://...``). Leave empty for the
+    venue's streaming host. ``PYNE_CAPITALCOM_WS_URL`` wins over this field."""

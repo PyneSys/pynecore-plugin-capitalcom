@@ -15,6 +15,7 @@ Imported by ``_base.py`` and many mix-ins; depends only on stdlib and
 """
 import json
 import math
+import os
 from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
 from collections.abc import Mapping
 from datetime import UTC, datetime, time
@@ -39,6 +40,29 @@ URL_DEMO = 'https://demo-api-capital.backend-capital.com'
 WS_URL = 'wss://api-streaming-capital.backend-capital.com/connect'
 
 ENDPOINT_PREFIX = '/api/v1/'
+
+
+def rest_url(demo: bool, override: str = "") -> str:
+    """Return the REST base URL for the demo or live system.
+
+    A per-process override (``PYNE_CAPITALCOM_REST_URL``) wins over the
+    config override, which wins over the venue hosts.
+
+    :param demo: ``True`` for the demo host, ``False`` for live.
+    :param override: The config's ``rest_url`` field.
+    :return: Base URL without the endpoint prefix.
+    """
+    return (os.environ.get("PYNE_CAPITALCOM_REST_URL") or override
+            or (URL_DEMO if demo else URL)).rstrip("/")
+
+
+def ws_url(override: str = "") -> str:
+    """Return the streaming URL, honouring the same override order as :func:`rest_url`.
+
+    :param override: The config's ``ws_url`` field.
+    :return: WebSocket URL.
+    """
+    return os.environ.get("PYNE_CAPITALCOM_WS_URL") or override or WS_URL
 
 TIMEFRAMES = {
     '1': 'MINUTE',
