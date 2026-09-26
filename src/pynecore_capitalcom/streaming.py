@@ -188,7 +188,8 @@ class _StreamingMixin(_CapitalComBase, ABC):
         except (ZoneInfoNotFoundError, ValueError):
             return True
         local_dt = datetime.fromtimestamp(epoch_time(), tz=tz)
-        return is_point_in_session(sym_info.opening_hours, local_dt)
+        return is_point_in_session(sym_info.opening_hours, local_dt,
+                                   sym_info.session_corrections)
 
     def _market_open_at(self, epoch_ts: float) -> bool:
         """True iff the symbol's opening_hours mark ``epoch_ts`` as open.
@@ -211,7 +212,8 @@ class _StreamingMixin(_CapitalComBase, ABC):
         assert self.timeframe is not None
         tf_seconds = max(1, int(in_seconds(self.timeframe)))
         local_dt = datetime.fromtimestamp(epoch_ts, tz=tz)
-        return is_in_session(sym_info.opening_hours, local_dt, tf_seconds)
+        return is_in_session(sym_info.opening_hours, local_dt, tf_seconds,
+                             sym_info.session_corrections)
 
     # --- LiveProviderPlugin (WebSocket) ------------------------------------
 
