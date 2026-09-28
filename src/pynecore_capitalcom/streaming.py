@@ -43,8 +43,8 @@ from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase, _QuoteSnapshot
 from .exceptions import CapitalComError, HistoricalPricesNotFoundError
-from .rest import _SESSION_RECREATE_CODES
 from .helpers import (
+    _is_session_error,
     _WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD,
     _WS_VOLUME_BASELINE_BARS,
     _WS_VOLUME_LOW_RATIO,
@@ -343,7 +343,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         # logged but must not tear the loop down — the socket is
                         # otherwise healthy and later frames may be fine.
                         err_code = str(data.get("errorCode") or "")
-                        if err_code in _SESSION_RECREATE_CODES:
+                        if _is_session_error(err_code):
                             broker_warning(
                                 "Capital.com WS rejected a frame with an "
                                 "invalid session (%s); re-authenticating on "

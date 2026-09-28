@@ -84,12 +84,27 @@ TYPES: dict[str, Literal['forex', 'crypto', 'stock', 'index']] = {
     'INDICES': 'index',
 }
 
-_RETRYABLE_CODES = frozenset({
-    'error.too-many.requests',
-    'error.security.client-token-missing',
-    'error.null.client.token',
-    'error.invalid.session.token',
-})
+def _is_session_error(code: str) -> bool:
+    """Return True when ``code`` says the venue session behind our tokens is gone.
+
+    The venue publishes no error-code list and the session family keeps
+    growing (``error.security.client-token-missing``, ``error.null.client.token``,
+    ``error.invalid.session.token``; ``error.security.session-expired`` first
+    appeared 212 lab cycles in), so the class is matched by shape instead of
+    enumerated: every ``error.security.*`` code plus anything naming the
+    session or the client token. A permanent credential problem is not in
+    this class (``_AUTH_ERROR_CODES``, checked first by the classifier), and a
+    misclassified permanent ``error.security.*`` code stays bounded: the
+    reactive re-login retries at most three times and surfaces the bootstrap
+    error itself.
+    """
+    return (
+        code.startswith('error.security.')
+        or 'session' in code
+        or 'client.token' in code
+        or 'client-token' in code
+    )
+
 
 _AUTH_ERROR_CODES = frozenset({
     'error.null.api.key',

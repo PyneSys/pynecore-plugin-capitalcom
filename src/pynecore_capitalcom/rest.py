@@ -54,9 +54,9 @@ from .helpers import (
     _INVALID_STOP_MIN_PREFIX,
     _INVALID_TP_MAX_PREFIX,
     _INVALID_TP_MIN_PREFIX,
+    _is_session_error,
     _NOT_FOUND_DEAL_ID_CODE,
     _NOT_FOUND_DEAL_REF_CODE,
-    _RETRYABLE_CODES,
     _extract_error_code,
     _extract_jwt_expiry,
     _extract_numeric_value,
@@ -118,13 +118,6 @@ _SESSION_BOOTSTRAP_REQUESTS = frozenset({
     ('session/encryptionKey', 'get'),
     ('session', 'post'),
 })
-# Codes that mean "your session is gone" — re-create and retry.
-_SESSION_RECREATE_CODES = frozenset({
-    'error.security.client-token-missing',
-    'error.null.client.token',
-    'error.invalid.session.token',
-})
-
 
 def _body_excerpt(text: str, limit: int = 160) -> str:
     """Whitespace-collapsed head of a response body for an error message."""
@@ -236,7 +229,7 @@ class _RestSessionMixin(_CapitalComBase, ABC):
             # error directly; bootstrap requests already go out without
             # stale auth headers (see snapshot above), so a real auth
             # failure here is terminal and needs operator attention.
-            if error_code in _SESSION_RECREATE_CODES \
+            if isinstance(error_code, str) and _is_session_error(error_code) \
                     and not is_bootstrap \
                     and self._capital_config.user_email and self._capital_config.api_password and _level < 3:
                 # Coordinate re-creation without holding ``_session_lock``
@@ -724,7 +717,7 @@ class _RestSessionMixin(_CapitalComBase, ABC):
             # ``error.invalid.session.token`` (a session-expiry signal,
             # not an order-rejection) routes here instead of falling
             # through to ``ExchangeOrderRejectedError``.
-            if code in _RETRYABLE_CODES:
+            if _is_session_error(code):
                 return ExchangeConnectionError(str(raw))
             # The venue's gateway sometimes leaks a raw Java exception class
             # name as the errorCode when its own backend times out (live

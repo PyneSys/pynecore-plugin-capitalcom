@@ -32,7 +32,7 @@ from pynecore_capitalcom import (
     CapitalComError,
 )
 from pynecore_capitalcom.exceptions import HistoricalPricesNotFoundError
-from pynecore_capitalcom.helpers import _WS_VOLUME_BASELINE_BARS
+from pynecore_capitalcom.helpers import _WS_VOLUME_BASELINE_BARS, _is_session_error
 from pynecore_capitalcom.plugin import _activity_fingerprint
 from pynecore_capitalcom.rest import _RestSessionMixin
 
@@ -11839,6 +11839,86 @@ def __test_call_reactive_retry_on_invalid_session_token__(monkeypatch):
     result = broker('positions', method='get')
     assert result == {'positions': []}
     assert captured_csts == ['old-cst', 'new-cst']
+
+
+def __test_call_reactive_retry_on_session_expired__(monkeypatch):
+    """error.security.session-expired re-creates the session and retries like an invalid token."""
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'old-x-sec'
+    broker.cst_token = 'old-cst'
+    broker._session_token_expiry_ts = 0.0  # no proactive refresh path
+
+    def fake_create_session():
+        broker.security_token = 'new-x-sec'
+        broker.cst_token = 'new-cst'
+    monkeypatch.setattr(broker, '_perform_session_login', fake_create_session)
+
+    responses = [
+        _MockHttpResponse(401, {'errorCode': 'error.security.session-expired'}),
+        _MockHttpResponse(200, {'positions': []}, {}),
+    ]
+    captured_csts: list[str] = []
+
+    def fake_get(url, **kwargs):
+        captured_csts.append(kwargs['headers'].get('CST', ''))
+        return responses.pop(0)
+    monkeypatch.setattr(httpx, 'get', fake_get)
+
+    result = broker('positions', method='get')
+    assert result == {'positions': []}
+    assert captured_csts == ['old-cst', 'new-cst']
+
+
+def __test_call_reactive_retry_on_unseen_security_code__(monkeypatch):
+    """A never-seen ``error.security.*`` code takes the same re-login + retry path."""
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'old-x-sec'
+    broker.cst_token = 'old-cst'
+    broker._session_token_expiry_ts = 0.0  # no proactive refresh path
+
+    def fake_create_session():
+        broker.security_token = 'new-x-sec'
+        broker.cst_token = 'new-cst'
+    monkeypatch.setattr(broker, '_perform_session_login', fake_create_session)
+
+    responses = [
+        _MockHttpResponse(401, {'errorCode': 'error.security.token-revoked'}),
+        _MockHttpResponse(200, {'positions': []}, {}),
+    ]
+    captured_csts: list[str] = []
+
+    def fake_get(url, **kwargs):
+        captured_csts.append(kwargs['headers'].get('CST', ''))
+        return responses.pop(0)
+    monkeypatch.setattr(httpx, 'get', fake_get)
+
+    result = broker('positions', method='get')
+    assert result == {'positions': []}
+    assert captured_csts == ['old-cst', 'new-cst']
+
+
+def __test_is_session_error_matches_the_session_family_only__():
+    """The predicate covers every observed session code plus unseen variants, nothing else."""
+    for code in (
+        'error.security.client-token-missing',
+        'error.null.client.token',
+        'error.invalid.session.token',
+        'error.security.session-expired',
+        'error.security.token-revoked',
+        'error.session.not-found',
+    ):
+        assert _is_session_error(code), code
+    for code in (
+        'error.invalid.details',
+        'error.null.api.key',
+        'error.invalid.accountId',
+        'error.too-many.requests',
+        'error.not-found.dealId',
+        'error.invalid.stoploss.minvalue',
+        'error.prices.not-found',
+        '',
+    ):
+        assert not _is_session_error(code), code
 
 
 # noinspection PyProtectedMember
