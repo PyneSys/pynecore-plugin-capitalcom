@@ -362,7 +362,12 @@ class _RecoveryMixin(_CapitalComBase, ABC):
            this, the runtime ``_reconcile_snapshot`` would later flag
            it via ``missing_pending_since`` and the grace tracker would
            raise :class:`UnexpectedCancelError`, halting a bot that has
-           nothing left to recover.
+           nothing left to recover. On a reconnect a filled ``closing``
+           position row is left alone: the engine of this very process
+           still books that exposure, and the snapshot reconcile turns
+           the deal's disappearance into the close fill it is waiting
+           for. On a fresh start the engine adopts the venue's net size
+           instead, so the row is plain residue and is retired.
         2. Bracket leg rows (``leg_kind in {'tp','sl'}``): Capital.com
            brackets are position attributes with no own ``dealId``,
            so the parent's state is the only handle. Retire the leg
@@ -387,6 +392,8 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         promoted = promoted_coids or set()
         retired_parent_coids: set[str] = set()
         retired_intent_keys: set[str] = set()
+        closing_parent_coids: set[str] = set()
+        reconnecting = self._connection_generation > 0
         retired_count = 0
 
         for row in list(self.store_ctx.iter_live_orders()):
@@ -394,6 +401,19 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             if extras.get('leg_kind') in ('tp', 'sl'):
                 continue
             if row.client_order_id in promoted:
+                continue
+            if (reconnecting
+                    and row.state == 'closing'
+                    and extras.get('kind') == 'position'
+                    and row.filled_qty > 0.0):
+                # Our DELETE landed right before the link dropped and the
+                # deal is gone: that disappearance IS the close fill the
+                # engine is still waiting for. Retiring the row here would
+                # swallow it — the engine then keeps the position open,
+                # rejects every reversal close re-dispatch against the
+                # retired row and only clears the book minutes later via
+                # its venue-flat detector (measured 2026-09-30, cycle 225).
+                closing_parent_coids.add(row.client_order_id)
                 continue
             did = row.exchange_order_id
             if not did:
@@ -454,6 +474,9 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             # this leg) may legitimately be absent from the stale
             # pre-recovery ``pos_by_deal_id`` snapshot — don't retire.
             if parent_coid is not None and str(parent_coid) in promoted:
+                continue
+            if parent_coid is not None and str(parent_coid) in closing_parent_coids:
+                # The parent's close fill tears its legs down with it.
                 continue
             orphan = False
             if parent_coid is not None and str(parent_coid) in retired_parent_coids:

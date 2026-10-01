@@ -434,6 +434,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _disappearance_tracker(self) -> 'DisappearanceTracker': ...
 
+    _connection_generation: int
+
     # --- Recovery (recovery.py) ---
     async def _load_activity_cursor_from_events(self) -> None: ...
 

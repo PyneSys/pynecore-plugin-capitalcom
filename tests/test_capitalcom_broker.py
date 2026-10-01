@@ -12444,6 +12444,75 @@ def __test_recover_does_not_retire_when_position_still_present__(tmp_path):
         store.close()
 
 
+def _seed_closing_row_with_bracket(ctx) -> None:
+    """A filled position whose full-close DELETE landed, plus its bracket legs."""
+    ctx.upsert_order(
+        'entry-coid', symbol='EURUSD', side='sell', qty=1.0, filled_qty=1.0,
+        state='closing', intent_key='Short', pine_entry_id='Short',
+        extras={'kind': 'position', 'order_type': 'market',
+                'entry_filled_at': 1.0, 'close_deal_reference': 'close-ref'},
+    )
+    ctx.set_exchange_id('entry-coid', 'deal-gone-1')
+    ctx.add_ref('entry-coid', 'deal_id', 'deal-gone-1')
+    for leg in ('tp', 'sl'):
+        ctx.upsert_order(
+            f'{leg}-coid', symbol='EURUSD', side='buy', qty=1.0,
+            state='confirmed', intent_key=f'Short-X\0Short\0{leg.upper()}',
+            pine_entry_id='Short',
+            extras={'leg_kind': leg, 'parent_coid': 'entry-coid',
+                    'parent_deal_id': 'deal-gone-1'},
+        )
+
+
+def __test_reconnect_recovery_keeps_a_vanished_closing_row_for_the_close_fill__(tmp_path):
+    """A DELETE that landed right before the link dropped must still yield its fill.
+
+    ``connect()`` re-runs the recovery pass on every reconnect. The engine
+    of this process still books the exposure, so the ``closing`` row has
+    to survive for the snapshot reconcile to turn the deal's disappearance
+    into the close fill; retiring it here swallowed the fill and every
+    reversal close re-dispatch was rejected until the venue-flat detector
+    cleared the book (measured 2026-09-30, cycle 225).
+    """
+    broker = _recovery_broker(positions=[])
+    broker._connection_generation = 1
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        _seed_closing_row_with_bracket(ctx)
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        for coid in ('entry-coid', 'tp-coid', 'sl-coid'):
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.closed_ts_ms is None
+        assert ctx.get_order('entry-coid').state == 'closing'
+        n_retired = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM events "
+            "WHERE kind = 'startup_orphan_retired'",
+        ).fetchone()['n']
+        assert n_retired == 0
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_fresh_start_recovery_retires_a_vanished_closing_row__(tmp_path):
+    """On a fresh start the engine adopts the venue's net size; the row is residue."""
+    broker = _recovery_broker(positions=[])
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        _seed_closing_row_with_bracket(ctx)
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        for coid in ('entry-coid', 'tp-coid', 'sl-coid'):
+            assert ctx.get_order(coid).closed_ts_ms is not None
+    finally:
+        ctx.close()
+        store.close()
+
+
 def _recovery_broker(*, positions):
     return _FakeBroker(config=_make_config(), responses={
         ('positions', 'get'): {'positions': positions},
