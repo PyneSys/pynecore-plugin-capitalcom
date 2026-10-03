@@ -9544,7 +9544,7 @@ def __test_update_symbol_info_dash_closed_marker_does_not_open_24h__(monkeypatch
             'dealingRules': {'minStepDistance': {'value': 0.01}},
         }
 
-    def fake_historical_prices():
+    def fake_historical_prices(**_kwargs):
         return {'prices': [{'closePrice': {'bid': 100.0, 'ask': 100.02}}]}
 
     monkeypatch.setattr(broker, 'get_single_market_details', fake_market_details)
@@ -9603,7 +9603,7 @@ def __test_update_symbol_info_emits_daytime_session_markers__(monkeypatch):
             },
         }
 
-    def fake_historical_prices():
+    def fake_historical_prices(**_kwargs):
         return {'prices': [{'closePrice': {'bid': 100.0, 'ask': 100.05}}]}
 
     monkeypatch.setattr(broker, 'get_single_market_details', fake_market_details)
@@ -9661,7 +9661,7 @@ def __test_update_symbol_info_marker_uses_source_midnight__(monkeypatch):
             },
         }
 
-    def fake_historical_prices():
+    def fake_historical_prices(**_kwargs):
         return {'prices': [{'closePrice': {'bid': 1.0, 'ask': 1.0001}}]}
 
     monkeypatch.setattr(broker, 'get_single_market_details', fake_market_details)
@@ -9716,7 +9716,7 @@ def __test_update_symbol_info_24h_emits_no_session_markers__(monkeypatch):
             },
         }
 
-    def fake_historical_prices():
+    def fake_historical_prices(**_kwargs):
         return {'prices': [{'closePrice': {'bid': 1.10, 'ask': 1.1001}}]}
 
     monkeypatch.setattr(broker, 'get_single_market_details', fake_market_details)
@@ -9788,7 +9788,7 @@ def __test_update_symbol_info_tz_shift_splits_local_midnight__(monkeypatch):
             },
         }
 
-    def fake_historical_prices():
+    def fake_historical_prices(**_kwargs):
         return {'prices': [{'closePrice': {'bid': 150.0, 'ask': 150.02}}]}
 
     monkeypatch.setattr(broker, 'get_single_market_details', fake_market_details)
