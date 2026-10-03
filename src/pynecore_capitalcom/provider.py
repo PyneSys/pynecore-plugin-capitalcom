@@ -86,16 +86,20 @@ class _ProviderMixin(_CapitalComBase, ABC):
             time_from: datetime | None = None,
             time_to: datetime | None = None,
             limit: int = 1000,
+            resolution: str | None = None,
     ) -> dict:
         """Get historical prices of the plugin's current symbol.
 
         :param time_from: The start time (interpreted as UTC).
         :param time_to: The end time (interpreted as UTC).
         :param limit: The maximum number of candles to return.
+        :param resolution: Capital.com resolution (e.g. ``DAY``); defaults to the
+                           plugin's own exchange timeframe.
         """
         assert self.symbol is not None
-        assert self.xchg_timeframe is not None
-        params = {'resolution': self.xchg_timeframe, 'max': limit}
+        resolution = resolution or self.xchg_timeframe
+        assert resolution is not None
+        params = {'resolution': resolution, 'max': limit}
         if time_from is not None:
             params['from'] = time_from.isoformat()
         if time_to is not None:
@@ -245,7 +249,9 @@ class _ProviderMixin(_CapitalComBase, ABC):
         except (KeyError, TypeError, ValueError):
             mincontract = 0.0
 
-        res = self.get_historical_prices()
+        # Symbol info must not depend on the instance timeframe, so the average
+        # spread is always measured on the last 1000 daily closes.
+        res = self.get_historical_prices(resolution=self.to_exchange_timeframe('1D'))
         avg_spred_summ = 0.0
         for p in res['prices']:
             spread = abs(p['closePrice']['bid'] - p['closePrice']['ask'])
