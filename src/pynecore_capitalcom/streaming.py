@@ -882,6 +882,10 @@ class _StreamingMixin(_CapitalComBase, ABC):
                             if bucket_ts < missing_ts
                         ]:
                             self._ws_quote_buckets.pop(stale_ts, None)
+                        # The WS copy of this slot may still arrive; its
+                        # bucket is gone, so the volume worker must not
+                        # read its ``ws_vol == 0`` as a silent quote feed.
+                        self._ws_recovered_slots.add(missing_ts)
                         consecutive_rest_recoveries += 1
                         missing_slot_ts = None
                         missing_slot_first_seen_at = 0.0
@@ -1068,13 +1072,16 @@ class _StreamingMixin(_CapitalComBase, ABC):
         =====================================  =============================
 
         REST-confirmed-bad streak: when REST fires for a full-coverage
-        bar and returns a real number, the worker increments
-        :attr:`_ws_bad_bar_streak`. At
-        :data:`_WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD`
+        bar and reports materially more volume than the WS counted
+        (``ws_vol < rest * _WS_VOLUME_LOW_RATIO``), the worker increments
+        :attr:`_ws_bad_bar_streak`; a REST value that agrees with the WS
+        count resets it. At :data:`_WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD`
         consecutive hits the WS is closed (``code=4001``,
         ``reason="quote-volume-stale"``) so the live_runner reconnects
         — mirrors the OHLC watchdog's stale-subscription recovery.
-        Partial-coverage bars NEVER count toward this streak.
+        Partial-coverage bars and slots the OHLC watchdog already
+        recovered from REST (their quote bucket was dropped with the
+        injection) NEVER count toward this streak.
 
         Quote frames preserve their order relative to in-flight bid bars
         (single-consumer FIFO) and carry immutable bar-open, cumulative-volume,
@@ -1195,6 +1202,10 @@ class _StreamingMixin(_CapitalComBase, ABC):
             self._ws_quote_buckets.pop(stale_ts, None)
 
         is_partial = bar_open_s_int < self._ws_coverage_started_at
+        recovered = bar_open_s_int in self._ws_recovered_slots
+        self._ws_recovered_slots = {
+            ts for ts in self._ws_recovered_slots if ts > bar_open_s_int
+        }
         baseline = self._ws_volume_baseline
         baseline_ready = (
             len(baseline) >= _WS_VOLUME_MIN_BASELINE_BARS
@@ -1256,12 +1267,17 @@ class _StreamingMixin(_CapitalComBase, ABC):
 
         # REST-confirmed bad streak: bump only when the WS value
         # was demonstrably wrong on a *full-coverage* bar (REST
-        # returned a real number and we trusted it over WS).
-        # Partial bars never count — those are expected after
-        # every reconnect.
-        if (rest_attempted and not is_partial
+        # reports materially more than the WS counted). A low bar
+        # that REST confirms is a quiet market, not a silent quote
+        # stream, and resets the streak. Partial bars never count —
+        # those are expected after every reconnect — and neither do
+        # slots the OHLC watchdog recovered, whose bucket it dropped.
+        if (rest_attempted and not is_partial and not recovered
                 and rest_vol > 0.0):
-            self._ws_bad_bar_streak += 1
+            if ws_vol < rest_vol * _WS_VOLUME_LOW_RATIO:
+                self._ws_bad_bar_streak += 1
+            else:
+                self._ws_bad_bar_streak = 0
         elif not need_rest:
             self._ws_bad_bar_streak = 0
         # `rest_failed_*` paths leave the streak unchanged: we
@@ -1622,6 +1638,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
         # otherwise mix pre- and post-reconnect counts that came from
         # different feed-health epochs.
         self._ws_quote_buckets = {}
+        self._ws_recovered_slots = set()
         self._ws_coverage_started_at = epoch_time()
         self._ws_volume_baseline = collections.deque(
             maxlen=_WS_VOLUME_BASELINE_BARS,

@@ -221,6 +221,10 @@ class CapitalCom(
         # partial coverage, zero quotes, or values far below the
         # rolling baseline. See :meth:`_volume_backfill_worker_loop`.
         self._ws_quote_buckets: dict[int, int] = {}
+        # Bar-open slots the OHLC watchdog injected from REST; their quote
+        # bucket is gone, so the worker must not read ``ws_vol == 0`` on a
+        # late WS copy as a silent quote feed.
+        self._ws_recovered_slots: set[int] = set()
         self._ws_coverage_started_at: float = 0.0
         self._ws_volume_baseline: collections.deque[int] = collections.deque(
             maxlen=_WS_VOLUME_BASELINE_BARS,

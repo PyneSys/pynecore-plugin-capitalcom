@@ -12854,6 +12854,7 @@ def _make_volume_broker(tf="1"):
     broker._raw_ohlc_queue = asyncio.Queue()
     broker._update_queue = asyncio.Queue()
     broker._ws_quote_buckets = {}
+    broker._ws_recovered_slots = set()
     broker._ws_volume_baseline = _collections.deque(
         maxlen=_WS_VOLUME_BASELINE_BARS,
     )
@@ -13073,6 +13074,89 @@ def __test_ws_volume_consecutive_bad_bars_force_reconnect__():
     )
     # Streak counter reset after the close.
     assert broker._ws_bad_bar_streak == 0
+
+
+def __test_ws_volume_rest_agreeing_low_bars_do_not_force_reconnect__():
+    """Low WS counts that REST confirms are a quiet market: no close(4001)."""
+    import collections as _collections
+
+    broker = _make_volume_broker(tf="1")
+    base_open = 1_700_000_000
+    broker._ws_coverage_started_at = float(base_open) - 60.0
+    broker._ws_volume_baseline = _collections.deque(
+        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
+    )
+    # Two low_ratio bars (10 < 100 * 0.20) whose REST volume matches
+    # the WS count — the quote stream is alive, the venue is quiet.
+    for off in (0, 60):
+        broker._ws_quote_buckets[base_open + off] = 10
+
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 10.0
+
+    frames = []
+    for off in (0, 60):
+        frames.append(("ohlc", {
+            "priceType": "bid", "t": (base_open + off) * 1000,
+            "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+        }))
+    asyncio.run(_run_worker_until_drained(
+        broker, frames, fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(base_open) + 65.0,
+    ))
+
+    items = [item for item in _drain_update_queue(broker)
+             if item is not None]
+    assert len(items) == 2
+    assert all(it[1]["_volume"] == 10.0 for it in items)
+    assert rest_calls == [base_open, base_open + 60]
+    assert broker._ws.close_calls == []
+    assert broker._ws_bad_bar_streak == 0
+
+
+def __test_ws_volume_recovered_slot_does_not_count_toward_stale_streak__():
+    """A slot the OHLC watchdog injected from REST never bumps the streak."""
+    import collections as _collections
+
+    broker = _make_volume_broker(tf="1")
+    base_open = 1_700_000_000
+    broker._ws_coverage_started_at = float(base_open) - 60.0
+    broker._ws_volume_baseline = _collections.deque(
+        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
+    )
+    # The watchdog recovered both slots and dropped their quote
+    # buckets; the late WS copies arrive with ws_vol == 0.
+    broker._ws_recovered_slots = {base_open, base_open + 60}
+
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 100.0
+
+    frames = []
+    for off in (0, 60):
+        frames.append(("ohlc", {
+            "priceType": "bid", "t": (base_open + off) * 1000,
+            "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
+        }))
+    asyncio.run(_run_worker_until_drained(
+        broker, frames, fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(base_open) + 65.0,
+    ))
+
+    items = [item for item in _drain_update_queue(broker)
+             if item is not None]
+    assert len(items) == 2
+    assert all(it[1]["_volume"] == 100.0 for it in items)
+    assert rest_calls == [base_open, base_open + 60]
+    assert broker._ws.close_calls == []
+    assert broker._ws_bad_bar_streak == 0
+    # Processed slots are forgotten so the set cannot grow unbounded.
+    assert broker._ws_recovered_slots == set()
 
 
 def __test_ws_volume_rest_failed_emits_median__():
