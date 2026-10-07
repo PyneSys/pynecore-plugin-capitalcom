@@ -126,6 +126,12 @@ _INVALID_LEVERAGE_CODE = 'error.invalid.leverage.value'
 # :class:`InsufficientMarginError` — a non-terminal reject the runner survives
 # (see its docstring) so the strategy can respond on a later bar.
 _FUNDS_REJECT_REASON_SUBSTRINGS = ('MARGIN', 'LEVERAGE', 'FUND', 'RISK', 'BALANCE')
+# Capital.com phrases a session-pause reject as free text, e.g. ``Rejected.
+# BTCUSD is currently closed. Timetable in place: UTC; Mon - 21:00, 21:05 -; ...``
+# (measured live), both as a POST/DELETE ``errorCode`` and as a confirm
+# ``rejectReason``.
+_MARKET_CLOSED_REJECT_SUBSTRINGS = ('CURRENTLY CLOSED', 'MARKET IS CLOSED', 'MARKET CLOSED',
+                                    'MARKET.CLOSED', 'TRADING HOURS')
 
 
 # --- Internal tuning constants ---------------------------------------------
@@ -265,6 +271,15 @@ def _is_funds_reject(reason: str) -> bool:
     :class:`InsufficientMarginError` rather than a plain reject."""
     reason_uc = reason.upper()
     return any(token in reason_uc for token in _FUNDS_REJECT_REASON_SUBSTRINGS)
+
+
+def _is_market_closed_reject(reason: str) -> bool:
+    """True when a Capital.com reject reason means the instrument is not
+    tradable right now (scheduled session pause / halt), so the caller should
+    raise the non-terminal :class:`MarketClosedError` rather than a plain
+    reject — nothing landed and the venue reopens on its own."""
+    reason_uc = reason.upper()
+    return any(token in reason_uc for token in _MARKET_CLOSED_REJECT_SUBSTRINGS)
 
 
 def _order_type_from_row(row: 'OrderRow', activity_type: str) -> OrderType:

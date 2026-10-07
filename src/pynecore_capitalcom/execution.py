@@ -25,6 +25,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeCapabilityError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    MarketClosedError,
     InsufficientMarginError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -72,6 +73,7 @@ from .exceptions import (
 from .helpers import (
     _extract_reject_reason,
     _is_funds_reject,
+    _is_market_closed_reject,
     _parse_iso_timestamp,
     _position_legs_from_payload,
     _size_from_units,
@@ -2621,6 +2623,11 @@ self._endpoint, data=self._body, method='post',
             # provider error escape instead killed the whole run through the
             # generic dispatch net (live incident:
             # ``error.validation.stop.price`` on a stop entry).
+            if _is_market_closed_reject(str(exc)):
+                raise MarketClosedError(
+                    f"Capital POST {self._endpoint} declined, market closed "
+                    f"(coid={coid}): {exc}",
+                ) from exc
             raise ExchangeOrderRejectedError(
                 f"Capital POST {self._endpoint} rejected (coid={coid}): {exc}",
             ) from exc
@@ -2696,6 +2703,8 @@ f'confirms/{server_ref}', method='get',
         deal_status = (confirm.get('dealStatus') or '').upper()
         if deal_status == 'REJECTED':
             reason = _extract_reject_reason(confirm)
+            if _is_market_closed_reject(reason):
+                raise MarketClosedError(f"Capital confirm REJECTED, market closed: {reason}")
             if _is_funds_reject(reason):
                 raise InsufficientMarginError(f"Capital reject: {reason}")
             raise ExchangeOrderRejectedError(

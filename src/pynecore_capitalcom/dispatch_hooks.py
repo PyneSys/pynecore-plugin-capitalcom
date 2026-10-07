@@ -23,6 +23,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     InsufficientMarginError,
+    MarketClosedError,
     OrderDispositionUnknownError,
 )
 from pynecore.core.broker.journal import (
@@ -46,12 +47,13 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 
-from .exceptions import CapitalComError, OrderNotFoundError
+from .exceptions import CapitalComApiError, CapitalComError, OrderNotFoundError
 from ._base import CapitalComHookCollaborator
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
     _extract_reject_reason,
     _is_funds_reject,
+    _is_market_closed_reject,
     _wire_float,
     _wire_id,
 )
@@ -173,6 +175,10 @@ f'confirms/{deal_ref}', method='get',
         deal_status = (confirm.get('dealStatus') or '').upper()
         if deal_status == 'REJECTED':
             reason = _extract_reject_reason(confirm)
+            if _is_market_closed_reject(reason):
+                raise MarketClosedError(
+                    f"Capital working-order amend declined, market closed: {reason}",
+                )
             if _is_funds_reject(reason):
                 raise InsufficientMarginError(
                     f"Capital reject on working-order amend: {reason}",
@@ -658,6 +664,23 @@ class _CapitalComCloseHooks:
                     client_order_id=coid,
                     cause=net if isinstance(net, Exception) else None,
                 ) from net
+            except CapitalComApiError as exc:
+                # The venue evaluated the DELETE and refused it: nothing
+                # landed, the target is untouched. A session-pause refusal
+                # (measured live: the 21:00 UTC maintenance break) is
+                # non-terminal — the engine retries once trading resumes;
+                # any other verdict is a definitive reject. Letting the raw
+                # provider error escape killed the run through the engine's
+                # generic dispatch net.
+                if _is_market_closed_reject(str(exc)):
+                    raise MarketClosedError(
+                        f"Capital DELETE positions/{row.exchange_order_id} "
+                        f"declined, market closed: {exc}",
+                    ) from exc
+                raise ExchangeOrderRejectedError(
+                    f"Capital DELETE positions/{row.exchange_order_id} "
+                    f"rejected: {exc}",
+                ) from exc
             except OrderNotFoundError:
                 # Target vanished between local snapshot and the DELETE
                 # (broker-side natural close, manual intervention, or
@@ -836,6 +859,10 @@ class _CapitalComCloseHooks:
                 deal_status = (confirm.get('dealStatus') or '').upper()
                 if deal_status == 'REJECTED':
                     reason = _extract_reject_reason(confirm)
+                    if _is_market_closed_reject(reason):
+                        raise MarketClosedError(
+                            f"Capital partial close declined, market closed: {reason}",
+                        )
                     if _is_funds_reject(reason):
                         raise InsufficientMarginError(
                             f"Capital reject on partial close: {reason}",
@@ -1258,6 +1285,10 @@ intent=new_intent,
                                  'tp': new_intent.tp_price,
                                  'sl': new_intent.sl_price,
                                  'trail_offset': new_intent.trail_offset},
+                    )
+                if _is_market_closed_reject(reason):
+                    raise MarketClosedError(
+                        f"Capital position amend declined, market closed: {reason}",
                     )
                 raise ExchangeOrderRejectedError(
                     f"Capital position amend REJECTED: {reason}",

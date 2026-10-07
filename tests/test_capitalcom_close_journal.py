@@ -53,6 +53,7 @@ import pytest
 from pynecore.core.broker.exceptions import (
     BrokerManualInterventionError,
     ExchangeOrderRejectedError,
+    MarketClosedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -66,7 +67,7 @@ from pynecore.core.broker.store_helpers import (
 )
 
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
-from pynecore_capitalcom.exceptions import OrderNotFoundError
+from pynecore_capitalcom.exceptions import CapitalComApiError, OrderNotFoundError
 
 
 def main():
@@ -780,6 +781,60 @@ def __test_execute_close_synthetic_exit_targets_parent_entry__(tmp_path):
     entry_b = ctx.get_order('coid-entry-b')
     assert entry_a is not None and entry_a.state == 'closing'
     assert entry_b is not None and entry_b.state == 'confirmed'
+    store.close()
+
+
+def _full_close_env() -> DispatchEnvelope:
+    return DispatchEnvelope(
+        intent=CloseIntent(
+            pine_id='Long', symbol='EURUSD', side='sell', qty=1.0,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+
+def __test_execute_close_full_delete_market_closed_is_non_terminal__(tmp_path):
+    """A session-pause refusal of the DELETE maps to ``MarketClosedError``.
+
+    Measured live: the reversal close dispatched into Capital.com's 21:00 UTC
+    maintenance break was answered ``Rejected. BTCUSD is currently closed.
+    Timetable in place: ...``; the raw API error escaped the hook and killed
+    the run. The venue reopens on its own, so the engine must retry instead.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/deal-L', 'delete'): CapitalComApiError(
+            "API error occured: Rejected. BTCUSD is currently closed. "
+            "Timetable in place: UTC; Mon - 21:00, 21:05 -;",
+            error_code="Rejected. BTCUSD is currently closed.",
+        ),
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+
+    with pytest.raises(MarketClosedError):
+        asyncio.run(broker.execute_close(_full_close_env()))
+    # The target stays an untouched live position.
+    target_row = ctx.get_order('coid-entry')
+    assert target_row is not None
+    assert target_row.state == 'confirmed'
+    store.close()
+
+
+def __test_execute_close_full_delete_api_error_is_a_reject_not_raw__(tmp_path):
+    """Any other synchronous API verdict on the DELETE is a definitive reject."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/deal-L', 'delete'): CapitalComApiError(
+            "API error occured: error.invalid.dealId", error_code="error.invalid.dealId",
+        ),
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+
+    with pytest.raises(ExchangeOrderRejectedError) as info:
+        asyncio.run(broker.execute_close(_full_close_env()))
+    assert not isinstance(info.value, MarketClosedError)
     store.close()
 
 
