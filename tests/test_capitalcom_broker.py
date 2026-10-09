@@ -2268,16 +2268,20 @@ def __test_cancel_with_outcome_404_no_activity_unknown__(tmp_path):
     store.close()
 
 
-def __test_cancel_with_outcome_network_error_unknown__(tmp_path):
-    """A transient DELETE failure keeps the cancel-tentative armed (UNKNOWN)."""
+def __test_cancel_with_outcome_network_error_raises_unknown__(tmp_path):
+    """A transient DELETE failure is a transport fault, not a venue answer.
+
+    The row stays live for the retry loop, but the probe is reported by
+    raising so the sync engine does not count it as venue evidence."""
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('error', 'workingorders/w1', 'delete'):
             httpx.ConnectError('boom'),
     })
     _seed_working_order(ctx)
-    outcome = asyncio.run(
-        broker.execute_cancel_with_outcome(_cancel_outcome_env()))
-    assert outcome == CancelDispositionOutcome.UNKNOWN
+    with pytest.raises(OrderDispositionUnknownError) as exc:
+        asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert isinstance(exc.value.__cause__, httpx.ConnectError)
+    assert len(list(ctx.iter_live_orders(symbol=None))) == 1
     store.close()
 
 

@@ -1877,9 +1877,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
           :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL` (terminal
           non-fill). No terminal row →
           :attr:`CancelDispositionOutcome.UNKNOWN` so the loop retries.
-        * Transient network failure →
-          :attr:`CancelDispositionOutcome.UNKNOWN` (keep cancel-tentative
-          armed).
+        * Transient network failure → :class:`OrderDispositionUnknownError`
+          (the cancel-tentative stays armed, but the probe does not count as
+          an answer from the venue).
 
         Only pending entry working orders enter the cancel-tentative state,
         so bracket-leg and filled-position rows are not classified here; an
@@ -1928,10 +1928,13 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     f'workingorders/{deal_id}', method='delete',
                 )
             except (httpx.TimeoutException, httpx.RequestError,
-                    ConnectionError, ExchangeConnectionError):
-                # Transient — keep the row live so the retry loop re-runs.
-                outcomes.append(CancelDispositionOutcome.UNKNOWN)
-                continue
+                    ConnectionError, ExchangeConnectionError) as exc:
+                # Transient — the row stays live so the retry loop re-runs.
+                raise OrderDispositionUnknownError(
+                    f"Capital.com cancel transport failure for working order "
+                    f"{deal_id}; disposition unknown",
+                    client_order_id=coid, cause=exc,
+                ) from exc
             except OrderNotFoundError:
                 resolved = await self._classify_cancel_via_activity(deal_id)
                 self._finalize_cancel_outcome_row(
