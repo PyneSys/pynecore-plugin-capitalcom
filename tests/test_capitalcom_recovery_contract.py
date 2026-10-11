@@ -155,7 +155,7 @@ def __test_recovery_contract_activity_single_match__(tmp_path):
         ('positions', 'get'): {'positions': []},
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': [
-            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+            {'epic': 'EURUSD', 'details': {'direction': 'BUY', 'size': 1.0},
              'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'DEAL-2',
              'type': 'POSITION', 'status': 'EXECUTED'},
         ]},
@@ -175,6 +175,9 @@ def __test_recovery_contract_activity_single_match__(tmp_path):
     _assert_confirmed_contract(
         ctx, coid='coid-activity', deal_id='DEAL-2',
     )
+    # The deal is absent from the positions snapshot: nothing proves the
+    # exposure is still open, so the row is not credited a fill.
+    assert ctx.get_order('coid-activity').filled_qty == 0.0
     store.close()
 
 
@@ -362,7 +365,7 @@ def __test_recovery_contract_journal_resolutions__(tmp_path):
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': [
             # row 2 activity-single-match candidate
-            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+            {'epic': 'EURUSD', 'details': {'direction': 'BUY', 'size': 1.0},
              'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'DEAL-B',
              'type': 'POSITION', 'status': 'EXECUTED'},
         ]},
@@ -606,4 +609,179 @@ def __test_startup_adoption_skips_other_instruments__(tmp_path):
     own = ctx.get_order("__pyne_adopted__BTCUSD__deal-own")
     assert own is not None and own.state == "confirmed"
     assert own.qty == 0.01 and own.side == "buy"
+    store.close()
+
+
+def _measured_entry_activities() -> list[dict]:
+    """The ``history/activity`` rows one market POST leaves, as measured.
+
+    Captured from the Capital.com demo (2026-10-11): the market entry's
+    ``POSITION`` open, the ``WORKING_ORDER`` it executed through, and a
+    resting limit entry dispatched in the same second — all BUY 0.01 within
+    one second, with direction and size inside ``details`` only.
+    """
+    return [
+        {'dateUTC': '2026-10-11T09:26:01.966', 'epic': 'BTCUSD',
+         'dealId': 'DEAL-POS', 'source': 'USER', 'type': 'POSITION',
+         'status': 'ACCEPTED',
+         'details': {'dealReference': 'p_DEAL-POS', 'workingOrderId': 'DEAL-MKT-WO',
+                     'size': 0.01, 'direction': 'BUY', 'level': 83011.0}},
+        {'dateUTC': '2026-10-11T09:26:01.966', 'epic': 'BTCUSD',
+         'dealId': 'DEAL-MKT-WO', 'source': 'USER', 'type': 'WORKING_ORDER',
+         'status': 'EXECUTED',
+         'details': {'dealReference': 'o_market', 'size': 0.01, 'direction': 'BUY',
+                     'level': 0}},
+        {'dateUTC': '2026-10-11T09:26:01.348', 'epic': 'BTCUSD',
+         'dealId': 'DEAL-LIMIT', 'source': 'USER', 'type': 'WORKING_ORDER',
+         'status': 'CREATED',
+         'details': {'dealReference': 'o_limit', 'size': 0.01, 'direction': 'BUY',
+                     'level': 82693.05}},
+    ]
+
+
+def _submitted_btc_row(ctx, coid: str, kind: str, order_type: str) -> None:
+    import datetime as _dt
+    ts_ms = int(_dt.datetime(2026, 10, 11, 9, 26, 1, 660000,
+                             tzinfo=_dt.UTC).timestamp() * 1000)
+    ctx.upsert_order(
+        coid, symbol='BTCUSD', side='buy', qty=0.01,
+        state='submitted', pine_entry_id='L', intent_key='L',
+        extras={'kind': kind, 'order_type': order_type},
+    )
+    ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+        (ts_ms, coid),
+    )
+
+
+def __test_recovery_resolves_interrupted_market_entry_from_measured_activity__(tmp_path):
+    """A market POST cut off before its response is owned again after restart.
+
+    The run stopped right after the POST (no ``dealReference`` recorded) while
+    the venue opened the position. Recovery must pick the ``POSITION`` open
+    among the three same-size activities, and credit the fill from the live
+    snapshot: otherwise startup adoption files the run's own exposure as
+    another run's (measured live: capitalcom cycle 269, 2026-10-11).
+    """
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'BTCUSD'},
+             'position': {'dealId': 'DEAL-POS', 'dealReference': 'p_DEAL-POS',
+                          'direction': 'BUY', 'size': 0.01, 'level': 83011.0}},
+        ]},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': _measured_entry_activities()},
+    })
+    broker.symbol = 'BTCUSD'
+    _submitted_btc_row(ctx, 'coid-market', 'position', 'market')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    _assert_confirmed_contract(ctx, coid='coid-market', deal_id='DEAL-POS')
+    row = ctx.get_order('coid-market')
+    assert row.filled_qty == 0.01
+    assert row.extras.get('confirm_level') == 83011.0
+    assert row.extras.get('entry_filled_at')
+    assert not any(
+        live.extras.get('adopted_startup') for live in ctx.iter_live_orders()
+    )
+    store.close()
+
+
+def __test_recovery_resolves_interrupted_resting_entry_by_created_working_order__(tmp_path):
+    """A resting entry is traced by the working order it created, unfilled."""
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': [
+            {'marketData': {'epic': 'BTCUSD'},
+             'workingOrderData': {'dealId': 'DEAL-LIMIT', 'direction': 'BUY',
+                                  'orderSize': 0.01, 'orderLevel': 82693.05}},
+        ]},
+        ('history/activity', 'get'): {'activities': _measured_entry_activities()},
+    })
+    broker.symbol = 'BTCUSD'
+    _submitted_btc_row(ctx, 'coid-limit', 'working', 'limit')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    _assert_confirmed_contract(ctx, coid='coid-limit', deal_id='DEAL-LIMIT')
+    assert ctx.get_order('coid-limit').filled_qty == 0.0
+    store.close()
+
+
+def __test_recovery_skips_activity_of_a_deal_another_row_tracks__(tmp_path):
+    """A deal already journaled under another row is no candidate."""
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': _measured_entry_activities()},
+    })
+    broker.symbol = 'BTCUSD'
+    ctx.upsert_order(
+        'coid-other', symbol='BTCUSD', side='buy', qty=0.01,
+        state='confirmed', pine_entry_id='L2', intent_key='L2',
+        exchange_order_id='DEAL-POS', extras={'kind': 'position'},
+    )
+    ctx.add_ref('coid-other', 'deal_id', 'DEAL-POS')
+    _submitted_btc_row(ctx, 'coid-market', 'position', 'market')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    assert ctx.get_order('coid-market').state == 'submitted'
+    store.close()
+
+
+def __test_recovery_confirm_get_direct_credits_live_market_fill__(tmp_path):
+    """A recovered market entry whose deal is open carries its fill."""
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'DEAL-4', 'direction': 'BUY', 'size': 1.0,
+                          'level': 1.1}},
+        ]},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+        ('confirms/REF-4', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'OPEN',
+            'dealId': 'DEAL-4', 'level': 1.1, 'size': 1.0,
+        },
+    })
+    broker.symbol = 'EURUSD'
+    ctx.upsert_order(
+        'coid-confirm', symbol='EURUSD', side='buy', qty=1.0,
+        state='server_ref_seen', pine_entry_id='Long', intent_key='Long',
+        extras={'kind': 'position', 'order_type': 'market',
+                'deal_reference': 'REF-4'},
+    )
+    ctx.add_ref('coid-confirm', 'deal_reference', 'REF-4')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    _assert_confirmed_contract(ctx, coid='coid-confirm', deal_id='DEAL-4')
+    row = ctx.get_order('coid-confirm')
+    assert row.filled_qty == 1.0
+    assert row.extras.get('confirm_level') == 1.1
+    store.close()
+
+
+def __test_recovery_counts_one_candidate_per_deal__(tmp_path):
+    """Several activities of one deal are one candidate, not an ambiguity."""
+    activities = _measured_entry_activities()
+    activities.append({
+        'dateUTC': '2026-10-11T09:26:01.500', 'epic': 'BTCUSD',
+        'dealId': 'DEAL-LIMIT', 'source': 'USER', 'type': 'WORKING_ORDER',
+        'status': 'ACCEPTED',
+        'details': {'size': 0.01, 'direction': 'BUY', 'level': 82693.05},
+    })
+    broker, store, ctx = _open_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': activities},
+    })
+    broker.symbol = 'BTCUSD'
+    _submitted_btc_row(ctx, 'coid-limit', 'working', 'limit')
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    _assert_confirmed_contract(ctx, coid='coid-limit', deal_id='DEAL-LIMIT')
     store.close()

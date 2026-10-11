@@ -631,6 +631,78 @@ class _CapitalComResumeHooks:
             return self._verdict_submitted(row, refs)
         return ResumeOutcome(status='still_unknown')
 
+    def _live_position_fill(
+            self, row: 'OrderRow', deal_id: str | None,
+    ) -> tuple[bool, float, float]:
+        """Fill fields for a recovered entry, from the live positions snapshot.
+
+        A MARKET entry (``kind='position'``) whose deal is open on the venue
+        has filled, and nothing later reports that fill: Capital.com's
+        activity window is 60 s, and the snapshot reconcile only reports
+        fill progress on a row that is already partly filled. Confirming the
+        row unfilled leaves the run without ownership of exposure its own
+        dispatch opened — startup adoption then treats the position as
+        another run's (measured live: capitalcom cycle 269, 2026-10-11 —
+        the next opposite entry netted the run's own long away and its
+        bracket attach failed on the vanished deal).
+
+        :return: ``(is_filled, filled_qty, fill_price)``; unfilled for a
+            working order row or a deal absent from the snapshot.
+        """
+        if (row.extras or {}).get('kind') != 'position' or deal_id is None:
+            return False, 0.0, 0.0
+        hit = self.pos_by_deal_id.get(deal_id)
+        if hit is None:
+            return False, 0.0, 0.0
+        position = hit.get('position') or {}
+        size = _wire_float(position.get('size'), finite=True) or 0.0
+        level = _wire_float(position.get('level'), finite=True) or 0.0
+        filled_qty = min(row.qty, size)
+        if filled_qty <= 0.0:
+            return False, 0.0, 0.0
+        return True, filled_qty, level
+
+    def _activity_matches_row(self, activity: Mapping, row: 'OrderRow') -> bool:
+        """Whether an activity row can be the venue trace of ``row``'s POST.
+
+        The ``detailed=true`` payload carries direction and size inside
+        ``details`` only. One market POST leaves two same-size activities
+        (the ``POSITION`` open and the ``WORKING_ORDER`` it executed
+        through), and a resting entry dispatched the same second leaves a
+        third, so the type must match the row's kind: a MARKET entry is
+        traced by its ``POSITION`` open, a resting entry by the
+        ``WORKING_ORDER`` it created (an ``EXECUTED`` working order is a
+        market POST's internal order or a fill, never a creation). Deals
+        another journal row already tracks are not candidates.
+        """
+        if (activity.get('epic') or '') != row.symbol:
+            return False
+        activity_type = (activity.get('type') or '').upper()
+        status = (activity.get('status') or '').upper()
+        if (row.extras or {}).get('kind') == 'working':
+            if activity_type != 'WORKING_ORDER' or status in ('EXECUTED', 'REJECTED'):
+                return False
+        elif activity_type != 'POSITION' or status == 'REJECTED':
+            return False
+        details = activity.get('details') or {}
+        row_side = 'BUY' if row.side == 'buy' else 'SELL'
+        if (details.get('direction') or '').upper() != row_side:
+            return False
+        size = _wire_float(details.get('size'), finite=True)
+        if size is None or abs(size - row.qty) > 1e-9:
+            return False
+        row_created = row.created_ts_ms / 1000.0 if row.created_ts_ms else 0.0
+        when = _parse_iso_timestamp(activity.get('dateUTC') or '')
+        if row_created and abs(when - row_created) > 3.0:
+            return False
+        deal_id = _wire_id(activity.get('dealId'))
+        store_ctx = self.plugin.store_ctx
+        if deal_id is not None and store_ctx is not None:
+            tracked = store_ctx.find_by_ref('deal_id', deal_id)
+            if tracked is not None and tracked.client_order_id != row.client_order_id:
+                return False
+        return True
+
     def _verdict_submitted(
             self, row: 'OrderRow', refs: Mapping[str, str],
     ) -> ResumeOutcome:
@@ -641,7 +713,7 @@ class _CapitalComResumeHooks:
         1. Stored ``deal_reference`` (preferred from ``refs``, falling
            back to ``extras``) matches a positions / working snapshot →
            ``recovery_path='stored_ref'``, confirmed.
-        2. Activity heuristic (epic + direction + size + ±3 s) →
+        2. Activity heuristic (see :meth:`_activity_matches_row`) →
            single match → ``recovery_path='activity_single_match'``;
            multiple matches → ambiguous side-channel (see class
            docstring); zero matches → ``still_unknown`` with
@@ -659,12 +731,16 @@ class _CapitalComResumeHooks:
                     'position' if hit is self.pos_by_ref.get(stored_ref)
                     else 'working'
                 )
+                exchange_id = str(deal_id) if deal_id else None
+                is_filled, filled_qty, fill_price = self._live_position_fill(
+                    row, exchange_id,
+                )
                 return ResumeOutcome(
                     status='confirmed',
-                    exchange_id=str(deal_id) if deal_id else None,
-                    is_filled=False,
-                    filled_qty=0.0,
-                    fill_price=0.0,
+                    exchange_id=exchange_id,
+                    is_filled=is_filled,
+                    filled_qty=filled_qty,
+                    fill_price=fill_price,
                     recovery_path='stored_ref',
                     recovery_context={
                         'deal_reference': stored_ref,
@@ -672,21 +748,21 @@ class _CapitalComResumeHooks:
                     },
                 )
 
-        # Activity heuristic: epic + direction + size + ±3 s createdDateUTC.
-        row_side = 'BUY' if row.side == 'buy' else 'SELL'
-        row_created = row.created_ts_ms / 1000.0 if row.created_ts_ms else 0.0
+        # Activity heuristic: activity type + epic + direction + size +
+        # ±3 s around the row's creation.
         candidates: list[dict] = []
-        for a in self.activities:
-            if (a.get('epic') or '') != row.symbol:
+        candidate_deal_ids: set[str] = set()
+        for activity in self.activities:
+            if not self._activity_matches_row(activity, row):
                 continue
-            if (a.get('direction') or '').upper() != row_side:
-                continue
-            if abs(float(a.get('size') or 0.0) - row.qty) > 1e-9:
-                continue
-            when = _parse_iso_timestamp(a.get('dateUTC') or '')
-            if row_created and abs(when - row_created) > 3.0:
-                continue
-            candidates.append(a)
+            # One deal may leave several activities (a resting entry's
+            # creation and its later status rows); it is one candidate.
+            deal_id = _wire_id(activity.get('dealId'))
+            if deal_id is not None:
+                if deal_id in candidate_deal_ids:
+                    continue
+                candidate_deal_ids.add(deal_id)
+            candidates.append(activity)
 
         if not candidates:
             return ResumeOutcome(
@@ -694,13 +770,14 @@ class _CapitalComResumeHooks:
                 recovery_path='no_match',
             )
         if len(candidates) == 1:
-            deal_id = candidates[0].get('dealId')
+            deal_id = _wire_id(candidates[0].get('dealId'))
+            is_filled, filled_qty, fill_price = self._live_position_fill(row, deal_id)
             return ResumeOutcome(
                 status='confirmed',
-                exchange_id=str(deal_id) if deal_id else None,
-                is_filled=False,
-                filled_qty=0.0,
-                fill_price=0.0,
+                exchange_id=deal_id,
+                is_filled=is_filled,
+                filled_qty=filled_qty,
+                fill_price=fill_price,
                 recovery_path='activity_single_match',
                 recovery_context={'activity_count': 1},
             )
@@ -774,12 +851,15 @@ class _CapitalComResumeHooks:
                 'position' if hit is self.pos_by_ref.get(ref)
                 else 'working'
             )
+            is_filled, filled_qty, fill_price = self._live_position_fill(
+                row, str(deal_id),
+            )
             return ResumeOutcome(
                 status='confirmed',
                 exchange_id=str(deal_id),
-                is_filled=False,
-                filled_qty=0.0,
-                fill_price=0.0,
+                is_filled=is_filled,
+                filled_qty=filled_qty,
+                fill_price=fill_price,
                 recovery_path='ttl_fallback_snapshot',
                 recovery_context={
                     'deal_reference': ref,
@@ -812,16 +892,15 @@ class _CapitalComResumeHooks:
         # from a long-dead session confirms "accepted" hours later).
         # The account snapshots were taken at recovery start, after any
         # resubmission POST — a live deal is necessarily present in one
-        # of them, so absence from both is conclusive. Only then do we
-        # confirm an unfilled order; fill stamping stays with the
-        # surviving-entry sweep / engine reconcile.
+        # of them, so absence from both is conclusive.
         if deal_id in self.pos_by_deal_id or deal_id in self.wo_by_deal_id:
+            is_filled, filled_qty, fill_price = self._live_position_fill(row, deal_id)
             return ResumeOutcome(
                 status='confirmed',
                 exchange_id=deal_id,
-                is_filled=False,
-                filled_qty=0.0,
-                fill_price=0.0,
+                is_filled=is_filled,
+                filled_qty=filled_qty,
+                fill_price=fill_price,
                 recovery_path='confirm_get_direct',
                 recovery_context={'deal_reference': ref},
             )

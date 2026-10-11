@@ -2794,7 +2794,7 @@ def __test_recover_submitted_row_single_activity_match_promotes__(tmp_path):
         ('positions', 'get'): {'positions': []},
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': [
-            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+            {'epic': 'EURUSD', 'details': {'direction': 'BUY', 'size': 1.0},
              'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'matched',
              'type': 'POSITION', 'status': 'EXECUTED'},
         ]},
@@ -2827,7 +2827,7 @@ def __test_recover_disposition_unknown_promotes_via_activity_match__(tmp_path):
         ('positions', 'get'): {'positions': []},
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': [
-            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+            {'epic': 'EURUSD', 'details': {'direction': 'BUY', 'size': 1.0},
              'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'recovered',
              'type': 'POSITION', 'status': 'EXECUTED'},
         ]},
@@ -2854,10 +2854,10 @@ def __test_recover_submitted_row_multi_match_raises_manual_intervention__(tmp_pa
         ('positions', 'get'): {'positions': []},
         ('workingorders', 'get'): {'workingOrders': []},
         ('history/activity', 'get'): {'activities': [
-            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+            {'epic': 'EURUSD', 'details': {'direction': 'BUY', 'size': 1.0},
              'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'm1',
              'type': 'POSITION', 'status': 'EXECUTED'},
-            {'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0,
+            {'epic': 'EURUSD', 'details': {'direction': 'BUY', 'size': 1.0},
              'dateUTC': '2026-04-21T10:00:00.500', 'dealId': 'm2',
              'type': 'POSITION', 'status': 'EXECUTED'},
         ]},
