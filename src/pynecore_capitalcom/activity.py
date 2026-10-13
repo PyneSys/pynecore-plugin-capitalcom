@@ -46,6 +46,7 @@ from .helpers import (
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
     _POLL_INTERVAL_S,
+    _activity_watermark_floor,
     _order_type_from_row,
     _parse_iso_timestamp,
 )
@@ -204,14 +205,22 @@ class _ActivityMixin(_CapitalComBase, ABC):
         activities_sorted = sorted(
             activities, key=lambda x: x.get('dateUTC') or '',
         )
-        # Cursor watermark guard: once we defer a row in this batch, no
-        # further activity in the same batch may advance ``last_date_utc``.
-        # The batch is sorted ascending by ``dateUTC``, so any row after
-        # the first defer is at-or-after the deferred timestamp; advancing
-        # cursor past that timestamp would make the next poll's
-        # ``date_utc < cursor.last_date_utc`` guard permanently drop the
-        # deferred row and silently desync the strategy.
+        # Cursor watermark guard: once we defer a row in this batch — a
+        # closing fill without a price, or a row no bot-owned order matches
+        # yet — no further activity in the same batch may advance
+        # ``last_date_utc``. The batch is sorted ascending by ``dateUTC``,
+        # so any row after the first defer is at-or-after the deferred
+        # timestamp; advancing cursor past that timestamp would make the
+        # next polls' date guard drop the deferred row once it falls out of
+        # the publication-lag band, silently desyncing the strategy.
         deferred_in_batch = False
+        # Rows inside the publication-lag band below the watermark are
+        # still processed (fingerprint dedup drops the ones already seen):
+        # the venue can publish a row after a newer one moved the watermark.
+        watermark_floor = (
+            _activity_watermark_floor(cursor.last_date_utc)
+            if cursor.last_date_utc else ''
+        )
         # Every fingerprint in this batch, collected BEFORE the watermark
         # guard: the end-of-poll retention below must keep any fingerprint
         # that a future poll could still consult, and consultable rows are
@@ -223,7 +232,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
             fingerprint = _activity_fingerprint(a)
             batch_fingerprints.add(fingerprint)
 
-            if cursor.last_date_utc and date_utc < cursor.last_date_utc:
+            if watermark_floor and date_utc < watermark_floor:
                 continue
             if fingerprint in cursor.seen_fingerprints:
                 continue
@@ -270,7 +279,10 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 # Truly external rows fall out of Capital.com's 60s rolling
                 # window without further noise; the
                 # ``external_logged_fingerprints`` set keeps the audit log
-                # one-shot per row within the session.
+                # one-shot per row within the session. A later matched row
+                # in this batch must not move the watermark past this one,
+                # or the date guard drops it once its reference lands.
+                deferred_in_batch = True
                 if (self.store_ctx is not None
                         and fingerprint not in cursor.external_logged_fingerprints):
                     cursor.external_logged_fingerprints.add(fingerprint)
@@ -674,15 +686,15 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 yield event
 
         # End-of-poll pruning — both dedup structures stay bounded by the
-        # venue's 60s rolling window instead of growing for the whole
-        # session. Safe by construction: the watermark guard above skips
-        # any row older than ``last_date_utc`` before its fingerprint is
-        # consulted, and an external row that left the rolling window can
-        # never be returned by the venue again.
+        # venue's rolling window instead of growing for the whole session.
+        # Safe by construction: the watermark guard above skips any row
+        # older than the watermark's publication-lag floor before its
+        # fingerprint is consulted, and an external row that left the
+        # rolling window can never be returned by the venue again.
         if cursor.last_date_utc:
-            watermark = cursor.last_date_utc
+            prune_floor = _activity_watermark_floor(cursor.last_date_utc)
             stale = [fp for fp, d in cursor.seen_fingerprints.items()
-                     if d < watermark]
+                     if d < prune_floor]
             for fp in stale:
                 del cursor.seen_fingerprints[fp]
         cursor.external_logged_fingerprints &= batch_fingerprints

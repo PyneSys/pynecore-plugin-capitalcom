@@ -97,8 +97,18 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         Capital re-issues the deferred row with a populated ``level``
         (fresh fingerprint, identical ``dealId`` and ``dateUTC``), so
         the pair is a stable identity for the resolution probe.
+
+        Only a fresh cursor is rebuilt. On a reconnect inside the running
+        process the in-memory cursor already holds every fingerprint this
+        process logged, and its watermark is pinned below rows the events
+        do not record as unresolved — an activity no bot-owned order
+        matched yet stays retryable without a persisted constraint. A
+        rebuild would advance the watermark past such a row to a newer
+        processed one, and the date guard would drop its fill once the
+        reference lands. A fresh process needs no such pin: the engine
+        adopts the venue position at startup.
         """
-        if self.store_ctx is None:
+        if self.store_ctx is None or self._connection_generation > 0:
             return
         cutoff_ms = int((epoch_time() - 86400.0) * 1000)
         cursor = self._activity_cursor
@@ -243,6 +253,16 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             pos_by_deal_id, wo_by_deal_id, promoted_coids,
         )
 
+        if self._connection_generation > 0:
+            # A reconnect inside the running process: its engine never
+            # re-adopts the venue size, so it still needs every fill the
+            # outage held back. Stamping a surviving entry as accounted
+            # would suppress its first real fill as a replay, and adopting
+            # an untracked leg — a working order that filled during the
+            # outage — would capture the POSITION activity before the
+            # working-order bridge can credit it to its own row.
+            return
+
         self._stamp_surviving_entry_fills(pos_by_deal_id)
 
         # Symmetric counterpart to orphan retirement: adopt live exchange
@@ -362,10 +382,11 @@ class _RecoveryMixin(_CapitalComBase, ABC):
            this, the runtime ``_reconcile_snapshot`` would later flag
            it via ``missing_pending_since`` and the grace tracker would
            raise :class:`UnexpectedCancelError`, halting a bot that has
-           nothing left to recover. On a reconnect a filled ``closing``
-           position row is left alone: the engine of this very process
-           still books that exposure, and the snapshot reconcile turns
-           the deal's disappearance into the close fill it is waiting
+           nothing left to recover. On a reconnect ``confirmed`` and
+           ``closing`` rows are left alone: the engine of this very
+           process still books their exposure, and the activity poll,
+           the snapshot reconcile and the disappearance tracker turn the
+           deal's disappearance into the fill or cancel it is waiting
            for. On a fresh start the engine adopts the venue's net size
            instead, so the row is plain residue and is retired.
         2. Bracket leg rows (``leg_kind in {'tp','sl'}``): Capital.com
@@ -392,7 +413,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         promoted = promoted_coids or set()
         retired_parent_coids: set[str] = set()
         retired_intent_keys: set[str] = set()
-        closing_parent_coids: set[str] = set()
+        kept_parent_coids: set[str] = set()
         reconnecting = self._connection_generation > 0
         retired_count = 0
 
@@ -402,18 +423,20 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 continue
             if row.client_order_id in promoted:
                 continue
-            if (reconnecting
-                    and row.state == 'closing'
-                    and extras.get('kind') == 'position'
-                    and row.filled_qty > 0.0):
-                # Our DELETE landed right before the link dropped and the
-                # deal is gone: that disappearance IS the close fill the
-                # engine is still waiting for. Retiring the row here would
-                # swallow it — the engine then keeps the position open,
-                # rejects every reversal close re-dispatch against the
-                # retired row and only clears the book minutes later via
-                # its venue-flat detector (measured 2026-09-30, cycle 225).
-                closing_parent_coids.add(row.client_order_id)
+            if reconnecting and row.state in ('confirmed', 'closing'):
+                # The engine of this process still tracks the row and waits
+                # for whatever made its deal disappear: our DELETE landing
+                # right before the link dropped, a native TP/SL, a working
+                # order filling into a new position, a manual close. The
+                # activity poll's lookback covers the outage, and the
+                # snapshot reconcile and disappearance tracker resolve the
+                # rest. Retiring the row drops its deal_id reference, so its
+                # fill reads as external and is never booked — the engine
+                # then keeps the position open, rejects every reversal close
+                # re-dispatch against the retired row and only clears the
+                # book minutes later via its venue-flat detector (measured
+                # 2026-09-30, cycle 225).
+                kept_parent_coids.add(row.client_order_id)
                 continue
             did = row.exchange_order_id
             if not did:
@@ -475,8 +498,8 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             # pre-recovery ``pos_by_deal_id`` snapshot — don't retire.
             if parent_coid is not None and str(parent_coid) in promoted:
                 continue
-            if parent_coid is not None and str(parent_coid) in closing_parent_coids:
-                # The parent's close fill tears its legs down with it.
+            if parent_coid is not None and str(parent_coid) in kept_parent_coids:
+                # The kept parent's own resolution tears its legs down.
                 continue
             orphan = False
             if parent_coid is not None and str(parent_coid) in retired_parent_coids:

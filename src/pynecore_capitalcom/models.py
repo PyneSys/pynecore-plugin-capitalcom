@@ -82,10 +82,11 @@ class _ActivityCursor:
     :meth:`CapitalCom._load_activity_cursor_from_events` can replay the
     last-24h window at ``connect()`` time. The stored ``dateUTC`` exists
     solely so :meth:`CapitalCom._process_activity` can prune entries that
-    fall behind the ``last_date_utc`` watermark after each poll — the
-    watermark guard skips such rows before their fingerprint is ever
-    consulted, so pruned entries are unreachable by construction and the
-    mapping stays bounded by the venue's 60-second activity window.
+    fall behind the ``last_date_utc`` watermark's publication-lag floor
+    after each poll — the watermark guard skips such rows before their
+    fingerprint is ever consulted, so pruned entries are unreachable by
+    construction and the mapping stays bounded by the venue's activity
+    window plus that lag.
 
     ``external_logged_fingerprints`` is a session-only set tracking
     activities that we observed *without* a matching bot-owned row. These

@@ -2462,6 +2462,93 @@ def __test_process_activity_prunes_dedup_state_behind_watermark__(tmp_path):
     store.close()
 
 
+def _seed_entry_row(ctx, coid: str, deal_id: str) -> None:
+    ctx.upsert_order(coid, symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id=coid,
+                     extras={'kind': 'position'})
+    ctx.add_ref(coid, 'deal_id', deal_id)
+    ctx.set_exchange_id(coid, deal_id)
+
+
+def _entry_activity(date_utc: str, deal_id: str) -> dict:
+    return {
+        'dateUTC': date_utc, 'dealId': deal_id,
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER',
+        'details': {'size': 1.0, 'level': 1.10, 'direction': 'BUY'},
+    }
+
+
+def __test_process_activity_keeps_an_unmatched_row_behind_the_watermark__(tmp_path):
+    """An activity whose deal reference is not stored yet stays retryable.
+
+    A later matched row in the same batch must not move the watermark past
+    it: once ``execute_entry`` stores the reference, the next poll has to
+    deliver the fill.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_entry_row(ctx, 'late-ref', 'd-late')
+    first = _entry_activity('2026-04-21T10:00:00.000', 'd-race')
+    second = _entry_activity('2026-04-21T10:00:05.000', 'd-late')
+
+    async def drain(acts):
+        return [ev async for ev in broker._process_activity(acts)]
+
+    assert [ev.order.id for ev in asyncio.run(drain([first, second]))] == ['d-late']
+    _seed_entry_row(ctx, 'race-ref', 'd-race')
+    replayed = asyncio.run(drain([first, second]))
+    assert [ev.order.id for ev in replayed] == ['d-race']
+    store.close()
+
+
+def __test_reconnect_keeps_the_watermark_behind_an_unmatched_row__(tmp_path):
+    """A reconnect must not rebuild the watermark past a retryable row.
+
+    The unmatched row leaves no persisted constraint, so rebuilding the
+    cursor from ``activity_processed`` events would jump to the newer
+    matched row — beyond the publication-lag band — and the date guard
+    would drop the earlier fill once its reference lands.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_entry_row(ctx, 'late-ref', 'd-late')
+    first = _entry_activity('2026-04-21T10:00:00.000', 'd-race')
+    second = _entry_activity('2026-04-21T10:01:30.000', 'd-late')
+
+    async def drain(acts):
+        return [ev async for ev in broker._process_activity(acts)]
+
+    assert [ev.order.id for ev in asyncio.run(drain([first, second]))] == ['d-late']
+    broker._connection_generation = 1
+    asyncio.run(broker._load_activity_cursor_from_events())
+    _seed_entry_row(ctx, 'race-ref', 'd-race')
+    replayed = asyncio.run(drain([first, second]))
+    assert [ev.order.id for ev in replayed] == ['d-race']
+    store.close()
+
+
+def __test_process_activity_delivers_a_row_published_after_a_newer_one__(tmp_path):
+    """The venue publishes a row up to a minute after the deal it stamps.
+
+    A row stamped before the watermark but within that lag is still a fill
+    the engine has not seen; only rows older than the lag band are skipped.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_entry_row(ctx, 'newer', 'd-newer')
+    _seed_entry_row(ctx, 'late', 'd-late')
+    _seed_entry_row(ctx, 'stale', 'd-stale')
+    newer = _entry_activity('2026-04-21T10:00:30.000', 'd-newer')
+    late = _entry_activity('2026-04-21T10:00:00.000', 'd-late')
+    stale = _entry_activity('2026-04-21T09:59:00.000', 'd-stale')
+
+    async def drain(acts):
+        return [ev async for ev in broker._process_activity(acts)]
+
+    assert [ev.order.id for ev in asyncio.run(drain([newer]))] == ['d-newer']
+    delivered = asyncio.run(drain([stale, late, newer]))
+    assert [ev.order.id for ev in delivered] == ['d-late']
+    assert asyncio.run(drain([stale, late, newer])) == []
+    store.close()
+
+
 def __test_process_activity_fills_zero_level_from_position_snapshot__(tmp_path):
     """Capital.com sometimes returns a market-entry activity row with an
     empty/zero ``level`` field.  The fill price must be back-filled from
@@ -12581,6 +12668,65 @@ def __test_restart_leaves_a_not_yet_executed_working_order_unstamped__(tmp_path)
         row = ctx.get_order('wo-coid')
         assert row is not None
         assert not (row.extras or {}).get('entry_filled_at')
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_reconnect_leaves_an_undelivered_entry_fill_unstamped__(tmp_path):
+    """A reconnect must not mark an entry whose fill the engine never got.
+
+    The engine of the running process does not re-adopt the venue size on
+    a reconnect, so the market entry's delayed activity is its only fill.
+    Stamping ``entry_filled_at`` here would suppress it as a replay.
+    """
+    broker = _recovery_broker(positions=[{
+        'position': {'dealId': 'deal-S', 'dealReference': 'ref-S', 'size': 1.0},
+    }])
+    broker._connection_generation = 1
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order(
+            'entry-coid', symbol='EURUSD', side='sell', qty=1.0,
+            filled_qty=1.0, state='confirmed',
+            intent_key='Short', pine_entry_id='Short',
+            extras={'kind': 'position', 'order_type': 'market'},
+        )
+        ctx.set_exchange_id('entry-coid', 'deal-S')
+        ctx.add_ref('entry-coid', 'deal_id', 'deal-S')
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        row = ctx.get_order('entry-coid')
+        assert row is not None and row.closed_ts_ms is None
+        assert not (row.extras or {}).get('entry_filled_at')
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_reconnect_keeps_a_natively_closed_position_for_its_fill__(tmp_path):
+    """A TP/SL that closed the deal during the outage must still reach the engine.
+
+    The row stays ``confirmed`` until its closing activity arrives; retiring
+    it on the reconnect would drop its ``deal_id`` reference and the closing
+    activity would then read as external.
+    """
+    broker = _recovery_broker(positions=[])
+    broker._connection_generation = 1
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        _seed_closing_row_with_bracket(ctx)
+        ctx.upsert_order('entry-coid', state='confirmed')
+
+        asyncio.run(broker._recover_in_flight_submissions())
+
+        for coid in ('entry-coid', 'tp-coid', 'sl-coid'):
+            row = ctx.get_order(coid)
+            assert row is not None
+            assert row.closed_ts_ms is None
+        found = ctx.find_by_ref('deal_id', 'deal-gone-1')
+        assert found is not None and found.client_order_id == 'entry-coid'
     finally:
         ctx.close()
         store.close()

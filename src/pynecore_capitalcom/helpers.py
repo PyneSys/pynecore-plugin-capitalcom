@@ -428,6 +428,26 @@ def _parse_iso_timestamp(value: str) -> float:
         return 0.0
 
 
+def _activity_watermark_floor(watermark: str) -> str:
+    """Oldest ``dateUTC`` an activity row may carry and still be processed.
+
+    The venue publishes an activity row up to :data:`_ACTIVITY_LAG_S` after
+    the deal it stamps, so a row can surface after a newer row already moved
+    the watermark. Rows inside that lag band are left to fingerprint dedup;
+    only rows older than the band are skipped by date.
+
+    :param watermark: The cursor's ``last_date_utc``.
+    :return: The watermark minus the publication lag, in the venue's
+        ``YYYY-MM-DDTHH:MM:SS.sss`` format; the watermark itself when it
+        does not parse.
+    """
+    ts = _parse_iso_timestamp(watermark)
+    if ts <= 0.0:
+        return watermark
+    floor = datetime.fromtimestamp(ts - _ACTIVITY_LAG_S, tz=UTC)
+    return floor.strftime('%Y-%m-%dT%H:%M:%S.') + f"{floor.microsecond // 1000:03d}"
+
+
 def _position_legs_from_payload(
         payload: Mapping, symbol: str,
 ) -> list[PositionLeg]:
