@@ -20,6 +20,7 @@ set, watermark, external-activity log dedup), ``_current_poll_id``
 the reconciler).
 """
 import asyncio
+import math
 from abc import ABC
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator
@@ -41,7 +42,13 @@ from pynecore.core.plugin import override
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
-from .helpers import _POLL_INTERVAL_S, _order_type_from_row, _parse_iso_timestamp
+from .helpers import (
+    _ACTIVITY_LAG_S,
+    _ACTIVITY_MAX_PERIOD_S,
+    _POLL_INTERVAL_S,
+    _order_type_from_row,
+    _parse_iso_timestamp,
+)
 from .models import _activity_fingerprint
 
 if TYPE_CHECKING:
@@ -119,14 +126,14 @@ class _ActivityMixin(_CapitalComBase, ABC):
         self._current_poll_id += 1
         positions_resp = await self._call('positions', method='get')
         working_resp = await self._call('workingorders', method='get')
-        # Capital.com activity rolling window is 60s; ask for the full
-        # window each poll so a slow tick can't drop a fill.
-        last_period = 60
+        polled_at = epoch_time()
         activity_resp = await self._call(
             'history/activity',
-            data={'lastPeriod': last_period, 'detailed': 'true'},
+            data={'lastPeriod': self._activity_lookback_s(polled_at),
+                  'detailed': 'true'},
             method='get',
         )
+        self._activity_polled_at = polled_at
 
         positions_by_deal: dict[str, dict] = {}
         for row in positions_resp.get('positions') or []:
@@ -153,6 +160,25 @@ class _ActivityMixin(_CapitalComBase, ABC):
         async for ev in self._missing_pending_tracker(
                 working_by_deal, positions_by_deal):
             yield ev
+
+    def _activity_lookback_s(self, now: float) -> int:
+        """``lastPeriod`` covering every activity since the last successful read.
+
+        A fixed window loses whatever the venue logged while the poll could
+        not read: a fill that happened during an outage longer than the window
+        never reaches the engine (measured live: cycle 276, 2026-10-13 — a 76s
+        REST outage swallowed a market entry's fill, and the next opposite
+        entry netted against it). Reaching back past the last successful read
+        recovers those rows; fingerprint dedup and the date watermark drop the
+        ones already processed.
+
+        :param now: Epoch time of the read about to be issued.
+        :return: Lookback in whole seconds, capped at the venue maximum.
+        """
+        since_last = 0.0
+        if self._activity_polled_at > 0.0:
+            since_last = max(0.0, now - self._activity_polled_at)
+        return min(_ACTIVITY_MAX_PERIOD_S, math.ceil(since_last) + _ACTIVITY_LAG_S)
 
     async def _process_activity(
             self, activities: list[dict],

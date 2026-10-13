@@ -150,6 +150,14 @@ _MARKET_CLOSED_REJECT_SUBSTRINGS = ('CURRENTLY CLOSED', 'MARKET IS CLOSED', 'MAR
 # calls the sync engine issues.
 _POLL_INTERVAL_S = 1.5
 
+#: Lookback the activity poll asks for beyond the time since its last
+#: successful read: the venue publishes an activity row up to a minute after
+#: the deal it stamps.
+_ACTIVITY_LAG_S = 60
+
+#: Largest ``lastPeriod`` ``GET /history/activity`` accepts (one day).
+_ACTIVITY_MAX_PERIOD_S = 86400
+
 #: ``orders.extras`` key stamped on a parked (``disposition_unknown``) entry
 #: row when a cancel intent reached it before the venue handed back a deal
 #: id. The parked-submission resolver honours it the moment the id lands:

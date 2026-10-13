@@ -14098,3 +14098,66 @@ def __test_gateway_5xx_with_a_json_body_is_still_a_transport_error__(monkeypatch
     with pytest.raises(CapitalComTransportError, match="HTTP 503") as info:
         broker('positions', method='get')
     assert not isinstance(info.value, CapitalComApiError)
+
+
+class _WindowedActivityBroker(_FakeBroker):
+    """Fake venue whose activity feed honours ``lastPeriod`` like the real one."""
+
+    def __init__(self, *, activities, config=None):
+        super().__init__(config=config, responses={
+            ('positions', 'get'): {'positions': []},
+            ('workingorders', 'get'): {'workingOrders': []},
+        })
+        self._activities = activities
+
+    async def _call(self, endpoint, *, data=None, method='post'):
+        if endpoint != 'history/activity':
+            return await super()._call(endpoint, data=data, method=method)
+        self._calls.append((endpoint, method, data))
+        oldest = time.time() - float((data or {})['lastPeriod'])
+        return {'activities': [
+            a for a in self._activities
+            if datetime.strptime(a['dateUTC'], '%Y-%m-%dT%H:%M:%S.%f')
+            .replace(tzinfo=timezone.utc).timestamp() >= oldest
+        ]}
+
+
+def __test_activity_poll_after_an_outage_reaches_back_to_the_last_read__(tmp_path):
+    """A fill logged while the poll could not read still reaches the engine.
+
+    Measured live (cycle 276, 2026-10-13): a 76s REST outage outlasted the
+    poll's fixed 60s activity window, the market entry's fill activity fell
+    out of it, and the engine never booked the fill — the next opposite
+    entry then netted against the unbooked position.
+    """
+    now = time.time()
+    fill_at = datetime.fromtimestamp(now - 80.0, timezone.utc)
+    broker = _WindowedActivityBroker(
+        config=_make_config(),
+        activities=[{
+            'dateUTC': fill_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+            'dealId': 'deal-S', 'type': 'POSITION', 'status': 'EXECUTED',
+            'source': 'USER', 'size': 1.0, 'level': 1.10,
+        }],
+    )
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order('coid-S', symbol='EURUSD', side='sell', qty=1.0,
+                         state='confirmed', pine_entry_id='S',
+                         extras={'kind': 'position', 'order_type': 'market'})
+        ctx.add_ref('coid-S', 'deal_id', 'deal-S')
+        ctx.set_exchange_id('coid-S', 'deal-S')
+        broker._activity_polled_at = now - 85.0
+
+        events = asyncio.run(_drain_agen(broker._poll_once()))
+
+        fills = [ev for ev in events if ev.event_type == 'filled']
+        assert len(fills) == 1
+        assert fills[0].pine_id == 'S'
+        assert fills[0].leg_type is LegType.ENTRY
+        # Back to the steady-state window once the gap is covered.
+        assert asyncio.run(_drain_agen(broker._poll_once())) == []
+        assert broker._calls[-1][2]['lastPeriod'] <= 62
+    finally:
+        ctx.close()
+        store.close()

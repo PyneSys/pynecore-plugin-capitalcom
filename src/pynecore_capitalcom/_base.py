@@ -260,6 +260,9 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     _activity_cursor: _ActivityCursor
     _instrument_rules_cache: dict[str, _InstrumentRules]
     _current_poll_id: int
+    # Epoch time the last successful activity read was issued; the next
+    # poll's ``lastPeriod`` reaches back past it (``_activity_lookback_s``).
+    _activity_polled_at: float
     # Lazily-built core disappearance tracker (reconcile.py owns it).
     _disappearance: 'DisappearanceTracker | None'
 
