@@ -99,6 +99,12 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     plugin_name = "Capital.com"
     Config = CapitalComConfig
+
+    # Fills come from the polled activity feed (every 1.5 s). The journal shows
+    # a healthy worst case of about 15 s, but the venue has stamped an activity
+    # row 61 s after its deal (demo, 2026-07-10), and a rate-limited poll backs
+    # off up to 30 s on top of that.
+    fill_report_grace_s = 120.0
     timezone = 'US/Eastern'
 
     @property
