@@ -18,9 +18,10 @@ from pynecore.core.broker.exceptions import (
     ExchangeCapabilityError,
     ExchangeRateLimitError,
     ExchangeOrderRejectedError,
+    VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.models import (
-    CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType,
+    CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType, QuarantineKind,
 )
 from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
 from pynecore.core.broker.run_identity import RunIdentity
@@ -3083,8 +3084,8 @@ def __test_missing_pending_tracker_stop_with_sink_quarantines__(tmp_path):
         ),
     })
     latched = []
-    broker.quarantine_sink = lambda reason, context: latched.append(
-        (reason, context))
+    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
+        (reason, context, kind))
     old_ts = __import__('time').time() - 120.0
     ctx.upsert_order('lost', symbol='EURUSD', side='buy', qty=1.0,
                      state='confirmed', pine_entry_id='Long',
@@ -3101,9 +3102,10 @@ def __test_missing_pending_tracker_stop_with_sink_quarantines__(tmp_path):
     events = asyncio.run(drain())   # no raise: the process stays alive
     assert len(events) == 1 and events[0].event_type == 'cancelled'
     assert len(latched) == 1
-    reason, context = latched[0]
+    reason, context, kind = latched[0]
     assert 'lost' in reason
     assert context['policy'] == 'stop'
+    assert kind is QuarantineKind.EXTERNAL_INTERVENTION
     row = ctx.get_order('lost')
     assert row is not None and row.closed_ts_ms is not None
     store.close()
@@ -3199,7 +3201,7 @@ def __test_stale_natural_close_row_retired_as_closed_without_policy__(tmp_path):
         ),
     })
     latched = []
-    broker.quarantine_sink = lambda reason, context: latched.append(reason)
+    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(reason)
     now = __import__('time').time()
     ctx.upsert_order('stuck', symbol='EURUSD', side='buy', qty=0.01,
                      state='closing', pine_entry_id='Long',
@@ -14307,3 +14309,205 @@ def __test_activity_poll_after_an_outage_reaches_back_to_the_last_read__(tmp_pat
     finally:
         ctx.close()
         store.close()
+
+
+# noinspection PyProtectedMember
+def __test_call_refuses_order_writes_while_venue_writes_blocked__(monkeypatch):
+    """The transport chokepoint refuses every order mutation under the latch.
+
+    POST / PUT / DELETE raise :class:`VenueWritesQuarantinedError` before
+    anything reaches ``httpx``, while reads and the login bootstrap keep
+    going out: ingestion and session upkeep continue during the quarantine.
+    """
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'sec-tok'
+    broker.cst_token = 'cst-tok'
+    broker._session_token_expiry_ts = 0.0  # skip proactive refresh
+    broker.venue_writes_blocked = lambda: True
+    sent: list[tuple[str, str]] = []
+
+    def recorder(method):
+        def send(url, **_kwargs):
+            sent.append((method, url.rsplit('/api/v1/', 1)[-1]))
+            return _MockHttpResponse(200, {'ok': True}, {})
+        return send
+
+    for method in ('get', 'post', 'put', 'delete'):
+        monkeypatch.setattr(httpx, method, recorder(method))
+
+    refused = [
+        ('positions', 'post', {'epic': 'EURUSD'}),
+        ('workingorders', 'POST', {'epic': 'EURUSD'}),
+        ('positions/deal-1', 'put', {'stopLevel': 1.0}),
+        ('workingorders/deal-2', 'delete', None),
+        ('positions/deal-3', 'delete', None),
+    ]
+    for endpoint, method, data in refused:
+        with pytest.raises(VenueWritesQuarantinedError):
+            broker(endpoint, data=data, method=method)
+    with pytest.raises(VenueWritesQuarantinedError):
+        broker('positions', data={'epic': 'EURUSD'})  # default method is POST
+    assert sent == []
+
+    assert broker('positions', method='get') == {'ok': True}
+    assert broker('session', data={'identifier': 'x'}) == {'ok': True}
+    assert sent == [('get', 'positions'), ('post', 'session')]
+
+    broker.venue_writes_blocked = lambda: False
+    broker('positions/deal-1', data={'stopLevel': 1.0}, method='put')
+    assert sent[-1] == ('put', 'positions/deal-1')
+
+
+# noinspection PyProtectedMember
+def __test_trailing_monitor_stays_pending_while_venue_writes_blocked__(
+        tmp_path, monkeypatch,
+):
+    """The activation PUT refused by the quarantine keeps the row ``pending``.
+
+    Runs the real ``_call`` -> account-lock -> ``__call__`` path: the
+    refusal must not escape the poll, must not advance the trailing state
+    machine, and nothing may reach the wire. Once the latch clears, the
+    next poll sends the PUT.
+    """
+    monkeypatch.setenv('HOME', str(tmp_path))
+    broker = CapitalCom(config=_make_config())
+    broker._account_id = 'capitalcom-demo-test-account'
+    broker.security_token = 'sec-tok'
+    broker.cst_token = 'cst-tok'
+    broker._session_token_expiry_ts = 0.0  # skip proactive refresh
+    broker.venue_writes_blocked = lambda: True
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    puts: list[str] = []
+
+    def fake_put(url, **_kwargs):
+        puts.append(url)
+        return _MockHttpResponse(200, {'dealReference': 'putref'}, {})
+
+    def fake_get(url, **_kwargs):
+        assert url.endswith('/confirms/putref')
+        return _MockHttpResponse(200, {'dealStatus': 'ACCEPTED'}, {})
+
+    monkeypatch.setattr(httpx, 'put', fake_put)
+    monkeypatch.setattr(httpx, 'get', fake_get)
+    try:
+        ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+                         state='confirmed', pine_entry_id='Long',
+                         from_entry='Long', trailing_distance=0.005,
+                         extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L',
+                                 'trail_state': 'pending',
+                                 'trail_activation_price': 1.15})
+        positions = {'deal-L': {
+            'market': {'epic': 'EURUSD', 'bid': 1.1502, 'offer': 1.1504},
+            'position': {'trailingStop': False},
+        }}
+
+        asyncio.run(broker._trailing_activation_monitor(positions))
+        asyncio.run(broker._trailing_activation_monitor(positions))
+        row = ctx.get_order('sl-coid')
+        assert row is not None
+        assert (row.extras or {}).get('trail_state') == 'pending'
+        assert puts == []
+
+        broker.venue_writes_blocked = lambda: False
+        asyncio.run(broker._trailing_activation_monitor(positions))
+        row = ctx.get_order('sl-coid')
+        assert row is not None
+        assert (row.extras or {}).get('trail_state') == 'activating'
+        assert len(puts) == 1 and puts[0].endswith('/positions/deal-L')
+    finally:
+        ctx.close()
+        store.close()
+
+
+# noinspection PyProtectedMember
+def __test_call_refuses_write_when_quarantine_latches_during_refresh__(monkeypatch):
+    """A quarantine latched while the request waits on a re-login still wins.
+
+    The proactive session refresh is blocking I/O; ingestion can latch the
+    external-intervention quarantine meanwhile. The write must be refused
+    at the send, not only at the entry of ``__call__``.
+    """
+    broker = _FakeBroker(config=_make_config())
+    broker.security_token = 'sec-tok'
+    broker.cst_token = 'cst-tok'
+    blocked = [False]
+    broker.venue_writes_blocked = lambda: blocked[0]
+
+    def refresh():
+        blocked[0] = True
+
+    broker._refresh_session_if_stale = refresh
+    sent: list[str] = []
+
+    def put(url, **_kwargs):
+        sent.append(url)
+        return _MockHttpResponse(200, {'dealReference': 'ref'}, {})
+
+    monkeypatch.setattr(httpx, 'put', put)
+    with pytest.raises(VenueWritesQuarantinedError):
+        broker('positions/deal-1', data={'stopLevel': 1.0}, method='put')
+    assert sent == []
+
+
+def __test_trailing_monitor_activation_keeps_live_take_profit__(tmp_path):
+    """The full-replacement activation PUT carries the live ``profitLevel``."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'putref'},
+        ('confirms/putref', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', trailing_distance=0.005,
+                     extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L',
+                             'trail_state': 'pending',
+                             'trail_activation_price': 1.15})
+    positions = {'deal-L': {
+        'market': {'epic': 'EURUSD', 'bid': 1.1502, 'offer': 1.1504},
+        'position': {'trailingStop': False, 'profitLevel': 1.17},
+    }}
+
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    puts = [c for c in broker._calls if c[:2] == ('positions/deal-L', 'put')]
+    assert len(puts) == 1
+    assert puts[0][2] == {
+        'trailingStop': True, 'stopDistance': pytest.approx(0.005),
+        'profitLevel': pytest.approx(1.17),
+    }
+    row = ctx.get_order('sl-coid')
+    assert row is not None
+    assert (row.extras or {}).get('trail_state') == 'activating'
+    store.close()
+
+
+def __test_trailing_monitor_rejected_activation_stays_pending__(tmp_path):
+    """A ``REJECTED`` confirm keeps the row ``pending`` so the next tick retries."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): [{'dealReference': 'ref-1'},
+                                      {'dealReference': 'ref-2'}],
+        ('confirms/ref-1', 'get'): {'dealStatus': 'REJECTED',
+                                    'rejectReason': 'RISK_CHECK'},
+        ('confirms/ref-2', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', trailing_distance=0.005,
+                     extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L',
+                             'trail_state': 'pending',
+                             'trail_activation_price': 1.15})
+    positions = {'deal-L': {
+        'market': {'epic': 'EURUSD', 'bid': 1.1502, 'offer': 1.1504},
+        'position': {'trailingStop': False},
+    }}
+
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    row = ctx.get_order('sl-coid')
+    assert row is not None
+    assert (row.extras or {}).get('trail_state') == 'pending'
+
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    row = ctx.get_order('sl-coid')
+    assert row is not None
+    assert (row.extras or {}).get('trail_state') == 'activating'
+    puts = [c for c in broker._calls if c[:2] == ('positions/deal-L', 'put')]
+    assert len(puts) == 2
+    store.close()

@@ -369,12 +369,14 @@ class _BracketMixin(_CapitalComBase, ABC):
         monitor:
 
         - ``pending``: row carries ``trail_activation_price``; the
-          exchange is not yet trailing.  On the first tick where the
-          mid-price crosses the threshold, transition to ``activating``
-          and PUT ``trailingStop=true``.
-        - ``activating``: idempotent PUT retry every tick until the
-          snapshot confirms the exchange flipped to native trailing.
-          Then transition to ``active`` and clear the activation fields.
+          exchange is not yet trailing.  On every tick where the
+          mid-price is past the threshold, PUT ``trailingStop=true``
+          (keeping the live ``profitLevel``) and transition to
+          ``activating`` once the confirm is not ``REJECTED``; a failed,
+          refused or rejected PUT keeps the row ``pending``.
+        - ``activating``: wait until the snapshot confirms the exchange
+          flipped to native trailing. Then transition to ``active`` and
+          clear the activation fields.
         - ``active``: managed by the exchange; the monitor is a no-op.
         """
         if self.store_ctx is None:
@@ -409,18 +411,45 @@ class _BracketMixin(_CapitalComBase, ABC):
             if state == 'pending':
                 if not crossed:
                     continue
-                # Send the PUT first; only flip to ``activating`` if the
-                # broker accepted it. Otherwise a transient BrokerError
-                # would leave the row in ``activating`` forever — the
-                # snapshot branch below would never see ``trailingStop``
-                # set, and the ``pending`` branch wouldn't re-enter, so
-                # the protective trailing stop would stay inactive.
-                body = {'trailingStop': True,
-                        'stopDistance': float(row.trailing_distance or 0.0)}
+                # ``PUT /positions/{dealId}`` is full replacement (see
+                # :meth:`publish_native_failsafe_sl`): the live take-profit
+                # rides along so swapping the stop for the trailing pair
+                # does not clear it.
+                body: dict = {'trailingStop': True,
+                              'stopDistance': float(row.trailing_distance or 0.0)}
+                live_profit = _wire_float(
+                    (pos.get('position') or {}).get('profitLevel'), finite=True,
+                )
+                if live_profit is not None:
+                    body['profitLevel'] = live_profit
+                # Send the PUT first; only flip to ``activating`` once the
+                # broker accepted it. ``activating`` only waits for the
+                # snapshot and never re-sends, so a failed, refused or
+                # ``REJECTED`` activation must stay ``pending`` for the next
+                # tick to retry — otherwise the protective trailing stop
+                # would stay inactive forever. The HTTP success alone is not
+                # the verdict; the confirm is.
                 try:
-                    await self._call(
+                    resp = await self._call(
                         f'positions/{parent_deal_id}', data=body, method='put',
                     )
+                    deal_ref = (resp.get('dealReference')
+                                if isinstance(resp, dict) else None)
+                    if deal_ref:
+                        confirm = await self._call(
+                            f'confirms/{deal_ref}', method='get',
+                        )
+                        if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
+                            self.store_ctx.log_event(
+                                'trailing_activation_rejected',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=row.exchange_order_id,
+                                payload={
+                                    'deal_reference': deal_ref,
+                                    'reason': _extract_reject_reason(confirm),
+                                },
+                            )
+                            continue
                 except BrokerError:
                     # Stay in pending; next tick re-tries.
                     continue

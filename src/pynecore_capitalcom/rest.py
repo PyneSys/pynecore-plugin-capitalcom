@@ -193,6 +193,15 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         url = rest_url(self._capital_config.demo, self._capital_config.rest_url)
         url += ENDPOINT_PREFIX + endpoint
 
+        # Quarantine chokepoint: every non-GET request except the login
+        # mutates orders or positions, and every REST path (engine
+        # dispatch, background monitors, the serialized partial close and
+        # the re-login retry) reaches the venue through here. Checked
+        # immediately before the send, after the session refresh, so a
+        # quarantine latched while this worker waited on a re-login still
+        # stops the write.
+        if method_lc != 'get' and not is_bootstrap:
+            self.ensure_venue_writes_allowed(f"{method_lc.upper()} {endpoint}")
         res: httpx.Response = getattr(httpx, method_lc)(url, **params)
         # A 5xx or a non-JSON body never carries an API verdict: the venue's
         # gateway answered for a backend that did not (measured live: nginx

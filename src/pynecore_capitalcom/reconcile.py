@@ -14,10 +14,9 @@ into:
 * ``_missing_pending_tracker`` — drives the tracker's grace-expiry
   protocol: rows missing past the grace window are retired as
   unexpected cancels (dual signal) and the configured
-  ``on_unexpected_cancel`` policy is applied — ``stop`` /
-  ``stop_and_cancel`` latch the engine quarantine through
-  ``quarantine_sink``; ``halt`` (or an unwired sink) raises
-  :class:`UnexpectedCancelError`.
+  ``on_unexpected_cancel`` policy is applied — ``stop`` latches the
+  engine's external-intervention quarantine through ``quarantine_sink``;
+  ``halt`` (or an unwired sink) raises :class:`UnexpectedCancelError`.
 
 State touched: BrokerStore through ``self.store_ctx``,
 ``_current_poll_id`` (read), ``_disappearance`` (lazy build).
@@ -1015,7 +1014,6 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 ),
                 confirm_missing=self._confirm_missing_cancelled,
                 is_exempt=self._is_disappearance_exempt,
-                cancel_siblings=self._cancel_sibling_orders,
                 request_quarantine=self.quarantine_sink,
                 cancelled_event_factory=self._missing_pending_cancelled_event,
             )
@@ -1183,7 +1181,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         order bookkeeping consistent (essential under the non-halting
         ``ignore`` / ``re_place`` policies, where the event is the ONLY
         signal), while the policy separately decides the operational
-        reaction — ``stop`` / ``stop_and_cancel`` latch the engine
+        reaction — ``stop`` latches the engine's external-intervention
         quarantine, ``halt`` raises :class:`UnexpectedCancelError`
         through the poll loop.
         """
@@ -1226,45 +1224,5 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             pine_id=row.pine_entry_id,
             from_entry=row.from_entry,
         )
-
-    async def _cancel_sibling_orders(self, row: 'OrderRow') -> None:
-        """Best-effort cancel sweep for the ``stop_and_cancel`` policy.
-
-        Deletes every other bot-owned working order / position in the
-        origin row's symbol at the broker and retires its store row
-        through the cascade audit path. Per-order failures are swallowed
-        — this is a best-effort pass run while the quarantine / halt is
-        already armed.
-        """
-        if self.store_ctx is None:
-            return
-        cascade_journal = DispatchJournal(self.store_ctx)
-        for other in list(self.store_ctx.iter_live_orders(symbol=row.symbol)):
-            if (other.client_order_id == row.client_order_id
-                    or not other.exchange_order_id):
-                continue
-            kind = (other.extras or {}).get('kind', 'working')
-            endpoint = (f'workingorders/{other.exchange_order_id}'
-                        if kind == 'working'
-                        else f'positions/{other.exchange_order_id}')
-            try:
-                await self._call(endpoint, method='delete')
-            except (OrderNotFoundError, BrokerError):
-                pass
-            cascade_journal.apply_reconcile_outcome(
-                other.client_order_id,
-                ReconcileOutcome(
-                    kind='terminal_close',
-                    reason='unexpected_cancel_cascade',
-                    new_state='rejected',
-                    audit_event='unexpected_cancel_cascade',
-                    close_row=True,
-                    audit_payload={
-                        'origin_coid': row.client_order_id,
-                        'origin_deal_id': row.exchange_order_id,
-                    },
-                    exchange_order_id=other.exchange_order_id,
-                ),
-            )
 
     # --- Trailing activation monitor --------------------------------------
