@@ -7,7 +7,31 @@ cursor) with the bracket-leg id helpers and the activity fingerprint —
 all stateless, all required cross-mixin.
 """
 import hashlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import TypeVar
+
+from pynecore.core.broker.exceptions import (
+    ExchangeOrderRejectedError,
+    ExchangeRateLimitError,
+    VenueWritesQuarantinedError,
+)
+from pynecore.core.broker.protection_guard import ProtectionLevels
+
+from .exceptions import CapitalComApiError
+
+_T = TypeVar('_T')
+
+#: Errors of a position write that prove nothing landed on the venue: a
+#: parsed API refusal (mapped or not), a rate-limit answer, or the
+#: quarantine gate that stops the request before it is sent. Transport
+#: failures and every other error leave the outcome unknown.
+_VENUE_REFUSALS: tuple[type[Exception], ...] = (
+    ExchangeOrderRejectedError,
+    ExchangeRateLimitError,
+    VenueWritesQuarantinedError,
+    CapitalComApiError,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +60,11 @@ class _InstrumentRules:
     (or the field is unavailable); the execute path treats ``<= 0`` as
     "no ceiling known" and skips the pre-check.
 
+    ``price_tick`` is the instrument's price step (``minStepDistance``), the
+    same value the provider publishes as the symbol's ``mintick``. ``0.0``
+    when the venue does not quote it; consumers that compare price levels
+    then treat the grid as unknown.
+
     ``fetched_at`` is the epoch second the entry was cached at; the lookup
     re-fetches once it ages past
     :data:`pynecore_capitalcom.helpers._INSTRUMENT_RULES_TTL_S`. Capital.com
@@ -49,6 +78,7 @@ class _InstrumentRules:
     fetched_at: float
     max_size: float = 0.0
     min_stop_or_limit_distance_unit: str = 'POINTS'
+    price_tick: float = 0.0
 
     def min_bracket_distance_at(self, reference_price: float) -> float:
         """Minimum SL/TP distance in price units at ``reference_price``.
@@ -103,6 +133,57 @@ class _ActivityCursor:
     last_date_utc: str | None = None
     seen_fingerprints: dict[str, str] = field(default_factory=dict)
     external_logged_fingerprints: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _ProtectionWrite:
+    """One own ``PUT /positions/{dealId}`` while it is in flight.
+
+    ``levels`` is the complete protection the PUT leaves on the position
+    (the PUT replaces every bracket field). The outcome stays unknown until
+    the caller marks the write :meth:`accepted` once the venue confirmed it,
+    or :meth:`refused` once the venue definitively turned it down (a
+    ``REJECTED`` confirm). Sending the PUT through :meth:`send` marks a
+    refusal the request itself raises.
+    """
+    levels: ProtectionLevels
+    ok: bool = False
+    rejected: bool = False
+
+    def accepted(self) -> None:
+        """Mark the write as confirmed by the venue."""
+        self.ok = True
+
+    def refused(self) -> None:
+        """Mark the write as definitively refused by the venue: nothing landed."""
+        self.rejected = True
+
+    async def send(self, request: Awaitable[_T]) -> _T:
+        """Await the PUT ``request``; an error proving nothing landed marks the refusal.
+
+        :param request: The awaitable that sends this write's PUT.
+        :return: The request's response.
+        """
+        try:
+            return await request
+        except _VENUE_REFUSALS:
+            self.rejected = True
+            raise
+
+
+@dataclass
+class _OwnCloseHandle:
+    """An own close recorded before its request left.
+
+    ``withdraw`` drops the record from the target rows; call :meth:`failed`
+    when the venue refused the close, so no later close activity can be
+    attributed to it.
+    """
+    withdraw: Callable[[], None]
+
+    def failed(self) -> None:
+        """The venue refused the close."""
+        self.withdraw()
 
 
 def _bracket_leg_id(deal_id: str, kind: str) -> str:

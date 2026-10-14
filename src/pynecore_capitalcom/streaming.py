@@ -1611,6 +1611,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
             # already see the wired port. See ``_detect_account_mode``.
             await self._detect_account_mode()
             await self._load_activity_cursor_from_events()
+            self._send_pending_manual_close_reports()
             await self._recover_in_flight_submissions()
 
         assert self.timeframe is not None and self.symbol is not None

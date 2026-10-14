@@ -33,6 +33,7 @@ from .helpers import (
     TYPES,
     _INSTRUMENT_RULES_TTL_S,
     _parse_opening_hours_segment,
+    _wire_float,
 )
 from .models import _InstrumentRules
 
@@ -564,6 +565,9 @@ class _ProviderMixin(_CapitalComBase, ABC):
                 min_distance = value
                 min_distance_unit = str(rule.get('unit') or 'POINTS').upper()
                 break
+        price_tick = _wire_float(
+            (dealing.get('minStepDistance') or {}).get('value'), finite=True,
+        )
         rules = _InstrumentRules(
             epic=epic,
             lot_step=lot_step if lot_step > 0.0 else 0.01,
@@ -572,6 +576,7 @@ class _ProviderMixin(_CapitalComBase, ABC):
             min_stop_or_limit_distance=min_distance,
             min_stop_or_limit_distance_unit=min_distance_unit,
             fetched_at=now,
+            price_tick=price_tick if price_tick is not None and price_tick > 0.0 else 0.0,
         )
         self._instrument_rules_cache[epic] = rules
         bid_raw = snapshot.get('bid')

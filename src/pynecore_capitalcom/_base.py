@@ -29,6 +29,8 @@ import asyncio
 import collections
 import threading
 from abc import ABC
+from collections.abc import Iterable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Protocol, cast
@@ -45,10 +47,11 @@ from pynecore.types.ohlcv import OHLCV
 
 from .config import CapitalComConfig
 from .helpers import _size_from_units
-from .models import _ActivityCursor, _InstrumentRules
+from .models import _ActivityCursor, _InstrumentRules, _OwnCloseHandle, _ProtectionWrite
 
 if TYPE_CHECKING:
     from pynecore.core.broker.disappearance import DisappearanceTracker
+    from pynecore.core.broker.protection_guard import ProtectionLevelGuard
     from pynecore.core.broker.models import DispatchEnvelope, PositionLeg
     from pynecore.core.broker.storage import OrderRow, RunContext
 
@@ -88,6 +91,14 @@ class CapitalComHookCollaborator(Protocol):
             tp_coid: str | None, sl_coid: str | None, reason: str,
             stage: str, deal_reference: str | None = None,
     ) -> None: ...
+
+    def protection_write(
+            self, deal_id: str, body: dict,
+    ) -> AbstractContextManager[_ProtectionWrite]: ...
+
+    def own_close(
+            self, deal_ids: Iterable[str], *, full: bool, size: float | None,
+    ) -> AbstractContextManager[_OwnCloseHandle]: ...
 
 
 class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
@@ -163,6 +174,18 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             stage=stage,
             deal_reference=deal_reference,
         )
+
+    def protection_write(
+            self, deal_id: str, body: dict,
+    ) -> AbstractContextManager[_ProtectionWrite]:
+        """Record one own ``PUT /positions/{deal_id}`` for a standalone hook."""
+        return self._protection_write(deal_id, body)
+
+    def own_close(
+            self, deal_ids: Iterable[str], *, full: bool, size: float | None,
+    ) -> AbstractContextManager[_OwnCloseHandle]:
+        """Record an own close of ``deal_ids`` for a standalone hook."""
+        return self._own_close(deal_ids, full=full, size=size)
 
     if TYPE_CHECKING:
         def __call__(
@@ -271,6 +294,18 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     _activity_polled_at: float
     # Lazily-built core disappearance tracker (reconcile.py owns it).
     _disappearance: 'DisappearanceTracker | None'
+    # Lazily-built protection-level guard (intervention.py owns it).
+    _protection: 'ProtectionLevelGuard | None'
+    # Last ``/positions`` size seen per guarded position key; a change marks
+    # a partial close whose effect on the bracket is re-baselined.
+    _protection_sizes: dict[str, float]
+    # Own protection writes per guarded position key: how many are in flight
+    # and when the last one was sent or settled (wall clock). A size-change
+    # adoption only takes a snapshot read after both.
+    _protection_in_flight: dict[str, int]
+    _protection_written_at: dict[str, float]
+    # Deals whose stop the core native fail-safe manager writes.
+    _failsafe_deal_ids: set[str]
 
     # --- Account mode ---
     # ``True`` once ``connect()`` reads ``hedgingMode`` from the account
@@ -427,6 +462,32 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _record_bracket_resolution(self, *args: Any, **kwargs: Any) -> None: ...
 
     async def _trailing_activation_monitor(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    # --- External intervention (intervention.py) ---
+    def _protection_write(
+            self, deal_id: str, body: dict,
+    ) -> AbstractContextManager[_ProtectionWrite]: ...
+
+    def _own_close(
+            self, deal_ids: Iterable[str], *, full: bool, size: float | None,
+    ) -> AbstractContextManager[_OwnCloseHandle]: ...
+
+    def _forget_protection(self, deal_id: str) -> None: ...
+
+    def _claim_failsafe_protection(self, deal_ids: Iterable[str]) -> None: ...
+
+    async def _observe_protection(
+            self, positions_by_deal: dict[str, dict],
+            read_started_at: float | None,
+    ) -> None: ...
+
+    def _stamp_protection_adopt(self, coid: str, after: float) -> None: ...
+
+    def _attribute_close_activity(self, row: 'OrderRow', activity: dict) -> bool: ...
+
+    def _report_manual_close(self, row: 'OrderRow', activity: dict) -> None: ...
+
+    def _send_pending_manual_close_reports(self) -> None: ...
 
     # --- Reconcile (reconcile.py) ---
     def _reconcile_snapshot(

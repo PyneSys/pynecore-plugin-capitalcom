@@ -33,7 +33,11 @@ from pynecore_capitalcom import (
     CapitalComError,
 )
 from pynecore_capitalcom.exceptions import HistoricalPricesNotFoundError
-from pynecore_capitalcom.helpers import _WS_VOLUME_BASELINE_BARS, _is_session_error
+from pynecore_capitalcom.helpers import (
+    _WS_VOLUME_BASELINE_BARS,
+    _is_session_error,
+    _parse_iso_timestamp,
+)
 from pynecore_capitalcom.plugin import _activity_fingerprint
 from pynecore_capitalcom.rest import _RestSessionMixin
 
@@ -1356,6 +1360,30 @@ def _live_position(deal_id='deal-L', *, size=2.0, stop_level=None,
     return {'market': {'epic': 'EURUSD'}, 'position': pos}
 
 
+def _capture_quarantine(broker):
+    """Install a recording quarantine sink, returning its call log."""
+    latched: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
+        (reason, context, kind))
+    return latched
+
+
+def _seed_own_close(ctx, coid, activity, *, full=True, size=None):
+    """Record the own close that produced ``activity`` on its entry row.
+
+    Mirrors what :meth:`CapitalCom._own_close` writes before the DELETE /
+    reduce POST leaves, stamped at the activity's venue time.
+    """
+    sent_at = _parse_iso_timestamp(activity['dateUTC'])
+    row = ctx.get_order(coid)
+    extras = dict(row.extras or {})
+    extras['own_close_expected'] = [{
+        'full': full, 'size': size, 'sent_at': sent_at,
+        'done_at': sent_at, 'matched': [],
+    }]
+    ctx.upsert_order(coid, extras=extras)
+
+
 def __test_reconcile_feeds_observed_static_stop__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path)
     _seed_failsafe_entry(ctx)  # coid-entry -> deal-L, kind=position, qty=2.0
@@ -2045,7 +2073,7 @@ def __test_execute_cancel_bracket_leg_clears_via_put__(tmp_path):
     assert len(put_calls) == 1, f"expected one PUT, got {broker._calls}"
     endpoint, _, body = put_calls[0]
     assert endpoint == 'positions/deal-L'
-    # TP cancel → only profitLevel cleared; stopLevel untouched (omitted).
+    # TP cancel with no live SL sister → the body clears the TP only.
     assert body == {'profitLevel': None}
     # Mirror the execute_exit/modify_exit minta: a confirm round-trip on
     # the returned dealReference must follow the bracket PUT (TTL-bounded
@@ -2420,6 +2448,7 @@ def __test_process_activity_prunes_dedup_state_behind_watermark__(tmp_path):
     session-long memory-leak fix.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     ctx.upsert_order('coid', symbol='EURUSD', side='buy', qty=1.0,
                      state='confirmed', pine_entry_id='Long',
                      extras={'kind': 'position'})
@@ -2460,6 +2489,8 @@ def __test_process_activity_prunes_dedup_state_behind_watermark__(tmp_path):
     assert entry_fp not in cursor.seen_fingerprints
     assert _activity_fingerprint(later) in cursor.seen_fingerprints
     assert cursor.external_logged_fingerprints == set()
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -8085,6 +8116,7 @@ def __test_reconcile_snapshot_working_to_position_stamps_kind_and_entry_filled__
     instead of closing it.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     # Seed: a working LIMIT entry that's already been ack'd by the
     # broker (state='server_ref_seen', kind='working').
     ctx.upsert_order(
@@ -8155,6 +8187,8 @@ def __test_reconcile_snapshot_working_to_position_stamps_kind_and_entry_filled__
         f"leg_type={close_events[0].leg_type!r}"
     )
     assert close_events[0].order.side == 'sell'
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -8221,6 +8255,7 @@ def __test_process_activity_manual_close_routes_as_close_when_entry_activity_rol
     """
     import datetime as _dt
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     ctx.upsert_order(
         'coid-entry', symbol='EURUSD', side='buy', qty=1.0, filled_qty=1.0,
         state='confirmed', pine_entry_id='Long',
@@ -8273,6 +8308,8 @@ def __test_process_activity_manual_close_routes_as_close_when_entry_activity_rol
         f"close-leg side must flip vs entry side (buy→sell); got "
         f"{ev.order.side!r}"
     )
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -8383,6 +8420,8 @@ def __test_process_activity_close_is_yielded_with_a_live_opposite_row__(tmp_path
         # Closing trade of a short is a BUY (opposite the entry direction).
         'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
     }
+    # The close is the bot's own DELETE, recorded before it left.
+    _seed_own_close(ctx, short_coid, activity)
 
     async def drain():
         out = []
@@ -8443,6 +8482,8 @@ def __test_process_activity_close_with_stale_snapshot_takes_the_breadcrumb_path_
         'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
         'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
     }
+    # The close is the bot's own DELETE, recorded before it left.
+    _seed_own_close(ctx, short_coid, activity)
     # STALE snapshot: /positions still carries the closed short at full
     # size — the lag race the breadcrumb machinery exists for.
     positions_by_deal = {
@@ -8604,6 +8645,8 @@ def __test_natural_close_retires_only_the_closed_rows_exposure__(tmp_path):
         'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
         'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
     }
+    # The close is the bot's own DELETE, recorded before it left.
+    _seed_own_close(ctx, short_coid, activity)
 
     async def drain():
         out = []
@@ -8674,6 +8717,8 @@ def __test_natural_close_zeroes_the_journal_cursor_without_a_reversal__(tmp_path
         'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
         'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
     }
+    # The close is the bot's own DELETE, recorded before it left.
+    _seed_own_close(ctx, short_coid, activity)
 
     async def drain():
         out = []
@@ -8742,6 +8787,7 @@ def __test_process_activity_manual_close_without_reversal_still_yields__(tmp_pat
     so it needs the reducing fill.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     _seed_reversal_short_leg(ctx)
 
     activity = {
@@ -8766,6 +8812,8 @@ def __test_process_activity_manual_close_without_reversal_still_yields__(tmp_pat
     assert events[0].order.side == 'buy', (
         "closing a short is a buy (opposite the entry side)"
     )
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -8805,6 +8853,8 @@ def __test_process_activity_explicit_close_with_opposite_entry_still_yields__(tm
         'epic': 'EURUSD', 'size': 100.0, 'level': 1.14162,
         'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.14162},
     }
+    # The close is the bot's own DELETE, recorded before it left.
+    _seed_own_close(ctx, 'coid-short', activity)
 
     async def drain():
         out = []
@@ -8831,6 +8881,7 @@ def __test_process_activity_manual_close_routes_as_close__(tmp_path):
     a false UnexpectedCancelError.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx)
     # Promote the entry row past its first entry-fill activity (the
     # discriminator the plugin uses to recognise subsequent activities
@@ -8877,6 +8928,8 @@ def __test_process_activity_manual_close_routes_as_close__(tmp_path):
         assert (row.extras or {}).get('natural_close_at') is not None, (
             f"row {coid!r} must carry natural_close_at after manual close"
         )
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -9024,6 +9077,7 @@ def __test_process_activity_manual_partial_close_zero_level_emits_with_proxy_pri
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
     })
+    quarantined = _capture_quarantine(broker)
     e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx, qty=1.0)
     entry_row = ctx.get_order(e_coid)
     assert entry_row is not None
@@ -9076,6 +9130,8 @@ def __test_process_activity_manual_partial_close_zero_level_emits_with_proxy_pri
         "proxy-priced emit must commit the fingerprint so the next "
         "poll does not re-emit the same partial close"
     )
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -9146,6 +9202,7 @@ def __test_process_activity_partial_close_does_not_teardown__(tmp_path):
         (covered by the companion reconcile test below).
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx, qty=1.0)
     entry_row = ctx.get_order(e_coid)
     assert entry_row is not None
@@ -9200,6 +9257,8 @@ def __test_process_activity_partial_close_does_not_teardown__(tmp_path):
         "close so a subsequent reconcile poll can promote the row to "
         "a teardown if the deal then vanishes (race-window resolution)"
     )
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -9249,6 +9308,12 @@ def __test_reconcile_promotes_close_event_yielded_after_race__(tmp_path):
     store.close()
 
 
+def _recent_venue_iso(seconds_ago: float) -> str:
+    """A venue-format ``dateUTC`` ``seconds_ago`` before now."""
+    dt = datetime.fromtimestamp(time.time() - seconds_ago, tz=timezone.utc)
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.') + f"{dt.microsecond // 1000:03d}"
+
+
 def __test_load_activity_cursor_clamps_below_unresolved_deferred_close__(tmp_path):
     """Across-restart cursor clamp: when a previous incarnation logged
     an ``activity_close_deferred_no_price`` event AND a later
@@ -9259,8 +9324,8 @@ def __test_load_activity_cursor_clamps_below_unresolved_deferred_close__(tmp_pat
     deferred close, silently desyncing strategy and broker.
     """
     broker, store, ctx = _make_broker(tmp_path)
-    deferred_date = '2026-04-21T11:00:00.000'
-    later_date = '2026-04-21T11:00:05.000'
+    deferred_date = _recent_venue_iso(60.0)
+    later_date = _recent_venue_iso(55.0)
     ctx.log_event(
         'activity_close_deferred_no_price',
         exchange_order_id='deal-L',
@@ -9302,8 +9367,8 @@ def __test_load_activity_cursor_advances_past_resolved_deferred_close__(tmp_path
     the resolved close's timestamp.
     """
     broker, store, ctx = _make_broker(tmp_path)
-    deferred_date = '2026-04-21T11:00:00.000'
-    later_date = '2026-04-21T11:00:05.000'
+    deferred_date = _recent_venue_iso(60.0)
+    later_date = _recent_venue_iso(55.0)
     ctx.log_event(
         'activity_close_deferred_no_price',
         exchange_order_id='deal-L',
@@ -9355,8 +9420,8 @@ def __test_load_activity_cursor_clamps_when_sibling_shares_dateutc__(tmp_path):
     unresolved until *its own* dealId reappears in ``activity_processed``.
     """
     broker, store, ctx = _make_broker(tmp_path)
-    shared_date = '2026-04-21T11:00:00.000'
-    later_date = '2026-04-21T11:00:05.000'
+    shared_date = _recent_venue_iso(60.0)
+    later_date = _recent_venue_iso(55.0)
     # Deferred close on deal-L (no level yet — resolution still pending).
     ctx.log_event(
         'activity_close_deferred_no_price',
@@ -9396,6 +9461,56 @@ def __test_load_activity_cursor_clamps_when_sibling_shares_dateutc__(tmp_path):
     # Sibling's fingerprint must still be tracked for dedup on next poll.
     assert 'fp-sibling' in cursor.seen_fingerprints
     assert 'fp-later' in cursor.seen_fingerprints
+    store.close()
+
+
+def __test_load_activity_cursor_replays_the_previous_process_events__(tmp_path):
+    """A restart opens a NEW run instance of the same logical run: the
+    ``activity_processed`` events it must replay were written by the
+    previous instance, so the rebuild cannot be scoped to its own one.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    processed_date = _recent_venue_iso(30.0)
+    ctx.log_event(
+        'activity_processed',
+        exchange_order_id='deal-O',
+        payload={'fingerprint': 'fp-prev', 'dateUTC': processed_date,
+                 'deal_id': 'deal-O',
+                 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER'},
+    )
+    ctx.close()
+    restarted = _FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+    })
+    restarted.store_ctx = store.open_run(
+        RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                    account_id="test-account", label=None),
+        script_source="// test",
+    )
+    assert restarted.store_ctx.run_instance_id != ctx.run_instance_id
+
+    asyncio.run(restarted._load_activity_cursor_from_events())
+    cursor = restarted._activity_cursor
+    assert cursor.seen_fingerprints.get('fp-prev') == processed_date
+    assert cursor.last_date_utc == processed_date
+    store.close()
+
+
+def __test_load_activity_cursor_skips_rows_the_venue_no_longer_returns__(tmp_path):
+    """Only rows inside the largest ``lastPeriod`` window can come back from
+    the venue; older ones are not replayed into the cursor."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.log_event(
+        'activity_processed',
+        exchange_order_id='deal-O',
+        payload={'fingerprint': 'fp-old', 'dateUTC': _recent_venue_iso(2 * 86400.0),
+                 'deal_id': 'deal-O',
+                 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER'},
+    )
+    asyncio.run(broker._load_activity_cursor_from_events())
+    cursor = broker._activity_cursor
+    assert 'fp-old' not in cursor.seen_fingerprints
+    assert cursor.last_date_utc is None
     store.close()
 
 
@@ -11040,12 +11155,14 @@ def __test_process_activity_suppresses_already_recorded_entry_fill_replay__(tmp_
 
     # The same entry-fill activity re-served on the post-restart poll,
     # with the venue having backfilled ``level`` (so the fingerprint
-    # differs from whatever a prior seen_fingerprints entry held).
+    # differs from whatever a prior seen_fingerprints entry held). The
+    # measured payload carries the trade direction in ``details``; the
+    # row's own direction is what marks it as the entry, not a close.
     activity = {
         'dateUTC': '2026-04-21T09:00:00.000', 'dealId': 'deal-L',
         'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SYSTEM',
-        'epic': 'EURUSD', 'direction': 'BUY',
-        'size': 100.0, 'level': 1.17512,
+        'epic': 'EURUSD',
+        'details': {'direction': 'BUY', 'size': 100.0, 'level': 1.17512},
     }
     fingerprint = _activity_fingerprint(activity)
 
@@ -11057,14 +11174,10 @@ def __test_process_activity_suppresses_already_recorded_entry_fill_replay__(tmp_
 
     events = asyncio.run(drain())
 
-    entry_fills = [
-        ev for ev in events
-        if ev.event_type == 'filled' and ev.leg_type == LegType.ENTRY
-    ]
-    assert not entry_fills, (
+    assert not events, (
         f"an entry fill the adopted position already includes must NOT "
-        f"be re-emitted on restart (would double-count 100 -> 200); got "
-        f"{entry_fills!r}"
+        f"be re-emitted on restart (would double-count 100 -> 200), nor "
+        f"read as a close; got {events!r}"
     )
     # Durability: the replayed activity must still be deduped so it is
     # not re-evaluated on every subsequent poll.
@@ -11098,6 +11211,7 @@ def __test_process_activity_close_breadcrumb_persists_before_yield__(tmp_path):
     iteration; the legacy post-yield order would surface ``None``.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     # Pre-stamped entry row: subsequent USER activity classifies as a
     # manual close (LegType.CLOSE) rather than another entry.
     ctx.upsert_order(
@@ -11164,6 +11278,8 @@ def __test_process_activity_close_breadcrumb_persists_before_yield__(tmp_path):
         f"close_event_yielded_at breadcrumb, NOT natural_close_at; got "
         f"natural_close_at={bcs[0]['natural_close_at']!r}"
     )
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -13949,6 +14065,7 @@ def __test_opposite_direction_close_without_stamp_routes_as_close__(tmp_path):
     restart) — deterministic where the old path relied on the fragile
     time fallback."""
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     ctx.upsert_order(
         'coid-entry', symbol='EURUSD', side='buy', qty=1.0, filled_qty=1.0,
         state='confirmed', pine_entry_id='L1',
@@ -13965,6 +14082,8 @@ def __test_opposite_direction_close_without_stamp_routes_as_close__(tmp_path):
     assert len(events) == 1
     assert events[0].leg_type == LegType.CLOSE
     assert events[0].order.side == 'sell'
+    # No own close explains the USER close: it is booked, then reported.
+    assert len(quarantined) == 1
     store.close()
 
 

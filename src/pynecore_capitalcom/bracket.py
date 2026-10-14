@@ -64,6 +64,8 @@ class _BracketMixin(_CapitalComBase, ABC):
             return
         now_ts = epoch_time()
         deal_id = entry_row.exchange_order_id
+        if deal_id:
+            self._forget_protection(deal_id)
         bracket_coids: list[str] = []
         if deal_id:
             for r in list(self.store_ctx.iter_live_orders(symbol=entry_row.symbol)):
@@ -430,26 +432,31 @@ class _BracketMixin(_CapitalComBase, ABC):
                 # would stay inactive forever. The HTTP success alone is not
                 # the verdict; the confirm is.
                 try:
-                    resp = await self._call(
-                        f'positions/{parent_deal_id}', data=body, method='put',
-                    )
-                    deal_ref = (resp.get('dealReference')
-                                if isinstance(resp, dict) else None)
-                    if deal_ref:
-                        confirm = await self._call(
-                            f'confirms/{deal_ref}', method='get',
-                        )
-                        if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
-                            self.store_ctx.log_event(
-                                'trailing_activation_rejected',
-                                client_order_id=row.client_order_id,
-                                exchange_order_id=row.exchange_order_id,
-                                payload={
-                                    'deal_reference': deal_ref,
-                                    'reason': _extract_reject_reason(confirm),
-                                },
+                    with self._protection_write(
+                            str(parent_deal_id), body,
+                    ) as protection:
+                        resp = await protection.send(self._call(
+                            f'positions/{parent_deal_id}', data=body, method='put',
+                        ))
+                        deal_ref = (resp.get('dealReference')
+                                    if isinstance(resp, dict) else None)
+                        if deal_ref:
+                            confirm = await self._call(
+                                f'confirms/{deal_ref}', method='get',
                             )
-                            continue
+                            if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
+                                protection.refused()
+                                self.store_ctx.log_event(
+                                    'trailing_activation_rejected',
+                                    client_order_id=row.client_order_id,
+                                    exchange_order_id=row.exchange_order_id,
+                                    payload={
+                                        'deal_reference': deal_ref,
+                                        'reason': _extract_reject_reason(confirm),
+                                    },
+                                )
+                                continue
+                        protection.accepted()
                 except BrokerError:
                     # Stay in pending; next tick re-tries.
                     continue
@@ -538,6 +545,11 @@ class _BracketMixin(_CapitalComBase, ABC):
                     " — refusing to PUT against a guessed position."
                 )
             deal_ids = [deal_id]
+
+        # The manager owns these positions' stop from now on and detects
+        # edits on its own; the plugin's guard must stop judging them before
+        # the manager's levels reach the venue.
+        self._claim_failsafe_protection(deal_ids)
 
         body: dict = {
             'stopLevel': (

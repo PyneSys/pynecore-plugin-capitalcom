@@ -7,7 +7,7 @@ back. This mix-in walks the BrokerStore at startup and resolves every
 non-terminal row:
 
 * ``_load_activity_cursor_from_events`` — replays the
-  ``activity_processed`` events from the last 24h to rebuild
+  ``activity_processed`` events of the venue's activity window to rebuild
   ``_activity_cursor.seen_fingerprints`` + watermark.
 * ``_recover_in_flight_submissions`` — orchestration: batch-fetches the
   three REST snapshots, then hands ``submitted`` /
@@ -54,6 +54,8 @@ from pynecore.lib.log import broker_info
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import OrderNotFoundError
 from .helpers import (
+    _ACTIVITY_LAG_S,
+    _ACTIVITY_MAX_PERIOD_S,
     _extract_reject_reason,
     _parse_iso_timestamp,
     _position_legs_from_payload,
@@ -78,7 +80,10 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         the window would re-emit every activity row as a duplicate
         event. The plugin side-steps the issue by writing the
         fingerprint to the BrokerStore on every processed row and
-        reloading the last 24 h on connect.
+        reloading, on connect, the rows the venue can still return: those
+        whose ``dateUTC`` lies within the largest ``lastPeriod`` window.
+        The events are read across every instance of the logical run —
+        they were written by the process that ended, not by this one.
 
         Deferred-close clamp: the in-batch clamp in
         :meth:`_process_activity` only protects the in-memory cursor.
@@ -108,17 +113,21 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         reference lands. A fresh process needs no such pin: the engine
         adopts the venue position at startup.
         """
-        if self.store_ctx is None or self._connection_generation > 0:
+        store_ctx = self.store_ctx
+        if store_ctx is None or self._connection_generation > 0:
             return
-        cutoff_ms = int((epoch_time() - 86400.0) * 1000)
+        cutoff_s = epoch_time() - _ACTIVITY_MAX_PERIOD_S - _ACTIVITY_LAG_S
         cursor = self._activity_cursor
 
-        processed_payloads = list(self.store_ctx.iter_events_by_kind_since(
-            'activity_processed', cutoff_ms,
-        ))
-        deferred_payloads = list(self.store_ctx.iter_events_by_kind_since(
-            'activity_close_deferred_no_price', cutoff_ms,
-        ))
+        def recent(kind: str) -> list[dict]:
+            return [
+                payload
+                for _, _, _, payload in store_ctx.iter_events_by_kind_for_run_id(kind)
+                if _parse_iso_timestamp(str(payload.get('dateUTC') or '')) >= cutoff_s
+            ]
+
+        processed_payloads = recent('activity_processed')
+        deferred_payloads = recent('activity_close_deferred_no_price')
 
         processed_keys: set[tuple[str, str]] = set()
         for payload in processed_payloads:
@@ -139,15 +148,9 @@ class _RecoveryMixin(_CapitalComBase, ABC):
 
         for payload in processed_payloads:
             fp: str | None = payload.get('fingerprint')
-            date_utc: str | None = payload.get('dateUTC')
+            date_utc = str(payload['dateUTC'])
             if fp:
-                # A missing dateUTC replays as '' — such an entry sorts
-                # below any real watermark and the first poll prunes it,
-                # matching the poll-path guard that would skip its row
-                # before the fingerprint is consulted anyway.
-                cursor.seen_fingerprints[fp] = date_utc or ''
-            if not date_utc:
-                continue
+                cursor.seen_fingerprints[fp] = date_utc
             if (deferred_min_unresolved is not None
                     and date_utc >= deferred_min_unresolved):
                 continue

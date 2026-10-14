@@ -85,6 +85,8 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             self,
             positions_by_deal: dict[str, dict],
             working_by_deal: dict[str, dict],
+            *,
+            read_started_at: float | None = None,
     ) -> AsyncIterator[OrderEvent]:
         """Authoritative snapshot reconcile.
 
@@ -93,7 +95,13 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         (working → position flip on fill, partial fills via cumulative
         size decrease). Rows whose exchange counterpart has disappeared
         get a ``missing_pending_since`` stamp so the grace tracker can
-        close them out after the grace window.
+        close them out after the grace window. Last, every guarded bot
+        position's SL/TP is judged against the levels the bot set
+        (:meth:`_observe_protection`).
+
+        :param read_started_at: Wall-clock time the ``/positions`` read
+            started; ``None`` judges the snapshot regardless of the last
+            own protection write.
         """
         if self.store_ctx is None:
             return
@@ -310,7 +318,10 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     'close_event_yielded_at_poll_id',
                 )
                 if stamp_poll_id != self._current_poll_id:
-                    extras = {k: v for k, v in (row.extras or {}).items()
+                    # Re-read: the row snapshot predates this poll's yields,
+                    # and another writer may have extended the extras since.
+                    current = self.store_ctx.get_order(row.client_order_id)
+                    extras = {k: v for k, v in ((current or row).extras or {}).items()
                               if k not in (
                                   'close_event_yielded_at',
                                   'close_event_yielded_at_poll_id',
@@ -575,6 +586,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             },
             now_ts,
         )
+        await self._observe_protection(positions_by_deal, read_started_at)
 
     async def _vanished_closing_row_fill(
             self, row: 'OrderRow', now_ts: float,

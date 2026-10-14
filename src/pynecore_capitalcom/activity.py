@@ -43,6 +43,7 @@ from pynecore.core.plugin import override
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
 from .helpers import (
+    EXTRAS_KEY_PROTECTION_ADOPT_AFTER,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
     _POLL_INTERVAL_S,
@@ -125,6 +126,9 @@ class _ActivityMixin(_CapitalComBase, ABC):
         # caused the defer; :meth:`_reconcile_snapshot` then refuses to
         # clear breadcrumbs whose poll-id matches the current cycle.
         self._current_poll_id += 1
+        # Every own protection write recorded before this instant may be
+        # missing from the snapshot; the protection guard skips those.
+        positions_read_started_at = epoch_time()
         positions_resp = await self._call('positions', method='get')
         working_resp = await self._call('workingorders', method='get')
         polled_at = epoch_time()
@@ -155,7 +159,8 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 positions_by_deal):
             yield ev
         async for ev in self._reconcile_snapshot(
-                positions_by_deal, working_by_deal):
+                positions_by_deal, working_by_deal,
+                read_started_at=positions_read_started_at):
             yield ev
         await self._trailing_activation_monitor(positions_by_deal)
         async for ev in self._missing_pending_tracker(
@@ -428,64 +433,84 @@ class _ActivityMixin(_CapitalComBase, ABC):
                          or date_utc > cursor.last_date_utc)):
                 cursor.last_date_utc = date_utc
 
-            if self.store_ctx is not None:
-                self.store_ctx.log_event(
-                    'activity_processed',
-                    exchange_order_id=deal_id,
-                    client_order_id=row.client_order_id,
-                    payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
-                             'deal_id': deal_id,
-                             'type': a.get('type'), 'status': a.get('status'),
-                             'source': a.get('source')},
+            # Idempotent entry-fill replay guard. An ENTRY fill whose
+            # matched row already carries ``entry_filled_at`` was
+            # ALREADY accounted for — either earlier in this session
+            # (the first emit stamps it, and the venue's 60s rolling
+            # window keeps re-serving the same activity) or in a prior
+            # process incarnation whose durable row persisted the
+            # stamp. On restart the engine's startup reconcile adopts
+            # the venue position, which already INCLUDES this entry
+            # fill; re-emitting it would drive
+            # :meth:`BrokerPosition.record_fill` to double-count the
+            # exposure (the observed 100 -> 200 desync). Capital.com
+            # opens a fresh ``dealId`` for every entry, so a genuine
+            # second entry matches a different row that carries no
+            # ``entry_filled_at`` — this guard only ever fires on a
+            # replay of the same accounted fill. The activity stays
+            # durable (``activity_processed`` logged below, cursor advanced
+            # above); only the position-affecting yield is dropped.
+            # Robust to the venue backfilling the activity ``level``
+            # between ingest and restart (which changes the content-
+            # addressed fingerprint and would otherwise defeat
+            # ``seen_fingerprints`` dedup).
+            entry_fill_already_recorded = (
+                event is not None
+                and event.event_type == 'filled'
+                and event.leg_type == LegType.ENTRY
+                and (row.extras or {}).get('entry_filled_at') is not None
+            )
+            # Closing-leg twin of the guard above. A row stamped
+            # ``natural_close_at`` with its exposure cursor retired
+            # already delivered its close fill — either from an
+            # earlier activity or from the snapshot reconcile's
+            # vanished-``closing``-row path, which prices the fill
+            # from the DELETE's confirm when the venue publishes the
+            # close activity late or not at all. Capital.com never
+            # reuses a dealId, so a later closing activity on such a
+            # row can only be that same close surfacing again;
+            # yielding it would walk the engine's flat book into a
+            # phantom opposite position.
+            close_fill_already_recorded = (
+                event is not None
+                and event.event_type == 'filled'
+                and event.leg_type in (
+                    LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                    LegType.TRAILING_STOP, LegType.CLOSE,
                 )
+                and (row.extras or {}).get('natural_close_at') is not None
+                and row.filled_qty <= 0.0
+            )
+            # Attribute a USER / DEALER close before its effects land: the
+            # bot's own DELETE / reduce POST carries the same source as an
+            # operator's close, and only the own-close record written before
+            # that request tells them apart. Someone else's close is booked
+            # like any other, then reported. The report it owes is persisted
+            # in the same transaction as the dedup commit: a process that
+            # dies after the commit must still find the report on restart,
+            # where the deduplicated activity no longer replays.
+            report_close = False
+            if self.store_ctx is not None:
+                with self.store_ctx.transaction():
+                    self.store_ctx.log_event(
+                        'activity_processed',
+                        exchange_order_id=deal_id,
+                        client_order_id=row.client_order_id,
+                        payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
+                                 'deal_id': deal_id,
+                                 'type': a.get('type'), 'status': a.get('status'),
+                                 'source': a.get('source')},
+                    )
+                    report_close = (
+                        event is not None
+                        and not entry_fill_already_recorded
+                        and not close_fill_already_recorded
+                        and event.event_type == 'filled'
+                        and event.leg_type == LegType.CLOSE
+                        and self._attribute_close_activity(row, a)
+                    )
 
             if event is not None:
-                # Idempotent entry-fill replay guard. An ENTRY fill whose
-                # matched row already carries ``entry_filled_at`` was
-                # ALREADY accounted for — either earlier in this session
-                # (the first emit stamps it, and the venue's 60s rolling
-                # window keeps re-serving the same activity) or in a prior
-                # process incarnation whose durable row persisted the
-                # stamp. On restart the engine's startup reconcile adopts
-                # the venue position, which already INCLUDES this entry
-                # fill; re-emitting it would drive
-                # :meth:`BrokerPosition.record_fill` to double-count the
-                # exposure (the observed 100 -> 200 desync). Capital.com
-                # opens a fresh ``dealId`` for every entry, so a genuine
-                # second entry matches a different row that carries no
-                # ``entry_filled_at`` — this guard only ever fires on a
-                # replay of the same accounted fill. The activity stays
-                # durable (``activity_processed`` logged + cursor advanced
-                # above); only the position-affecting yield is dropped.
-                # Robust to the venue backfilling the activity ``level``
-                # between ingest and restart (which changes the content-
-                # addressed fingerprint and would otherwise defeat
-                # ``seen_fingerprints`` dedup).
-                entry_fill_already_recorded = (
-                    event.event_type == 'filled'
-                    and event.leg_type == LegType.ENTRY
-                    and (row.extras or {}).get('entry_filled_at') is not None
-                )
-                # Closing-leg twin of the guard above. A row stamped
-                # ``natural_close_at`` with its exposure cursor retired
-                # already delivered its close fill — either from an
-                # earlier activity or from the snapshot reconcile's
-                # vanished-``closing``-row path, which prices the fill
-                # from the DELETE's confirm when the venue publishes the
-                # close activity late or not at all. Capital.com never
-                # reuses a dealId, so a later closing activity on such a
-                # row can only be that same close surfacing again;
-                # yielding it would walk the engine's flat book into a
-                # phantom opposite position.
-                close_fill_already_recorded = (
-                    event.event_type == 'filled'
-                    and event.leg_type in (
-                        LegType.TAKE_PROFIT, LegType.STOP_LOSS,
-                        LegType.TRAILING_STOP, LegType.CLOSE,
-                    )
-                    and (row.extras or {}).get('natural_close_at') is not None
-                    and row.filled_qty <= 0.0
-                )
                 # Working-order fill (WORKING_ORDER EXECUTED): promote the
                 # row to its position identity BEFORE yielding the fill.
                 # The new dealId comes from the same-instant POSITION
@@ -674,6 +699,12 @@ class _ActivityMixin(_CapitalComBase, ABC):
                             mark_extras['close_event_yielded_at_poll_id'] = (
                                 self._current_poll_id
                             )
+                            # A reduction may change the bracket the venue
+                            # keeps on the residual: the next snapshot read
+                            # after it becomes the accepted protection.
+                            mark_extras[EXTRAS_KEY_PROTECTION_ADOPT_AFTER] = (
+                                epoch_time()
+                            )
                             self.store_ctx.upsert_order(
                                 row.client_order_id, extras=mark_extras,
                             )
@@ -683,7 +714,17 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     # torn down above — only the double-counting fill is
                     # dropped.
                     continue
-                yield event
+                if not report_close:
+                    yield event
+                    continue
+                # The close is already durable (dedup committed, exposure
+                # retired), so a replay after a restart is suppressed: the
+                # report must also run when the consumer abandons this
+                # generator at the yield instead of resuming it.
+                try:
+                    yield event
+                finally:
+                    self._report_manual_close(row, a)
 
         # End-of-poll pruning — both dedup structures stay bounded by the
         # venue's rolling window instead of growing for the whole session.
@@ -838,15 +879,21 @@ class _ActivityMixin(_CapitalComBase, ABC):
         is_explicit_close_source = source in (
             'TP', 'SL', 'CLOSE_OUT', 'CLOSE', 'MARGIN', 'STOP_OUT',
         )
-        is_manual_close = (
+        closes_filled_entry = (
             row_kind == 'position'
             and row_leg_kind not in ('tp', 'sl')
             and (
                 is_same_direction is False
                 or (is_same_direction is None and entry_already_filled)
             )
-            and source in ('USER', 'DEALER')
         )
+        is_manual_close = closes_filled_entry and source in ('USER', 'DEALER')
+        # ``SYSTEM`` is a venue-side action, never an operator's or another
+        # bot's, but unlike ``CLOSE_OUT`` the source alone does not say
+        # "close": only the same direction / fill-state evidence the manual
+        # path uses makes it one, so an entry-side ``SYSTEM`` row still
+        # routes as the entry fill.
+        is_system_close = closes_filled_entry and source == 'SYSTEM'
         is_closing_leg = (
             activity_type == 'POSITION'
             and status in ('EXECUTED', 'ACCEPTED')
@@ -854,6 +901,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 is_explicit_close_source
                 or row_leg_kind in ('tp', 'sl')
                 or is_manual_close
+                or is_system_close
             )
         )
 
@@ -875,11 +923,11 @@ class _ActivityMixin(_CapitalComBase, ABC):
         # Bracket TP/SL fill fallback: ONLY when the closing event truly
         # comes from a bracket leg — explicit ``source in ('TP', 'SL')`` or
         # the row itself is a stored bracket leg. Generic closes
-        # (``CLOSE``/``CLOSE_OUT``/``MARGIN``/``STOP_OUT`` and manual
-        # ``USER``/``DEALER`` closes) execute at the prevailing market
-        # price, NOT at the bracket SL level — falling back to the still-
-        # attached SL leg's stored level would misprice the fill and
-        # corrupt P&L. When the activity ``level`` is missing for those
+        # (``CLOSE``/``CLOSE_OUT``/``MARGIN``/``STOP_OUT``, venue-side
+        # ``SYSTEM`` and manual ``USER``/``DEALER`` closes) execute at the
+        # prevailing market price, NOT at the bracket SL level — falling
+        # back to the still-attached SL leg's stored level would misprice
+        # the fill and corrupt P&L. When the activity ``level`` is missing for those
         # cases, leave it at 0; :meth:`_process_activity` defers the
         # event (no yield, no dedup commit, no ``natural_close_at``
         # stamp) so the next poll re-evaluates with a fresh
@@ -951,6 +999,11 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     # already ran for TP/SL above; everything else is
                     # an exchange-side close (margin, stop-out, manual
                     # via Close button) on the entry row.
+                    leg_type = LegType.CLOSE
+                    event_type = 'filled'
+                elif is_system_close:
+                    # Venue-side close of a filled bot entry — booked
+                    # like ``CLOSE_OUT``, never an operator intervention.
                     leg_type = LegType.CLOSE
                     event_type = 'filled'
                 elif is_manual_close:

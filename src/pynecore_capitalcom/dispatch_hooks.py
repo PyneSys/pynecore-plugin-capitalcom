@@ -60,7 +60,7 @@ from .helpers import (
 from .models import _bracket_leg_id
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.storage import OrderRow
+    from pynecore.core.broker.storage import OrderRow, RunContext
 
     from .models import _InstrumentRules
 
@@ -261,6 +261,52 @@ f'confirms/{deal_ref}', method='get',
         )]
 
 
+def _surviving_sister_levels(
+        store_ctx: 'RunContext | None', row: 'OrderRow',
+        parent_deal_id: str, leg_kind: str,
+) -> dict:
+    """Bracket fields a single-leg clear must re-send for the other leg.
+
+    ``PUT /positions/{dealId}`` replaces every bracket field, so clearing one
+    leg with a body naming only that leg would clear its sister as well. The
+    sister's live journal row tells what the venue carries for it: a fixed
+    level, a native trailing stop (active, or accepted by the activation
+    monitor), or nothing. A stop leg waiting for its trailing activation
+    still carries its fixed stop level on the venue when the exit had one.
+
+    :param store_ctx: The run journal.
+    :param row: The leg row being cleared.
+    :param parent_deal_id: The position both legs sit on.
+    :param leg_kind: ``'tp'`` or ``'sl'`` — the leg being cleared.
+    :return: The sister's PUT fields; empty when it has none on the venue.
+    """
+    if store_ctx is None:
+        return {}
+    sister_kind = 'sl' if leg_kind == 'tp' else 'tp'
+    for other in store_ctx.iter_live_orders(symbol=row.symbol):
+        extras = other.extras or {}
+        if (other.client_order_id == row.client_order_id
+                or extras.get('leg_kind') != sister_kind
+                or str(extras.get('parent_deal_id')) != parent_deal_id
+                or other.state not in ('confirmed', 'disposition_unknown')):
+            continue
+        if sister_kind == 'tp':
+            return ({'profitLevel': float(other.tp_level)}
+                    if other.tp_level is not None else {})
+        trail_state = extras.get('trail_state')
+        if other.trailing_stop or trail_state == 'activating':
+            distance = (other.trailing_distance
+                        if other.trailing_distance is not None
+                        else _wire_float(extras.get('trail_offset'), finite=True))
+            if distance is None:
+                return {}
+            return {'trailingStop': True, 'stopDistance': float(distance)}
+        if other.sl_level is not None:
+            return {'stopLevel': float(other.sl_level)}
+        return {}
+    return {}
+
+
 class _CapitalComCancelHooks:
     """Hook set for the cancel dispatch's per-target sweep.
 
@@ -279,7 +325,8 @@ class _CapitalComCancelHooks:
       ``from_entry`` cancel → PUT ``/positions/{parent_deal_id}`` with
       ``profitLevel: null`` or ``stopLevel: null``. Trailing SLs add
       ``trailingStop: False`` so the native trailing mechanism stops
-      managing the parent.
+      managing the parent. The PUT replaces every bracket field, so a
+      sister leg that stays live is re-sent with its own level.
     * **Bracket leg** picked up by an entry cancel (``from_entry is
       None``) → silent skip; TV semantics: ``strategy.cancel(entry_id)``
       after the entry filled must leave the protective bracket alive.
@@ -317,9 +364,12 @@ class _CapitalComCancelHooks:
         logs the matching ``cancelled`` / ``cancel_already_gone`` /
         ``cancel_noop`` event so the audit trail stays compatible with
         the pre-journal implementation. Network failures on a wire
-        call raise :class:`OrderDispositionUnknownError`; the journal
-        flips the command row to ``disposition_unknown`` and
-        recovery on next start re-evaluates.
+        call (or on the confirm read after a bracket-leg PUT) raise
+        :class:`OrderDispositionUnknownError`; the journal flips the
+        command row to ``disposition_unknown`` and recovery on next start
+        re-evaluates. A bracket-leg PUT the venue confirms ``REJECTED``
+        leaves the leg row live and raises
+        :class:`ExchangeOrderRejectedError`.
         """
         store_ctx = self._plugin.store_ctx
         applied: list[str] = []
@@ -389,13 +439,15 @@ class _CapitalComCancelHooks:
                             row.client_order_id, 'cancel_pending',
                         )
                     continue
-                # ``stopLevel: null`` / ``profitLevel: null`` — Capital.com
-                # treats null as an explicit clear, leaving the unspecified
-                # leg untouched so the sister bracket survives. A trailing
-                # SL needs the ``trailingStop: False`` flag too: clearing
-                # ``stopLevel`` alone does not disable the native trailing
-                # mechanism, so without this the broker would keep the
-                # trailing stop active even after the local row is closed.
+                # ``stopLevel: null`` / ``profitLevel: null`` clears the
+                # leg. A trailing SL needs the ``trailingStop: False`` flag
+                # too: clearing ``stopLevel`` alone does not disable the
+                # native trailing mechanism, so without this the broker
+                # would keep the trailing stop active even after the local
+                # row is closed. ``PUT /positions/{dealId}`` replaces every
+                # bracket field (verified 2026-05-25, a field the body omits
+                # is cleared), so the sister leg that stays live is re-sent
+                # with its own level.
                 body: dict
                 if leg_kind == 'tp':
                     body = {'profitLevel': None}
@@ -403,22 +455,49 @@ class _CapitalComCancelHooks:
                     body = {'stopLevel': None}
                     if row.trailing_distance or extras.get('trail_offset'):
                         body['trailingStop'] = False
+                body.update(_surviving_sister_levels(
+                    store_ctx, row, str(parent_deal_id), leg_kind,
+                ))
                 target_already_gone = False
+                reject_reason: str | None = None
                 try:
-                    resp = await self._plugin.call_api(
-        f'positions/{parent_deal_id}',
-                        data=body, method='put',
-                    )
-                    # Mirror the confirm round-trip ``execute_exit`` /
-                    # ``modify_exit`` already perform after every bracket
-                    # PUT — Capital.com's confirms endpoint is TTL-bounded
-                    # and the activity stream uses it as the truth source.
-                    new_ref = (resp or {}).get('dealReference') \
-                        if isinstance(resp, dict) else None
-                    if new_ref:
-                        await self._plugin.call_api(
-            f'confirms/{new_ref}', method='get',
-                        )
+                    with self._plugin.protection_write(
+                            str(parent_deal_id), body,
+                    ) as protection:
+                        resp = await protection.send(self._plugin.call_api(
+                            f'positions/{parent_deal_id}',
+                            data=body, method='put',
+                        ))
+                        # Mirror the confirm round-trip ``execute_exit`` /
+                        # ``modify_exit`` already perform after every bracket
+                        # PUT — Capital.com's confirms endpoint is TTL-bounded
+                        # and the activity stream uses it as the truth source.
+                        new_ref = (resp or {}).get('dealReference') \
+                            if isinstance(resp, dict) else None
+                        confirm: dict = {}
+                        if new_ref:
+                            try:
+                                confirm = await self._plugin.call_api(
+                                    f'confirms/{new_ref}', method='get',
+                                )
+                            except (httpx.TimeoutException, httpx.RequestError,
+                                    ConnectionError, CapitalComError,
+                                    BrokerError) as net:
+                                # The PUT was answered, only its verdict could
+                                # not be read (a confirm 404 is the TTL, not a
+                                # gone position): the leg stays live and the
+                                # cancel is ambiguous.
+                                raise OrderDispositionUnknownError(
+                                    f"Capital cancel-sweep confirm {new_ref} for "
+                                    f"positions/{parent_deal_id} ambiguous: {net}",
+                                    client_order_id=coid,
+                                    cause=net if isinstance(net, Exception) else None,
+                                ) from net
+                        if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
+                            protection.refused()
+                            reject_reason = _extract_reject_reason(confirm)
+                        else:
+                            protection.accepted()
                 except (httpx.TimeoutException, httpx.RequestError,
                         ConnectionError, ExchangeConnectionError) as net:
                     raise OrderDispositionUnknownError(
@@ -437,6 +516,26 @@ class _CapitalComCancelHooks:
                             exchange_order_id=str(parent_deal_id),
                             intent_key=intent.intent_key,
                         )
+                if reject_reason is not None:
+                    # The venue kept the leg: it stays live locally, and the
+                    # journal marks the cancel rejected.
+                    if store_ctx is not None:
+                        store_ctx.log_event(
+                            'cancel_rejected',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=str(parent_deal_id),
+                            intent_key=intent.intent_key,
+                            payload={'leg_kind': leg_kind, 'reason': reject_reason},
+                        )
+                    if _is_market_closed_reject(reject_reason):
+                        raise MarketClosedError(
+                            f"Capital bracket-leg cancel on positions/{parent_deal_id} "
+                            f"declined, market closed: {reject_reason}",
+                        )
+                    raise ExchangeOrderRejectedError(
+                        f"Capital bracket-leg cancel on positions/{parent_deal_id} "
+                        f"REJECTED: {reject_reason}",
+                    )
                 if store_ctx is not None:
                     store_ctx.close_order(row.client_order_id)
                     store_ctx.log_event(
@@ -651,9 +750,12 @@ class _CapitalComCloseHooks:
         for row in targets:
             close_ref: str | None = None
             try:
-                resp = await self._plugin.call_api(
-                    f'positions/{row.exchange_order_id}', method='delete',
-                )
+                with self._plugin.own_close(
+                        [row.exchange_order_id or ''], full=True, size=None,
+                ):
+                    resp = await self._plugin.call_api(
+                        f'positions/{row.exchange_order_id}', method='delete',
+                    )
                 if isinstance(resp, dict):
                     close_ref = _wire_id(resp.get('dealReference'))
             except (httpx.TimeoutException, httpx.RequestError,
@@ -765,15 +867,18 @@ class _CapitalComCloseHooks:
         # External manual/API writers remain outside our control; the
         # post-snapshot ownership validation below still detects mismatches.
         try:
-            post_resp, pre_rows = await self._plugin.submit_exclusive_partial_close(
-                coid=coid,
-                symbol=intent.symbol,
-                expected_direction=expected_direction,
-                target_deal_ids=self._target_deal_ids,
-                body=body,
-                intent_qty=intent.qty,
-                lot_step=rules.lot_step,
-            )
+            with self._plugin.own_close(
+                    self._target_deal_ids, full=False, size=quantized_qty,
+            ) as own_close:
+                post_resp, pre_rows = await self._plugin.submit_exclusive_partial_close(
+                    coid=coid,
+                    symbol=intent.symbol,
+                    expected_direction=expected_direction,
+                    target_deal_ids=self._target_deal_ids,
+                    body=body,
+                    intent_qty=intent.qty,
+                    lot_step=rules.lot_step,
+                )
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
             raise OrderDispositionUnknownError(
@@ -858,6 +963,7 @@ class _CapitalComCloseHooks:
                 # position amend, bracket SL PUT).
                 deal_status = (confirm.get('dealStatus') or '').upper()
                 if deal_status == 'REJECTED':
+                    own_close.failed()
                     reason = _extract_reject_reason(confirm)
                     if _is_market_closed_reject(reason):
                         raise MarketClosedError(
@@ -1199,110 +1305,115 @@ class _CapitalComModifyExitHooks:
                 f"no exchange_order_id (coid={coid!r})"
             )
 
-        try:
-            resp = await self._plugin.call_api(
-f'positions/{deal_id}', data=self._body, method='put',
-            )
-        except (httpx.TimeoutException, httpx.RequestError,
-                ConnectionError, ExchangeConnectionError) as net:
-            # PUT outcome ambiguous: the broker may already have applied
-            # the amend while local state still reflects the pre-amend
-            # bracket. Seed/refresh the leg rows so the next reconcile
-            # snapshot resolves them against authoritative broker state.
-            self._seed_added_legs_disposition_unknown(new_intent)
-            self._mark_existing_sl_force_rejected_on_pending_trail()
-            self._persist_existing_legs_attempted_target(new_intent)
-            self._plugin.mark_bracket_legs_disposition_unknown(
-intent=new_intent,
-                parent_coid=self._target_row.client_order_id,
-                deal_id=deal_id,
-                tp_coid=self._ambiguous_tp_coid,
-                sl_coid=self._ambiguous_sl_coid,
-                reason=str(net), stage='put',
-            )
-            raise OrderDispositionUnknownError(
-                f"Capital modify_exit PUT positions/{deal_id} "
-                f"ambiguous: {net}",
-                client_order_id=self._target_row.client_order_id,
-                cause=net if isinstance(net, Exception) else None,
-                predecessor_cancel_ids=(),
-            ) from net
-
-        new_ref = _wire_id(resp.get('dealReference'))
-        post_put_state: dict = {}
-        if new_ref:
+        # Full replacement: the body is the whole protection the position
+        # carries afterwards.
+        with self._plugin.protection_write(deal_id, self._body) as protection:
             try:
-                modify_confirm = await self._plugin.call_api(
-    f'confirms/{new_ref}', method='get',
-                )
+                resp = await protection.send(self._plugin.call_api(
+                    f'positions/{deal_id}', data=self._body, method='put',
+                ))
             except (httpx.TimeoutException, httpx.RequestError,
-                    ConnectionError, ExchangeConnectionError,
-                    CapitalComError, BrokerError) as net:
-                # PUT landed (got a dealReference) but the confirm read
-                # failed. Same ambiguity as PUT-timeout: the broker may
-                # already have applied the amend. Mapped broker errors
-                # (404 OrderNotFoundError, 429 ExchangeRateLimitError,
-                # etc.) on the confirm GET are treated identically to
-                # network failures here.
-                # Persist the server-allocated deal_reference on the
-                # modify command row before raising so restart recovery
-                # (_verdict_modify_exit) can resolve via confirms/{ref}
-                # without falling back to snapshot matching.
-                if self._plugin.store_ctx is not None:
-                    self._plugin.store_ctx.add_ref(
-                        coid, 'deal_reference', new_ref,
-                    )
+                    ConnectionError, ExchangeConnectionError) as net:
+                # PUT outcome ambiguous: the broker may already have applied
+                # the amend while local state still reflects the pre-amend
+                # bracket. Seed/refresh the leg rows so the next reconcile
+                # snapshot resolves them against authoritative broker state.
                 self._seed_added_legs_disposition_unknown(new_intent)
                 self._mark_existing_sl_force_rejected_on_pending_trail()
                 self._persist_existing_legs_attempted_target(new_intent)
                 self._plugin.mark_bracket_legs_disposition_unknown(
-    intent=new_intent,
+                    intent=new_intent,
                     parent_coid=self._target_row.client_order_id,
                     deal_id=deal_id,
                     tp_coid=self._ambiguous_tp_coid,
                     sl_coid=self._ambiguous_sl_coid,
-                    reason=str(net), stage='confirm',
-                    deal_reference=new_ref,
+                    reason=str(net), stage='put',
                 )
                 raise OrderDispositionUnknownError(
-                    f"Capital modify_exit confirm {new_ref} "
+                    f"Capital modify_exit PUT positions/{deal_id} "
                     f"ambiguous: {net}",
                     client_order_id=self._target_row.client_order_id,
                     cause=net if isinstance(net, Exception) else None,
                     predecessor_cancel_ids=(),
                 ) from net
 
-            deal_status = (modify_confirm.get('dealStatus') or '').upper()
-            if deal_status == 'REJECTED':
-                reason = _extract_reject_reason(modify_confirm)
-                if self._plugin.store_ctx is not None:
-                    self._plugin.store_ctx.log_event(
-                        'modify_exit_rejected',
+            new_ref = _wire_id(resp.get('dealReference'))
+            post_put_state: dict = {}
+            if new_ref:
+                try:
+                    modify_confirm = await self._plugin.call_api(
+                        f'confirms/{new_ref}', method='get',
+                    )
+                except (httpx.TimeoutException, httpx.RequestError,
+                        ConnectionError, ExchangeConnectionError,
+                        CapitalComError, BrokerError) as net:
+                    # PUT landed (got a dealReference) but the confirm read
+                    # failed. Same ambiguity as PUT-timeout: the broker may
+                    # already have applied the amend. Mapped broker errors
+                    # (404 OrderNotFoundError, 429 ExchangeRateLimitError,
+                    # etc.) on the confirm GET are treated identically to
+                    # network failures here.
+                    # Persist the server-allocated deal_reference on the
+                    # modify command row before raising so restart recovery
+                    # (_verdict_modify_exit) can resolve via confirms/{ref}
+                    # without falling back to snapshot matching.
+                    if self._plugin.store_ctx is not None:
+                        self._plugin.store_ctx.add_ref(
+                            coid, 'deal_reference', new_ref,
+                        )
+                    self._seed_added_legs_disposition_unknown(new_intent)
+                    self._mark_existing_sl_force_rejected_on_pending_trail()
+                    self._persist_existing_legs_attempted_target(new_intent)
+                    self._plugin.mark_bracket_legs_disposition_unknown(
+                        intent=new_intent,
+                        parent_coid=self._target_row.client_order_id,
+                        deal_id=deal_id,
+                        tp_coid=self._ambiguous_tp_coid,
+                        sl_coid=self._ambiguous_sl_coid,
+                        reason=str(net), stage='confirm',
+                        deal_reference=new_ref,
+                    )
+                    raise OrderDispositionUnknownError(
+                        f"Capital modify_exit confirm {new_ref} "
+                        f"ambiguous: {net}",
                         client_order_id=self._target_row.client_order_id,
-                        exchange_order_id=self._target_row.exchange_order_id,
-                        intent_key=new_intent.intent_key,
-                        payload={'reason': reason,
-                                 'tp': new_intent.tp_price,
-                                 'sl': new_intent.sl_price,
-                                 'trail_offset': new_intent.trail_offset},
-                    )
-                if _is_market_closed_reject(reason):
-                    raise MarketClosedError(
-                        f"Capital position amend declined, market closed: {reason}",
-                    )
-                raise ExchangeOrderRejectedError(
-                    f"Capital position amend REJECTED: {reason}",
-                )
+                        cause=net if isinstance(net, Exception) else None,
+                        predecessor_cancel_ids=(),
+                    ) from net
 
-            post_put_state = {
-                'profit_level': modify_confirm.get('profitLevel'),
-                'stop_level': modify_confirm.get('stopLevel'),
-                'trailing_stop': modify_confirm.get('trailingStop'),
-                'stop_distance': modify_confirm.get('stopDistance'),
-            }
-            raw_confirm = modify_confirm
-        else:
-            raw_confirm = None
+                deal_status = (modify_confirm.get('dealStatus') or '').upper()
+                if deal_status == 'REJECTED':
+                    protection.refused()
+                    reason = _extract_reject_reason(modify_confirm)
+                    if self._plugin.store_ctx is not None:
+                        self._plugin.store_ctx.log_event(
+                            'modify_exit_rejected',
+                            client_order_id=self._target_row.client_order_id,
+                            exchange_order_id=self._target_row.exchange_order_id,
+                            intent_key=new_intent.intent_key,
+                            payload={'reason': reason,
+                                     'tp': new_intent.tp_price,
+                                     'sl': new_intent.sl_price,
+                                     'trail_offset': new_intent.trail_offset},
+                        )
+                    if _is_market_closed_reject(reason):
+                        raise MarketClosedError(
+                            f"Capital position amend declined, market closed: {reason}",
+                        )
+                    raise ExchangeOrderRejectedError(
+                        f"Capital position amend REJECTED: {reason}",
+                    )
+
+                post_put_state = {
+                    'profit_level': modify_confirm.get('profitLevel'),
+                    'stop_level': modify_confirm.get('stopLevel'),
+                    'trailing_stop': modify_confirm.get('trailingStop'),
+                    'stop_distance': modify_confirm.get('stopDistance'),
+                }
+                raw_confirm = modify_confirm
+            else:
+                raw_confirm = None
+            protection.accepted()
 
         return ModifyExitOutcome(
             server_ref=str(new_ref) if new_ref else '',

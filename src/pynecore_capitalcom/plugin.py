@@ -37,6 +37,7 @@ from .exceptions import (
     OrderNotFoundError,
 )
 from .execution import _ExecutionMixin
+from .intervention import _InterventionMixin
 from .helpers import _WS_VOLUME_BASELINE_BARS, _parse_opening_hours_segment
 from .models import _ActivityCursor, _InstrumentRules, _activity_fingerprint
 from .provider import _ProviderMixin
@@ -68,6 +69,7 @@ __all__ = [
 
 class CapitalCom(
     _RecoveryMixin,
+    _InterventionMixin,
     _ReconcileMixin,
     _BracketMixin,
     _ActivityMixin,
@@ -269,3 +271,10 @@ class CapitalCom(
         # ``quarantine_sink``, all injected by the runner / CLI after
         # ``__init__``.
         self._disappearance = None
+        # Protection-level guard (moved / removed SL/TP detection). Built
+        # lazily for the same reason as the disappearance tracker.
+        self._protection = None
+        self._protection_sizes: dict[str, float] = {}
+        self._protection_in_flight: dict[str, int] = {}
+        self._protection_written_at: dict[str, float] = {}
+        self._failsafe_deal_ids: set[str] = set()

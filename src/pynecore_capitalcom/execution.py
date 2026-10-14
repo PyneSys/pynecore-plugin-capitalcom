@@ -345,7 +345,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             if store_ctx is not None else None
         )
         try:
-            await self._call(f'positions/{leg_id}', method='delete')
+            with self._own_close([leg_id], full=True, size=None):
+                await self._call(f'positions/{leg_id}', method='delete')
         except OrderNotFoundError:
             if store_ctx is not None:
                 store_ctx.log_event(
@@ -440,66 +441,72 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 float(sl_price) if sl_price is not None else None
             )
 
-        try:
-            resp = await self._call(
-                f'positions/{leg_id}', data=body, method='put',
-            )
-        except OrderNotFoundError:
-            # Leg vanished between the emulator's fetch and this amend —
-            # the bracket it would carry is moot.
-            return
-        except ExchangeConnectionError as net:
-            raise OrderDispositionUnknownError(
-                f"Capital PUT positions/{leg_id} ({symbol}) ambiguous during "
-                f"one-way bracket amend: {net}",
-                client_order_id=coid,
-                cause=net,
-            ) from net
-        except CapitalComError as exc:
-            # An unmapped Capital.com API error on the PUT is a definitive
-            # refusal of THIS amend — classify it so the attach path runs
-            # the defensive flatten instead of escaping as an untyped
-            # provider error (which the engine's write-side net would
-            # escalate to a halt).
-            raise ExchangeOrderRejectedError(
-                f"Capital PUT positions/{leg_id} bracket amend refused: {exc}",
-            ) from exc
+        # Full replacement: the body is the whole protection the row
+        # carries afterwards.
+        with self._protection_write(leg_id, body) as protection:
+            try:
+                resp = await protection.send(self._call(
+                    f'positions/{leg_id}', data=body, method='put',
+                ))
+            except OrderNotFoundError:
+                # Leg vanished between the emulator's fetch and this amend —
+                # the bracket it would carry is moot.
+                return
+            except ExchangeConnectionError as net:
+                raise OrderDispositionUnknownError(
+                    f"Capital PUT positions/{leg_id} ({symbol}) ambiguous during "
+                    f"one-way bracket amend: {net}",
+                    client_order_id=coid,
+                    cause=net,
+                ) from net
+            except CapitalComError as exc:
+                # An unmapped Capital.com API error on the PUT is a definitive
+                # refusal of THIS amend — classify it so the attach path runs
+                # the defensive flatten instead of escaping as an untyped
+                # provider error (which the engine's write-side net would
+                # escalate to a halt).
+                raise ExchangeOrderRejectedError(
+                    f"Capital PUT positions/{leg_id} bracket amend refused: {exc}",
+                ) from exc
 
-        if self.store_ctx is not None:
-            self.store_ctx.log_event(
-                'one_way_bracket_amend',
-                client_order_id=coid,
-                exchange_order_id=leg_id,
-                payload={
-                    'side': side,
-                    'tp_price': tp_price,
-                    'sl_price': sl_price,
-                    'trail_offset': trail_offset,
-                },
-            )
-        deal_ref = resp.get('dealReference') if isinstance(resp, dict) else None
-        if not deal_ref:
-            # No dealReference to confirm — treat the round-trip as success;
-            # the reconcile pass verifies the observed levels later. Mirrors
-            # ``publish_native_failsafe_sl``.
-            return
-        try:
-            confirm = await self._call(f'confirms/{deal_ref}', method='get')
-        except (OrderNotFoundError, ExchangeConnectionError) as net:
-            # The PUT went out but its outcome cannot be verified — leave
-            # the ownership row replayable rather than guessing.
-            raise OrderDispositionUnknownError(
-                f"Capital confirms/{deal_ref} ambiguous after one-way "
-                f"bracket amend on {leg_id} ({symbol}): {net}",
-                client_order_id=coid,
-                cause=net,
-            ) from net
-        if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
-            reason = _extract_reject_reason(confirm)
-            raise ExchangeOrderRejectedError(
-                f"Capital PUT positions/{leg_id} bracket amend REJECTED "
-                f"(coid={coid}): {reason}",
-            )
+            if self.store_ctx is not None:
+                self.store_ctx.log_event(
+                    'one_way_bracket_amend',
+                    client_order_id=coid,
+                    exchange_order_id=leg_id,
+                    payload={
+                        'side': side,
+                        'tp_price': tp_price,
+                        'sl_price': sl_price,
+                        'trail_offset': trail_offset,
+                    },
+                )
+            deal_ref = resp.get('dealReference') if isinstance(resp, dict) else None
+            if not deal_ref:
+                # No dealReference to confirm — treat the round-trip as success;
+                # the reconcile pass verifies the observed levels later. Mirrors
+                # ``publish_native_failsafe_sl``.
+                protection.accepted()
+                return
+            try:
+                confirm = await self._call(f'confirms/{deal_ref}', method='get')
+            except (OrderNotFoundError, ExchangeConnectionError) as net:
+                # The PUT went out but its outcome cannot be verified — leave
+                # the ownership row replayable rather than guessing.
+                raise OrderDispositionUnknownError(
+                    f"Capital confirms/{deal_ref} ambiguous after one-way "
+                    f"bracket amend on {leg_id} ({symbol}): {net}",
+                    client_order_id=coid,
+                    cause=net,
+                ) from net
+            if (confirm.get('dealStatus') or '').upper() == 'REJECTED':
+                protection.refused()
+                reason = _extract_reject_reason(confirm)
+                raise ExchangeOrderRejectedError(
+                    f"Capital PUT positions/{leg_id} bracket amend REJECTED "
+                    f"(coid={coid}): {reason}",
+                )
+            protection.accepted()
 
     async def get_open_orders(
             self, symbol: str | None = None,
@@ -1151,144 +1158,149 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             or (intent.trail_offset is not None and not trail_pending)
         )
         if body:
-            try:
-                resp = await self._put_bracket_with_notfound_retry(
-                    deal_id, body,
-                )
-            except (httpx.TimeoutException, httpx.RequestError,
-                    ConnectionError, ExchangeConnectionError) as net:
-                self._mark_bracket_legs_disposition_unknown(
-                    intent=intent, parent_coid=target_row.client_order_id,
-                    deal_id=deal_id,
-                    tp_coid=tp_coid if intent.tp_price is not None else None,
-                    sl_coid=sl_coid if sl_in_body else None,
-                    reason=str(net), stage='put',
-                )
-                # Pending-trail SL was deliberately NOT in the PUT body,
-                # so its disposition is unambiguous: the broker never
-                # heard about it. The post-PUT block that normally
-                # promotes ``submitted`` → ``confirmed`` does not run
-                # because we're about to raise — without this explicit
-                # promote, the row stays as ``submitted`` and (a)
-                # ``_recover_in_flight_submissions`` treats it as an
-                # in-flight broker submission on the next restart, and
-                # (b) ``_trailing_activation_monitor`` may eventually
-                # PUT the activation while the row's ``state`` is still
-                # the pre-PUT placeholder. Confirm it locally now —
-                # the activation monitor owns the row's lifecycle from
-                # here on.
-                if (has_sl_leg and not sl_in_body
-                        and self.store_ctx is not None):
-                    self.store_ctx.set_order_state(sl_coid, 'confirmed')
-                raise OrderDispositionUnknownError(
-                    f"Capital bracket PUT positions/{deal_id} ambiguous: {net}",
-                    client_order_id=target_row.client_order_id,
-                    cause=net if isinstance(net, Exception) else None,
-                ) from net
-            except (CapitalComError, BrokerError) as exc:
-                # `_call` runs `_map_exception` and re-raises 4xx as
-                # mapped subclasses (`ExchangeOrderRejectedError`,
-                # `InvalidStopDistanceError`, `InvalidStopMaxValueError`,
-                # `InvalidTakeProfitDistanceError`,
-                # `InvalidTakeProfitMaxValueError`, `OrderNotFoundError`,
-                # `InsufficientMarginError`, `ExchangeRateLimitError`,
-                # `AuthenticationError`). All of these mean the PUT did
-                # not attach the bracket — roll back the persisted leg
-                # rows. ``ExchangeConnectionError`` cannot reach this
-                # branch because the network ``except`` above already
-                # absorbs it.
-                self._rollback_bracket_legs(
-                    intent=intent, parent_coid=target_row.client_order_id,
-                    deal_id=deal_id,
-                    tp_coid=tp_coid if intent.tp_price is not None else None,
-                    sl_coid=sl_coid if has_sl_leg else None,
-                    reason='put_failed',
-                )
-                # The parent ENTRY is filled and committed; only the
-                # bracket attach failed, so the position is OPEN AND
-                # UNPROTECTED. Surface this distinctly so the sync
-                # engine can dispatch a defensive market close instead
-                # of halting (which would leave the unprotected fill
-                # exposed indefinitely). The original mapped exception
-                # is preserved on ``__cause__`` for log correlation.
-                raise BracketAttachAfterFillRejectedError(
-                    f"Capital bracket attach rejected after entry fill "
-                    f"(deal_id={deal_id}): {exc}",
-                    position_deal_id=deal_id,
-                    position_coid=target_row.client_order_id,
-                    symbol=intent.symbol,
-                    position_side=target_row.side,
-                    qty=target_row.qty,
-                    from_entry=intent.from_entry,
-                ) from exc
-
-            new_ref = resp.get('dealReference')
-            if new_ref:
+            # Full replacement: the body is the whole protection the
+            # position carries afterwards.
+            with self._protection_write(deal_id, body) as protection:
                 try:
-                    attach_confirm = await self._call(
-                        f'confirms/{new_ref}', method='get',
+                    resp = await protection.send(
+                        self._put_bracket_with_notfound_retry(deal_id, body),
                     )
                 except (httpx.TimeoutException, httpx.RequestError,
-                        ConnectionError, ExchangeConnectionError,
-                        CapitalComError, BrokerError) as net:
-                    # PUT landed, confirm read failed: state on the
-                    # exchange is unknown until the next /positions
-                    # snapshot reveals the real SL/TP. We catch BOTH
-                    # network/timeout AND mapped broker errors here:
-                    # the PUT already returned a ``dealReference``, so
-                    # the bracket may already be attached — a confirm
-                    # GET that 404s (``OrderNotFoundError``), 429s
-                    # (``ExchangeRateLimitError``) or otherwise lands
-                    # on the mapped-broker-error path is just as
-                    # ambiguous as a network timeout. Without this
-                    # branch the persisted TP/SL rows would stay in
-                    # ``submitted`` with no ``OrderDispositionUnknownError``
-                    # park record, so :meth:`_resolve_bracket_leg_disposition`
-                    # would never get a chance to promote or reject
-                    # them — leaving an orphan that can only be cleaned
-                    # up manually.
+                        ConnectionError, ExchangeConnectionError) as net:
                     self._mark_bracket_legs_disposition_unknown(
                         intent=intent, parent_coid=target_row.client_order_id,
                         deal_id=deal_id,
                         tp_coid=tp_coid if intent.tp_price is not None else None,
                         sl_coid=sl_coid if sl_in_body else None,
-                        reason=str(net), stage='confirm',
-                        deal_reference=new_ref,
+                        reason=str(net), stage='put',
                     )
-                    # Same reasoning as the PUT-timeout path above —
-                    # pending-trail SL is purely local; promote it to
-                    # ``confirmed`` so the activation monitor + recovery
-                    # see a coherent state.
+                    # Pending-trail SL was deliberately NOT in the PUT body,
+                    # so its disposition is unambiguous: the broker never
+                    # heard about it. The post-PUT block that normally
+                    # promotes ``submitted`` → ``confirmed`` does not run
+                    # because we're about to raise — without this explicit
+                    # promote, the row stays as ``submitted`` and (a)
+                    # ``_recover_in_flight_submissions`` treats it as an
+                    # in-flight broker submission on the next restart, and
+                    # (b) ``_trailing_activation_monitor`` may eventually
+                    # PUT the activation while the row's ``state`` is still
+                    # the pre-PUT placeholder. Confirm it locally now —
+                    # the activation monitor owns the row's lifecycle from
+                    # here on.
                     if (has_sl_leg and not sl_in_body
                             and self.store_ctx is not None):
                         self.store_ctx.set_order_state(sl_coid, 'confirmed')
                     raise OrderDispositionUnknownError(
-                        f"Capital bracket confirm {new_ref} ambiguous: {net}",
+                        f"Capital bracket PUT positions/{deal_id} ambiguous: {net}",
                         client_order_id=target_row.client_order_id,
                         cause=net if isinstance(net, Exception) else None,
                     ) from net
-                if (attach_confirm.get('dealStatus') or '').upper() == 'REJECTED':
-                    reason = _extract_reject_reason(attach_confirm)
+                except (CapitalComError, BrokerError) as exc:
+                    # `_call` runs `_map_exception` and re-raises 4xx as
+                    # mapped subclasses (`ExchangeOrderRejectedError`,
+                    # `InvalidStopDistanceError`, `InvalidStopMaxValueError`,
+                    # `InvalidTakeProfitDistanceError`,
+                    # `InvalidTakeProfitMaxValueError`, `OrderNotFoundError`,
+                    # `InsufficientMarginError`, `ExchangeRateLimitError`,
+                    # `AuthenticationError`). All of these mean the PUT did
+                    # not attach the bracket — roll back the persisted leg
+                    # rows. ``ExchangeConnectionError`` cannot reach this
+                    # branch because the network ``except`` above already
+                    # absorbs it.
                     self._rollback_bracket_legs(
                         intent=intent, parent_coid=target_row.client_order_id,
                         deal_id=deal_id,
                         tp_coid=tp_coid if intent.tp_price is not None else None,
                         sl_coid=sl_coid if has_sl_leg else None,
-                        reason=reason,
+                        reason='put_failed',
                     )
-                    # See the put_failed branch above — same unprotected
-                    # position semantics, raised distinctly so the sync
-                    # engine triggers a defensive close.
+                    # The parent ENTRY is filled and committed; only the
+                    # bracket attach failed, so the position is OPEN AND
+                    # UNPROTECTED. Surface this distinctly so the sync
+                    # engine can dispatch a defensive market close instead
+                    # of halting (which would leave the unprotected fill
+                    # exposed indefinitely). The original mapped exception
+                    # is preserved on ``__cause__`` for log correlation.
                     raise BracketAttachAfterFillRejectedError(
-                        f"Capital bracket attach REJECTED after entry fill "
-                        f"(deal_id={deal_id}): {reason}",
+                        f"Capital bracket attach rejected after entry fill "
+                        f"(deal_id={deal_id}): {exc}",
                         position_deal_id=deal_id,
                         position_coid=target_row.client_order_id,
                         symbol=intent.symbol,
                         position_side=target_row.side,
                         qty=target_row.qty,
                         from_entry=intent.from_entry,
-                    )
+                    ) from exc
+
+                new_ref = resp.get('dealReference')
+                if new_ref:
+                    try:
+                        attach_confirm = await self._call(
+                            f'confirms/{new_ref}', method='get',
+                        )
+                    except (httpx.TimeoutException, httpx.RequestError,
+                            ConnectionError, ExchangeConnectionError,
+                            CapitalComError, BrokerError) as net:
+                        # PUT landed, confirm read failed: state on the
+                        # exchange is unknown until the next /positions
+                        # snapshot reveals the real SL/TP. We catch BOTH
+                        # network/timeout AND mapped broker errors here:
+                        # the PUT already returned a ``dealReference``, so
+                        # the bracket may already be attached — a confirm
+                        # GET that 404s (``OrderNotFoundError``), 429s
+                        # (``ExchangeRateLimitError``) or otherwise lands
+                        # on the mapped-broker-error path is just as
+                        # ambiguous as a network timeout. Without this
+                        # branch the persisted TP/SL rows would stay in
+                        # ``submitted`` with no ``OrderDispositionUnknownError``
+                        # park record, so :meth:`_resolve_bracket_leg_disposition`
+                        # would never get a chance to promote or reject
+                        # them — leaving an orphan that can only be cleaned
+                        # up manually.
+                        self._mark_bracket_legs_disposition_unknown(
+                            intent=intent, parent_coid=target_row.client_order_id,
+                            deal_id=deal_id,
+                            tp_coid=tp_coid if intent.tp_price is not None else None,
+                            sl_coid=sl_coid if sl_in_body else None,
+                            reason=str(net), stage='confirm',
+                            deal_reference=new_ref,
+                        )
+                        # Same reasoning as the PUT-timeout path above —
+                        # pending-trail SL is purely local; promote it to
+                        # ``confirmed`` so the activation monitor + recovery
+                        # see a coherent state.
+                        if (has_sl_leg and not sl_in_body
+                                and self.store_ctx is not None):
+                            self.store_ctx.set_order_state(sl_coid, 'confirmed')
+                        raise OrderDispositionUnknownError(
+                            f"Capital bracket confirm {new_ref} ambiguous: {net}",
+                            client_order_id=target_row.client_order_id,
+                            cause=net if isinstance(net, Exception) else None,
+                        ) from net
+                    if (attach_confirm.get('dealStatus') or '').upper() == 'REJECTED':
+                        protection.refused()
+                        reason = _extract_reject_reason(attach_confirm)
+                        self._rollback_bracket_legs(
+                            intent=intent, parent_coid=target_row.client_order_id,
+                            deal_id=deal_id,
+                            tp_coid=tp_coid if intent.tp_price is not None else None,
+                            sl_coid=sl_coid if has_sl_leg else None,
+                            reason=reason,
+                        )
+                        # See the put_failed branch above — same unprotected
+                        # position semantics, raised distinctly so the sync
+                        # engine triggers a defensive close.
+                        raise BracketAttachAfterFillRejectedError(
+                            f"Capital bracket attach REJECTED after entry fill "
+                            f"(deal_id={deal_id}): {reason}",
+                            position_deal_id=deal_id,
+                            position_coid=target_row.client_order_id,
+                            symbol=intent.symbol,
+                            position_side=target_row.side,
+                            qty=target_row.qty,
+                            from_entry=intent.from_entry,
+                        )
+                protection.accepted()
 
         # --- Mark legs confirmed + persist risk on entry row ---
         if self.store_ctx is not None:

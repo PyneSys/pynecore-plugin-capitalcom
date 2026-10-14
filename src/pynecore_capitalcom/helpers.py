@@ -165,6 +165,21 @@ _ACTIVITY_MAX_PERIOD_S = 86400
 #: cancel a no-op. Value: ``{'cancel_coid': ..., 'intent_key': ...}``.
 EXTRAS_KEY_CANCEL_REQUESTED = 'cancel_requested'
 
+#: ``orders.extras`` key on a position row: the own closes sent against the
+#: position, each ``{'full', 'size', 'sent_at', 'done_at', 'matched'}``. A
+#: close activity one of them explains is the bot's own, not an operator's.
+EXTRAS_KEY_OWN_CLOSES = 'own_close_expected'
+
+#: ``orders.extras`` key on a position row: epoch seconds since the core
+#: native fail-safe manager writes the position's stop. The protection guard
+#: leaves such a position to the manager.
+EXTRAS_KEY_FAILSAFE_OWNED = 'native_failsafe_owned_at'
+
+#: ``orders.extras`` key on a position row: the next ``/positions`` read that
+#: starts after this epoch second becomes the position's accepted protection
+#: (set after a partial close).
+EXTRAS_KEY_PROTECTION_ADOPT_AFTER = 'protection_adopt_after'
+
 # TTL on cached ``_InstrumentRules`` entries. Capital.com widens the
 # bracket-distance minimum during volatile sessions; unbounded
 # caching would silently disable the pre-check. Five minutes bounds the
