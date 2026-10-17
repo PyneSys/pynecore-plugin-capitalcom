@@ -134,6 +134,17 @@ def _live_rows(ctx) -> list[dict]:
     return [_normalise_row(r) for r in rows]
 
 
+def _closed_rows(ctx) -> list[dict]:
+    rows = ctx._store._conn.execute(  # type: ignore[attr-defined]
+        "SELECT client_order_id FROM orders "
+        "WHERE run_instance_id = ? AND closed_ts_ms IS NOT NULL "
+        "ORDER BY client_order_id",
+        (ctx.run_instance_id,),
+    ).fetchall()
+    closed = [ctx.get_order(r['client_order_id']) for r in rows]
+    return [_normalise_row(r) for r in closed if r is not None]
+
+
 def _refs(ctx) -> list[tuple[str, str]]:
     rows = ctx._store._conn.execute(  # type: ignore[attr-defined]
         "SELECT ref_type, ref_value FROM order_refs "
@@ -157,8 +168,8 @@ def _run_dispatch(tmp_path, *, responses, intent_factory,
                   expect_exception=None):
     """Drive one dispatch through the journal path and return a snapshot.
 
-    Returns a dict with ``result``, ``error``, ``rows``, ``refs``, and
-    ``events`` so each contract test can pin the byte-level shape it
+    Returns a dict with ``result``, ``error``, ``rows`` (live),
+    ``closed_rows``, ``refs``, and ``events`` so each contract test can pin the byte-level shape it
     cares about.
     """
     broker = _FakeBroker(config=_make_config(), responses=responses)
@@ -175,6 +186,7 @@ def _run_dispatch(tmp_path, *, responses, intent_factory,
                 raise
             error = exc
         rows = _live_rows(ctx)
+        closed_rows = _closed_rows(ctx)
         refs = _refs(ctx)
         events = _event_kinds(ctx)
     finally:
@@ -182,7 +194,8 @@ def _run_dispatch(tmp_path, *, responses, intent_factory,
         store.close()
     return {
         'result': result, 'error': error,
-        'rows': rows, 'refs': refs, 'events': events,
+        'rows': rows, 'closed_rows': closed_rows, 'refs': refs,
+        'events': events,
     }
 
 
@@ -308,18 +321,20 @@ def __test_contract_confirm_rejected__(tmp_path):
     assert isinstance(out['error'], ExchangeOrderRejectedError)
     assert not isinstance(out['error'], InsufficientMarginError)
 
-    row = out['rows'][0]
+    # A definitive reject closes the row: the run owns no live order.
+    assert out['rows'] == []
+    row = out['closed_rows'][0]
     assert row['state'] == 'rejected'
     assert row['exchange_order_id'] is None
+    # deal_reference stays on the row for audit; the ``order_refs`` lookup
+    # rows go with the close, as a closed row needs no recovery.
     assert row['extras'] == {
         'kind': 'position', 'order_type': 'market',
         'deal_reference': 'ref-rej',
     }
-    # deal_reference WAS recorded before the REJECTED confirm so the
-    # recovery contract can resolve the row from a confirms/{ref} GET.
-    assert out['refs'] == [('deal_reference', 'ref-rej')]
+    assert out['refs'] == []
     assert out['events'] == [
-        'dispatch_submitted', 'deal_reference_seen', 'rejected',
+        'dispatch_submitted', 'deal_reference_seen', 'order_closed', 'rejected',
     ]
 
 
@@ -338,11 +353,12 @@ def __test_contract_confirm_rejected_margin_subclass__(tmp_path):
     )
     assert isinstance(out['error'], InsufficientMarginError)
 
-    row = out['rows'][0]
+    assert out['rows'] == []
+    row = out['closed_rows'][0]
     assert row['state'] == 'rejected'
     assert row['extras']['deal_reference'] == 'ref-mg'
     assert out['events'] == [
-        'dispatch_submitted', 'deal_reference_seen', 'rejected',
+        'dispatch_submitted', 'deal_reference_seen', 'order_closed', 'rejected',
     ]
 
 

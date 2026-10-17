@@ -41,6 +41,10 @@ it reports two kinds of evidence through
   Otherwise the venue publishes the edit up to a minute late, so the verdict
   waits for an activity read that started :data:`_LEVEL_EDIT_SETTLE_S` after
   the change was confirmed (:meth:`_InterventionMixin._resolve_held_edit_verdicts`).
+  A change no venue edit explains is someone else's: the bot's levels moved
+  and neither the bot nor the venue moved them. The edits of a deal stay
+  remembered while a verdict on it waits, so an activity-read outage never
+  loses the venue edit that explains it.
   Meanwhile the bot does not write that position's protection
   (:meth:`_InterventionMixin._defer_protection_write`), so someone else's
   levels are never replaced before the quarantine latches. While an own
@@ -116,6 +120,8 @@ from pynecore.core.broker.store_helpers import (
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
 from .helpers import (
+    ACTOR_CLIENT,
+    ACTOR_DEALER,
     CLOSE_VERDICT_AMBIGUOUS,
     CLOSE_VERDICT_DEALER,
     CLOSE_VERDICT_FOREIGN,
@@ -141,6 +147,7 @@ from .helpers import (
     EXTRAS_KEY_WORKING_ACCEPTED_ATTRIBUTES,
     OWN_CLOSE_CURSOR_RETIRED,
     _ACTIVITY_LAG_S,
+    _activity_actor,
     _level_on_tick_grid,
     _parse_iso_timestamp,
     _wire_float,
@@ -214,10 +221,6 @@ _UNSETTLED_WRITE_S = 120.0
 #: Own-close records older than this are dropped (the activity feed's
 #: longest lookback).
 _OWN_CLOSE_RETAIN_S = 86400.0
-
-#: Activity sources of a level edit that is the venue's own (``SYSTEM``) or
-#: its dealing desk's (``DEALER``), never another client's.
-_VENUE_EDIT_SOURCES = frozenset({'SYSTEM', 'DEALER'})
 
 #: How long a level-edit activity is remembered for the guard's judgement,
 #: counted from when this process first saw it (a restart's activity read
@@ -713,30 +716,38 @@ class _InterventionMixin(_CapitalComBase, ABC):
         else's; each own write the venue did not refuse explains one such
         edit (:meth:`_own_write_claims`).
 
-        * ``foreign``: a ``USER`` edit no own write explains — someone else
-          edited the bot's levels, whatever else happened since.
-        * ``venue``: the newest edit is a ``SYSTEM`` or ``DEALER`` one;
-          returned with it as ``(venue time, source)``. Own writes sent after
-          the change was confirmed explain nothing about it, so their edits
-          never count as the newest.
+        Who made an edit is read from its source (:func:`_activity_actor`),
+        the same reading the close and cancel attribution use.
+
+        * ``foreign``: a client (``USER``) edit no own write explains —
+          someone else edited the bot's levels, whatever else happened since.
+        * ``venue``: the newest edit is the venue's own or its dealing
+          desk's; returned with it as ``(venue time, source)``. Own writes
+          sent after the change was confirmed explain nothing about it, so
+          their edits never count as the newest.
         * ``unexplained``: no edit, or only the bot's own, explains the change.
         """
         edits = self._level_edits.get(verdict.deal_id) or {}
         claims = self._own_write_claims(verdict.row_coid, verdict.guard_key, edits)
         candidates = [(edit[0], edit[1], identity) for identity, edit in edits.items()
                       if edit[0] >= verdict.edits_after]
-        if any(source not in _VENUE_EDIT_SOURCES and identity not in claims
+        if any(_activity_actor(source) == ACTOR_CLIENT and identity not in claims
                for _, source, identity in candidates):
             return _EDIT_FOREIGN, None
+        # An own echo the venue dated in the same millisecond as a venue edit
+        # explains the bot's own levels, not the change: the venue's edit is
+        # the newer one.
         newest = max(((activity_ts, source) for activity_ts, source, identity in candidates
                       if claims.get(identity, float('-inf')) < verdict.observed_at),
+                     key=lambda edit: (edit[0], _activity_actor(edit[1]) != ACTOR_CLIENT),
                      default=None)
-        if newest is None or newest[1] not in _VENUE_EDIT_SOURCES:
+        if newest is None or _activity_actor(newest[1]) == ACTOR_CLIENT:
             return _EDIT_UNEXPLAINED, None
         return _EDIT_VENUE, newest
 
     def _own_write_claims(
-            self, row_coid: str | None, key: str, edits: dict[str, tuple[float, str, float]],
+            self, row_coid: str | None, key: str,
+            edits: dict[str, tuple[float, str, float, float]],
     ) -> dict[str, float]:
         """The ``USER`` edits of a deal the bot's own writes of ``key`` explain.
 
@@ -757,7 +768,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
         if not writes:
             return {}
         user_edits = sorted((edit[0], identity) for identity, edit in edits.items()
-                            if edit[1] not in _VENUE_EDIT_SOURCES)
+                            if _activity_actor(edit[1]) == ACTOR_CLIENT)
         claims: dict[str, float] = {}
         for sent_at, done_at in writes:
             earliest = self._venue_time_floor(sent_at)
@@ -972,8 +983,10 @@ class _InterventionMixin(_CapitalComBase, ABC):
         A position's stop / limit edit (``EDIT_STOP_AND_LIMIT``) and a resting
         order's amend (``WORKING_ORDER`` ``MODIFIED``) both count. Recorded
         for every activity the poll and the startup read return (the bot's
-        own echoes included), kept for :data:`_LEVEL_EDIT_RETAIN_S` after it
-        was first seen.
+        own echoes included), kept for :data:`_LEVEL_EDIT_RETAIN_S` after a
+        read last served it. The edits of a deal a verdict is held on are
+        kept as long as the verdict waits: they are its evidence, however
+        long the activity reads failed in between.
         """
         kind = str(activity.get('type') or '').upper()
         status = str(activity.get('status') or '').upper()
@@ -989,11 +1002,14 @@ class _InterventionMixin(_CapitalComBase, ABC):
         identity = _close_identity(activity)
         seen = edits.get(identity)
         edits[identity] = (activity_ts, str(activity.get('source') or '').upper(),
-                           seen[2] if seen is not None else now)
+                           seen[2] if seen is not None else now, now)
         horizon = now - _LEVEL_EDIT_RETAIN_S
+        held_deals = {verdict.deal_id for verdict in self._held_edit_verdicts.values()}
         for stale_deal in list(self._level_edits):
+            if stale_deal in held_deals:
+                continue
             kept = {k: v for k, v in self._level_edits[stale_deal].items()
-                    if max(v[0], v[2]) >= horizon}
+                    if max(v[0], v[3]) >= horizon}
             if kept:
                 self._level_edits[stale_deal] = kept
             else:
@@ -1140,10 +1156,10 @@ class _InterventionMixin(_CapitalComBase, ABC):
         )
         working = key.startswith(_WORKING_KEY_PREFIX)
         args = ('working order' if working else 'position', deal_id,
-                'the dealing desk' if source == 'DEALER' else 'the venue',
+                'the dealing desk' if _activity_actor(source) == ACTOR_DEALER else 'the venue',
                 'order level' if working else 'stop/limit levels',
                 context.get('expected'), context.get('observed'))
-        if source == 'DEALER':
+        if _activity_actor(source) == ACTOR_DEALER:
             logger.warning(message, *args)
         else:
             logger.info(message, *args)
@@ -1181,7 +1197,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
         source = edit[1] if edit is not None else None
         if edit is not None:
             self._consume_level_edit(deal_id, key, edit[0])
-        if source == 'DEALER':
+        if _activity_actor(source) == ACTOR_DEALER:
             logger.warning(
                 "bot position %s: the dealing desk edited its stop/limit levels around "
                 "a reduction (found %s); accepted, not an intervention",
@@ -1522,12 +1538,11 @@ class _InterventionMixin(_CapitalComBase, ABC):
         or take-profit added, an expiry set (the order expiring later would
         be the venue's own mechanics, the expiry is not), a guaranteed or
         trailing flag. Reported once per edit like a moved level. Attributes
-        the venue itself (``SYSTEM``) or its dealing desk (``DEALER``) set, as
-        the newest edit activity on the order since the bot's last own amend
-        says, become the accepted state instead (WARNING for the dealing
-        desk), like the levels of :meth:`_adopt_venue_level_edit`. Either
-        verdict waits for the activity feed to cover the change
-        (:meth:`_hold_edit_verdict`).
+        the venue or its dealing desk set (:func:`_activity_actor`), as the
+        newest edit activity on the order since the bot's last own amend says,
+        become the accepted state instead (WARNING for the dealing desk), like
+        the levels of :meth:`_adopt_venue_level_edit`. Either verdict waits
+        for the activity feed to cover the change (:meth:`_hold_edit_verdict`).
 
         :param row: The own working-order row.
         :param deal_id: Its ``dealId``.
@@ -1598,9 +1613,9 @@ class _InterventionMixin(_CapitalComBase, ABC):
             "bot working order %s: %s set %s on it (expected %s); accepted, "
             "not an intervention"
         )
-        args = (deal_id, 'the dealing desk' if source == 'DEALER' else 'the venue',
+        args = (deal_id, 'the dealing desk' if _activity_actor(source) == ACTOR_DEALER else 'the venue',
                 dict(attributes) or 'none', dict(expected) or 'none')
-        if source == 'DEALER':
+        if _activity_actor(source) == ACTOR_DEALER:
             logger.warning(message, *args)
         else:
             logger.info(message, *args)
@@ -2494,19 +2509,21 @@ class _InterventionMixin(_CapitalComBase, ABC):
     def _venue_end_of_working_order(activity: dict) -> str | None:
         """Who ended a resting order, when its terminal ``activity`` shows no client did.
 
+        Who cancelled it is read from the source (:func:`_activity_actor`).
+
         :return: ``'dealer'`` for a dealing-desk cancel; ``'venue'`` for an
-            expiry, a rejection, or a cancel from any source but ``USER`` and
-            ``DEALER``; ``None`` for a ``USER`` cancel or an execution.
+            expiry, a rejection, or a cancel the venue itself made; ``None``
+            for a client (``USER``) cancel or an execution.
         """
         status = str(activity.get('status') or '').upper()
-        source = str(activity.get('source') or '').upper()
         if status == 'EXECUTED' or str(activity.get('type') or '').upper() == 'POSITION':
             return None
         if status in ('EXPIRED', 'REJECTED'):
             return 'venue'
-        if source == 'DEALER':
+        actor = _activity_actor(activity.get('source'))
+        if actor == ACTOR_DEALER:
             return 'dealer'
-        if source == 'USER':
+        if actor == ACTOR_CLIENT:
             return None
         return 'venue'
 
@@ -2656,9 +2673,10 @@ class _InterventionMixin(_CapitalComBase, ABC):
     ) -> str:
         """Judge who closed (part of) a bot position, once per close.
 
-        Own closes and closes an own netting order explains are logged. A
-        ``DEALER`` close is a dealing-desk action: booked with a loud warning,
-        never reported. Every other source is the venue's own mechanics. The
+        Who closed it is read from the source (:func:`_activity_actor`). Own
+        closes and closes an own netting order explains are logged. A
+        dealing-desk close is booked with a loud warning, never reported. The
+        venue's own closes are its mechanics and are not judged. The
         verdict is persisted on the row under the close's level-independent
         identity (:func:`~pynecore_capitalcom.models._close_identity`); a
         re-issued activity of the same close gets the stored verdict back
@@ -2672,7 +2690,8 @@ class _InterventionMixin(_CapitalComBase, ABC):
         if store_ctx is None:
             return CLOSE_VERDICT_UNJUDGED
         source = str(activity.get('source') or '').upper()
-        if source not in ('USER', 'DEALER'):
+        actor = _activity_actor(source)
+        if actor not in (ACTOR_CLIENT, ACTOR_DEALER):
             return CLOSE_VERDICT_VENUE
         close_id = _close_identity(activity)
         fresh = store_ctx.get_order(row.client_order_id) or row
@@ -2711,7 +2730,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
                 payload=payload,
             )
             return CLOSE_VERDICT_OWN
-        if source == 'DEALER':
+        if _activity_actor(source) == ACTOR_DEALER:
             logger.warning(
                 "Capital.com dealing desk closed bot position %s (%s) at %s; "
                 "booked, not treated as an operator intervention",
@@ -2785,6 +2804,138 @@ class _InterventionMixin(_CapitalComBase, ABC):
             payload=self._manual_close_report(row, activity),
         )
         return CLOSE_VERDICT_FOREIGN
+
+    def _foreign_consumption_report(
+            self, row: 'OrderRow', activities: Iterable[dict], *,
+            earliest: float, latest: float,
+    ) -> dict | None:
+        """The report of someone else's order that netted a vanished bot position away.
+
+        On a netting account an opposite order nets FIFO against the oldest
+        deals of the other side, and the venue logs a deal it consumes whole
+        on the consuming deal only: the bot's deal just disappears, with no
+        close activity of its own. A client (``USER``) ``POSITION`` activity
+        on the epic, in the direction that reduces the bot's position, at
+        least as large as the bot's exposure, dated in the window the deal
+        vanished in, and on a deal this run did not open, is that consumer:
+        someone else's order closed the bot's position. Nothing is reported
+        (``None``) when the evidence could be the bot's own: an own close
+        whose window covers the activity, an own entry still waiting for its
+        ``dealId`` in that direction, or an own opposite order that could
+        have netted the position.
+
+        :param row: The vanished bot position row.
+        :param activities: Activity rows to search: the run's
+            ``external_activity_ignored`` audit, and the startup read.
+        :param earliest: Venue time the deal was last known to exist.
+        :param latest: Venue time it was known gone.
+        :return: A manual-close report (:meth:`_send_manual_close_report`),
+            or ``None``.
+        """
+        store_ctx = self.store_ctx
+        deal_id = row.exchange_order_id
+        if store_ctx is None or self._hedging_enabled or not deal_id:
+            return None
+        reducing = 'SELL' if row.side == 'buy' else 'BUY'
+        rules = self._instrument_rules_cache.get(row.symbol)
+        tolerance = max(0.5 * rules.lot_step if rules is not None else 0.0,
+                        1e-9 * max(1.0, row.filled_qty))
+        candidates: list[tuple[float, dict]] = []
+        for activity in activities:
+            details = activity.get('details') or {}
+            consumer = _wire_id(activity.get('dealId'))
+            activity_ts = _parse_iso_timestamp(str(activity.get('dateUTC') or ''))
+            size = _wire_float(activity.get('size') or details.get('size'), finite=True)
+            working_order = _wire_id(details.get('workingOrderId'))
+            if (str(activity.get('type') or '').upper() != 'POSITION'
+                    or str(activity.get('status') or '').upper() not in ('ACCEPTED', 'EXECUTED')
+                    or _activity_actor(activity.get('source')) != ACTOR_CLIENT
+                    or activity.get('epic') != row.symbol
+                    or str(details.get('direction') or '').upper() != reducing
+                    or consumer is None or consumer == deal_id
+                    or not earliest <= activity_ts <= latest
+                    or (size is not None and size < row.filled_qty - tolerance)
+                    or store_ctx.find_by_ref('deal_id', consumer) is not None
+                    or (working_order is not None
+                        and store_ctx.find_by_ref('deal_id', working_order) is not None)):
+                continue
+            candidates.append((activity_ts, activity))
+        if not candidates:
+            return None
+        activity_ts, activity = min(candidates, key=lambda candidate: candidate[0])
+        own_explanation = self._own_explanation_of_consumption(row, activity_ts, reducing)
+        if own_explanation is not None:
+            logger.error(
+                "bot position %s (%s) vanished while opposite order %s (USER, %s) was "
+                "dated %s, but %s could have netted it too: not reported — check the "
+                "venue history",
+                deal_id, row.symbol, activity.get('dealId'), reducing,
+                activity.get('dateUTC'), own_explanation,
+            )
+            store_ctx.log_event(
+                'position_netted_away_ambiguous',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id,
+                payload={'consumer': {k: activity.get(k) for k in (
+                    'dateUTC', 'dealId', 'type', 'status', 'source')},
+                    'own_explanation': own_explanation},
+            )
+            return None
+        details = activity.get('details') or {}
+        size = details.get('size', activity.get('size'))
+        consumer = activity.get('dealId')
+        return {
+            'report_id': f"netted:{deal_id}:{_close_identity(activity)}",
+            'client_order_id': row.client_order_id,
+            'deal_id': deal_id,
+            'changed_at_ms': int(activity_ts * 1000.0) if activity_ts > 0.0 else None,
+            'reason': (
+                f"bot position {deal_id} ({row.symbol}) was closed on the venue by "
+                f"someone else: USER {reducing} order {consumer} of {size} at "
+                f"{activity.get('dateUTC')} netted it away and matches no own order"
+            ),
+            'context': {
+                'deal_id': deal_id,
+                'client_order_id': row.client_order_id,
+                'exposure': row.filled_qty,
+                'consumer': {k: activity.get(k) for k in (
+                    'dateUTC', 'dealId', 'type', 'status', 'source')},
+                'size': size,
+                'direction': reducing,
+            },
+        }
+
+    def _own_explanation_of_consumption(
+            self, row: 'OrderRow', activity_ts: float, direction: str,
+    ) -> str | None:
+        """What of the bot's own could have netted ``row``'s deal away at ``activity_ts``.
+
+        :param row: The vanished bot position row.
+        :param activity_ts: Venue time of the opposite order.
+        :param direction: The direction that reduces the position.
+        :return: A description for the log, or ``None`` when nothing own could.
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        for other in store_ctx.iter_live_orders(symbol=row.symbol):
+            for record in (other.extras or {}).get(EXTRAS_KEY_OWN_CLOSES) or ():
+                if not isinstance(record, dict):
+                    continue
+                sent_at = _wire_float(record.get('sent_at'), finite=True)
+                if sent_at is None:
+                    continue
+                done_at = _wire_float(record.get('done_at'), finite=True)
+                latest = (done_at if done_at is not None
+                          else sent_at + _UNSETTLED_WRITE_S) + _CLOCK_SKEW_S
+                if self._own_close_earliest(sent_at) <= activity_ts <= latest:
+                    return f"own close of {other.exchange_order_id or other.client_order_id}"
+        for entry_direction, sent_at in self._unconfirmed_own_entries(row.symbol):
+            if entry_direction == direction and abs(activity_ts - sent_at) <= _CLOCK_SKEW_S:
+                return "an own entry still waiting for its dealId"
+        executed, resting = self._own_netting_candidates(row, activity_ts, None, None)
+        if executed or resting:
+            return f"own opposite order(s) {[*executed, *resting]}"
+        return None
 
     def _resolve_netting_pending(
             self, working_by_deal: dict[str, dict], read_started_at: float | None,

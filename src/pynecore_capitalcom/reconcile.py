@@ -1317,12 +1317,13 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         it is someone else's, reported) through the activity stream, which
         also retires the row. The verdict therefore waits
         :attr:`fill_report_grace_s` for that activity. A deal still gone
-        without one is retired with an ERROR and a
-        ``position_vanished_unattributed`` audit event, never a quarantine:
-        the evidence cannot show who closed it (a netting consumption is
-        reported on the consuming deal only). The engine's own venue-flat /
-        shrink detector books the change, since the plugin's position view
-        counts own deals only.
+        without one is judged from the consuming deal instead (a netting
+        consumption is reported on the consuming deal only): someone else's
+        opposite order that netted it away is reported, anything else is
+        retired with an ERROR and a ``position_vanished_unattributed`` audit
+        event, never a quarantine (:meth:`_unattributed_vanish`). The
+        engine's own venue-flat / shrink detector books the change, since
+        the plugin's position view counts own deals only.
         """
         extras = row.extras or {}
         deal_id = row.exchange_order_id
@@ -1399,27 +1400,60 @@ class _ReconcileMixin(_CapitalComBase, ABC):
     def _unattributed_vanish(self, row: 'OrderRow') -> MissingConfirmation:
         """Retire a filled bot position whose deal vanished without a close activity.
 
-        An own DELETE explains a ``closing`` row's disappearance; anything
-        else is logged ERROR and audited, the bracket legs are torn down and
-        the row's exposure leaves the journal. Never reported as an
-        intervention: nothing shows who closed the deal.
+        An own DELETE explains a ``closing`` row's disappearance. On a
+        netting account someone else's opposite order that consumed the deal
+        whole is logged on the consuming deal only: such an order, found in
+        the run's audit of activities on deals it does not own
+        (:meth:`_foreign_consumption_report`), is someone else's close of the
+        bot's position — the row is retired like any close, then reported.
+        Anything else is logged ERROR and audited, the bracket legs are torn
+        down and the row's exposure leaves the journal, never reported:
+        nothing shows who closed the deal.
         """
-        assert self.store_ctx is not None
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
         own_delete = row.state == 'closing'
+        missing_since = _wire_float((row.extras or {}).get(MISSING_PENDING_EXTRA), finite=True)
         payload = {
             'deal_id': row.exchange_order_id,
             'symbol': row.symbol,
             'side': row.side,
             'exposure': row.filled_qty,
-            'missing_since': (row.extras or {}).get(MISSING_PENDING_EXTRA),
+            'missing_since': missing_since,
             'grace_s': self.fill_report_grace_s,
         }
+        report: dict | None = None
+        if not own_delete:
+            seen = self._seen_position_deals.get(row.exchange_order_id or '')
+            last_seen = seen[2] if seen is not None else row.created_ts_ms / 1000.0
+            gone_at = missing_since if missing_since is not None else epoch_time()
+            report = self._foreign_consumption_report(
+                row,
+                [audit.get('activity') or {} for _, _, _, audit
+                 in store_ctx.iter_events_by_kind_for_run_id('external_activity_ignored')],
+                earliest=self._venue_time_floor(last_seen),
+                latest=self._venue_time_ceiling(gone_at),
+            )
         if own_delete:
-            self.store_ctx.log_event(
+            store_ctx.log_event(
                 'own_close_vanished_without_activity',
                 client_order_id=row.client_order_id,
                 exchange_order_id=row.exchange_order_id,
                 payload=payload,
+            )
+        elif report is not None:
+            store_ctx.log_event(
+                'position_netted_away_by_foreign_order',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload={**payload, 'report_id': report['report_id'],
+                         'consumer': report['context']['consumer']},
+            )
+            store_ctx.log_event(
+                'manual_close_report_pending',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload=report,
             )
         else:
             logger.error(
@@ -1429,7 +1463,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 row.exchange_order_id, row.symbol, row.side, row.filled_qty,
                 self.fill_report_grace_s,
             )
-            self.store_ctx.log_event(
+            store_ctx.log_event(
                 'position_vanished_unattributed',
                 client_order_id=row.client_order_id,
                 exchange_order_id=row.exchange_order_id,
@@ -1437,6 +1471,8 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             )
         self._close_bracket_after_natural_close(row)
         self._retire_netted_journal_exposure(row, row.filled_qty)
+        if report is not None:
+            self._send_manual_close_report(report)
         return MissingConfirmation(MissingResolution.CLOSED)
 
     def _feed_native_failsafe_observed(

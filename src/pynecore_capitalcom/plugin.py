@@ -292,7 +292,7 @@ class CapitalCom(
         self._venue_clock_samples: collections.deque[tuple[float, float, float]] = (
             collections.deque())
         self._own_close_sends: dict[float, float] = {}
-        self._level_edits: dict[str, dict[str, tuple[float, str, float]]] = {}
+        self._level_edits: dict[str, dict[str, tuple[float, str, float, float]]] = {}
         self._netting_pending: dict[str, tuple[float, dict]] = {}
         self._working_attributes_seen: dict[str, tuple] = {}
         self._working_attributes_reported: set[tuple[str, tuple]] = set()

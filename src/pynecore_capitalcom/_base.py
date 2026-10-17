@@ -386,8 +386,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     _own_close_sends: dict[float, float]
     # Accepted level-edit activities (``EDIT_STOP_AND_LIMIT``, ``WORKING_ORDER``
     # ``MODIFIED``) per deal: ``dealId`` -> ``{edit identity: (venue time,
-    # source, wall time first seen)}``.
-    _level_edits: dict[str, dict[str, tuple[float, str, float]]]
+    # source, wall time first seen, wall time last served by a read)}``.
+    _level_edits: dict[str, dict[str, tuple[float, str, float, float]]]
     # Closes only a resting own working order could explain, waiting for a
     # later working-order read: close identity -> (wall time queued, record).
     _netting_pending: dict[str, tuple[float, dict]]
@@ -648,6 +648,11 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _report_manual_close(self, row: 'OrderRow', activity: dict) -> None: ...
 
+    def _foreign_consumption_report(
+            self, row: 'OrderRow', activities: Iterable[dict], *,
+            earliest: float, latest: float,
+    ) -> dict | None: ...
+
     def _send_manual_close_report(self, report: dict) -> None: ...
 
     def _send_pending_manual_close_reports(self) -> None: ...
@@ -674,6 +679,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _venue_time_floor(self, local_ts: float) -> float: ...
 
+    def _venue_time_ceiling(self, local_ts: float) -> float: ...
+
     def _working_order_write(
             self, row: 'OrderRow', level: float, *, previous_level: float | None,
     ) -> AbstractContextManager[_ProtectionWrite]: ...
@@ -691,6 +698,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _foreign_deals(
             self, positions: Iterable[dict], symbol: str, *, direction: str | None = None,
     ) -> list[dict]: ...
+
+    def _unconfirmed_own_entries(self, symbol: str) -> list[tuple[str, float]]: ...
 
     def _note_foreign_deals(self, positions: Iterable[dict], symbol: str) -> None: ...
 

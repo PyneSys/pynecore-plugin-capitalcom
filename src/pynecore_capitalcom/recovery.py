@@ -631,30 +631,62 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             )
 
     def _retire_vanished_startup_position(
-            self, row: 'OrderRow', *, closed_by_activity: bool,
-    ) -> None:
+            self, row: 'OrderRow', *, closed_by_activity: bool, activities: list[dict],
+    ) -> dict | None:
         """Retire a filled own position the startup snapshot no longer shows.
 
         Its exposure leaves the journal and the row is marked naturally
         closed, so a copy of its close activity the poll reads later is
         suppressed instead of booked into the book the engine adopts from the
-        venue. Without a close activity nothing shows who closed it: ERROR and
-        a ``position_vanished_unattributed`` audit event, never a report.
+        venue. Without a close activity of its own, the deal may have been
+        consumed whole by someone else's opposite order, which the venue logs
+        on the consuming deal only: such an order in the startup read or in
+        the run's audit of activities on deals it does not own
+        (:meth:`_foreign_consumption_report`) is someone else's close,
+        reported once the rows are retired. Otherwise nothing shows who
+        closed it: ERROR and a ``position_vanished_unattributed`` audit
+        event, never a report.
 
         :param row: The own position row, still live.
         :param closed_by_activity: A close activity of the deal was found
             (and judged) in the startup activity read.
+        :param activities: The startup ``/history/activity`` read.
+        :return: The report to send once the rows are retired, or ``None``.
         """
         store_ctx = self.store_ctx
         assert store_ctx is not None
         payload = {'state': row.state, 'leg_kind': None, 'exposure': row.filled_qty,
                    'closed_by_activity': closed_by_activity}
+        report: dict | None = None
+        if not closed_by_activity and row.state != 'closing':
+            audited = [audit.get('activity') or {} for _, _, _, audit
+                       in store_ctx.iter_events_by_kind_for_run_id('external_activity_ignored')]
+            report = self._foreign_consumption_report(
+                row, [*activities, *audited],
+                earliest=self._venue_time_floor(row.created_ts_ms / 1000.0),
+                latest=self._venue_time_ceiling(epoch_time()),
+            )
         if closed_by_activity or row.state == 'closing':
             store_ctx.log_event(
                 'startup_orphan_retired',
                 client_order_id=row.client_order_id,
                 exchange_order_id=row.exchange_order_id,
                 payload=payload,
+            )
+        elif report is not None:
+            store_ctx.log_event(
+                'position_netted_away_by_foreign_order',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload={**payload, 'symbol': row.symbol, 'side': row.side,
+                         'at_startup': True, 'report_id': report['report_id'],
+                         'consumer': report['context']['consumer']},
+            )
+            store_ctx.log_event(
+                'manual_close_report_pending',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload=report,
             )
         else:
             logger.error(
@@ -672,6 +704,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             )
         self._close_bracket_after_natural_close(row)
         self._retire_netted_journal_exposure(row, row.filled_qty)
+        return report
 
     def _retire_startup_orphans(
             self,
@@ -716,10 +749,13 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         A filled own position retired in pass 1 is a close of the bot's own
         exposure, not residue: with a close activity among ``closed_deals``
         (judged and, when someone else's, reported by
-        :meth:`_account_downtime_closes`) it is retired as closed; with none it
-        is logged ERROR with a ``position_vanished_unattributed`` audit event,
-        never reported. Either way its exposure leaves the journal and a later
-        copy of its close activity is never booked again.
+        :meth:`_account_downtime_closes`) it is retired as closed; with none,
+        someone else's opposite order that netted it away is reported once
+        the rows are retired, and anything else is logged ERROR with a
+        ``position_vanished_unattributed`` audit event, never reported
+        (:meth:`_retire_vanished_startup_position`). Either way its exposure
+        leaves the journal and a later copy of its close activity is never
+        booked again.
 
         A resting own entry order retired in pass 1 on a fresh start is judged
         against the startup ``activities`` the way a cancel the poll sees is
@@ -747,7 +783,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         kept_parent_coids: set[str] = set()
         reconnecting = self._connection_generation > 0
         retired_count = 0
-        cancel_reports: list[dict] = []
+        pending_reports: list[dict] = []
 
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
@@ -821,11 +857,14 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                      or extras.get('partial_close_retired_at') is not None)
             )
             if filled_position:
-                self._retire_vanished_startup_position(row, closed_by_activity=did in closed)
+                report = self._retire_vanished_startup_position(
+                    row, closed_by_activity=did in closed, activities=activities or [])
+                if report is not None:
+                    pending_reports.append(report)
             elif row.state == 'confirmed' and extras.get('kind') == ENTRY_KIND_WORKING:
                 report = self._judge_vanished_startup_working_order(row, activities or [])
                 if report is not None:
-                    cancel_reports.append(report)
+                    pending_reports.append(report)
             else:
                 self.store_ctx.log_event(
                     'startup_orphan_retired',
@@ -903,7 +942,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 "position/working order on exchange",
                 retired_count,
             )
-        for report in cancel_reports:
+        for report in pending_reports:
             self._send_manual_close_report(report)
 
     def _judge_vanished_startup_working_order(

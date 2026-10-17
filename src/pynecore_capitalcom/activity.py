@@ -46,6 +46,9 @@ from pynecore.core.plugin import override
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
 from .helpers import (
+    ACTOR_CLIENT,
+    ACTOR_DEALER,
+    ACTOR_VENUE,
     BOOKED_CLOSES_RETAINED,
     CLOSE_VERDICT_FOREIGN,
     CLOSE_VERDICT_UNJUDGED,
@@ -56,6 +59,7 @@ from .helpers import (
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
     _POLL_INTERVAL_S,
+    _activity_actor,
     _activity_watermark_floor,
     _order_type_from_row,
     _parse_iso_timestamp,
@@ -259,12 +263,14 @@ class _ActivityMixin(_CapitalComBase, ABC):
             fingerprint = _activity_fingerprint(a)
             batch_fingerprints.add(fingerprint)
 
-            if watermark_floor and date_utc < watermark_floor:
-                continue
             # Who edited a deal's stop / limit levels decides whether the
             # protection guard reports the edit; remembered even for a row
-            # an earlier process already processed.
+            # an earlier process already processed, and for one below the
+            # watermark: a read after an outage serves it again, and the
+            # edit stays the evidence of a verdict still to be decided.
             self._note_level_edit(a)
+            if watermark_floor and date_utc < watermark_floor:
+                continue
             if fingerprint in cursor.seen_fingerprints:
                 continue
 
@@ -1032,13 +1038,18 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 or (is_same_direction is None and entry_already_filled)
             )
         )
-        is_manual_close = closes_filled_entry and source in ('USER', 'DEALER')
-        # ``SYSTEM`` is a venue-side action, never an operator's or another
-        # bot's, but unlike ``CLOSE_OUT`` the source alone does not say
-        # "close": only the same direction / fill-state evidence the manual
-        # path uses makes it one, so an entry-side ``SYSTEM`` row still
-        # routes as the entry fill.
-        is_system_close = closes_filled_entry and source == 'SYSTEM'
+        # Who made the row is the shared source reading the close attribution
+        # uses (:func:`_activity_actor`): a client or the dealing desk
+        # closing by hand, or the venue itself.
+        actor = _activity_actor(source)
+        is_manual_close = closes_filled_entry and actor in (ACTOR_CLIENT, ACTOR_DEALER)
+        # A venue-side action (``SYSTEM``, or any source but a client's or
+        # the dealing desk's) is never an operator's or another bot's, but
+        # unlike ``CLOSE_OUT`` the source alone does not say "close": only
+        # the same direction / fill-state evidence the manual path uses makes
+        # it one, so an entry-side ``SYSTEM`` row still routes as the entry
+        # fill.
+        is_system_close = closes_filled_entry and actor == ACTOR_VENUE
         is_closing_leg = (
             activity_type == 'POSITION'
             and status in ('EXECUTED', 'ACCEPTED')

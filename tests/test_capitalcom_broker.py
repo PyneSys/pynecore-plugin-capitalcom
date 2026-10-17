@@ -600,10 +600,14 @@ def __test_execute_entry_rejected_margin_maps_to_margin_error__(tmp_path):
     env = _entry_envelope()
     with pytest.raises(InsufficientMarginError):
         asyncio.run(broker.execute_entry(env))
-    # Row should be persisted as rejected
-    rows = [r for r in ctx.iter_live_orders() if r.state == 'rejected']
-    # rejected rows are still "live" until closed; we just verify state flipped.
-    assert len(rows) == 1
+    # The row is persisted as rejected and closed: no live order remains.
+    assert list(ctx.iter_live_orders()) == []
+    rows = ctx._store._conn.execute(
+        "SELECT state, closed_ts_ms FROM orders",
+    ).fetchall()
+    assert [(row['state'], row['closed_ts_ms'] is not None) for row in rows] == [
+        ('rejected', True),
+    ]
     store.close()
 
 

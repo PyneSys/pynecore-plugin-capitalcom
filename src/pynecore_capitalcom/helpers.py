@@ -282,6 +282,34 @@ EXTERNAL_REDUCTION_VERDICTS = frozenset({
     CLOSE_VERDICT_FOREIGN, CLOSE_VERDICT_DEALER, CLOSE_VERDICT_VENUE,
 })
 
+#: Who made an activity, by its ``source`` (:func:`_activity_actor`).
+ACTOR_CLIENT = 'client'
+ACTOR_DEALER = 'dealer'
+ACTOR_VENUE = 'venue'
+
+
+def _activity_actor(source: object) -> str:
+    """Who made an activity, read from its ``source``.
+
+    The venue documents ``USER``, ``DEALER``, ``SYSTEM``, ``TP``, ``SL`` and
+    ``CLOSE_OUT`` (live rows carry ``CLOSE``, ``MARGIN`` and ``STOP_OUT`` too).
+    Only ``USER`` is a client's request: the bot's own requests and anyone
+    else's (the web platform, another API client) carry it alike, so only an
+    own-request record tells them apart. ``DEALER`` is the broker's dealing
+    desk, a person at the broker acting on the account: never another client,
+    so never an intervention, but a decision the operator is told about.
+    Every other source, and a missing one, is the venue's own mechanics.
+
+    :param source: The activity's ``source`` field.
+    :return: :data:`ACTOR_CLIENT`, :data:`ACTOR_DEALER` or :data:`ACTOR_VENUE`.
+    """
+    normalized = str(source or '').upper()
+    if normalized == 'USER':
+        return ACTOR_CLIENT
+    if normalized == 'DEALER':
+        return ACTOR_DEALER
+    return ACTOR_VENUE
+
 # TTL on cached ``_InstrumentRules`` entries. Capital.com widens the
 # bracket-distance minimum during volatile sessions; unbounded
 # caching would silently disable the pre-check. Five minutes bounds the

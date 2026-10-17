@@ -45,6 +45,7 @@ from pynecore.core.broker.storage import BrokerStore
 
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
 from pynecore_capitalcom.dispatch_hooks import _CapitalComCancelHooks
+from pynecore_capitalcom.helpers import EXTRAS_KEY_OWN_LEVEL_WRITES
 
 
 def main():
@@ -190,6 +191,31 @@ def _close_activity(*, source='USER', size=2.0, level=1.12, date_utc=None):
     }
 
 
+def _iso(epoch_s: float) -> str:
+    """The venue's ``dateUTC`` format for ``epoch_s``."""
+    return datetime.fromtimestamp(epoch_s, UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+
+
+def _someone_else_edits(broker, deal_id='deal-L', *, working=False):
+    """Feed the edit activities the venue publishes up to someone else's change.
+
+    The venue publishes one ``USER`` edit per accepted write: one for every
+    own write the bot recorded on the key, dated when it was sent, and one
+    for the change someone else made just now, which no own write explains.
+    """
+    key = ('working:' if working else 'position:') + deal_id
+    row = broker.store_ctx.find_by_ref('deal_id', deal_id)
+    saved = (row.extras or {}).get(EXTRAS_KEY_OWN_LEVEL_WRITES) if row is not None else None
+    writes = (saved or {}).get(key) or []
+    shape = ({'type': 'WORKING_ORDER', 'status': 'MODIFIED'} if working
+             else {'type': 'EDIT_STOP_AND_LIMIT', 'status': 'ACCEPTED'})
+    for sent_at, _done_at in writes:
+        broker._note_level_edit(
+            {'dateUTC': _iso(sent_at), 'dealId': deal_id, 'source': 'USER', **shape})
+    broker._note_level_edit(
+        {'dateUTC': _now_iso(0.01), 'dealId': deal_id, 'source': 'USER', **shape})
+
+
 def _event_kinds(ctx) -> list[str]:
     return [r['kind'] for r in ctx._store._conn.execute(
         "SELECT kind FROM events WHERE run_instance_id = ?",
@@ -206,6 +232,7 @@ def __test_removed_stop_is_reported_on_the_second_poll__(tmp_path):
 
     _poll(broker, _position(stop=1.05, profit=1.20))
     assert latched == []
+    _someone_else_edits(broker)
     _poll(broker, _position(profit=1.20))
     assert latched == [], "one poll alone never proves an edit"
     _poll(broker, _position(profit=1.20))
@@ -222,6 +249,7 @@ def __test_removed_take_profit_is_reported__(tmp_path):
     broker, store, ctx, latched = _make_broker(tmp_path)
     _seed_position(ctx)
     _attach(broker, tp=1.20, sl=1.05)
+    _someone_else_edits(broker)
     _poll(broker, _position(stop=1.05))
     _poll(broker, _position(stop=1.05))
     assert len(latched) == 1
@@ -232,6 +260,7 @@ def __test_moved_stop_beyond_half_a_tick_is_reported__(tmp_path):
     broker, store, ctx, latched = _make_broker(tmp_path)
     _seed_position(ctx)
     _attach(broker, tp=1.20, sl=1.05)
+    _someone_else_edits(broker)
     _poll(broker, _position(stop=1.04, profit=1.20))
     _poll(broker, _position(stop=1.04, profit=1.20))
     assert len(latched) == 1
@@ -242,6 +271,7 @@ def __test_moved_take_profit_is_reported__(tmp_path):
     broker, store, ctx, latched = _make_broker(tmp_path)
     _seed_position(ctx)
     _attach(broker, tp=1.20, sl=1.05)
+    _someone_else_edits(broker)
     _poll(broker, _position(stop=1.05, profit=1.25))
     _poll(broker, _position(stop=1.05, profit=1.25))
     assert len(latched) == 1
@@ -265,6 +295,7 @@ def __test_trailing_turned_off_is_reported__(tmp_path):
     put = [c for c in broker._calls if c[1] == 'put'][-1]
     assert put[2] == {'profitLevel': 1.20, 'trailingStop': True, 'stopDistance': 0.5}
     _poll(broker, _position(stop=1.07, profit=1.20, trailing=True, distance=0.5))
+    _someone_else_edits(broker)
     _poll(broker, _position(stop=1.07, profit=1.20))
     assert latched == []
     _poll(broker, _position(stop=1.07, profit=1.20))
@@ -276,6 +307,7 @@ def __test_changed_trail_distance_is_reported_after_the_second_poll__(tmp_path):
     broker, store, ctx, latched = _make_broker(tmp_path)
     _seed_position(ctx)
     _attach(broker, trail_offset=0.5)
+    _someone_else_edits(broker)
     _poll(broker, _position(stop=1.07, trailing=True, distance=0.8))
     assert latched == []
     _poll(broker, _position(stop=1.08, trailing=True, distance=0.8))
@@ -434,6 +466,7 @@ def __test_released_failsafe_parent_is_guarded_again_after_the_bots_own_bracket_
     for _ in range(3):
         _poll(broker, own)
     assert latched == []
+    _someone_else_edits(broker)
     _poll(broker, edited)
     _poll(broker, edited)
     assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
@@ -454,6 +487,7 @@ def __test_failsafe_written_parent_without_partial_legs_is_guarded_after_a_resta
         _poll(restarted, manager_levels)
     assert restarted_latched == []
     assert 'protection_baseline_unverified' not in _event_kinds(ctx)
+    _someone_else_edits(restarted)
     _poll(restarted, _position(stop=1.00))
     _poll(restarted, _position(stop=1.00))
     assert len(restarted_latched) == 1
@@ -473,6 +507,7 @@ def __test_persisted_levels_survive_a_restart__(tmp_path):
     for _ in range(3):
         _poll(restarted, _position(stop=1.05, profit=1.20))
     assert restarted_latched == [], "the restored own levels match the venue"
+    _someone_else_edits(restarted)
     _poll(restarted, _position(profit=1.20))
     _poll(restarted, _position(profit=1.20))
     assert len(restarted_latched) == 1, "the restored levels are still judged"
@@ -537,6 +572,7 @@ def __test_size_change_rebaselines_instead_of_reporting__(tmp_path):
     assert latched == []
     assert 'protection_adopted_after_size_change' in _event_kinds(ctx)
     # ...and are judged from then on.
+    _someone_else_edits(broker)
     _poll(broker, _position(size=1.0))
     _poll(broker, _position(size=1.0))
     assert len(latched) == 1
@@ -791,6 +827,7 @@ def __test_amend_confirmed_rejected_stops_its_levels_being_acceptable__(tmp_path
     _poll(broker, _position(stop=1.05, profit=1.20))
     assert latched == []
     # Someone else puts exactly the refused levels on the position.
+    _someone_else_edits(broker)
     for _ in range(2):
         _poll(broker, _position(stop=1.10, profit=1.30))
     assert len(latched) == 1
@@ -805,6 +842,7 @@ def __test_amend_put_refused_by_the_venue_stops_its_levels_being_acceptable__(tm
         ExchangeOrderRejectedError('error.invalid.stoploss'))
     with pytest.raises(ExchangeOrderRejectedError):
         _amend(broker)
+    _someone_else_edits(broker)
     for _ in range(2):
         _poll(broker, _position(stop=1.10, profit=1.30))
     assert len(latched) == 1

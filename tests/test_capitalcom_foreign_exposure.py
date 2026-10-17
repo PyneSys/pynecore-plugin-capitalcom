@@ -56,6 +56,7 @@ from pynecore.core.broker.store_helpers import KIND_PARTIAL_CLOSE
 
 from pynecore_capitalcom import CapitalCom, CapitalComConfig, foreign, intervention
 from pynecore_capitalcom.exceptions import OrderNotFoundError
+from pynecore_capitalcom.helpers import EXTRAS_KEY_OWN_LEVEL_WRITES
 from pynecore_capitalcom.models import _activity_fingerprint
 
 
@@ -209,6 +210,44 @@ def _now_iso(offset_s: float = 0.0) -> str:
     """The venue's ``dateUTC`` format for now plus ``offset_s``."""
     stamp = datetime.fromtimestamp(time.time() + offset_s, UTC)
     return stamp.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+
+
+def _iso(epoch_s: float) -> str:
+    """The venue's ``dateUTC`` format for ``epoch_s``."""
+    return datetime.fromtimestamp(epoch_s, UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+
+
+def _edit_shape(working: bool) -> dict:
+    return ({'type': 'WORKING_ORDER', 'status': 'MODIFIED'} if working
+            else {'type': 'EDIT_STOP_AND_LIMIT', 'status': 'ACCEPTED'})
+
+
+def _own_write_echo_rows(ctx, deal_id='deal-L', *, working=False) -> list[dict]:
+    """The ``USER`` edit activity the venue publishes for each own write the
+    bot recorded on the key, dated when the write was sent."""
+    key = ('working:' if working else 'position:') + deal_id
+    row = ctx.find_by_ref('deal_id', deal_id)
+    saved = (row.extras or {}).get(EXTRAS_KEY_OWN_LEVEL_WRITES) if row is not None else None
+    return [{'dateUTC': _iso(sent_at), 'dealId': deal_id, 'source': 'USER',
+             'epic': 'EURUSD', **_edit_shape(working)}
+            for sent_at, _done_at in (saved or {}).get(key) or []]
+
+
+def _own_write_echoes(broker, deal_id='deal-L', *, working=False) -> None:
+    """Feed the echo of every own write on the key (:func:`_own_write_echo_rows`)."""
+    for echo in _own_write_echo_rows(broker.store_ctx, deal_id, working=working):
+        broker._note_level_edit(echo)
+
+
+def _someone_else_edits(broker, deal_id='deal-L', *, working=False) -> None:
+    """Feed the edit activities the venue publishes up to someone else's change.
+
+    One ``USER`` edit per accepted write: the echo of every own write, and one
+    for the change someone else made just now, which no own write explains.
+    """
+    _own_write_echoes(broker, deal_id, working=working)
+    broker._note_level_edit({'dateUTC': _now_iso(0.01), 'dealId': deal_id, 'source': 'USER',
+                             'epic': 'EURUSD', **_edit_shape(working)})
 
 
 def _close_activity(*, source='USER', size=2.0, level=1.12, date_utc=None):
@@ -757,8 +796,14 @@ def __test_market_entry_whose_preflight_read_fails_is_skipped_not_rejected__(tmp
     assert skipped.value.reason == 'entry_preflight_unavailable'
     assert skipped.value.reason != 'broker_rejected_entry'
     assert _posts(broker) == []
-    rows = list(ctx.iter_live_orders())
-    assert rows and all(row.state == 'rejected' for row in rows)
+    # The persist-first row is terminal and closed, so the retry next sync
+    # starts from a run that owns no live order.
+    assert list(ctx.iter_live_orders()) == []
+    rows = ctx._store._conn.execute(
+        "SELECT state, closed_ts_ms FROM orders",
+    ).fetchall()
+    assert rows and all(row['state'] == 'rejected' and row['closed_ts_ms'] is not None
+                        for row in rows)
     assert latched == []
     store.close()
 
@@ -1017,6 +1062,7 @@ def __test_unprotected_position_reports_a_stop_someone_else_adds__(tmp_path):
 
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0)))
     assert 'protection_baseline_adopted' in _event_kinds(ctx)
+    _someone_else_edits(broker)
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.05)))
     assert latched == []
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.05)))
@@ -1037,6 +1083,7 @@ def __test_level_added_with_a_reduction_of_a_bare_position_is_reported__(tmp_pat
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0)))
 
     reduced = _by_deal(_raw('deal-L', 'BUY', 1.0, **added))
+    _someone_else_edits(broker)
     for _ in range(3):
         _poll(broker, reduced)
 
@@ -1055,6 +1102,7 @@ def __test_reduction_of_a_bare_position_keeps_it_bare__(tmp_path):
     assert len(_events(ctx, 'protection_adopted_after_size_change')) == 1
 
     stopped = _by_deal(_raw('deal-L', 'BUY', 1.0, stopLevel=1.05))
+    _someone_else_edits(broker)
     _poll(broker, stopped)
     _poll(broker, stopped)
     assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
@@ -1087,6 +1135,7 @@ def __test_released_failsafe_parent_keeps_the_bots_own_protection__(tmp_path):
     adopted = _event_payloads(ctx, 'protection_baseline_adopted')
     assert [a['source'] for a in adopted] == ['native_failsafe_handover']
 
+    _someone_else_edits(broker)
     moved = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
     _poll(broker, moved)
     _poll(broker, moved)
@@ -1115,6 +1164,7 @@ def __test_own_bracket_without_recorded_levels_is_adopted_after_a_restart__(tmp_
         'own_bracket_legs']
 
     removed = _by_deal(_raw('deal-L', 'BUY', 2.0, profitLevel=1.20))
+    _someone_else_edits(restarted)
     _poll(restarted, removed)
     _poll(restarted, removed)
     assert len(restarted_latched) == 1
@@ -1168,6 +1218,7 @@ def __test_pending_trailing_stop_is_judged__(tmp_path):
     _set_pending_trail(ctx, activation=1.50)
 
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.05, profitLevel=1.20)))
+    _someone_else_edits(broker)
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20)))
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20)))
     assert len(latched) == 1
@@ -1218,6 +1269,7 @@ def __test_level_edit_is_judged_by_its_activity_source__(tmp_path, caplog, sourc
     _seed_position(ctx)
     _attach(broker, tp=1.20, sl=1.05)
     _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.05, profitLevel=1.20)))
+    _own_write_echoes(broker)
 
     assert asyncio.run(_drain(broker._process_activity([_level_edit(source)]))) == []
     edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
@@ -1252,7 +1304,7 @@ def _start_with_edit(ctx, edit: dict, venue: dict):
     restarted, restarted_latched = _make_plugin(ctx, responses={
         ('positions', 'get'): {'positions': [venue]},
         ('workingorders', 'get'): {'workingOrders': []},
-        ('history/activity', 'get'): {'activities': [edit, {
+        ('history/activity', 'get'): {'activities': [*_own_write_echo_rows(ctx), edit, {
             'dateUTC': _now_iso(-1.0), 'dealId': 'deal-Z', 'type': 'POSITION',
             'status': 'EXECUTED', 'source': 'USER', 'epic': 'GBPUSD',
             'details': {'direction': 'BUY', 'size': 1.0, 'level': 1.3}}]},
@@ -1327,7 +1379,8 @@ def __test_level_edit_whose_activity_is_published_late_is_judged_by_its_source__
         tmp_path, source, reported):
     """The venue publishes an edit's activity up to a minute after the
     position shows it: the verdict on a confirmed mismatch waits for an
-    activity read that started that long after the mismatch."""
+    activity read that started that long after the mismatch. Someone else's
+    edit, once read, decides it at once."""
     broker, store, ctx, latched = _published_lag_broker(tmp_path)
     edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
     for _ in range(3):
@@ -1335,18 +1388,20 @@ def __test_level_edit_whose_activity_is_published_late_is_judged_by_its_source__
     assert latched == [], "held until the activity feed covers the change"
     assert _events(ctx, 'protection_venue_edit_adopted') == []
 
+    _own_write_echoes(broker)
     assert asyncio.run(_drain(broker._process_activity([_level_edit(source)]))) == []
     _poll(broker, edited)
-    assert latched == [], "an activity read right after the mismatch proves nothing"
-    _poll(broker, edited, activity_read_at=time.time() + intervention._LEVEL_EDIT_SETTLE_S)
-
     if reported:
         assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
         assert _events(ctx, 'protection_venue_edit_adopted') == []
-    else:
-        assert latched == []
-        adopted = _events(ctx, 'protection_venue_edit_adopted')
-        assert len(adopted) == 1 and adopted[0]['source'] == source
+        store.close()
+        return
+    assert latched == [], "an activity read right after the mismatch proves nothing"
+    _poll(broker, edited, activity_read_at=time.time() + intervention._LEVEL_EDIT_SETTLE_S)
+
+    assert latched == []
+    adopted = _events(ctx, 'protection_venue_edit_adopted')
+    assert len(adopted) == 1 and adopted[0]['source'] == source
     store.close()
 
 
@@ -1361,11 +1416,133 @@ def __test_venue_edit_never_covers_a_later_edit_whose_activity_is_published_late
         _poll(broker, edited)
     assert latched == []
 
+    _own_write_echoes(broker)
     assert asyncio.run(_drain(broker._process_activity([_level_edit('USER')]))) == []
     _poll(broker, edited, activity_read_at=time.time() + intervention._LEVEL_EDIT_SETTLE_S)
 
     assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
     assert _events(ctx, 'protection_venue_edit_adopted') == []
+    store.close()
+
+
+def __test_venue_edit_held_through_an_activity_read_outage_is_still_the_venues__(
+        tmp_path, monkeypatch):
+    """The venue moves the bot's stop and the verdict waits for the feed to
+    settle; then the activity reads fail for longer than an edit is
+    remembered. The edits of a deal a verdict waits on are its evidence: the
+    first read after the outage still finds the venue's edit."""
+    broker, store, ctx, latched = _published_lag_broker(tmp_path)
+    _feed(broker, _level_edit('SYSTEM'))
+    edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
+    for _ in range(3):
+        _poll(broker, edited)
+    assert latched == [] and _events(ctx, 'level_edit_verdict_held')
+
+    later = time.time() + intervention._LEVEL_EDIT_RETAIN_S + 100.0
+    monkeypatch.setattr(intervention, 'epoch_time', lambda: later)
+    # The read after the outage serves some other deal's edit, not this one.
+    _feed(broker, {'dateUTC': _now_iso(1.0), 'dealId': 'deal-F', 'type': 'EDIT_STOP_AND_LIMIT',
+                   'status': 'ACCEPTED', 'source': 'USER', 'epic': 'EURUSD'})
+    _poll(broker, edited, activity_read_at=later)
+
+    assert latched == []
+    adopted = _events(ctx, 'protection_venue_edit_adopted')
+    assert len(adopted) == 1 and adopted[0]['source'] == 'SYSTEM'
+    assert _events(ctx, 'protection_edit_unattributed') == []
+    store.close()
+
+
+def __test_venue_edit_read_before_an_outage_explains_the_change_confirmed_after_it__(
+        tmp_path, monkeypatch):
+    """A venue edit read before the snapshot shows its change, then an
+    activity-read outage longer than an edit is remembered: the read after the
+    outage serves the edit again, below the cursor's watermark by then, and
+    that keeps it as the evidence of the change confirmed afterwards."""
+    broker, store, ctx, latched = _published_lag_broker(tmp_path)
+    system_edit = _level_edit('SYSTEM')
+    # A later activity on the bot's deal moves the cursor's watermark more
+    # than the publication lag past the edit.
+    swap = {'dateUTC': _now_iso(120.0), 'dealId': 'deal-L', 'type': 'SWAP',
+            'status': 'ACCEPTED', 'source': 'SYSTEM', 'epic': 'EURUSD'}
+    _feed(broker, system_edit, swap)
+
+    later = time.time() + intervention._LEVEL_EDIT_RETAIN_S + 100.0
+    monkeypatch.setattr(intervention, 'epoch_time', lambda: later)
+    other_edit = {'dateUTC': _now_iso(130.0), 'dealId': 'deal-F',
+                  'type': 'EDIT_STOP_AND_LIMIT', 'status': 'ACCEPTED', 'source': 'USER',
+                  'epic': 'EURUSD'}
+    _feed(broker, system_edit, swap, other_edit)
+    edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
+    for _ in range(3):
+        _poll(broker, edited)
+    _poll(broker, edited, activity_read_at=time.time() + intervention._LEVEL_EDIT_SETTLE_S)
+
+    assert latched == []
+    adopted = _events(ctx, 'protection_venue_edit_adopted')
+    assert len(adopted) == 1 and adopted[0]['source'] == 'SYSTEM'
+    assert _events(ctx, 'protection_edit_unattributed') == []
+    store.close()
+
+
+@pytest.mark.parametrize('source', ['SL', 'TP', 'CLOSE_OUT', '', 'SYSTEM', 'DEALER'])
+def __test_venue_edit_dated_with_the_own_echo_is_the_newest__(tmp_path, source):
+    """The venue dates its edit in the same millisecond as the echo of the
+    bot's own write: the venue's edit made the change, whatever its source
+    is called."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    _attach(broker, tp=1.20, sl=1.05)
+    _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.05, profitLevel=1.20)))
+    echoes = _own_write_echo_rows(ctx)
+    for echo in echoes:
+        broker._note_level_edit(echo)
+
+    _feed(broker, dict(_level_edit(source), dateUTC=echoes[-1]['dateUTC']))
+    edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
+    for _ in range(3):
+        _poll(broker, edited)
+
+    assert latched == []
+    assert len(_events(ctx, 'protection_venue_edit_adopted')) == 1
+    store.close()
+
+def __test_change_no_edit_activity_explains_is_reported__(tmp_path):
+    """The feed covered the change and holds no edit that made it: neither the
+    bot nor the venue moved the bot's levels, so the change is someone
+    else's."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    _attach(broker, tp=1.20, sl=1.05)
+    _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.05, profitLevel=1.20)))
+    edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
+
+    for _ in range(4):
+        _poll(broker, edited)
+
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    assert _events(ctx, 'protection_venue_edit_adopted') == []
+    store.close()
+
+
+@pytest.mark.parametrize('source', ['SL', 'TP', 'CLOSE_OUT', ''])
+def __test_level_edit_from_any_venue_source_is_the_venues__(tmp_path, source):
+    """Only ``USER`` is a client's request: an edit from any other source is
+    the venue's own (``DEALER`` its dealing desk's), the same reading the
+    close and cancel attribution use."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    _attach(broker, tp=1.20, sl=1.05)
+    _poll(broker, _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.05, profitLevel=1.20)))
+    _own_write_echoes(broker)
+
+    _feed(broker, _level_edit(source))
+    edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
+    for _ in range(3):
+        _poll(broker, edited)
+
+    assert latched == []
+    adopted = _events(ctx, 'protection_venue_edit_adopted')
+    assert len(adopted) == 1 and adopted[0]['source'] == source
     store.close()
 
 
@@ -1970,6 +2147,7 @@ def __test_working_order_level_moved_by_someone_else_is_reported__(tmp_path):
     assert (row.extras or {}).get('order_level') == pytest.approx(1.20)
 
     _poll(broker, {}, _working(1.20))
+    _someone_else_edits(broker, 'wo-1', working=True)
     _poll(broker, {}, _working(1.25))
     assert latched == []
     _poll(broker, {}, _working(1.25))
@@ -2003,6 +2181,7 @@ def __test_working_order_attribute_someone_else_adds_is_reported__(tmp_path, att
     _poll(broker, {}, plain)
     assert latched == []
 
+    _someone_else_edits(broker, 'wo-1', working=True)
     _poll(broker, {}, _working_with(**attributes))
     assert latched == [], "a second read decides"
     _poll(broker, {}, _working_with(**attributes))
@@ -2029,11 +2208,27 @@ def __test_working_order_attributes_an_operator_resume_accepted_are_the_baseline
     restarted, restarted_latched = _make_plugin(ctx)
     restarted.operator_resume_ts_ms = broker.operator_resume_ts_ms
     _poll(restarted, {}, stopped)
+    _someone_else_edits(restarted, 'wo-1', working=True)
     widened = _working_with(stopDistance=50.0)
     _poll(restarted, {}, widened)
     _poll(restarted, {}, widened)
     assert len(restarted_latched) == 1
     assert restarted_latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    store.close()
+
+
+def __test_working_order_attributes_no_edit_explains_are_reported__(tmp_path):
+    """An attribute on the bot's resting order that the covered feed
+    attributes to no edit is someone else's: reported once."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _place_working(broker, 1.20)
+    _poll(broker, {}, _working(1.20))
+    stopped = _working_with(stopDistance=25.0)
+
+    for _ in range(4):
+        _poll(broker, {}, stopped)
+
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
     store.close()
 
 
@@ -2320,6 +2515,7 @@ def __test_refused_ambiguous_own_amend_is_not_reported_after_a_restart__(tmp_pat
     for _ in range(3):
         _poll(restarted, {}, _working(1.20))
     assert latched == [], "the venue still carries the bot's own placed level"
+    _someone_else_edits(restarted, 'wo-1', working=True)
     _poll(restarted, {}, _working(1.30))
     _poll(restarted, {}, _working(1.30))
     assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
@@ -2355,6 +2551,7 @@ def __test_off_grid_placed_level_accepts_either_grid_neighbour__(tmp_path):
         _poll(broker, {}, _working(level))
     assert latched == []
 
+    _someone_else_edits(broker, 'wo-1', working=True)
     _poll(broker, {}, _working(1.26))
     _poll(broker, {}, _working(1.26))
     assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
@@ -2377,6 +2574,7 @@ def __test_echoed_placed_level_is_the_bots_own__(tmp_path):
     for _ in range(3):
         _poll(broker, {}, _working(1.26))
     assert latched == []
+    _someone_else_edits(broker, 'wo-1', working=True)
     _poll(broker, {}, _working(1.27))
     _poll(broker, {}, _working(1.27))
     assert len(latched) == 1, "one tick off an echoed grid level is someone else's"
@@ -2397,6 +2595,7 @@ def __test_own_amend_to_an_off_grid_level_accepts_the_venue_echo__(tmp_path):
         _poll(broker, {}, _working(1.26))
     assert latched == [], "the venue kept the bot's own amend at 1.26"
 
+    _someone_else_edits(broker, 'wo-1', working=True)
     _poll(broker, {}, _working(1.29))
     _poll(broker, {}, _working(1.29))
     assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
@@ -2647,6 +2846,22 @@ def __test_close_on_a_foreign_deal_is_ignored__(tmp_path):
     store.close()
 
 
+@pytest.mark.parametrize('source', ['', 'LIQUIDATION'])
+def __test_close_from_any_venue_source_is_booked_as_the_venues_close__(tmp_path, source):
+    """A close of a filled bot position whose source is neither a client's
+    nor the dealing desk's is the venue's own close: booked as a close,
+    never as an entry fill, and never reported."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+
+    events = asyncio.run(_drain(broker._process_activity([_close_activity(source=source)])))
+
+    assert [(e.leg_type, e.order.side, e.fill_qty) for e in events] == [
+        (LegType.CLOSE, 'sell', 2.0)]
+    assert latched == []
+    store.close()
+
+
 def __test_own_opposite_row_whose_deal_closed_does_not_explain_a_close__(tmp_path):
     broker, store, ctx, latched = _make_broker(tmp_path)
     _seed_position(ctx)
@@ -2801,6 +3016,94 @@ def __test_vanished_position_waits_for_its_close_activity__(tmp_path):
     store.close()
 
 
+def _consuming_order(*, source='USER', direction='SELL', size=3.0, offset_s=-140.0):
+    """Someone's opposite market order on the epic, as the venue logs it.
+
+    A netting account nets it FIFO against the oldest deals of the other
+    side; a deal it consumes whole is reported on this consuming deal only.
+    """
+    return {'dateUTC': _now_iso(offset_s), 'dealId': 'deal-X', 'type': 'POSITION',
+            'status': 'ACCEPTED', 'source': source, 'epic': 'EURUSD',
+            'details': {'direction': direction, 'size': size, 'level': 1.11}}
+
+
+def _vanish_after_the_grace(broker, ctx):
+    """The disappearance verdict on ``deal-L``, missed past the fill-report grace."""
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    ctx.upsert_order('coid-entry', extras={**(row.extras or {}),
+                                           'missing_pending_since': time.time() - 130.0})
+    return asyncio.run(broker._confirm_missing_cancelled(ctx.get_order('coid-entry')))
+
+
+def _vanishing_broker(tmp_path):
+    broker, store, ctx, latched = _make_broker(tmp_path, responses={
+        ('error', 'positions/deal-L', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id'),
+        ('positions', 'get'): {'positions': []},
+    })
+    _seed_position(ctx)
+    broker._remember_positions_snapshot(_by_deal(_raw('deal-L', 'BUY', 2.0)), time.time() - 150.0)
+    return broker, store, ctx, latched
+
+
+def __test_foreign_order_that_netted_the_bot_deal_away_is_reported__(tmp_path):
+    """Someone else adds to the bot's side and then sells more than that add:
+    the venue nets the order FIFO, the bot's older deal goes first and is
+    logged on the consuming deal only. The bot's deal just vanishes, and the
+    consuming order proves whose close it was."""
+    broker, store, ctx, latched = _vanishing_broker(tmp_path)
+    assert asyncio.run(_drain(broker._process_activity([_consuming_order()]))) == []
+    assert _events(ctx, 'external_activity_ignored')
+
+    verdict = _vanish_after_the_grace(broker, ctx)
+
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    assert 'closed on the venue by someone else' in latched[0][0]
+    assert latched[0][1]['consumer']['dealId'] == 'deal-X'
+    assert len(_events(ctx, 'position_netted_away_by_foreign_order')) == 1
+    assert _events(ctx, 'position_vanished_unattributed') == []
+    store.close()
+
+
+@pytest.mark.parametrize('consumer', [
+    {'source': 'DEALER'}, {'direction': 'BUY'}, {'size': 1.0}, {'offset_s': -600.0},
+])
+def __test_vanished_bot_deal_without_a_consuming_order_is_logged_not_reported__(
+        tmp_path, consumer):
+    """A dealing-desk order, a same-direction add, an order too small to take
+    the bot's whole deal, or one long before the deal was last seen: none of
+    them consumed it. Nothing shows who closed it: ERROR and audit only."""
+    broker, store, ctx, latched = _vanishing_broker(tmp_path)
+    assert asyncio.run(_drain(broker._process_activity([_consuming_order(**consumer)]))) == []
+
+    verdict = _vanish_after_the_grace(broker, ctx)
+
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert latched == []
+    assert len(_events(ctx, 'position_vanished_unattributed')) == 1
+    assert _events(ctx, 'position_netted_away_by_foreign_order') == []
+    store.close()
+
+
+def __test_consuming_order_an_own_entry_may_have_sent_is_logged_not_reported__(tmp_path):
+    """An own opposite entry still waiting for its ``dealId`` may be the
+    consuming order: the evidence is ambiguous, so ERROR and audit only."""
+    broker, store, ctx, latched = _vanishing_broker(tmp_path)
+    _seed_unconfirmed_entry(ctx, coid='coid-short', side='sell')
+    assert asyncio.run(_drain(broker._process_activity([_consuming_order()]))) == []
+
+    verdict = _vanish_after_the_grace(broker, ctx)
+
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert latched == []
+    ambiguous = _events(ctx, 'position_netted_away_ambiguous')
+    assert len(ambiguous) == 1 and 'dealId' in ambiguous[0]['own_explanation']
+    assert len(_events(ctx, 'position_vanished_unattributed')) == 1
+    store.close()
+
+
 def _park_partial_close(ctx, *, sent_at, matched):
     ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0, filled_qty=2.0,
                      state='confirmed', pine_entry_id='Long', exchange_order_id='orig',
@@ -2891,6 +3194,7 @@ def __test_parked_partial_close_with_a_target_reduced_by_someone_else_settles__(
     assert latched == []
 
     _poll(broker, unprotected)
+    _someone_else_edits(broker, 'orig')
     stopped = _by_deal(_raw('orig', 'BUY', 1.5, stopLevel=1.05))
     _poll(broker, stopped)
     _poll(broker, stopped)
@@ -3008,6 +3312,30 @@ def _restart_with_history(ctx, *, positions, activities):
     })
     asyncio.run(broker._recover_in_flight_submissions())
     return broker, latched
+
+
+def __test_foreign_order_that_netted_the_bot_deal_away_while_down_is_reported_once__(tmp_path):
+    """The netting consumption happened while the bot was down: the startup
+    reconciliation finds the bot's deal gone and the consuming order in the
+    history, and reports the same foreign close once."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    consumer = _consuming_order(offset_s=-10.0)
+
+    restarted, restarted_latched = _restart_with_history(ctx, positions=[], activities=[consumer])
+
+    assert len(restarted_latched) == 1
+    assert restarted_latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    assert 'closed on the venue by someone else' in restarted_latched[0][0]
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is not None
+    netted = _events(ctx, 'position_netted_away_by_foreign_order')
+    assert len(netted) == 1 and netted[0]['at_startup'] is True
+    assert _events(ctx, 'position_vanished_unattributed') == []
+
+    again, again_latched = _restart_with_history(ctx, positions=[], activities=[consumer])
+    assert again_latched == [], "reported once, not on every restart"
+    store.close()
 
 
 def __test_manual_close_while_the_bot_was_down_is_reported_once_and_not_booked__(tmp_path):
