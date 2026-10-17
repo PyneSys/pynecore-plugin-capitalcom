@@ -13,6 +13,9 @@ from pynecore_capitalcom import CapitalCom
 from pynecore.core.ohlcv import OHLCVReader
 from pynecore.cli.app import app_state
 
+#: The environment variable that opts in to tests talking to a live venue.
+__test_helper_LIVE_TESTS_ENV = 'PYNE_LIVE_TESTS'
+
 
 def main():
     """
@@ -178,8 +181,25 @@ def __test_capitalcom_pagination_non_minute_timeframe__(tmp_path):
     assert got == expected
 
 
+def __test_helper_require_live_opt_in():
+    """Skip the calling test unless live venue tests were asked for explicitly.
+
+    The gate lives in the test itself, so it holds under any pytest config,
+    rootdir or ``-m`` expression.
+    """
+    if os.environ.get(__test_helper_LIVE_TESTS_ENV) != '1':
+        pytest.skip(f"live venue test: set {__test_helper_LIVE_TESTS_ENV}=1 to run it")
+
+
+@pytest.mark.live
 def __test_capitalcom_real_data_download__(tmp_path):
-    """Test CapitalCom provider with real data download if configuration exists"""
+    """Test CapitalCom provider with real data download if configuration exists.
+
+    A live test: it logs in to the Capital.com DEMO API with the workdir's
+    credentials, the same API key a running bot may be using. It runs only
+    with ``PYNE_LIVE_TESTS=1`` in the environment.
+    """
+    __test_helper_require_live_opt_in()
     # Disable debug logging to reduce output noise
     logging.getLogger().setLevel(logging.WARNING)
 
@@ -362,3 +382,19 @@ def __test_capitalcom_real_data_download__(tmp_path):
 
     finally:
         pass  # No need to restore any method since we're not patching anymore
+
+
+def __test_real_data_download_is_an_opt_in_live_test__(tmp_path, monkeypatch):
+    """The DEMO login test skips before it reads any credentials unless
+    ``PYNE_LIVE_TESTS=1`` asks for it, whatever selected it."""
+    def credentials_read(_self):
+        raise AssertionError("the live test read the workdir credentials without an opt-in")
+
+    monkeypatch.setattr(type(app_state), '_find_workdir', credentials_read)
+    for value in (None, '', '0', 'true'):
+        if value is None:
+            monkeypatch.delenv(__test_helper_LIVE_TESTS_ENV, raising=False)
+        else:
+            monkeypatch.setenv(__test_helper_LIVE_TESTS_ENV, value)
+        with pytest.raises(pytest.skip.Exception):
+            __test_capitalcom_real_data_download__(tmp_path)

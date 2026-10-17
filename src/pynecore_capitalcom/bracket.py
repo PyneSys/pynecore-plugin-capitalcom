@@ -32,6 +32,7 @@ from pynecore.core.broker.models import ExitIntent
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
 from .helpers import _extract_reject_reason, _wire_float
+from .intervention import _protection_key
 
 if TYPE_CHECKING:
     from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
@@ -373,9 +374,13 @@ class _BracketMixin(_CapitalComBase, ABC):
         - ``pending``: row carries ``trail_activation_price``; the
           exchange is not yet trailing.  On every tick where the
           mid-price is past the threshold, PUT ``trailingStop=true``
-          (keeping the live ``profitLevel``) and transition to
+          (keeping the bot's own take-profit) and transition to
           ``activating`` once the confirm is not ``REJECTED``; a failed,
-          refused or rejected PUT keeps the row ``pending``.
+          refused or rejected PUT keeps the row ``pending``. The PUT
+          replaces every bracket field, so it is not sent while the venue
+          carries protection the bot did not set: that is someone else's
+          edit, which the protection guard reports, not something to
+          overwrite.
         - ``activating``: wait until the snapshot confirms the exchange
           flipped to native trailing. Then transition to ``active`` and
           clear the activation fields.
@@ -413,17 +418,18 @@ class _BracketMixin(_CapitalComBase, ABC):
             if state == 'pending':
                 if not crossed:
                     continue
+                if not await self._venue_protection_is_own(str(parent_deal_id), pos):
+                    continue
                 # ``PUT /positions/{dealId}`` is full replacement (see
-                # :meth:`publish_native_failsafe_sl`): the live take-profit
-                # rides along so swapping the stop for the trailing pair
-                # does not clear it.
+                # :meth:`publish_native_failsafe_sl`): the bot's own
+                # take-profit rides along so swapping the stop for the
+                # trailing pair does not clear it. Never the venue's: a level
+                # someone else put there must not become the bot's.
                 body: dict = {'trailingStop': True,
                               'stopDistance': float(row.trailing_distance or 0.0)}
-                live_profit = _wire_float(
-                    (pos.get('position') or {}).get('profitLevel'), finite=True,
-                )
-                if live_profit is not None:
-                    body['profitLevel'] = live_profit
+                own_profit = self._own_take_profit(str(parent_deal_id))
+                if own_profit is not None:
+                    body['profitLevel'] = own_profit
                 # Send the PUT first; only flip to ``activating`` once the
                 # broker accepted it. ``activating`` only waits for the
                 # snapshot and never re-sends, so a failed, refused or
@@ -492,6 +498,19 @@ class _BracketMixin(_CapitalComBase, ABC):
                     exchange_order_id=row.exchange_order_id,
                     payload={'distance': row.trailing_distance},
                 )
+
+    def _own_take_profit(self, parent_deal_id: str) -> float | None:
+        """The take-profit level of the bot's own live TP leg on ``parent_deal_id``."""
+        if self.store_ctx is None:
+            return None
+        for row in self.store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            if (extras.get('leg_kind') == 'tp'
+                    and str(extras.get('parent_deal_id') or '') == parent_deal_id
+                    and row.state != 'rejected'
+                    and extras.get('natural_close_at') is None):
+                return _wire_float(row.tp_level, finite=True)
+        return None
 
     async def publish_native_failsafe_sl(self, snapshot: 'NativeBracketSnapshot') -> None:
         """§2.6.7 fail-safe actuator: PUT the worst-SL onto the parent dealId.
@@ -567,9 +586,13 @@ class _BracketMixin(_CapitalComBase, ABC):
         # leave the remaining legs without the downtime stop.
         deal_refs: list[str | None] = []
         for deal_id in deal_ids:
-            resp = await self._call(
-                f'positions/{deal_id}', data=body, method='put',
-            )
+            sent_at = epoch_time()
+            # The venue stamps this write ``USER`` like someone else's edit.
+            with self._own_write_in_flight(_protection_key(deal_id)):
+                resp = await self._call(
+                    f'positions/{deal_id}', data=body, method='put',
+                )
+                self._note_own_protection_write(deal_id, sent_at, epoch_time())
             deal_refs.append(
                 resp.get('dealReference') if isinstance(resp, dict) else None,
             )

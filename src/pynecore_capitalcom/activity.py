@@ -20,8 +20,10 @@ set, watermark, external-activity log dedup), ``_current_poll_id``
 the reconciler).
 """
 import asyncio
+import logging
 import math
 from abc import ABC
+from dataclasses import replace
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator
 
@@ -37,12 +39,19 @@ from pynecore.core.broker.models import (
     LegType,
     OrderEvent,
     OrderStatus,
+    QuarantineKind,
 )
 from pynecore.core.plugin import override
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
 from .helpers import (
+    BOOKED_CLOSES_RETAINED,
+    CLOSE_VERDICT_FOREIGN,
+    CLOSE_VERDICT_UNJUDGED,
+    EXTERNAL_REDUCTION_VERDICTS,
+    EXTRAS_KEY_BOOKED_CLOSES,
+    EXTRAS_KEY_NETTED_FOREIGN_DEAL,
     EXTRAS_KEY_PROTECTION_ADOPT_AFTER,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
@@ -50,11 +59,14 @@ from .helpers import (
     _activity_watermark_floor,
     _order_type_from_row,
     _parse_iso_timestamp,
+    _wire_float,
 )
-from .models import _activity_fingerprint
+from .models import _activity_fingerprint, _close_identity
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
+
+logger = logging.getLogger(__name__)
 
 
 class _ActivityMixin(_CapitalComBase, ABC):
@@ -138,6 +150,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
                   'detailed': 'true'},
             method='get',
         )
+        activity_read_at = epoch_time()
         self._activity_polled_at = polled_at
 
         positions_by_deal: dict[str, dict] = {}
@@ -146,6 +159,8 @@ class _ActivityMixin(_CapitalComBase, ABC):
             did = pos.get('dealId')
             if did:
                 positions_by_deal[str(did)] = row
+        self._remember_positions_snapshot(positions_by_deal, positions_read_started_at)
+        self._note_foreign_deals(positions_by_deal.values(), self.symbol or '')
 
         working_by_deal: dict[str, dict] = {}
         for wo in working_resp.get('workingOrders') or []:
@@ -156,7 +171,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
 
         async for ev in self._process_activity(
                 activity_resp.get('activities') or [],
-                positions_by_deal):
+                positions_by_deal, read_at=activity_read_at):
             yield ev
         async for ev in self._reconcile_snapshot(
                 positions_by_deal, working_by_deal,
@@ -189,6 +204,8 @@ class _ActivityMixin(_CapitalComBase, ABC):
     async def _process_activity(
             self, activities: list[dict],
             positions_by_deal: dict[str, dict] | None = None,
+            *,
+            read_at: float | None = None,
     ) -> AsyncIterator[OrderEvent]:
         """Convert activity rows to events, with fingerprint-based dedup.
 
@@ -205,7 +222,12 @@ class _ActivityMixin(_CapitalComBase, ABC):
             ``level`` empty (= ``0.0``) on some market entries, and the
             position snapshot is the authoritative open price for those
             cases.
+        :param read_at: Local time right after the activity read returned;
+            the batch samples the venue clock against it (see
+            :meth:`_note_venue_clock`). ``None`` leaves the clock unsampled.
         """
+        if read_at is not None:
+            self._note_venue_clock(activities, read_at)
         cursor = self._activity_cursor
         activities_sorted = sorted(
             activities, key=lambda x: x.get('dateUTC') or '',
@@ -231,7 +253,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
         # that a future poll could still consult, and consultable rows are
         # exactly those the venue still returns in its rolling window.
         batch_fingerprints: set[str] = set()
-        for a in activities_sorted:
+        for index, a in enumerate(activities_sorted):
             date_utc = a.get('dateUTC') or ''
             deal_id = str(a.get('dealId') or '')
             fingerprint = _activity_fingerprint(a)
@@ -239,6 +261,10 @@ class _ActivityMixin(_CapitalComBase, ABC):
 
             if watermark_floor and date_utc < watermark_floor:
                 continue
+            # Who edited a deal's stop / limit levels decides whether the
+            # protection guard reports the edit; remembered even for a row
+            # an earlier process already processed.
+            self._note_level_edit(a)
             if fingerprint in cursor.seen_fingerprints:
                 continue
 
@@ -258,10 +284,41 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 # — and the disappearance tracker confirms a FALSE
                 # unexpected cancel on a filled entry after the grace
                 # window (quarantine + orphaned venue position).
+                #
+                # The back-link alone does not make the deal the order's: on
+                # a netting account an executing working order reduces the
+                # oldest opposite deal, and that deal's activity may name the
+                # order too. A deal of the other direction, or one that
+                # existed before the order executed, is a deal the order
+                # netted — never promoted, never booked against the order's
+                # row; the order's own execution is retired unbooked
+                # (:meth:`_retire_order_netted_into_foreign_deal`). An order
+                # that already lives under another deal owns no further deal
+                # either.
                 wo_id = str((a.get('details') or {}).get('workingOrderId') or '')
                 if wo_id and wo_id != deal_id:
                     wo_row = self.store_ctx.find_by_ref('deal_id', wo_id)
-                    if wo_row is not None:
+                    activity_ts = _parse_iso_timestamp(date_utc)
+                    conflict = (
+                        self._promotion_conflict(
+                            wo_row.side, deal_id, activity_ts, positions_by_deal,
+                        )
+                        if wo_row is not None else None
+                    )
+                    if wo_row is None:
+                        # The order's execution may have been retired unbooked
+                        # as one that only netted a foreign deal (its row is
+                        # closed, its refs gone); a deal it opened with the
+                        # rest surfaced only now.
+                        self._note_residual_after_netting_retirement(
+                            wo_id, deal_id, activity_ts, positions_by_deal,
+                            a.get('details') or {},
+                        )
+                    elif conflict is not None:
+                        self._report_own_order_netted_foreign_deal(
+                            wo_row, wo_id, deal_id, conflict, positions_by_deal,
+                        )
+                    elif wo_row.exchange_order_id == wo_id:
                         if (wo_row.extras or {}).get('kind') == 'working':
                             self._promote_working_row_to_position(
                                 wo_row, deal_id, stamp_entry_filled=False,
@@ -425,6 +482,17 @@ class _ActivityMixin(_CapitalComBase, ABC):
                                      'status': a.get('status'),
                                      'source': a.get('source')},
                         )
+                    # Who closed the position does not depend on the price:
+                    # judge the close now (once per close, the verdict is
+                    # kept on the row) and report someone else's close at
+                    # once. The booking waits for a priced copy of the
+                    # activity; if none ever comes, the vanished deal is
+                    # left to the disappearance verdict.
+                    if (event.leg_type == LegType.CLOSE
+                            and (row.extras or {}).get('natural_close_at') is None
+                            and self._attribute_close_activity(
+                                row, a, positions_by_deal) == CLOSE_VERDICT_FOREIGN):
+                        self._report_manual_close(row, a)
                     continue
 
             cursor.seen_fingerprints[fingerprint] = date_utc
@@ -471,15 +539,23 @@ class _ActivityMixin(_CapitalComBase, ABC):
             # row can only be that same close surfacing again;
             # yielding it would walk the engine's flat book into a
             # phantom opposite position.
-            close_fill_already_recorded = (
+            is_close_fill = (
                 event is not None
                 and event.event_type == 'filled'
                 and event.leg_type in (
                     LegType.TAKE_PROFIT, LegType.STOP_LOSS,
                     LegType.TRAILING_STOP, LegType.CLOSE,
                 )
-                and (row.extras or {}).get('natural_close_at') is not None
-                and row.filled_qty <= 0.0
+            )
+            # The venue may re-issue a close under a new fingerprint (a
+            # level-less row republished with its level): the close's
+            # level-independent identity, recorded when it was booked,
+            # suppresses the copy.
+            close_id = _close_identity(a)
+            close_fill_already_recorded = is_close_fill and (
+                ((row.extras or {}).get('natural_close_at') is not None
+                 and row.filled_qty <= 0.0)
+                or close_id in ((row.extras or {}).get(EXTRAS_KEY_BOOKED_CLOSES) or ())
             )
             # Attribute a USER / DEALER close before its effects land: the
             # bot's own DELETE / reduce POST carries the same source as an
@@ -489,7 +565,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
             # in the same transaction as the dedup commit: a process that
             # dies after the commit must still find the report on restart,
             # where the deduplicated activity no longer replays.
-            report_close = False
+            close_verdict = CLOSE_VERDICT_UNJUDGED
             if self.store_ctx is not None:
                 with self.store_ctx.transaction():
                     self.store_ctx.log_event(
@@ -501,14 +577,24 @@ class _ActivityMixin(_CapitalComBase, ABC):
                                  'type': a.get('type'), 'status': a.get('status'),
                                  'source': a.get('source')},
                     )
-                    report_close = (
-                        event is not None
-                        and not entry_fill_already_recorded
-                        and not close_fill_already_recorded
-                        and event.event_type == 'filled'
-                        and event.leg_type == LegType.CLOSE
-                        and self._attribute_close_activity(row, a)
-                    )
+                    if (event is not None
+                            and not entry_fill_already_recorded
+                            and not close_fill_already_recorded
+                            and event.event_type == 'filled'
+                            and event.leg_type == LegType.CLOSE):
+                        close_verdict = self._attribute_close_activity(
+                            row, a, positions_by_deal,
+                        )
+                    if is_close_fill and not close_fill_already_recorded:
+                        self._rewrite_extras(
+                            row.client_order_id,
+                            lambda extras: extras.__setitem__(
+                                EXTRAS_KEY_BOOKED_CLOSES,
+                                [*(extras.get(EXTRAS_KEY_BOOKED_CLOSES) or ())][
+                                    -BOOKED_CLOSES_RETAINED + 1:] + [close_id],
+                            ),
+                        )
+            report_close = close_verdict == CLOSE_VERDICT_FOREIGN
 
             if event is not None:
                 # Working-order fill (WORKING_ORDER EXECUTED): promote the
@@ -531,7 +617,19 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     promoted_deal_id = self._find_promoted_deal_id(
                         row, activities_sorted, positions_by_deal,
                     )
-                    if promoted_deal_id:
+                    netted = self._netted_foreign_deal(
+                        row, activities_sorted, positions_by_deal,
+                    )
+                    if netted is not None and not promoted_deal_id:
+                        event = self._retire_order_netted_into_foreign_deal(
+                            row, event, netted, positions_by_deal,
+                        )
+                    elif promoted_deal_id:
+                        if netted is not None:
+                            event = self._book_residual_of_partly_netted_order(
+                                row, event, netted, promoted_deal_id,
+                                activities_sorted, positions_by_deal,
+                            )
                         self._promote_working_row_to_position(
                             row, promoted_deal_id, stamp_entry_filled=True,
                         )
@@ -673,6 +771,13 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     #     waiting for the missing-pending grace window
                     #     (which would otherwise raise a false
                     #     :class:`UnexpectedCancelError`).
+                    #   * Deal absent, but a later close of the same deal
+                    #     follows in this batch (an own partial close and
+                    #     someone else's close of the rest) → not this
+                    #     close's teardown: it is booked like a partial, and
+                    #     the last close tears down. Tearing down at the
+                    #     first would turn the later, different close into
+                    #     a suppressed replay — never booked, never judged.
                     deal_remaining: float | None = None
                     if (deal_id and positions_by_deal
                             and deal_id in positions_by_deal):
@@ -680,7 +785,9 @@ class _ActivityMixin(_CapitalComBase, ABC):
                             positions_by_deal[deal_id].get('position') or {}
                         )
                         deal_remaining = float(pos_snap.get('size') or 0.0)
-                    if deal_remaining is None or deal_remaining <= 0.0:
+                    if ((deal_remaining is None or deal_remaining <= 0.0)
+                            and not self._later_close_in_batch(
+                                activities_sorted, index, deal_id, row)):
                         retired_exposure = row.filled_qty
                         self._close_bracket_after_natural_close(row)
                         self._retire_netted_journal_exposure(
@@ -705,14 +812,52 @@ class _ActivityMixin(_CapitalComBase, ABC):
                             mark_extras[EXTRAS_KEY_PROTECTION_ADOPT_AFTER] = (
                                 epoch_time()
                             )
-                            self.store_ctx.upsert_order(
-                                row.client_order_id, extras=mark_extras,
-                            )
+                            # The run's share of the deal shrinks by what
+                            # someone else (or the venue) took: the
+                            # ``filled_qty`` exposure cursor follows it, as it
+                            # does after an own partial close. An own close
+                            # already lowered it at dispatch; an own netting
+                            # entry offsets it with its own cursor.
+                            remaining: float | None = None
+                            if (event.leg_type == LegType.CLOSE
+                                    and close_verdict in EXTERNAL_REDUCTION_VERDICTS):
+                                remaining = max(
+                                    0.0, refreshed.filled_qty - float(event.fill_qty or 0.0),
+                                )
+                                mark_extras['partial_close_retired_at'] = epoch_time()
+                            if remaining is None:
+                                self.store_ctx.upsert_order(
+                                    row.client_order_id, extras=mark_extras,
+                                )
+                            else:
+                                self.store_ctx.upsert_order(
+                                    row.client_order_id, filled_qty=remaining,
+                                    extras=mark_extras,
+                                )
+                                self.store_ctx.log_event(
+                                    'partial_close_journal_retired',
+                                    client_order_id=row.client_order_id,
+                                    exchange_order_id=deal_id,
+                                    payload={
+                                        'retired_exposure': float(event.fill_qty or 0.0),
+                                        'remaining_exposure': remaining,
+                                        'source': a.get('source'),
+                                        'verdict': close_verdict,
+                                    },
+                                )
                 if suppress_fill:
                     # The activity is already durable (``activity_processed``
                     # logged, cursor advanced) and the entry/bracket rows were
                     # torn down above — only the double-counting fill is
                     # dropped.
+                    continue
+                if (event.event_type in ('cancelled', 'rejected')
+                        and (row.extras or {}).get('kind') == 'working'
+                        and self._note_working_order_end(row, a)
+                        and event.event_type == 'cancelled'):
+                    # The venue itself ended the resting order: the engine
+                    # would take the cancel for someone else's. The
+                    # disappearance verdict retires the row as the venue's.
                     continue
                 if not report_close:
                     yield event
@@ -1072,6 +1217,28 @@ class _ActivityMixin(_CapitalComBase, ABC):
             fill_id=_activity_fingerprint(activity),
         )
 
+    def _later_close_in_batch(
+            self, activities: list[dict], index: int, deal_id: str, row: 'OrderRow',
+    ) -> bool:
+        """Whether an unprocessed close of ``deal_id`` follows ``activities[index]``.
+
+        :param activities: The batch, sorted by ``dateUTC``.
+        :param index: The position of the close being booked.
+        :param deal_id: Its deal.
+        :param row: The bot position row the deal belongs to.
+        """
+        seen = self._activity_cursor.seen_fingerprints
+        for later in activities[index + 1:]:
+            if (str(later.get('dealId') or '') != deal_id
+                    or _activity_fingerprint(later) in seen):
+                continue
+            event = self._activity_to_event(later, row)
+            if (event is not None and event.event_type == 'filled'
+                    and event.leg_type in (LegType.TAKE_PROFIT, LegType.STOP_LOSS,
+                                           LegType.TRAILING_STOP, LegType.CLOSE)):
+                return True
+        return False
+
     def _find_promoted_deal_id(
             self,
             row: 'OrderRow',
@@ -1096,6 +1263,11 @@ class _ActivityMixin(_CapitalComBase, ABC):
         quarantined the run). With no clean candidate the caller defers;
         the next poll's snapshot back-link completes the migration
         within the grace window.
+
+        A candidate the order cannot have opened is rejected too: a deal of
+        the other direction, or one created well before the activity naming
+        it (:meth:`_promotion_conflict`) — a netting account reports the deal
+        an executing working order reduced with the same back-link.
         """
         old_id = row.exchange_order_id or ''
         if not old_id:
@@ -1114,15 +1286,301 @@ class _ActivityMixin(_CapitalComBase, ABC):
                             or '') == old_id):
                 new_id = str(a.get('dealId') or '')
                 if (new_id and new_id != old_id
-                        and not owned_by_other(new_id)):
+                        and not owned_by_other(new_id)
+                        and self._promotion_conflict(
+                            row.side, new_id,
+                            _parse_iso_timestamp(str(a.get('dateUTC') or '')),
+                            positions_by_deal) is None):
                     return new_id
         for deal_id, raw in (positions_by_deal or {}).items():
             pos = raw.get('position') or {}
             if (str(pos.get('workingOrderId') or '') == old_id
                     and deal_id != old_id
-                    and not owned_by_other(deal_id)):
+                    and not owned_by_other(deal_id)
+                    and self._promotion_conflict(
+                        row.side, deal_id, 0.0, positions_by_deal) is None):
                 return deal_id
         return None
+
+    def _netted_foreign_deal(
+            self,
+            row: 'OrderRow',
+            activities: list[dict],
+            positions_by_deal: dict[str, dict] | None,
+    ) -> tuple[str, str] | None:
+        """The foreign deal an executed own working order netted instead of opening one.
+
+        On a netting account an executing working order reduces the oldest
+        opposite deal, and the venue names the order on that deal too. The
+        evidence, in order: the netted deal the row already recorded (the
+        deal's activity came first), the batch's ``POSITION`` activity
+        back-linking the order, the same-poll ``/positions`` snapshot. Only a
+        deal no own row tracks and that the order cannot have opened
+        (:meth:`_promotion_conflict`) counts.
+
+        :return: ``(dealId, conflict)``, or ``None`` without such evidence.
+        """
+        store_ctx = self.store_ctx
+        old_id = row.exchange_order_id or ''
+        if store_ctx is None or not old_id:
+            return None
+        fresh = store_ctx.get_order(row.client_order_id) or row
+        recorded = (fresh.extras or {}).get(EXTRAS_KEY_NETTED_FOREIGN_DEAL)
+        if isinstance(recorded, dict) and recorded.get('deal_id'):
+            return str(recorded['deal_id']), str(recorded.get('conflict') or '')
+
+        candidates: list[tuple[str, float]] = [
+            (str(a.get('dealId') or ''), _parse_iso_timestamp(str(a.get('dateUTC') or '')))
+            for a in activities
+            if (str(a.get('type') or '') == 'POSITION'
+                and str((a.get('details') or {}).get('workingOrderId') or '') == old_id)
+        ]
+        candidates.extend(
+            (deal_id, 0.0) for deal_id, raw in (positions_by_deal or {}).items()
+            if str((raw.get('position') or {}).get('workingOrderId') or '') == old_id
+        )
+        for deal_id, activity_ts in candidates:
+            if (not deal_id or deal_id == old_id
+                    or store_ctx.find_by_ref('deal_id', deal_id) is not None):
+                continue
+            conflict = self._promotion_conflict(
+                row.side, deal_id, activity_ts, positions_by_deal)
+            if conflict is not None:
+                return deal_id, conflict
+        return None
+
+    def _retire_order_netted_into_foreign_deal(
+            self,
+            row: 'OrderRow',
+            event: OrderEvent,
+            netted: tuple[str, str],
+            positions_by_deal: dict[str, dict] | None,
+    ) -> OrderEvent:
+        """Retire an own working order whose execution only netted a foreign deal.
+
+        The order executed, but into someone else's deal: the run holds no
+        exposure from it. Booking its fill would give the engine a position
+        the venue never shows the run, so the row is retired instead, with
+        nothing booked on the exposure cursor, and the engine gets the entry
+        back as ``rejected`` (no fill, no quarantine of its own). The netting
+        itself is reported once (ERROR, audit event, ``ENTRY_BLOCK``). The
+        retirement is remembered by the order's ``dealId``
+        (:meth:`_netting_retirements`): a deal the order opened with the rest
+        of its size may surface only later.
+
+        :param row: The own working-order row.
+        :param event: The ``filled`` ENTRY event of the order's execution.
+        :param netted: ``(dealId, conflict)`` of the netted foreign deal.
+        :param positions_by_deal: The poll's ``/positions`` rows by ``dealId``.
+        :return: The ``rejected`` event to yield in place of the fill.
+        """
+        assert self.store_ctx is not None
+        wo_id = row.exchange_order_id or ''
+        deal_id, conflict = netted
+        self._report_own_order_netted_foreign_deal(
+            row, wo_id, deal_id, conflict, positions_by_deal,
+        )
+        fresh = self.store_ctx.get_order(row.client_order_id)
+        if fresh is not None and fresh.closed_ts_ms is None:
+            retired = {'client_order_id': row.client_order_id, 'side': row.side,
+                       'symbol': row.symbol, 'netted_deal_id': deal_id}
+            self._netting_retirements()[wo_id] = retired
+            self.store_ctx.log_event(
+                'own_working_order_retired_netted_foreign_deal',
+                client_order_id=row.client_order_id,
+                exchange_order_id=wo_id,
+                payload={'netted_deal_id': deal_id, 'conflict': conflict,
+                         'side': row.side, 'symbol': row.symbol,
+                         'executed_qty': event.fill_qty,
+                         'executed_price': event.fill_price},
+            )
+            self.store_ctx.close_order(row.client_order_id)
+        order = event.order
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=order.id, symbol=order.symbol, side=order.side,
+                order_type=order.order_type, qty=order.qty,
+                filled_qty=0.0, remaining_qty=order.qty,
+                price=order.price, stop_price=order.stop_price,
+                average_fill_price=None, status=OrderStatus.REJECTED,
+                timestamp=order.timestamp, fee=0.0, fee_currency='',
+                reduce_only=order.reduce_only, client_order_id=order.client_order_id,
+            ),
+            event_type='rejected',
+            fill_price=None,
+            fill_qty=None,
+            timestamp=event.timestamp,
+            pine_id=event.pine_id,
+            from_entry=event.from_entry,
+            leg_type=event.leg_type,
+        )
+
+    def _book_residual_of_partly_netted_order(
+            self,
+            row: 'OrderRow',
+            event: OrderEvent,
+            netted: tuple[str, str],
+            promoted_deal_id: str,
+            activities: list[dict],
+            positions_by_deal: dict[str, dict] | None,
+    ) -> OrderEvent:
+        """The fill of an own working order that netted a foreign deal and opened one.
+
+        On a netting account an order larger than the foreign deal it nets
+        consumes that deal and opens a deal of its own with the rest. Only the
+        rest is the run's exposure: the ``WORKING_ORDER EXECUTED`` fill is cut
+        to the opened deal's size, so the engine never books exposure the
+        venue does not show the run. The netting itself is reported once
+        (ERROR, audit event, ``ENTRY_BLOCK``).
+
+        :param row: The own working-order row.
+        :param event: The ``filled`` ENTRY event of the order's whole execution.
+        :param netted: ``(dealId, conflict)`` of the netted foreign deal.
+        :param promoted_deal_id: The deal the order opened.
+        :param activities: The activity batch.
+        :param positions_by_deal: The poll's ``/positions`` rows by ``dealId``.
+        :return: The event to book: the residual fill, or ``event`` unchanged
+            when the opened size is unknown.
+        """
+        assert self.store_ctx is not None
+        wo_id = row.exchange_order_id or ''
+        deal_id, conflict = netted
+        self._report_own_order_netted_foreign_deal(
+            row, wo_id, deal_id, conflict, positions_by_deal,
+        )
+        opened: float | None = None
+        for activity in activities:
+            if (str(activity.get('type') or '') == 'POSITION'
+                    and str(activity.get('dealId') or '') == promoted_deal_id):
+                details = activity.get('details') or {}
+                opened = _wire_float(activity.get('size') or details.get('size'), finite=True)
+                if opened is not None:
+                    break
+        if opened is None:
+            raw = (positions_by_deal or {}).get(promoted_deal_id)
+            if raw is not None:
+                opened = _wire_float((raw.get('position') or {}).get('size'), finite=True)
+        executed = float(event.fill_qty or 0.0)
+        self.store_ctx.log_event(
+            'own_working_order_partly_netted_foreign_deal',
+            client_order_id=row.client_order_id,
+            exchange_order_id=promoted_deal_id,
+            payload={'working_order': wo_id, 'netted_deal_id': deal_id,
+                     'conflict': conflict, 'executed_qty': executed,
+                     'opened_qty': opened},
+        )
+        if opened is None or opened <= 0.0 or opened >= executed:
+            if opened is None:
+                logger.error(
+                    "own working order %s (%s) netted foreign deal %s and opened "
+                    "deal %s of unknown size: its whole execution of %s is booked",
+                    wo_id, row.symbol, deal_id, promoted_deal_id, executed,
+                )
+            return event
+        order = event.order
+        return replace(
+            event,
+            order=replace(order, filled_qty=opened,
+                          remaining_qty=max(0.0, order.qty - opened)),
+            fill_qty=opened,
+        )
+
+    def _netting_retirements(self) -> dict[str, dict]:
+        """Own working orders retired because their execution only netted a foreign deal.
+
+        A retired order's row is closed and its refs are gone, yet a deal the
+        order opened with the rest of its size can surface after the
+        retirement (the venue publishes it a poll later, or the bot restarts
+        in between). Loaded once per process from the run's audit events
+        (every instance of the logical run), together with the residual deals
+        already reported, and kept up to date by
+        :meth:`_retire_order_netted_into_foreign_deal`.
+
+        :return: The order's ``dealId`` -> ``{'client_order_id', 'side',
+            'symbol', 'netted_deal_id'}``; empty without a journal.
+        """
+        retired = self._netting_retired_orders
+        if retired is not None:
+            return retired
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return {}
+        retired = {}
+        for _, coid, wo_id, payload in store_ctx.iter_events_by_kind_for_run_id(
+                'own_working_order_retired_netted_foreign_deal'):
+            if wo_id:
+                retired[wo_id] = {'client_order_id': coid, 'side': payload.get('side'),
+                                  'symbol': payload.get('symbol'),
+                                  'netted_deal_id': payload.get('netted_deal_id')}
+        self._residual_deals_reported.update(
+            deal_id for _, _, deal_id, _ in store_ctx.iter_events_by_kind_for_run_id(
+                'own_working_order_residual_unbooked')
+            if deal_id
+        )
+        self._netting_retired_orders = retired
+        return retired
+
+    def _note_residual_after_netting_retirement(
+            self, wo_id: str, deal_id: str, activity_ts: float,
+            positions_by_deal: dict[str, dict] | None, details: dict,
+    ) -> bool:
+        """Report a deal a retired own working order opened with the rest of its size.
+
+        The deal back-links the order (``workingOrderId``), is not the
+        foreign deal the order netted, and is one the order can have opened
+        (:meth:`_promotion_conflict`). The venue holds exposure the bot's own
+        order opened, but the order's execution was retired unbooked and the
+        engine took the entry back as rejected: the deal is in no book and
+        unprotected, and the bot never closes, amends or brackets it. ERROR,
+        an ``own_working_order_residual_unbooked`` audit event and an
+        ``ENTRY_BLOCK`` quarantine naming the deal, once per deal for the run.
+
+        :param wo_id: The ``dealId`` of the order the deal back-links.
+        :param deal_id: The deal.
+        :param activity_ts: Venue time of the activity naming the deal, ``0``
+            when the deal comes from a ``/positions`` read.
+        :param positions_by_deal: The ``/positions`` rows by ``dealId``.
+        :param details: The activity's ``details`` or the deal's ``position``
+            object, for the report.
+        :return: Whether the deal is such a residual (reported now or earlier).
+        """
+        store_ctx = self.store_ctx
+        retired = self._netting_retirements().get(wo_id)
+        if store_ctx is None or retired is None or deal_id == retired.get('netted_deal_id'):
+            return False
+        side = str(retired.get('side') or '')
+        if (side not in ('buy', 'sell')
+                or self._promotion_conflict(side, deal_id, activity_ts,
+                                            positions_by_deal) is not None):
+            return False
+        if deal_id in self._residual_deals_reported:
+            return True
+        self._residual_deals_reported.add(deal_id)
+        self._foreign_deals_logged.add(deal_id)
+        position = ((positions_by_deal or {}).get(deal_id) or {}).get('position') or {}
+        direction = position.get('direction') or details.get('direction')
+        size = position.get('size', details.get('size'))
+        symbol = retired.get('symbol') or self.symbol
+        message = (
+            f"own working order {wo_id} ({symbol}) netted foreign deal "
+            f"{retired.get('netted_deal_id')} and also opened deal {deal_id} "
+            f"({direction} {size}): its execution was retired unbooked, so the deal is "
+            f"in no book and unprotected — the bot never closes, amends or brackets it; "
+            f"close it on the venue, new entries are blocked"
+        )
+        logger.error("%s", message)
+        context = {'working_order': wo_id, 'deal_id': deal_id, 'symbol': symbol,
+                   'netted_deal_id': retired.get('netted_deal_id'),
+                   'direction': direction, 'size': size, 'details': details}
+        store_ctx.log_event(
+            'own_working_order_residual_unbooked',
+            client_order_id=retired.get('client_order_id'),
+            exchange_order_id=deal_id,
+            payload=context,
+        )
+        if self.quarantine_sink is not None:
+            self.quarantine_sink(message, context, kind=QuarantineKind.ENTRY_BLOCK)
+        return True
 
     def _promote_working_row_to_position(
             self, wo_row: 'OrderRow', new_deal_id: str, *,
@@ -1145,6 +1603,9 @@ class _ActivityMixin(_CapitalComBase, ABC):
         """
         assert self.store_ctx is not None
         old_deal_id = wo_row.exchange_order_id
+        # The resting order's level guard ends with the order; its persisted
+        # levels share the row with the position's protection to come.
+        self._forget_working_order_guard(old_deal_id)
         refreshed = self.store_ctx.get_order(wo_row.client_order_id)
         base_extras = dict((refreshed or wo_row).extras or {})
         base_extras['kind'] = 'position'

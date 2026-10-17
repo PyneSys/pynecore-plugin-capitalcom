@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Protocol, cast
 
+from pynecore.core.broker.exceptions import OrderSkippedByPlugin
 from pynecore.core.broker.models import (
     EntryIntent,
     ExchangeOrder,
@@ -47,11 +48,18 @@ from pynecore.types.ohlcv import OHLCV
 
 from .config import CapitalComConfig
 from .helpers import _size_from_units
-from .models import _ActivityCursor, _InstrumentRules, _OwnCloseHandle, _ProtectionWrite
+from .models import (
+    _ActivityCursor,
+    _ForeignExitBlock,
+    _HeldEditVerdict,
+    _InstrumentRules,
+    _OwnCloseHandle,
+    _ProtectionWrite,
+)
 
 if TYPE_CHECKING:
     from pynecore.core.broker.disappearance import DisappearanceTracker
-    from pynecore.core.broker.protection_guard import ProtectionLevelGuard
+    from pynecore.core.broker.protection_guard import ProtectionLevelGuard, ProtectionLevels
     from pynecore.core.broker.models import DispatchEnvelope, PositionLeg
     from pynecore.core.broker.storage import OrderRow, RunContext
 
@@ -82,6 +90,10 @@ class CapitalComHookCollaborator(Protocol):
             intent_qty: float, lot_step: float,
     ) -> tuple[dict, list[dict]]: ...
 
+    async def submit_market_entry(
+            self, *, coid: str, symbol: str, side: str, body: dict,
+    ) -> dict: ...
+
     async def instrument_rules(self, epic: str) -> _InstrumentRules: ...
 
     def quantize_size(self, qty: float, rules: _InstrumentRules) -> float: ...
@@ -100,6 +112,19 @@ class CapitalComHookCollaborator(Protocol):
             self, deal_ids: Iterable[str], *, full: bool, size: float | None,
     ) -> AbstractContextManager[_OwnCloseHandle]: ...
 
+    def working_order_write(
+            self, row: 'OrderRow', level: float, *, previous_level: float | None,
+    ) -> AbstractContextManager[_ProtectionWrite]: ...
+
+    def report_unattributed_opposite(
+            self, *, coid: str, intent_key: str, symbol: str,
+            opposite_deal_ids: list[str], attributable: bool, context: dict,
+    ) -> None: ...
+
+    def stamp_own_cancel_accepted(self, coid: str, sent_at: float) -> None: ...
+
+    def own_cancel(self, coid: str) -> AbstractContextManager[float]: ...
+
 
 class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     """Shared instance state + Capital.com–private cross-mix-in surface.
@@ -115,7 +140,7 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # a healthy worst case of about 15 s, but the venue has stamped an activity
     # row 61 s after its deal (demo, 2026-07-10), and a rate-limited poll backs
     # off up to 30 s on top of that.
-    fill_report_grace_s = 120.0
+    fill_report_grace_s: float = 120.0
     timezone = 'US/Eastern'
 
     @property
@@ -144,6 +169,22 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             body=body,
             intent_qty=intent_qty,
             lot_step=lot_step,
+        )
+
+    async def submit_market_entry(
+            self, *, coid: str, symbol: str, side: str, body: dict,
+    ) -> dict:
+        """POST one market entry; on a netting account never against a foreign deal.
+
+        A hedging account opens every POST as its own deal, so it goes out
+        as is. On a netting account an opposite deal is netted FIFO, so the
+        POST is sent only after a final snapshot under the account write lock
+        shows no foreign deal on the side it would reduce.
+        """
+        if self._hedging_enabled or self.store_ctx is None:
+            return await self._call('positions', data=body, method='post')
+        return await self._submit_netting_safe_entry(
+            coid=coid, symbol=symbol, side=side, body=body,
         )
 
     async def instrument_rules(self, epic: str) -> _InstrumentRules:
@@ -186,6 +227,31 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     ) -> AbstractContextManager[_OwnCloseHandle]:
         """Record an own close of ``deal_ids`` for a standalone hook."""
         return self._own_close(deal_ids, full=full, size=size)
+
+    def working_order_write(
+            self, row: 'OrderRow', level: float, *, previous_level: float | None,
+    ) -> AbstractContextManager[_ProtectionWrite]:
+        """Record one own ``PUT /workingorders/{dealId}`` for a standalone hook."""
+        return self._working_order_write(row, level, previous_level=previous_level)
+
+    def report_unattributed_opposite(
+            self, *, coid: str, intent_key: str, symbol: str,
+            opposite_deal_ids: list[str], attributable: bool, context: dict,
+    ) -> None:
+        """Report opposite deals an own partial close cannot be shown to own, for a hook."""
+        self._report_unattributed_opposite(
+            coid=coid, intent_key=intent_key, symbol=symbol,
+            opposite_deal_ids=opposite_deal_ids, attributable=attributable,
+            context=context,
+        )
+
+    def stamp_own_cancel_accepted(self, coid: str, sent_at: float) -> None:
+        """Record an accepted own working-order ``DELETE`` for a standalone hook."""
+        self._stamp_own_cancel_accepted(coid, sent_at)
+
+    def own_cancel(self, coid: str) -> AbstractContextManager[float]:
+        """Record an own working-order ``DELETE`` before it leaves, for a standalone hook."""
+        return self._own_cancel(coid)
 
     if TYPE_CHECKING:
         def __call__(
@@ -304,8 +370,65 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # adoption only takes a snapshot read after both.
     _protection_in_flight: dict[str, int]
     _protection_written_at: dict[str, float]
+    # Own writes per guard key (position or resting order) whose outcome is
+    # not back yet: a verdict held on the key waits for them to settle.
+    _own_writes_in_flight: dict[str, int]
     # Deals whose stop the core native fail-safe manager writes.
     _failsafe_deal_ids: set[str]
+    # Manual-close report ids this process already sent to the policy.
+    _manual_close_reports_sent: set[str]
+    # Lower-bound samples of the venue clock minus the local clock, one per
+    # activity read: ``(local wall read time, monotonic read time,
+    # newest dateUTC - local wall read time)``.
+    _venue_clock_samples: collections.deque[tuple[float, float, float]]
+    # Own close requests this process sent: wall-clock send time -> monotonic
+    # send time.
+    _own_close_sends: dict[float, float]
+    # Accepted level-edit activities (``EDIT_STOP_AND_LIMIT``, ``WORKING_ORDER``
+    # ``MODIFIED``) per deal: ``dealId`` -> ``{edit identity: (venue time,
+    # source, wall time first seen)}``.
+    _level_edits: dict[str, dict[str, tuple[float, str, float]]]
+    # Closes only a resting own working order could explain, waiting for a
+    # later working-order read: close identity -> (wall time queued, record).
+    _netting_pending: dict[str, tuple[float, dict]]
+    # Attributes the bot never sets seen once on its resting order (a second
+    # read decides): ``dealId`` -> attribute signature; and the edits already
+    # reported, ``(dealId, signature)``.
+    _working_attributes_seen: dict[str, tuple]
+    _working_attributes_reported: set[tuple[str, tuple]]
+    # Confirmed changes of the bot's levels whose author the activity feed
+    # may not show yet, by change identity; and how long after a change an
+    # activity read must start before it is trusted to show the author.
+    _held_edit_verdicts: dict[str, _HeldEditVerdict]
+    _level_edit_settle_s: float
+    # Snapshots of a key whose levels verdict is held, read after the change
+    # was confirmed: the start of the newest read, and levels other than the
+    # verdict's that reads showed in a row (levels, consecutive reads).
+    _held_level_views: dict[str, float]
+    _held_level_changes: dict[str, tuple['ProtectionLevels', int]]
+    # Start of the snapshot read the guard is judging, for its report hook.
+    _judged_read_started_at: float | None
+
+    # --- Foreign exposure (foreign.py) ---
+    # Foreign deals already logged once.
+    _foreign_deals_logged: set[str]
+    # ``(reason, key, foreign deal ids)`` refusals already reported.
+    _foreign_blocks_reported: set[tuple]
+    # The last poll's ``/positions`` rows by ``dealId`` and its read start.
+    _positions_snapshot: tuple[float, dict[str, dict]] | None
+    # Every deal a ``/positions`` read showed recently: ``dealId`` ->
+    # ``(createdDateUTC epoch, direction, last seen at)``.
+    _seen_position_deals: dict[str, tuple[float, str, float]]
+    # Own partial exits deals this run did not open block, by intent key; and
+    # the ones whose block latched.
+    _foreign_exit_blocks: dict[str, _ForeignExitBlock]
+    _foreign_exit_latched: set[str]
+    # Own working orders retired because their execution only netted a
+    # foreign deal, by the order's ``dealId`` (loaded lazily from the audit
+    # events, see ``activity.py``); and the deals such an order opened with
+    # the rest of its size that were already reported.
+    _netting_retired_orders: dict[str, dict] | None
+    _residual_deals_reported: set[str]
 
     # --- Account mode ---
     # ``True`` once ``connect()`` reads ``hedgingMode`` from the account
@@ -345,6 +468,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             target_deal_ids: frozenset[str], body: dict,
             intent_qty: float, lot_step: float,
     ) -> tuple[dict, list[dict]]: ...
+
+    async def _submit_netting_safe_entry(
+            self, *, coid: str, symbol: str, side: str, body: dict,
+    ) -> dict: ...
 
     def create_session(self) -> None: ...
 
@@ -445,6 +572,11 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             self, *args: Any, **kwargs: Any,
     ) -> None: ...
 
+    def _note_residual_after_netting_retirement(
+            self, wo_id: str, deal_id: str, activity_ts: float,
+            positions_by_deal: dict[str, dict] | None, details: dict,
+    ) -> bool: ...
+
     # --- Bracket lifecycle (bracket.py) ---
     def _close_bracket_after_natural_close(self, entry_row: 'OrderRow') -> None: ...
 
@@ -472,6 +604,14 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             self, deal_ids: Iterable[str], *, full: bool, size: float | None,
     ) -> AbstractContextManager[_OwnCloseHandle]: ...
 
+    def _own_close_earliest(self, sent_at: float) -> float: ...
+
+    def _unconfirmed_reverse_leg(
+            self, positions: Iterable[dict], *, coid: str, intent_key: str | None, symbol: str,
+            direction: str, target_deal_id: str, size: float, lot_step: float,
+            sent_at: float, done_at: float | None,
+    ) -> str | None: ...
+
     def _forget_protection(self, deal_id: str) -> None: ...
 
     def _claim_failsafe_protection(self, deal_ids: Iterable[str]) -> None: ...
@@ -483,11 +623,138 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _stamp_protection_adopt(self, coid: str, after: float) -> None: ...
 
-    def _attribute_close_activity(self, row: 'OrderRow', activity: dict) -> bool: ...
+    async def _venue_protection_is_own(self, deal_id: str, pos: dict) -> bool: ...
+
+    def _rewrite_extras(self, coid: str, mutate: Callable[[dict], Any]) -> None: ...
+
+    def _stamp_own_cancel_accepted(self, coid: str, sent_at: float) -> None: ...
+
+    def _own_cancel(self, coid: str) -> AbstractContextManager[float]: ...
+
+    @staticmethod
+    def _own_cancel_explains(row: 'OrderRow', activity_ts: float) -> bool: ...
+
+    @staticmethod
+    def _venue_end_of_working_order(activity: dict) -> str | None: ...
+
+    def _note_working_order_end(self, row: 'OrderRow', activity: dict) -> bool: ...
+
+    def _own_close_cursor_retired(self, row: 'OrderRow', activity: dict) -> bool: ...
+
+    def _attribute_close_activity(
+            self, row: 'OrderRow', activity: dict,
+            positions_by_deal: dict[str, dict] | None = None,
+    ) -> str: ...
 
     def _report_manual_close(self, row: 'OrderRow', activity: dict) -> None: ...
 
+    def _send_manual_close_report(self, report: dict) -> None: ...
+
     def _send_pending_manual_close_reports(self) -> None: ...
+
+    def _reload_netting_pending(self) -> None: ...
+
+    def _resolve_netting_pending(
+            self, working_by_deal: dict[str, dict], read_started_at: float | None,
+    ) -> None: ...
+
+    def _note_venue_clock(self, activities: Iterable[dict], read_at: float) -> None: ...
+
+    def _note_level_edit(self, activity: dict) -> None: ...
+
+    def _resolve_held_edit_verdicts(self) -> None: ...
+
+    def _reload_held_edit_verdicts(self) -> None: ...
+
+    def _defer_protection_write(self, deal_id: str, *, intent_key: str, symbol: str) -> None: ...
+
+    def _note_own_protection_write(self, deal_id: str, sent_at: float, done_at: float) -> None: ...
+
+    def _own_write_in_flight(self, key: str) -> AbstractContextManager[None]: ...
+
+    def _venue_time_floor(self, local_ts: float) -> float: ...
+
+    def _working_order_write(
+            self, row: 'OrderRow', level: float, *, previous_level: float | None,
+    ) -> AbstractContextManager[_ProtectionWrite]: ...
+
+    def _forget_working_order_guard(self, deal_id: str | None) -> None: ...
+
+    async def _observe_working_orders(
+            self, working_by_deal: dict[str, dict],
+            read_started_at: float | None,
+    ) -> None: ...
+
+    # --- Foreign exposure (foreign.py) ---
+    def _owned_deal_ids(self, positions: Iterable[dict]) -> set[str] | None: ...
+
+    def _foreign_deals(
+            self, positions: Iterable[dict], symbol: str, *, direction: str | None = None,
+    ) -> list[dict]: ...
+
+    def _note_foreign_deals(self, positions: Iterable[dict], symbol: str) -> None: ...
+
+    def _remember_positions_snapshot(
+            self, positions_by_deal: dict[str, dict], read_started_at: float,
+    ) -> None: ...
+
+    def _cached_foreign_deals(self, symbol: str, direction: str) -> list[dict]: ...
+
+    def _exit_blockers(
+            self, positions: Iterable[dict], symbol: str, direction: str,
+            target_deal_ids: Iterable[str],
+    ) -> list[dict]: ...
+
+    def _cached_exit_blockers(
+            self, symbol: str, direction: str, target_deal_ids: Iterable[str],
+    ) -> list[dict]: ...
+
+    def _cached_deal_units(self, deal_ids: set[str], lot_step: float) -> int | None: ...
+
+    def _other_run_deal_ids(self, symbol: str, deal_ids: Iterable[str]) -> list[str]: ...
+
+    @staticmethod
+    def _partial_close_block(foreign: list[dict]) -> str: ...
+
+    def _foreign_block_reported(self, reason: str, key: str, foreign: list[dict]) -> bool: ...
+
+    def _foreign_exit_cached_refusal(
+            self, reason: str, key: str, foreign: list[dict],
+    ) -> bool: ...
+
+    def _foreign_exit_latch_due(self, intent_key: str) -> bool: ...
+
+    def _foreign_exit_unblocked(self, intent_key: str) -> None: ...
+
+    def _foreign_exit_skip(
+            self, *, reason: str, intent_key: str, symbol: str, foreign: list[dict],
+            write: dict, fresh: bool, direction: str, targets: Iterable[str],
+    ) -> OrderSkippedByPlugin: ...
+
+    def _promotion_conflict(
+            self, side: str, deal_id: str, activity_ts: float,
+            positions_by_deal: dict[str, dict] | None,
+    ) -> str | None: ...
+
+    def _report_own_order_netted_foreign_deal(
+            self, wo_row: 'OrderRow', wo_id: str, deal_id: str, conflict: str,
+            positions_by_deal: dict[str, dict] | None,
+    ) -> None: ...
+
+    def _report_foreign_block(
+            self, *, reason: str, key: str, symbol: str, foreign: list[dict],
+            write: dict, latch: bool,
+    ) -> str: ...
+
+    def _foreign_block_skip(
+            self, *, reason: str, intent_key: str, symbol: str, foreign: list[dict],
+            write: dict, latch: bool,
+    ) -> OrderSkippedByPlugin: ...
+
+    def _report_unattributed_opposite(
+            self, *, coid: str, intent_key: str, symbol: str,
+            opposite_deal_ids: list[str], attributable: bool, context: dict,
+    ) -> None: ...
 
     # --- Reconcile (reconcile.py) ---
     def _reconcile_snapshot(

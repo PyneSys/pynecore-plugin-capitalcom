@@ -39,13 +39,19 @@ class _FakeBroker(CapitalCom):
                          ohlcv_dir=ohlcv_dir, config=config)
         self._responses: dict = responses or {}
         self._calls: list = []
+        # A netting-account market entry is sent under the account write
+        # lock, which needs the resolved account identity.
+        self._account_id = 'capitalcom-demo-contract-account'
 
-    async def _call(self, endpoint, *, data=None, method='post'):
+    def _call_serialized_write(self, endpoint, *, data=None, method='post'):
         self._calls.append((endpoint, method, data))
         err = self._responses.get(('error', endpoint, method))
         if err is not None:
             raise err
         return self._responses.get((endpoint, method), {})
+
+    async def _call(self, endpoint, *, data=None, method='post'):
+        return self._call_serialized_write(endpoint, data=data, method=method)
 
 
 def _make_config(**overrides) -> CapitalComConfig:
@@ -250,10 +256,11 @@ def __test_contract_limit_happy__(tmp_path):
     assert row['filled_qty'] == 0.0
     # ``confirm_level`` MUST NOT be persisted for non-filled rows — the
     # activity-poll recovery fallback would otherwise treat the working
-    # order's reservation price as the fill price.
+    # order's reservation price as the fill price. ``order_level`` is the
+    # placed level the working-order guard judges the venue against.
     assert row['extras'] == {
         'kind': 'working', 'order_type': 'limit',
-        'deal_reference': 'ref-lim',
+        'deal_reference': 'ref-lim', 'order_level': 1.20,
     }
     assert out['refs'] == [
         ('deal_id', 'deal-lim'),

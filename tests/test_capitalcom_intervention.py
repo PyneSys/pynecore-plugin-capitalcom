@@ -105,6 +105,8 @@ def _new_broker(ctx, *, responses=None) -> tuple[_FakeBroker, list]:
     broker.symbol = 'EURUSD'
     broker._account_id = 'capitalcom-demo-test-account'
     broker.store_ctx = ctx
+    # The venue publishes every activity at once here; see ``_poll``.
+    broker._level_edit_settle_s = 0.0
     latched: list = []
     broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
         (reason, context, kind))
@@ -162,8 +164,12 @@ async def _drain(agen):
 
 
 def _poll(broker, positions, *, read_started_at=None):
-    """One snapshot reconcile, read after every own write so far."""
+    """One snapshot reconcile, read after every own write so far.
+
+    The poll's activity read follows its snapshot reads, as in ``_poll_once``.
+    """
     started = time.time() if read_started_at is None else read_started_at
+    broker._activity_polled_at = max(started, time.time())
     return asyncio.run(_drain(broker._reconcile_snapshot(
         positions, {}, read_started_at=started,
     )))
@@ -389,6 +395,69 @@ def __test_failsafe_put_hands_the_position_to_the_manager__(tmp_path):
     assert row is not None
     assert (row.extras or {}).get('native_failsafe_owned_at') is not None
     assert 'protection_levels' not in (row.extras or {})
+    store.close()
+
+
+def _failsafe_wrote(broker, ctx) -> None:
+    """A software partial-bracket parent whose stop the native fail-safe manager wrote."""
+    ctx.upsert_order('leg-partial', symbol='EURUSD', side='sell', qty=1.0,
+                     state='partial_bracket_leg',
+                     extras={'leg_kind': 'tp_partial',
+                             'parent_entry_dispatch_ref': 'coid-entry'})
+    broker._responses[('positions/deal-L', 'put')] = {'dealReference': 'fs'}
+    broker._responses[('confirms/fs', 'get')] = {'dealStatus': 'ACCEPTED'}
+    asyncio.run(broker.publish_native_failsafe_sl(NativeBracketSnapshot(
+        parent_entry_dispatch_ref='coid-entry', symbol='EURUSD',
+        parent_side='long', stop_level=1.02, profit_level=None,
+        trailing_stop=None, generation=1,
+    )))
+    ctx.set_order_state('leg-partial', 'cancelled')
+    ctx.close_order('leg-partial')
+
+
+@pytest.mark.parametrize('edited', [
+    _position(stop=1.01, profit=1.20),
+    _position(profit=1.20),
+    _position(stop=1.05),
+])
+def __test_released_failsafe_parent_is_guarded_again_after_the_bots_own_bracket__(
+        tmp_path, edited):
+    """The engine releases a parent from the fail-safe manager before it
+    attaches the bot's own whole-row bracket: from that write on the guard
+    judges the position again, so a moved or removed level is reported."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    _failsafe_wrote(broker, ctx)
+    _attach(broker, tp=1.20, sl=1.05)
+
+    own = _position(stop=1.05, profit=1.20)
+    for _ in range(3):
+        _poll(broker, own)
+    assert latched == []
+    _poll(broker, edited)
+    _poll(broker, edited)
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    store.close()
+
+
+def __test_failsafe_written_parent_without_partial_legs_is_guarded_after_a_restart__(tmp_path):
+    """A restarted engine registers only the parents that still have partial
+    legs: the levels the manager left on such a position are the baseline,
+    and a later edit is judged."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    _failsafe_wrote(broker, ctx)
+
+    restarted, restarted_latched = _new_broker(ctx)
+    manager_levels = _position(stop=1.02)
+    for _ in range(3):
+        _poll(restarted, manager_levels)
+    assert restarted_latched == []
+    assert 'protection_baseline_unverified' not in _event_kinds(ctx)
+    _poll(restarted, _position(stop=1.00))
+    _poll(restarted, _position(stop=1.00))
+    assert len(restarted_latched) == 1
+    assert restarted_latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
     store.close()
 
 
@@ -670,10 +739,19 @@ def __test_user_close_explained_only_by_a_resting_order_is_ambiguous__(tmp_path,
     ctx.upsert_order('coid-short-wo', symbol='EURUSD', side='sell', qty=1.0,
                      state='confirmed', pine_entry_id='Short',
                      exchange_order_id='wo-1', extras={'kind': 'working'})
+    broker._note_venue_clock([{'dateUTC': _now_iso()}], time.time())
+    asyncio.run(_drain(broker._process_activity(
+        [_close_activity(size=1.0, date_utc=_now_iso(-60.0))], _position(size=1.0),
+    )))
+    assert latched == []
+    kinds = _event_kinds(ctx)
+    assert 'user_close_netting_pending' in kinds, "a later order read decides"
+    assert 'user_close_ambiguous_netting' not in kinds
+
+    # A working-order read well after the close no longer shows the order:
+    # it may have executed into the position.
     with caplog.at_level(logging.ERROR):
-        asyncio.run(_drain(broker._process_activity(
-            [_close_activity(size=1.0)], _position(size=1.0),
-        )))
+        _poll(broker, _position(size=1.0))
     assert latched == []
     kinds = _event_kinds(ctx)
     assert 'user_close_ambiguous_netting' in kinds

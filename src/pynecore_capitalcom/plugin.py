@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
@@ -37,9 +38,16 @@ from .exceptions import (
     OrderNotFoundError,
 )
 from .execution import _ExecutionMixin
-from .intervention import _InterventionMixin
+from .foreign import _ForeignExposureMixin
+from .intervention import _LEVEL_EDIT_SETTLE_S, _InterventionMixin
 from .helpers import _WS_VOLUME_BASELINE_BARS, _parse_opening_hours_segment
-from .models import _ActivityCursor, _InstrumentRules, _activity_fingerprint
+from .models import (
+    _ActivityCursor,
+    _ForeignExitBlock,
+    _HeldEditVerdict,
+    _InstrumentRules,
+    _activity_fingerprint,
+)
 from .provider import _ProviderMixin
 from .reconcile import _ReconcileMixin
 from .recovery import _RecoveryMixin
@@ -70,6 +78,7 @@ __all__ = [
 class CapitalCom(
     _RecoveryMixin,
     _InterventionMixin,
+    _ForeignExposureMixin,
     _ReconcileMixin,
     _BracketMixin,
     _ActivityMixin,
@@ -277,4 +286,27 @@ class CapitalCom(
         self._protection_sizes: dict[str, float] = {}
         self._protection_in_flight: dict[str, int] = {}
         self._protection_written_at: dict[str, float] = {}
+        self._own_writes_in_flight: dict[str, int] = {}
         self._failsafe_deal_ids: set[str] = set()
+        self._manual_close_reports_sent: set[str] = set()
+        self._venue_clock_samples: collections.deque[tuple[float, float, float]] = (
+            collections.deque())
+        self._own_close_sends: dict[float, float] = {}
+        self._level_edits: dict[str, dict[str, tuple[float, str, float]]] = {}
+        self._netting_pending: dict[str, tuple[float, dict]] = {}
+        self._working_attributes_seen: dict[str, tuple] = {}
+        self._working_attributes_reported: set[tuple[str, tuple]] = set()
+        self._held_edit_verdicts: dict[str, _HeldEditVerdict] = {}
+        self._level_edit_settle_s: float = _LEVEL_EDIT_SETTLE_S
+        self._held_level_views: dict[str, float] = {}
+        self._held_level_changes: dict[str, tuple[ProtectionLevels, int]] = {}
+        self._judged_read_started_at: float | None = None
+        # Foreign exposure on the run's epic (see ``foreign.py``).
+        self._foreign_deals_logged: set[str] = set()
+        self._foreign_blocks_reported: set[tuple] = set()
+        self._positions_snapshot: tuple[float, dict[str, dict]] | None = None
+        self._seen_position_deals: dict[str, tuple[float, str, float]] = {}
+        self._foreign_exit_blocks: dict[str, _ForeignExitBlock] = {}
+        self._foreign_exit_latched: set[str] = set()
+        self._netting_retired_orders: dict[str, dict] | None = None
+        self._residual_deals_reported: set[str] = set()

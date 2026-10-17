@@ -12,6 +12,8 @@ These hooks live in their own module (rather than inside ``execution.py``)
 so the dispatch surface stays small and the ~2700-line execution mix-in
 shrinks as each path migrates.
 """
+import logging
+from dataclasses import replace
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
@@ -19,7 +21,6 @@ import httpx
 
 from pynecore.core.broker.exceptions import (
     BrokerError,
-    BrokerManualInterventionError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     InsufficientMarginError,
@@ -54,6 +55,7 @@ from .helpers import (
     _extract_reject_reason,
     _is_funds_reject,
     _is_market_closed_reject,
+    _venue_rendered_level,
     _wire_float,
     _wire_id,
 )
@@ -63,6 +65,8 @@ if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow, RunContext
 
     from .models import _InstrumentRules
+
+logger = logging.getLogger(__name__)
 
 
 class _CapitalComModifyEntryHooks:
@@ -94,6 +98,9 @@ class _CapitalComModifyEntryHooks:
         self._target_row = target_row
         self._new_level = new_level
         self._order_type = order_type
+        # The grid level the venue kept an off-grid amend at, once its
+        # confirm echoed one (:func:`_venue_rendered_level`).
+        self._rendered_level: float | None = None
 
     async def submit_amend(
             self, *, coid: str, target_coid: str,
@@ -135,64 +142,89 @@ class _CapitalComModifyEntryHooks:
 
         deal_id = self._target_row.exchange_order_id
         body = {'level': self._new_level}
+        old_level = (
+            old_intent.limit
+            if old_intent.order_type == OrderType.LIMIT else old_intent.stop
+        )
 
-        try:
-            put_resp = await self._plugin.call_api(
-                f'workingorders/{deal_id}', data=body, method='put',
-            )
-        except (httpx.TimeoutException, httpx.RequestError,
-                ConnectionError, ExchangeConnectionError) as net:
-            raise OrderDispositionUnknownError(
-                f"Capital PUT workingorders/{deal_id} ambiguous: {net}",
-                client_order_id=coid,
-                cause=net if isinstance(net, Exception) else None,
-                predecessor_cancel_ids=(),
-            ) from net
+        # The level is the bot's own order state: the working-order guard
+        # expects it before the PUT leaves, so the venue showing it is never
+        # read as someone else's edit, and the venue still showing the old
+        # level is never read as one either.
+        with self._plugin.working_order_write(
+                self._target_row, self._new_level, previous_level=old_level,
+        ) as guard_write:
+            try:
+                put_resp = await guard_write.send(self._plugin.call_api(
+                    f'workingorders/{deal_id}', data=body, method='put',
+                ))
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError) as net:
+                raise OrderDispositionUnknownError(
+                    f"Capital PUT workingorders/{deal_id} ambiguous: {net}",
+                    client_order_id=coid,
+                    cause=net if isinstance(net, Exception) else None,
+                    predecessor_cancel_ids=(),
+                ) from net
 
-        deal_ref = put_resp.get('dealReference')
-        if not deal_ref:
-            raise OrderDispositionUnknownError(
-                f"Capital PUT workingorders/{deal_id}: no dealReference "
-                f"in response",
-                client_order_id=coid,
-                predecessor_cancel_ids=(),
-            )
-
-        try:
-            confirm = await self._plugin.call_api(
-f'confirms/{deal_ref}', method='get',
-            )
-        except (httpx.TimeoutException, httpx.RequestError,
-                ConnectionError, ExchangeConnectionError) as net:
-            raise OrderDispositionUnknownError(
-                f"Capital GET confirms/{deal_ref} ambiguous after "
-                f"working-order amend: {net}",
-                client_order_id=coid,
-                cause=net if isinstance(net, Exception) else None,
-                predecessor_cancel_ids=(),
-            ) from net
-
-        deal_status = (confirm.get('dealStatus') or '').upper()
-        if deal_status == 'REJECTED':
-            reason = _extract_reject_reason(confirm)
-            if _is_market_closed_reject(reason):
-                raise MarketClosedError(
-                    f"Capital working-order amend declined, market closed: {reason}",
+            deal_ref = put_resp.get('dealReference')
+            if not deal_ref:
+                raise OrderDispositionUnknownError(
+                    f"Capital PUT workingorders/{deal_id}: no dealReference "
+                    f"in response",
+                    client_order_id=coid,
+                    predecessor_cancel_ids=(),
                 )
-            if _is_funds_reject(reason):
-                raise InsufficientMarginError(
-                    f"Capital reject on working-order amend: {reason}",
-                )
-            raise ExchangeOrderRejectedError(
-                f"Capital confirm REJECTED on working-order amend: {reason}",
-            )
 
-        echoed_level_raw = confirm.get('level')
-        if echoed_level_raw is None:
-            echoed_level_raw = put_resp.get('level')
-        echoed_level = _wire_float(echoed_level_raw, finite=True)
-        if echoed_level is None:
-            echoed_level = self._new_level
+            try:
+                confirm = await self._plugin.call_api(
+                    f'confirms/{deal_ref}', method='get',
+                )
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError) as net:
+                raise OrderDispositionUnknownError(
+                    f"Capital GET confirms/{deal_ref} ambiguous after "
+                    f"working-order amend: {net}",
+                    client_order_id=coid,
+                    cause=net if isinstance(net, Exception) else None,
+                    predecessor_cancel_ids=(),
+                ) from net
+
+            deal_status = (confirm.get('dealStatus') or '').upper()
+            if deal_status == 'REJECTED':
+                guard_write.refused()
+                reason = _extract_reject_reason(confirm)
+                if _is_market_closed_reject(reason):
+                    raise MarketClosedError(
+                        f"Capital working-order amend declined, market closed: {reason}",
+                    )
+                if _is_funds_reject(reason):
+                    raise InsufficientMarginError(
+                        f"Capital reject on working-order amend: {reason}",
+                    )
+                raise ExchangeOrderRejectedError(
+                    f"Capital confirm REJECTED on working-order amend: {reason}",
+                )
+
+            echoed_level_raw = confirm.get('level')
+            if echoed_level_raw is None:
+                echoed_level_raw = put_resp.get('level')
+            echoed_level = _wire_float(echoed_level_raw, finite=True)
+            if echoed_level is None:
+                echoed_level = self._new_level
+            # The venue keeps a level between two ticks at a grid neighbour:
+            # its echo of this amend is the level the guard accepts.
+            try:
+                tick = (await self._plugin.instrument_rules(self._target_row.symbol)).price_tick
+            except (BrokerError, CapitalComError, httpx.HTTPError):
+                tick = 0.0
+            rendered = _venue_rendered_level(echoed_level_raw, self._new_level, tick)
+            self._rendered_level = rendered
+            if rendered is not None:
+                levels = guard_write.levels
+                guard_write.levels = (replace(levels, stop=rendered) if levels.stop is not None
+                                      else replace(levels, limit=rendered))
+            guard_write.accepted()
 
         # Mirror the new level onto the target row so the engine sees it
         # immediately. The target row lives outside the journal's
@@ -225,9 +257,10 @@ f'confirms/{deal_ref}', method='get',
         the latest target row directly from the store so its echoed
         level (mirrored by :meth:`submit_amend`) is included.
         """
-        if abs(outcome.new_level - self._new_level) > 1e-9:
+        expected = self._rendered_level if self._rendered_level is not None else self._new_level
+        if abs(outcome.new_level - expected) > 1e-9:
             raise RuntimeError(
-                f"Modify-entry outcome mismatch: expected {self._new_level!r}, "
+                f"Modify-entry outcome mismatch: expected {expected!r}, "
                 f"got {outcome.new_level!r}"
             )
         if row.symbol != new_intent.symbol:
@@ -593,9 +626,10 @@ class _CapitalComCancelHooks:
             # Working order: real DELETE.
             target_already_gone = False
             try:
-                await self._plugin.call_api(
-    f'workingorders/{row.exchange_order_id}', method='delete',
-                )
+                with self._plugin.own_cancel(row.client_order_id) as sent_at:
+                    await self._plugin.call_api(
+                        f'workingorders/{row.exchange_order_id}', method='delete',
+                    )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
                 raise OrderDispositionUnknownError(
@@ -613,6 +647,10 @@ class _CapitalComCancelHooks:
                         exchange_order_id=row.exchange_order_id,
                         intent_key=intent.intent_key,
                     )
+            else:
+                # The venue still had the order resting when it took the
+                # DELETE: evidence the close attribution may need later.
+                self._plugin.stamp_own_cancel_accepted(row.client_order_id, sent_at)
             if store_ctx is not None:
                 store_ctx.close_order(row.client_order_id)
                 store_ctx.log_event(
@@ -844,10 +882,19 @@ class _CapitalComCloseHooks:
         An accepted confirm with an unchanged target is parked as
         :class:`OrderDispositionUnknownError` for restart recovery; acceptance
         alone is not proof that netting settled. A fresh reverse leg attributable
-        to this POST is deleted, then the close is likewise parked rather than
-        reported as filled. Unattributable opposite exposure or any other target
-        mismatch requires manual intervention. A rejected confirm follows the
-        normal exchange-reject path.
+        to this POST — a new opposite deal the confirm names, or the one deal
+        the confirm reports ``OPENED`` that ``/positions`` does not list yet —
+        is deleted, then the close is likewise parked rather than reported as
+        filled; a DELETE the venue cannot route yet is repeated by the poll. A
+        target that something else moved meanwhile (a TP / SL fill, someone
+        else's reduction) parks the close as well: the own-close record
+        matches this POST's activity later
+        (``_resolve_partial_close_dispositions``). Opposite exposure the confirm
+        does not attribute to this POST is not deleted here: it is reported and
+        the close parked (``report_unattributed_opposite``), so the process
+        stays alive and the target's change is judged from its activities; the
+        close settles once the fill-report grace passes without an activity of
+        its own. A rejected confirm follows the normal exchange-reject path.
         """
         store_ctx = self._plugin.store_ctx
         rules = self._rules
@@ -870,6 +917,21 @@ class _CapitalComCloseHooks:
             with self._plugin.own_close(
                     self._target_deal_ids, full=False, size=quantized_qty,
             ) as own_close:
+                # The own-close record on the target is how a parked command
+                # learns its outcome later: the venue's activity for this POST
+                # is matched to the record, whatever else reduced the target
+                # meanwhile. Named before the POST leaves, so a process that
+                # dies with the request in flight still finds it.
+                if store_ctx is not None:
+                    target_row = store_ctx.find_by_ref(
+                        'deal_id', next(iter(self._target_deal_ids)),
+                    )
+                    existing = store_ctx.get_order(coid)
+                    merged_extras = dict((existing.extras or {}) if existing else {})
+                    merged_extras['own_close_sent_at'] = own_close.sent_at
+                    if target_row is not None:
+                        merged_extras['target_coid'] = target_row.client_order_id
+                    store_ctx.upsert_order(coid, extras=merged_extras)
                 post_resp, pre_rows = await self._plugin.submit_exclusive_partial_close(
                     coid=coid,
                     symbol=intent.symbol,
@@ -925,6 +987,9 @@ class _CapitalComCloseHooks:
         # the new position's ``dealId``), giving a deterministic
         # discriminator for the corrective DELETE — no clock involved.
         confirm_deal_ids: set[str] = set()
+        # ``dealId``s the confirm reports this POST OPENED: a fresh reverse
+        # leg, even before ``/positions`` lists it.
+        confirm_opened_ids: set[str] = set()
         if deal_ref:
             try:
                 confirm = await self._plugin.call_api(
@@ -981,9 +1046,20 @@ class _CapitalComCloseHooks:
                     affected_id = _wire_id(affected.get('dealId'))
                     if affected_id is not None:
                         confirm_deal_ids.add(affected_id)
+                        if str(affected.get('status') or '').upper() == 'OPENED':
+                            confirm_opened_ids.add(affected_id)
                 top_deal_id = _wire_id(confirm.get('dealId'))
                 if top_deal_id is not None:
                     confirm_deal_ids.add(top_deal_id)
+
+        if store_ctx is not None:
+            # Without a confirm naming the deals this POST touched, the poll
+            # attributes its reverse leg by its fit once the activity feed
+            # shows the POST reduced nothing (``_unconfirmed_reverse_leg``).
+            existing = store_ctx.get_order(coid)
+            merged_extras = dict((existing.extras or {}) if existing else {})
+            merged_extras['confirm_deal_ids'] = sorted(confirm_deal_ids)
+            store_ctx.upsert_order(coid, extras=merged_extras)
 
         target_deal_id = next(iter(self._target_deal_ids))
         expected_post_units = pre_target_units - intent_units
@@ -997,30 +1073,34 @@ class _CapitalComCloseHooks:
 
         post_rows = await position_snapshot()
         opposite_rows: list[dict] = []
-        attributed_reverse: dict | None = None
-        unresolved_opposite = False
+        # A fresh opposite deal the confirm names is this POST's own reverse leg.
+        reverse_id: str | None = None
         for raw in post_rows:
             position = raw.get('position') or {}
             if (position.get('direction') or '').upper() != opposite_dir:
                 continue
             opposite_rows.append(position)
             deal_id = _wire_id(position.get('dealId'))
-            if deal_id is None or deal_id in pre_deal_ids:
-                unresolved_opposite = True
-                continue
-            if confirm_deal_ids and deal_id in confirm_deal_ids:
-                attributed_reverse = position
+            if (deal_id is not None and deal_id not in pre_deal_ids
+                    and deal_id in confirm_deal_ids):
+                reverse_id = deal_id
                 break
-            unresolved_opposite = True
+        if reverse_id is None:
+            # ``/positions`` lists a fresh deal seconds late: the deal the
+            # confirm says this POST opened is its reverse leg all the same.
+            # Left alone it would stay on the venue unbooked, the bot's own
+            # exposure taken for someone else's.
+            listed = {_wire_id((raw.get('position') or {}).get('dealId')) for raw in post_rows}
+            unlisted_opened = sorted(
+                deal_id for deal_id in confirm_opened_ids
+                if deal_id not in pre_deal_ids and deal_id != target_deal_id
+                and deal_id not in listed
+            )
+            if len(unlisted_opened) == 1:
+                reverse_id = unlisted_opened[0]
 
         corrected_reverse_id: str | None = None
-        if attributed_reverse is not None:
-            reverse_id = _wire_id(attributed_reverse.get('dealId'))
-            if reverse_id is None:
-                raise BrokerManualInterventionError(
-                    "Partial close reverse leg has no valid dealId",
-                    intent_key=intent.intent_key,
-                )
+        if reverse_id is not None:
             corrected_reverse_id = reverse_id
             if store_ctx is not None:
                 existing = store_ctx.get_order(coid)
@@ -1034,12 +1114,17 @@ class _CapitalComCloseHooks:
                     exchange_order_id=reverse_id,
                     intent_key=intent.intent_key,
                 )
+            delete_landed = True
             try:
                 await self._plugin.call_api(
                     f'positions/{reverse_id}', method='delete',
                 )
             except OrderNotFoundError:
-                pass
+                # Already gone, or not yet routable: a deal fresh from a POST
+                # was measured unknown to ``positions/{dealId}`` for seconds.
+                # The poll repeats the DELETE while ``/positions`` lists it
+                # (``_resolve_partial_close_dispositions``).
+                delete_landed = False
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as net:
                 raise OrderDispositionUnknownError(
@@ -1051,14 +1136,15 @@ class _CapitalComCloseHooks:
             if store_ctx is not None:
                 existing = store_ctx.get_order(coid)
                 merged_extras = dict((existing.extras or {}) if existing else {})
-                merged_extras['corrective_delete_pending'] = False
+                merged_extras['corrective_delete_pending'] = not delete_landed
                 store_ctx.upsert_order(coid, extras=merged_extras)
                 store_ctx.log_event(
                     'partial_close_corrective_delete',
                     client_order_id=coid,
                     exchange_order_id=reverse_id,
                     intent_key=intent.intent_key,
-                    payload={'reason': 'race_reverse_leg_corrected'},
+                    payload={'reason': 'race_reverse_leg_corrected',
+                             'delete_landed': delete_landed},
                 )
             post_rows = await position_snapshot()
             opposite_rows = [
@@ -1066,18 +1152,13 @@ class _CapitalComCloseHooks:
                 if ((raw.get('position') or {}).get('direction') or '').upper()
                 == opposite_dir
             ]
-        elif unresolved_opposite:
-            raise BrokerManualInterventionError(
-                "Partial close race detected but reverse leg cannot be "
-                "confidently identified",
-                intent_key=intent.intent_key,
-                context={
-                    'coid': coid,
-                    'pre_target_units': pre_target_units,
-                    'intent_units': intent_units,
-                    'symbol': intent.symbol,
-                },
-            )
+        # The corrected reverse leg may still show while its DELETE settles;
+        # any other opposite deal is one this POST cannot be shown to own.
+        unattributed_opposite = [
+            position for position in opposite_rows
+            if corrected_reverse_id is None
+            or _wire_id(position.get('dealId')) != corrected_reverse_id
+        ]
 
         target_positions = [
             raw.get('position') or {} for raw in post_rows
@@ -1123,29 +1204,74 @@ class _CapitalComCloseHooks:
                 "deal has not reached the expected residual yet",
                 client_order_id=coid,
             )
-        elif corrected_reverse_id is not None and not opposite_rows:
+        elif unattributed_opposite:
+            # Opposite exposure this POST cannot be shown to own: its own
+            # reverse leg the confirm did not name, or someone else's opposite
+            # POST that consumed the target first. Never deleted; the close is
+            # parked and the target's change is judged from its activities.
+            self._plugin.report_unattributed_opposite(
+                coid=coid,
+                intent_key=intent.intent_key,
+                symbol=intent.symbol,
+                opposite_deal_ids=sorted(
+                    str(_wire_id(position.get('dealId')))
+                    for position in unattributed_opposite
+                ),
+                attributable=bool(confirm_deal_ids),
+                context={
+                    'target_deal_id': target_deal_id,
+                    'target_present': len(target_positions) == 1,
+                    'target_direction': target_direction,
+                    'target_units': target_units,
+                    'pre_target_units': pre_target_units,
+                    'expected_units': expected_post_units,
+                    'confirm_deal_ids': sorted(confirm_deal_ids),
+                    'corrected_reverse_deal_id': corrected_reverse_id,
+                },
+            )
+            raise OrderDispositionUnknownError(
+                "Capital partial close: opposite exposure appeared that this "
+                "POST cannot be shown to own; parked for activity attribution",
+                client_order_id=coid,
+            )
+        elif corrected_reverse_id is not None:
             raise OrderDispositionUnknownError(
                 "Capital partial close corrected its reverse leg but the exact "
                 "target deal disposition remains unknown",
                 client_order_id=coid,
             )
         else:
-            raise BrokerManualInterventionError(
-                "Partial close did not prove the exact target deal at the "
-                "expected residual",
-                intent_key=intent.intent_key,
-                context={
-                    'coid': coid,
-                    'target_deal_id': target_deal_id,
-                    'target_direction': target_direction,
-                    'target_units': target_units,
-                    'expected_units': expected_post_units,
-                    'opposite_deal_ids': [
-                        _wire_id(position.get('dealId'))
-                        for position in opposite_rows
-                    ],
-                    'symbol': intent.symbol,
-                },
+            # Something else moved the target between the snapshots: a TP /
+            # SL fill, a dealing-desk or someone else's reduction. Each of
+            # them publishes its own activity on the target, and the own-close
+            # record tells this POST's activity apart; the command stays
+            # parked until that evidence settles it.
+            divergence = {
+                'target_deal_id': target_deal_id,
+                'target_present': len(target_positions) == 1,
+                'target_direction': target_direction,
+                'target_units': target_units,
+                'pre_target_units': pre_target_units,
+                'expected_units': expected_post_units,
+                'symbol': intent.symbol,
+            }
+            logger.error(
+                "partial close %s of %s: the target deal is not at the expected "
+                "residual (%s); parked until the activity stream settles it",
+                coid, intent.symbol, divergence,
+            )
+            if store_ctx is not None:
+                store_ctx.log_event(
+                    'partial_close_target_diverged',
+                    client_order_id=coid,
+                    exchange_order_id=target_deal_id,
+                    intent_key=intent.intent_key,
+                    payload=divergence,
+                )
+            raise OrderDispositionUnknownError(
+                "Capital partial close: the exact target deal diverged from the "
+                "expected residual; parked for activity attribution",
+                client_order_id=coid,
             )
 
         return CloseOutcome(

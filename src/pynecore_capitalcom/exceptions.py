@@ -131,6 +131,39 @@ class InvalidTakeProfitMaxValueError(ExchangeOrderRejectedError):
         self.max_value = max_value
 
 
+class ForeignDealBlocksWriteError(ExchangeOrderRejectedError):
+    """A netting ``POST /positions`` was refused before it left: it could net a deal
+    this run does not own.
+
+    The reduce POST and an opposite market entry cannot name a ``dealId``: the
+    netting account applies them FIFO to the oldest deal on the side they
+    reduce. While a deal someone else opened sits on that side, the POST could
+    consume it, so the plugin refuses it instead of touching another party's
+    exposure. Raised inside the dispatch journal (the command row is marked
+    rejected and stays as the audit trail) and turned into a non-halting skip at
+    the ``execute_*`` boundary.
+
+    :ivar reason: Stable token: ``'foreign_deal_blocks_partial_close'`` or
+        ``'foreign_deal_blocks_opposite_entry'``.
+    :ivar foreign_deals: The blocking deals, one dict per deal with ``deal_id``,
+        ``direction``, ``size`` and ``created``.
+    """
+
+    def __init__(self, message: str, *, reason: str, foreign_deals: list[dict]) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.foreign_deals = foreign_deals
+
+
+class PositionSnapshotUnavailableError(ExchangeOrderRejectedError):
+    """The ``GET /positions`` read a netting POST needs first did not complete.
+
+    Nothing was sent: the POST is only issued after the snapshot proved it
+    cannot net a foreign deal. Classified as a refusal so the entry is dropped
+    for this bar and re-evaluated on the next one, never parked as ambiguous.
+    """
+
+
 class OrderNotFoundError(ExchangeOrderRejectedError):
     """Capital.com does not know the ``dealId`` / ``dealReference`` the plugin
     referenced — the order was cancelled, filled and purged, or never

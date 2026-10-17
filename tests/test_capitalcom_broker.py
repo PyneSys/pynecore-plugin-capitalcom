@@ -1952,10 +1952,12 @@ def __test_feed_observed_no_sink_is_silent__(tmp_path):
     store.close()
 
 
-def __test_execute_close_partial_race_outside_window_halts__(tmp_path):
+def __test_execute_close_partial_race_unattributed_opposite_parks__(tmp_path):
     # Pre-snapshot = 1 row size=2.0. POST partial close size=1.0.
     # Post-snapshot = 2 rows (original + fresh opposite) — expected 1 unit,
-    # but createdDateUTC is stale (outside ±3s) → manual intervention.
+    # and the confirm names no deal: the opposite row may be the bot's own
+    # reverse leg or someone else's. Never deleted, the process is not halted
+    # and nothing is latched: the close parks for activity attribution.
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions', 'get'): [
             {'positions': [
@@ -1977,6 +1979,8 @@ def __test_execute_close_partial_race_outside_window_halts__(tmp_path):
         ('positions', 'post'): {'dealReference': 'x'},
         ('confirms/x', 'get'): {'dealStatus': 'ACCEPTED'},
     })
+    latched: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(kind)
     ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
                      state='confirmed', pine_entry_id='Long',
                      exchange_order_id='orig', extras={'kind': 'position'})
@@ -1986,8 +1990,10 @@ def __test_execute_close_partial_race_outside_window_halts__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(BrokerManualInterventionError):
+    with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.execute_close(env))
+    assert not any(c[1] == 'delete' for c in broker._calls)
+    assert latched == []
     store.close()
 
 
@@ -7623,8 +7629,11 @@ def __test_modify_exit_pending_trail_sl_leg_carries_pending_state__(tmp_path):
     monitor_puts = [c for c in broker._calls
                     if c[0] == 'positions/deal-L' and c[1] == 'put']
     assert len(monitor_puts) == 1
+    # PUT is full replacement: the bot's own take-profit rides along, taken
+    # from its TP leg (the snapshot above carries no ``limitLevel``).
     assert monitor_puts[0][2] == {
         'trailingStop': True, 'stopDistance': pytest.approx(0.00500),
+        'profitLevel': pytest.approx(1.18250),
     }
     store.close()
 
@@ -8546,6 +8555,8 @@ def __test_process_activity_priceless_close_is_deferred_not_suppressed__(tmp_pat
         # No usable price anywhere on the close activity.
         'details': {'direction': 'BUY', 'size': 100.0},
     }
+    # The close is the bot's own reversal DELETE, recorded before it left.
+    _seed_own_close(ctx, short_coid, activity)
 
     async def drain():
         out = []
@@ -8949,6 +8960,7 @@ def __test_process_activity_manual_close_zero_level_defers__(tmp_path):
     vanished deal via the missing-pending grace window.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     sl_price = 1.17636  # the bracket SL level a buggy fallback would surface
     e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx, sl_price=sl_price)
     entry_row = ctx.get_order(e_coid)
@@ -8990,6 +9002,9 @@ def __test_process_activity_manual_close_zero_level_defers__(tmp_path):
             f"row {coid!r} must NOT carry natural_close_at after a "
             f"deferred close — the stamp would suppress reconcile recovery"
         )
+    # No own close explains the USER close: the intervention is reported at
+    # once, while the priceless fill itself waits for its price.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -9004,6 +9019,7 @@ def __test_process_activity_manual_close_with_snapshot_still_defers__(tmp_path):
     defer rather than emit at the entry price.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx)
     entry_row = ctx.get_order(e_coid)
     assert entry_row is not None
@@ -9046,6 +9062,9 @@ def __test_process_activity_manual_close_with_snapshot_still_defers__(tmp_path):
             f"row {coid!r} must NOT carry natural_close_at after a "
             f"deferred close"
         )
+    # No own close explains the USER close: the intervention is reported at
+    # once, while the priceless fill itself waits for its price.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -9148,6 +9167,7 @@ def __test_process_activity_manual_partial_close_zero_level_defers_when_proxy_un
         ('error', 'markets/EURUSD', 'get'):
             httpx.TimeoutException("read timeout"),
     })
+    quarantined = _capture_quarantine(broker)
     e_coid, _tp_coid, _sl_coid = _seed_bracket_setup(ctx, qty=1.0)
     entry_row = ctx.get_order(e_coid)
     assert entry_row is not None
@@ -9180,6 +9200,9 @@ def __test_process_activity_manual_partial_close_zero_level_defers_when_proxy_un
         "deferred activity (proxy unavailable) must remain retryable "
         "on the next poll — fingerprint must NOT be committed"
     )
+    # No own close explains the USER close: the intervention is reported at
+    # once, while the priceless fill itself waits for its price.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -9523,6 +9546,7 @@ def __test_process_activity_defer_does_not_advance_cursor_past_later_rows__(tmp_
     deferred row — silently desyncing the strategy from the broker.
     """
     broker, store, ctx = _make_broker(tmp_path)
+    quarantined = _capture_quarantine(broker)
     # Setup A: a stamped entry that will receive a zero-priced manual close.
     e_coid, _tp_coid, _sl_coid = _seed_bracket_setup(ctx)
     entry_row = ctx.get_order(e_coid)
@@ -9580,6 +9604,9 @@ def __test_process_activity_defer_does_not_advance_cursor_past_later_rows__(tmp_
         "MUST be added to seen_fingerprints to avoid re-emitting on the "
         "next poll (the cursor clamp alone would not dedup it)"
     )
+    # No own close explains the USER close: the intervention is reported at
+    # once, while the priceless fill itself waits for its price.
+    assert len(quarantined) == 1
     store.close()
 
 
@@ -12529,14 +12556,17 @@ def __test_call_token_rotation_recomputes_expiry_from_jwt__(monkeypatch):
 def __test_recover_retires_confirmed_row_with_no_exchange_counterpart__(
         tmp_path, caplog,
 ):
-    """A ``confirmed`` row whose ``dealId`` is gone gets retired silently.
+    """A ``confirmed`` row whose ``dealId`` is gone gets retired, never reported.
 
     Reproduces the user-reported case: the bot was stopped, the
     operator closed the position manually on the exchange UI, then
     started the bot again. The BrokerStore still carries the entry row
     plus its TP/SL bracket legs, but ``/positions`` and
     ``/workingorders`` return empty. Without the retire pass the runtime
-    reconcile would later raise ``UnexpectedCancelError`` and halt.
+    reconcile would later raise ``UnexpectedCancelError`` and halt. The
+    activity history shows no close of the filled position, so nothing
+    shows who closed it: ERROR plus a ``position_vanished_unattributed``
+    audit event for the position, plain retirement for its legs.
     """
     import logging as _logging
 
@@ -12587,9 +12617,14 @@ def __test_recover_retires_confirmed_row_with_no_exchange_counterpart__(
             "WHERE kind = 'startup_orphan_retired' "
             "ORDER BY client_order_id",
         ).fetchall()
-        assert {r['client_order_id'] for r in retired} == {
-            'entry-coid', 'tp-coid', 'sl-coid',
-        }
+        assert {r['client_order_id'] for r in retired} == {'tp-coid', 'sl-coid'}
+        vanished = store._conn.execute(
+            "SELECT client_order_id FROM events "
+            "WHERE kind = 'position_vanished_unattributed'",
+        ).fetchall()
+        assert [r['client_order_id'] for r in vanished] == ['entry-coid']
+        assert any(rec.levelno == _logging.ERROR and 'deal-gone-1' in rec.getMessage()
+                   for rec in caplog.records)
 
         # One [BROKER] INFO summary line.
         summary = [
@@ -13988,11 +14023,23 @@ def __test_native_failsafe_fans_over_hedging_legs__(tmp_path):
              'position': {'dealId': 'B', 'direction': 'BUY', 'size': 2.0,
                           'level': 1.12,
                           'createdDateUTC': '2026-07-10T10:00:01.000'}},
+            # Someone else's long on the same epic: never the bot's to protect.
+            {'market': {'epic': 'EURUSD'},
+             'position': {'dealId': 'F', 'direction': 'BUY', 'size': 5.0,
+                          'level': 1.11,
+                          'createdDateUTC': '2026-07-10T09:00:00.000'}},
         ]},
         ('positions/A', 'put'): {},
         ('positions/B', 'put'): {},
     })
     _hedged(broker)
+    for coid, deal_id, qty in (('coid-entry', 'A', 1.0), ('coid-entry-2', 'B', 2.0)):
+        ctx.upsert_order(
+            coid, symbol='EURUSD', side='buy', qty=qty, state='confirmed',
+            pine_entry_id='Long', exchange_order_id=deal_id, filled_qty=qty,
+            extras={'kind': 'position', 'entry_filled_at': 1700000000.0},
+        )
+        ctx.add_ref(coid, 'deal_id', deal_id)
     snapshot = NativeBracketSnapshot(
         parent_entry_dispatch_ref='coid-entry', symbol='EURUSD',
         parent_side='long', stop_level=1.05, profit_level=None,
@@ -14247,8 +14294,10 @@ def __test_missing_position_probe_follows_the_workingorder_backlink__(tmp_path):
     store.close()
 
 
-def __test_missing_position_probe_no_backlink_confirms_cancel__(tmp_path):
-    """A filled row whose deal is gone AND unlinked is a real cancel."""
+def __test_missing_position_probe_no_backlink_retires_unattributed__(tmp_path):
+    """A filled row whose deal is gone AND unlinked, with no close activity,
+    is retired with an ERROR and an audit event — never reported as a cancel
+    or an intervention: nothing shows who closed it."""
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('error', 'positions/old-1', 'get'): OrderNotFoundError(
             "API error occured: error.not-found.dealId", ref_type='deal_id',
@@ -14261,8 +14310,15 @@ def __test_missing_position_probe_no_backlink_confirms_cancel__(tmp_path):
                      extras={'kind': 'position'})
     row = ctx.get_order('coid-m')
     assert row is not None
+    quarantined = _capture_quarantine(broker)
     verdict = asyncio.run(broker._confirm_missing_cancelled(row))
-    assert verdict.resolution is MissingResolution.CANCELLED
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert quarantined == []
+    kinds = [r['kind'] for r in ctx._store._conn.execute(
+        "SELECT kind FROM events WHERE run_instance_id = ?",
+        (ctx.run_instance_id,),
+    )]
+    assert 'position_vanished_unattributed' in kinds
     store.close()
 
 
@@ -14569,11 +14625,15 @@ def __test_call_refuses_write_when_quarantine_latches_during_refresh__(monkeypat
 
 
 def __test_trailing_monitor_activation_keeps_live_take_profit__(tmp_path):
-    """The full-replacement activation PUT carries the live ``profitLevel``."""
+    """The full-replacement activation PUT carries the bot's own take-profit."""
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions/deal-L', 'put'): {'dealReference': 'putref'},
         ('confirms/putref', 'get'): {'dealStatus': 'ACCEPTED'},
     })
+    ctx.upsert_order('tp-coid', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', tp_level=1.17,
+                     extras={'leg_kind': 'tp', 'parent_deal_id': 'deal-L'})
     ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
                      state='confirmed', pine_entry_id='Long',
                      from_entry='Long', trailing_distance=0.005,

@@ -28,6 +28,7 @@ since the resolution depends on the parent position's live state.
 State touched: BrokerStore through ``self.store_ctx``,
 ``_activity_cursor`` (rebuilt).
 """
+import logging
 from abc import ABC
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from time import time as epoch_time
 from typing import TYPE_CHECKING, cast
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
+from pynecore.core.broker.models import LegType
 from pynecore.core.broker.journal import (
     DispatchJournal,
     EntryDispatchHooks,
@@ -42,30 +44,47 @@ from pynecore.core.broker.journal import (
     ResumeOutcome,
 )
 from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_WORKING,
     KIND_CANCEL,
     KIND_FULL_CLOSE,
     KIND_MODIFY_ENTRY,
     KIND_MODIFY_EXIT,
     KIND_PARTIAL_CLOSE,
-    adopt_untracked_position_legs,
 )
-from pynecore.lib.log import broker_info
+from pynecore.lib.log import broker_info, broker_warning
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import OrderNotFoundError
 from .helpers import (
+    BOOKED_CLOSES_RETAINED,
+    CLOSE_VERDICT_FOREIGN,
+    CLOSE_VERDICT_VENUE,
+    EXTERNAL_REDUCTION_VERDICTS,
+    EXTRAS_KEY_BOOKED_CLOSES,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
     _extract_reject_reason,
     _parse_iso_timestamp,
-    _position_legs_from_payload,
+    _retire_parked_partial_close_exposure,
     _wire_float,
     _wire_id,
     _wire_int,
 )
+from .models import _activity_fingerprint, _close_identity
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
+
+logger = logging.getLogger(__name__)
+
+#: Fill legs that reduce a position: what a close activity books.
+_CLOSE_LEG_TYPES = frozenset({
+    LegType.CLOSE, LegType.TAKE_PROFIT, LegType.STOP_LOSS, LegType.TRAILING_STOP,
+})
+
+#: ``WORKING_ORDER`` activity statuses that end a resting order.
+_WORKING_ORDER_ENDS = frozenset({'CANCELLED', 'DELETED', 'EXPIRED', 'REJECTED', 'EXECUTED'})
 
 
 class _RecoveryMixin(_CapitalComBase, ABC):
@@ -176,6 +195,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         """
         if self.store_ctx is None:
             return
+        positions_read_started_at = epoch_time()
         positions_resp = await self._call('positions', method='get')
         working_resp = await self._call('workingorders', method='get')
         activity_resp = await self._call(
@@ -183,6 +203,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             data={'lastPeriod': 86400, 'detailed': 'true'},
             method='get',
         )
+        activity_read_at = epoch_time()
 
         pos_by_ref: dict[str, dict] = {}
         pos_by_deal_id: dict[str, dict] = {}
@@ -243,6 +264,30 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             r.coid for r in resolutions if r.status == 'confirmed'
         }
 
+        # A fresh process: closes of own positions the previous process never
+        # processed (it was stopped, or they came while it was down) are
+        # already part of the venue size the engine adopts. They are judged
+        # here — someone else's close is reported — and never replayed as
+        # fills.
+        closed_deals: set[str] = set()
+        reports: list[tuple['OrderRow', dict]] = []
+        if self._connection_generation == 0:
+            self._note_venue_clock(activities, activity_read_at)
+            # Who edited a bot position's or resting order's levels while no
+            # process ran decides whether the guard, which restores the bot's
+            # own levels from the journal, reports the edit.
+            for activity in activities:
+                self._note_level_edit(activity)
+            # An own entry the venue executed under a fresh ``dealId`` while
+            # no process watched it is moved onto that deal first, so its
+            # downtime closes are judged and it is never retired as residue.
+            self._migrate_rekeyed_startup_rows(
+                pos_by_deal_id, wo_by_deal_id, promoted_coids,
+            )
+            closed_deals, reports = self._account_downtime_closes(
+                activities, pos_by_deal_id, positions_read_started_at,
+            )
+
         # After the in-flight recovery has had its chance to resolve
         # every ``submitted`` / ``server_ref_seen`` row, retire whatever
         # ``confirmed`` rows the BrokerStore still holds whose exchange
@@ -254,33 +299,26 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         # on a clean restart, even though there is nothing to recover.
         self._retire_startup_orphans(
             pos_by_deal_id, wo_by_deal_id, promoted_coids,
+            closed_deals=closed_deals, activities=activities,
         )
+        for row, activity in reports:
+            self._report_manual_close(row, activity)
 
         if self._connection_generation > 0:
             # A reconnect inside the running process: its engine never
             # re-adopts the venue size, so it still needs every fill the
             # outage held back. Stamping a surviving entry as accounted
-            # would suppress its first real fill as a replay, and adopting
-            # an untracked leg — a working order that filled during the
-            # outage — would capture the POSITION activity before the
-            # working-order bridge can credit it to its own row.
+            # would suppress its first real fill as a replay. The foreign
+            # deals on the epic were already logged by this process.
             return
 
         self._stamp_surviving_entry_fills(pos_by_deal_id)
 
-        # Symmetric counterpart to orphan retirement: adopt live exchange
-        # positions the BrokerStore is NOT tracking into confirmed
-        # per-leg ``position`` rows. A fresh process (or a recovery run
-        # under a different ``run_id``) that finds an existing venue
-        # position has no store row for it — the engine's startup
-        # reconcile adopts the net size into ``_position``, but
-        # ``execute_close`` / ``execute_exit`` derive their DELETE targets
-        # from confirmed ``position`` rows, so a subsequent
-        # ``strategy.close_all()`` would raise "no confirmed position
-        # rows" and strand the adopted exposure. Reconcile each untracked
-        # leg into a confirmed row so the normal close/exit paths can
-        # flatten it.
-        self._adopt_untracked_positions(positions_resp)
+        # A live deal on the epic that no row of this run tracks is not the
+        # run's exposure: the engine's startup clamp already leaves it out of
+        # the book, and the plugin never closes, amends, books or reports it.
+        # It is only made visible.
+        self._note_untracked_positions_at_startup(positions_resp)
 
     def _stamp_surviving_entry_fills(
             self, pos_by_deal_id: dict[str, dict],
@@ -332,46 +370,317 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 stamped,
             )
 
-    def _adopt_untracked_positions(self, positions_resp: Mapping) -> None:
-        """Seed confirmed ``position`` rows for untracked live venue legs.
+    def _migrate_rekeyed_startup_rows(
+            self,
+            pos_by_deal_id: dict[str, dict],
+            wo_by_deal_id: dict[str, dict],
+            promoted_coids: set[str],
+    ) -> None:
+        """Move own entry rows onto the live deal the venue re-keyed them into.
 
-        Thin wrapper over the core
-        :func:`~pynecore.core.broker.store_helpers.adopt_untracked_position_legs`
-        seeding pass. The account-wide ``/positions`` snapshot is
-        narrowed to this run's epic by the same symbol-scoped parse
-        :meth:`fetch_raw_positions` uses, so a foreign instrument's leg
-        structurally never reaches the seeding path (observed live: a
-        lane switched from EURUSD to BTCUSD adopted the old instrument's
-        orphaned short into the fresh run before the parse was shared).
+        A resting entry that executed while no process watched it opened its
+        position under a fresh ``dealId`` whose ``workingOrderId`` back-links
+        the order, and the venue can run even a market entry that way
+        (measured 2026-08-28, cycle 84). The poll migrates such a row as it
+        sees the execution; a fresh process sees only the result, so without
+        this pass the row is retired as an orphan and the bot's live deal is
+        filed as someone else's: out of the book, never protected, never
+        judged. Each live entry row neither snapshot shows under its own
+        ``dealId`` is moved onto the live deal the ``/positions`` snapshot
+        back-links to it (:meth:`_find_promoted_deal_id`, the deal's
+        direction checked). A resting order's fill was never booked: like
+        the fill the poll books, its exposure cursor is the order's size (a
+        working order executes all-or-nothing), so the closes that fit the
+        gap to the deal's present size are the downtime closes
+        :meth:`_account_downtime_closes` judges next.
 
-        Netting-account only: on a hedging account the core one-way
-        emulator closes per leg via ``close_leg`` reading
-        :meth:`fetch_raw_positions` directly, so no store row is needed
-        and seeding would double-count against the emulator's virtual
-        FIFO. On a one-way account the DELETE-per-``dealId`` close path
-        needs a confirmed ``position`` row per live leg.
+        :param pos_by_deal_id: The startup ``/positions`` rows by ``dealId``.
+        :param wo_by_deal_id: The startup ``/workingorders`` rows by ``dealId``.
+        :param promoted_coids: Rows the in-flight recovery just resolved.
         """
         store_ctx = self.store_ctx
-        if store_ctx is None or self._hedging_enabled:
-            return
-        symbol = self.symbol or ''
-        adopted_count = adopt_untracked_position_legs(
-            store_ctx,
-            _position_legs_from_payload(positions_resp, symbol),
-            symbol=symbol,
-        )
-        if adopted_count:
+        assert store_ctx is not None
+        for row in list(store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            did = row.exchange_order_id
+            if (not did or row.client_order_id in promoted_coids
+                    or row.state not in ('confirmed', 'closing')
+                    or extras.get('leg_kind') is not None
+                    or extras.get(ADOPTED_STARTUP_EXTRA_KEY)
+                    or extras.get('kind') not in ('position', 'working')
+                    or did in pos_by_deal_id or did in wo_by_deal_id):
+                continue
+            deal_id = self._find_promoted_deal_id(row, [], pos_by_deal_id)
+            if deal_id is None:
+                continue
+            unbooked = row.filled_qty <= 0.0
+            self._promote_working_row_to_position(row, deal_id, stamp_entry_filled=True)
+            if unbooked:
+                store_ctx.upsert_order(row.client_order_id, filled_qty=row.qty)
+            venue_size = _wire_float(
+                (pos_by_deal_id[deal_id].get('position') or {}).get('size'), finite=True)
             broker_info(
-                "startup: adopted %d untracked exchange position leg(s) "
-                "into confirmed store rows for close/exit routing",
-                adopted_count,
+                "startup: own %s entry %s (%s %s) executed as deal %s while the bot "
+                "was down; the row now tracks that deal",
+                extras.get('kind'), did, row.side, row.qty, deal_id,
             )
+            store_ctx.log_event(
+                'startup_rekeyed_row_migrated',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id,
+                payload={'previous_deal_id': did, 'kind': extras.get('kind'),
+                         'exposure': row.qty if unbooked else row.filled_qty,
+                         'fill_booked_before': not unbooked,
+                         'venue_size': venue_size},
+            )
+
+    def _account_downtime_closes(
+            self,
+            activities: list[dict],
+            pos_by_deal_id: dict[str, dict],
+            positions_read_started_at: float,
+    ) -> tuple[set[str], list[tuple['OrderRow', dict]]]:
+        """Judge the closes of own positions no earlier process processed.
+
+        A fresh process adopts the venue's net size, which already holds every
+        close that happened before its ``/positions`` read: a close the
+        previous process never processed — it came while the bot was down, or
+        just before it stopped — must not be booked again as a fill. Each
+        such close of a live own position row is attributed like a close the
+        poll sees (:meth:`_attribute_close_activity`), recorded as processed
+        and as booked on its row, and someone else's close is returned for
+        reporting. A position gone from the venue counts every close. A
+        position still on it counts, oldest first, the closes its snapshot
+        size already holds: those that fit the gap between the run's exposure
+        cursor and that size, and those dated before the snapshot read. The
+        venue clock bound alone never places the account's newest activity
+        before the read, so a close made just before the start would
+        otherwise be booked again on top of the adopted size. An own partial
+        close whose exposure an earlier process already took off the cursor
+        (:meth:`_own_close_cursor_retired`) counts whatever the snapshot
+        shows: the engine adopts the venue size clamped to that cursor, which
+        no longer holds the close, so the close never takes from the gap. A
+        close an earlier process already booked (a copy the venue re-issued
+        under a new fingerprint) is only recorded as processed.
+
+        :param activities: The startup ``/history/activity`` read.
+        :param pos_by_deal_id: The startup ``/positions`` rows by ``dealId``.
+        :param positions_read_started_at: Local time the ``/positions`` read started.
+        :return: The deals with close evidence, and ``(row, activity)`` per
+            close to report.
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        cursor = self._activity_cursor
+        snapshot_floor = self._venue_time_floor(positions_read_started_at)
+        closed_deals: set[str] = set()
+        reports: list[tuple['OrderRow', dict]] = []
+        snapshot_gaps: dict[str, float] = {}
+        for activity in sorted(activities, key=lambda a: str(a.get('dateUTC') or '')):
+            deal_id = _wire_id(activity.get('dealId'))
+            if deal_id is None:
+                continue
+            row = store_ctx.find_by_ref('deal_id', deal_id)
+            if (row is None or row.closed_ts_ms is not None
+                    or row.exchange_order_id != deal_id
+                    or (row.extras or {}).get('kind') != 'position'
+                    or (row.extras or {}).get('leg_kind') is not None
+                    or (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY)):
+                # A legacy startup-adopted row tracks a deal this run never
+                # opened: its closes are never judged or reported as an
+                # intervention (``_retire_startup_orphans`` retires the row).
+                continue
+            event = self._activity_to_event(activity, row, pos_by_deal_id.get(deal_id))
+            if (event is None or event.event_type != 'filled'
+                    or event.leg_type not in _CLOSE_LEG_TYPES):
+                continue
+            present = deal_id in pos_by_deal_id
+            activity_ts = _parse_iso_timestamp(str(activity.get('dateUTC') or ''))
+            size = float(event.fill_qty or 0.0)
+            own_retired = (present and event.leg_type == LegType.CLOSE
+                           and self._own_close_cursor_retired(row, activity))
+            gap = 0.0
+            if present and not own_retired:
+                gap = snapshot_gaps.get(deal_id, -1.0)
+                if gap < 0.0:
+                    venue_size = _wire_float(
+                        (pos_by_deal_id[deal_id].get('position') or {}).get('size'),
+                        finite=True,
+                    ) or 0.0
+                    gap = max(0.0, row.filled_qty - venue_size)
+                    snapshot_gaps[deal_id] = gap
+                fits_gap = 0.0 < size <= gap + 1e-9 * max(1.0, gap)
+                if not fits_gap and not 0.0 < activity_ts < snapshot_floor:
+                    # Possibly after the snapshot: the poll books it as usual.
+                    continue
+            closed_deals.add(deal_id)
+            fingerprint = _activity_fingerprint(activity)
+            if fingerprint in cursor.seen_fingerprints:
+                continue
+            close_id = _close_identity(activity)
+            date_utc = str(activity.get('dateUTC') or '')
+            fresh = store_ctx.get_order(row.client_order_id) or row
+            if close_id in ((fresh.extras or {}).get(EXTRAS_KEY_BOOKED_CLOSES) or ()):
+                # A copy the venue re-issued under a new fingerprint of a close
+                # an earlier process booked (and judged, and reported): the
+                # snapshot gap and the exposure cursor already hold it.
+                cursor.seen_fingerprints[fingerprint] = date_utc
+                store_ctx.log_event(
+                    'activity_processed',
+                    exchange_order_id=deal_id,
+                    client_order_id=row.client_order_id,
+                    payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
+                             'deal_id': deal_id, 'type': activity.get('type'),
+                             'status': activity.get('status'),
+                             'source': activity.get('source'),
+                             'startup_accounted': True, 'already_booked': True},
+                )
+                continue
+            if present and not own_retired:
+                snapshot_gaps[deal_id] = max(0.0, gap - size)
+            verdict = (self._attribute_close_activity(row, activity, pos_by_deal_id)
+                       if event.leg_type == LegType.CLOSE else CLOSE_VERDICT_VENUE)
+            cursor.seen_fingerprints[fingerprint] = date_utc
+            store_ctx.log_event(
+                'activity_processed',
+                exchange_order_id=deal_id,
+                client_order_id=row.client_order_id,
+                payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
+                         'deal_id': deal_id, 'type': activity.get('type'),
+                         'status': activity.get('status'),
+                         'source': activity.get('source'),
+                         'startup_accounted': True},
+            )
+            fresh = store_ctx.get_order(row.client_order_id) or row
+            extras = dict(fresh.extras or {})
+            extras[EXTRAS_KEY_BOOKED_CLOSES] = [
+                *(extras.get(EXTRAS_KEY_BOOKED_CLOSES) or ())][
+                    -BOOKED_CLOSES_RETAINED + 1:] + [close_id]
+            remaining: float | None = None
+            if present and verdict in EXTERNAL_REDUCTION_VERDICTS:
+                remaining = max(0.0, fresh.filled_qty - size)
+                extras['partial_close_retired_at'] = epoch_time()
+            if remaining is None:
+                store_ctx.upsert_order(row.client_order_id, extras=extras)
+            else:
+                store_ctx.upsert_order(row.client_order_id, filled_qty=remaining, extras=extras)
+            store_ctx.log_event(
+                'startup_close_accounted',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id,
+                payload={'dateUTC': date_utc, 'source': activity.get('source'),
+                         'size': size, 'verdict': verdict, 'deal_present': present,
+                         'remaining_exposure': remaining},
+            )
+            if verdict == CLOSE_VERDICT_FOREIGN:
+                reports.append((fresh, activity))
+        return closed_deals, reports
+
+    def _note_untracked_positions_at_startup(self, positions_resp: Mapping) -> None:
+        """Log every live deal on the run's epic that no row of this run tracks.
+
+        Such a deal was opened by someone else — an operator, another API
+        client, another Pyne run on the account — or by an earlier run under
+        a different ``run_id``. Either way this run's journal did not produce
+        it, so it is never the bot's: no store row is seeded for it, and the
+        close, exit and emulator paths never target it. Each one is logged
+        (WARNING, or INFO for a deal another Pyne run on the account owns)
+        with a ``foreign_deal_on_epic_at_startup`` audit event. A deal an own
+        working order opened with the rest of its size after its execution
+        was retired as netting a foreign deal is reported as that instead
+        (:meth:`_note_residual_after_netting_retirement`).
+        """
+        store_ctx = self.store_ctx
+        symbol = self.symbol or ''
+        if store_ctx is None or not symbol:
+            return
+        positions = positions_resp.get('positions') or []
+        raw_by_deal = {
+            str((raw.get('position') or {}).get('dealId')): raw for raw in positions
+        }
+        other_runs = store_ctx.foreign_live_exchange_order_ids(symbol=symbol)
+        for deal in self._foreign_deals(positions, symbol):
+            if deal.get('ownership_pending'):
+                # An unconfirmed own entry may have opened it; the poll logs
+                # it once that entry's ``dealId`` shows otherwise.
+                continue
+            deal_id = deal['deal_id']
+            raw = raw_by_deal.get(str(deal_id)) or {}
+            position = raw.get('position') or {}
+            wo_id = _wire_id(position.get('workingOrderId'))
+            if (wo_id is not None and wo_id != deal_id
+                    and self._note_residual_after_netting_retirement(
+                        wo_id, deal_id, 0.0, {deal_id: raw}, position)):
+                continue
+            self._foreign_deals_logged.add(deal_id)
+            other_run = deal_id in other_runs
+            message = (
+                "startup: deal %s on %s (%s %s, created %s) is not this run's "
+                "(%s); it is left alone — never closed, amended or booked"
+            )
+            args = (deal_id, symbol, deal['direction'], deal['size'], deal['created'],
+                    'owned by another Pyne run' if other_run else 'untracked')
+            if other_run:
+                broker_info(message, *args)
+            else:
+                broker_warning(message, *args)
+            store_ctx.log_event(
+                'foreign_deal_on_epic_at_startup',
+                exchange_order_id=deal_id,
+                payload={'symbol': symbol, 'other_pyne_run': other_run, **deal},
+            )
+
+    def _retire_vanished_startup_position(
+            self, row: 'OrderRow', *, closed_by_activity: bool,
+    ) -> None:
+        """Retire a filled own position the startup snapshot no longer shows.
+
+        Its exposure leaves the journal and the row is marked naturally
+        closed, so a copy of its close activity the poll reads later is
+        suppressed instead of booked into the book the engine adopts from the
+        venue. Without a close activity nothing shows who closed it: ERROR and
+        a ``position_vanished_unattributed`` audit event, never a report.
+
+        :param row: The own position row, still live.
+        :param closed_by_activity: A close activity of the deal was found
+            (and judged) in the startup activity read.
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        payload = {'state': row.state, 'leg_kind': None, 'exposure': row.filled_qty,
+                   'closed_by_activity': closed_by_activity}
+        if closed_by_activity or row.state == 'closing':
+            store_ctx.log_event(
+                'startup_orphan_retired',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload=payload,
+            )
+        else:
+            logger.error(
+                "startup: bot position %s (%s, %s %s) is gone from the venue and no "
+                "close activity of it is in the last day's history: retired, not "
+                "reported — the venue history must show who closed it",
+                row.exchange_order_id, row.symbol, row.side, row.filled_qty,
+            )
+            store_ctx.log_event(
+                'position_vanished_unattributed',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload={**payload, 'symbol': row.symbol, 'side': row.side,
+                         'at_startup': True},
+            )
+        self._close_bracket_after_natural_close(row)
+        self._retire_netted_journal_exposure(row, row.filled_qty)
 
     def _retire_startup_orphans(
             self,
             pos_by_deal_id: dict[str, dict],
             wo_by_deal_id: dict[str, dict],
             promoted_coids: set[str] | None = None,
+            *,
+            closed_deals: set[str] | None = None,
+            activities: list[dict] | None = None,
     ) -> None:
         """Retire live rows whose exchange counterpart is gone.
 
@@ -399,6 +708,24 @@ class _RecoveryMixin(_CapitalComBase, ABC):
            if ``parent_deal_id`` is set and missing from the positions
            snapshot.
 
+        A non-bracket row flagged :data:`ADOPTED_STARTUP_EXTRA_KEY` — seeded by
+        an earlier version for a venue deal this run's journal never produced
+        — is retired in pass 1 whatever the venue shows; its deal stays on the
+        venue untouched.
+
+        A filled own position retired in pass 1 is a close of the bot's own
+        exposure, not residue: with a close activity among ``closed_deals``
+        (judged and, when someone else's, reported by
+        :meth:`_account_downtime_closes`) it is retired as closed; with none it
+        is logged ERROR with a ``position_vanished_unattributed`` audit event,
+        never reported. Either way its exposure leaves the journal and a later
+        copy of its close activity is never booked again.
+
+        A resting own entry order retired in pass 1 on a fresh start is judged
+        against the startup ``activities`` the way a cancel the poll sees is
+        (:meth:`_judge_vanished_startup_working_order`); someone else's cancel
+        is reported once the rows are retired.
+
         ``promoted_coids`` lists rows resolved by the immediately preceding
         in-flight recovery pass. Their fresh ``deal_id`` came from
         ``activities`` or ``/confirms/{ref}`` and is therefore absent from
@@ -414,17 +741,37 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             return
 
         promoted = promoted_coids or set()
+        closed = closed_deals or set()
         retired_parent_coids: set[str] = set()
         retired_intent_keys: set[str] = set()
         kept_parent_coids: set[str] = set()
         reconnecting = self._connection_generation > 0
         retired_count = 0
+        cancel_reports: list[dict] = []
 
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
             if extras.get('leg_kind') in ('tp', 'sl'):
                 continue
             if row.client_order_id in promoted:
+                continue
+            if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
+                # A row an earlier version seeded for a venue deal this run's
+                # journal never produced. The deal is not the run's: it is
+                # left on the venue untouched, and only the row is retired so
+                # no close or exit path can target it.
+                self.store_ctx.log_event(
+                    'startup_adopted_row_retired',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                    payload={'state': row.state, 'filled_qty': row.filled_qty},
+                )
+                self.store_ctx.close_order(row.client_order_id)
+                retired_parent_coids.add(row.client_order_id)
+                if row.intent_key:
+                    self.store_ctx.record_complete(row.intent_key)
+                    retired_intent_keys.add(row.intent_key)
+                retired_count += 1
                 continue
             if reconnecting and row.state in ('confirmed', 'closing'):
                 # The engine of this process still tracks the row and waits
@@ -466,12 +813,26 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 continue
             if did in pos_by_deal_id or did in wo_by_deal_id:
                 continue
-            self.store_ctx.log_event(
-                'startup_orphan_retired',
-                client_order_id=row.client_order_id,
-                exchange_order_id=did,
-                payload={'state': row.state, 'leg_kind': None},
+            filled_position = (
+                extras.get('kind') == 'position'
+                and row.state in ('confirmed', 'closing')
+                and (row.filled_qty > 0.0
+                     or extras.get('entry_filled_at') is not None
+                     or extras.get('partial_close_retired_at') is not None)
             )
+            if filled_position:
+                self._retire_vanished_startup_position(row, closed_by_activity=did in closed)
+            elif row.state == 'confirmed' and extras.get('kind') == ENTRY_KIND_WORKING:
+                report = self._judge_vanished_startup_working_order(row, activities or [])
+                if report is not None:
+                    cancel_reports.append(report)
+            else:
+                self.store_ctx.log_event(
+                    'startup_orphan_retired',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=did,
+                    payload={'state': row.state, 'leg_kind': None},
+                )
             self.store_ctx.close_order(row.client_order_id)
             retired_parent_coids.add(row.client_order_id)
             # The envelope anchor in the ``envelopes`` table survives
@@ -542,6 +903,161 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 "position/working order on exchange",
                 retired_count,
             )
+        for report in cancel_reports:
+            self._send_manual_close_report(report)
+
+    def _judge_vanished_startup_working_order(
+            self, row: 'OrderRow', activities: list[dict],
+    ) -> dict | None:
+        """Judge who removed a resting own entry order while no process ran.
+
+        The newest terminal activity of the order in the startup read decides,
+        as the poll's would while the bot runs:
+
+        * a ``USER`` cancel: the bot's own when an own ``DELETE`` explains it
+          (:meth:`_own_cancel_explains`), otherwise someone else's — reported
+          like a cancel the poll sees, which the engine's
+          ``on_unexpected_cancel`` policy decides. The report is persisted
+          before the row is retired (``manual_close_report_pending``), so a
+          process that dies in between sends it on the next start;
+        * a dealing-desk (``DEALER``) cancel: a WARNING, never reported;
+        * any other source, an expiry or a rejection: the venue's own;
+        * an execution whose deal no snapshot shows, or no activity at all:
+          nothing shows who removed it — ERROR and a
+          ``working_order_vanished_unattributed`` audit event, never reported.
+
+        The judged activity is recorded as processed, so the poll does not
+        log it as foreign activity later.
+
+        :param row: The own working-order row, still live.
+        :param activities: The startup ``/history/activity`` read.
+        :return: The report to send once the rows are retired, or ``None``.
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        deal_id = row.exchange_order_id or ''
+        activity = self._newest_working_order_outcome(deal_id, activities)
+        status = str((activity or {}).get('status') or '').upper()
+        source = str((activity or {}).get('source') or '').upper()
+        date_utc = str((activity or {}).get('dateUTC') or '')
+        activity_ts = _parse_iso_timestamp(date_utc)
+        if activity is None:
+            verdict = 'own_cancel' if self._own_cancel_explains(row, 0.0) else 'unattributed'
+        elif (str(activity.get('type') or '').upper() == 'POSITION'
+              or status == 'EXECUTED'):
+            verdict = 'executed'
+        else:
+            end = self._venue_end_of_working_order(activity)
+            if end == 'venue':
+                verdict = 'venue_cancel'
+            elif end == 'dealer':
+                verdict = 'dealer_cancel'
+            elif self._own_cancel_explains(row, activity_ts):
+                verdict = 'own_cancel'
+            else:
+                verdict = 'foreign_cancel'
+        payload = {'state': row.state, 'leg_kind': None, 'kind': ENTRY_KIND_WORKING,
+                   'verdict': verdict, 'status': status or None, 'source': source or None,
+                   'dateUTC': date_utc or None}
+        store_ctx.log_event(
+            'startup_orphan_retired',
+            client_order_id=row.client_order_id,
+            exchange_order_id=deal_id,
+            payload=payload,
+        )
+        if activity is not None:
+            fingerprint = _activity_fingerprint(activity)
+            self._activity_cursor.seen_fingerprints[fingerprint] = date_utc
+            store_ctx.log_event(
+                'activity_processed',
+                exchange_order_id=deal_id,
+                client_order_id=row.client_order_id,
+                payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
+                         'deal_id': deal_id, 'type': activity.get('type'),
+                         'status': activity.get('status'),
+                         'source': activity.get('source'),
+                         'startup_accounted': True},
+            )
+        described = (deal_id, row.symbol, row.side, row.qty)
+        if verdict in ('executed', 'unattributed'):
+            logger.error(
+                "startup: bot working order %s (%s, %s %s) is gone from the venue and "
+                "%s: retired, not reported — the venue history must show what removed it",
+                *described,
+                'executed into no deal the venue shows' if verdict == 'executed'
+                else 'no activity of it is in the last day\'s history',
+            )
+            store_ctx.log_event(
+                'working_order_vanished_unattributed',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id,
+                payload={**payload, 'symbol': row.symbol, 'side': row.side, 'qty': row.qty},
+            )
+            return None
+        if verdict == 'dealer_cancel':
+            logger.warning(
+                "startup: Capital.com dealing desk cancelled bot working order %s "
+                "(%s, %s %s) at %s while the bot was down; not treated as an "
+                "operator intervention", *described, date_utc,
+            )
+            return None
+        if verdict == 'venue_cancel':
+            broker_info(
+                "startup: bot working order %s (%s, %s %s) ended on the venue while "
+                "the bot was down (%s %s at %s)", *described, source, status, date_utc,
+            )
+            return None
+        if verdict == 'own_cancel':
+            return None
+        assert activity is not None
+        report = {
+            'report_id': _close_identity(activity),
+            'client_order_id': row.client_order_id,
+            'deal_id': deal_id,
+            'changed_at_ms': int(activity_ts * 1000.0) if activity_ts > 0.0 else None,
+            'reason': (
+                f"bot working order {deal_id} ({row.symbol}, {row.side} {row.qty}) was "
+                f"cancelled on the venue by someone else while the bot was down: "
+                f"USER {status} at {date_utc} matches no own cancel"
+            ),
+            'context': {
+                'working_order': deal_id,
+                'client_order_id': row.client_order_id,
+                'symbol': row.symbol,
+                'side': row.side,
+                'qty': row.qty,
+                'activity': {k: activity.get(k) for k in (
+                    'dateUTC', 'dealId', 'type', 'status', 'source')},
+            },
+        }
+        store_ctx.log_event(
+            'manual_close_report_pending',
+            client_order_id=row.client_order_id,
+            exchange_order_id=deal_id,
+            payload=report,
+        )
+        return report
+
+    @staticmethod
+    def _newest_working_order_outcome(deal_id: str, activities: list[dict]) -> dict | None:
+        """The newest activity that ended the working order ``deal_id``, if any.
+
+        A ``WORKING_ORDER`` row of the order that cancelled, deleted, expired,
+        rejected or executed it, or a ``POSITION`` row back-linking it (the
+        deal its execution opened).
+        """
+        if not deal_id:
+            return None
+        outcomes = [
+            activity for activity in activities
+            if ((str(activity.get('type') or '').upper() == 'WORKING_ORDER'
+                 and _wire_id(activity.get('dealId')) == deal_id
+                 and str(activity.get('status') or '').upper() in _WORKING_ORDER_ENDS)
+                or (str(activity.get('type') or '').upper() == 'POSITION'
+                    and _wire_id((activity.get('details') or {}).get('workingOrderId'))
+                    == deal_id))
+        ]
+        return max(outcomes, key=lambda a: str(a.get('dateUTC') or ''), default=None)
 
 
 # === Recovery hook =========================================================
@@ -1551,6 +2067,14 @@ class _CapitalComResumeHooks:
                 path = 'partial_close_target_match_ttl_expired'
             else:
                 path = 'partial_close_target_match_no_ref'
+            # The dispatch never returned, so the target's exposure cursor
+            # still holds the closed size; lowered once, before the journal
+            # closes the command.
+            store_ctx = self.plugin.store_ctx
+            if store_ctx is not None:
+                _retire_parked_partial_close_exposure(
+                    store_ctx, row, close_units, rules.lot_step, path=path,
+                )
             confirm_deal_id = _wire_id((confirm or {}).get('dealId'))
             return ResumeOutcome(
                 status='confirmed',

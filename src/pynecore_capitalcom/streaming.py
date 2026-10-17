@@ -1612,6 +1612,8 @@ class _StreamingMixin(_CapitalComBase, ABC):
             await self._detect_account_mode()
             await self._load_activity_cursor_from_events()
             self._send_pending_manual_close_reports()
+            self._reload_netting_pending()
+            self._reload_held_edit_verdicts()
             await self._recover_in_flight_submissions()
 
         assert self.timeframe is not None and self.symbol is not None

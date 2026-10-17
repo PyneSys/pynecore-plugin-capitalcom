@@ -31,7 +31,7 @@ from pynecore.core.broker.models import OrderType, PositionLeg
 from .exceptions import CapitalComError
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.storage import OrderRow
+    from pynecore.core.broker.storage import OrderRow, RunContext
 
 
 URL = 'https://api-capital.backend-capital.com'
@@ -179,6 +179,108 @@ EXTRAS_KEY_FAILSAFE_OWNED = 'native_failsafe_owned_at'
 #: starts after this epoch second becomes the position's accepted protection
 #: (set after a partial close).
 EXTRAS_KEY_PROTECTION_ADOPT_AFTER = 'protection_adopt_after'
+
+#: ``orders.extras`` key on a position row: epoch seconds since the core native
+#: fail-safe manager owned the position's protection while it had a software
+#: partial-bracket leg. The guard forgot the bot's levels then; once the leg is
+#: gone, the venue's protection is the bot's (the manager's, or the bot's own
+#: unguarded writes) and becomes the accepted baseline again.
+EXTRAS_KEY_PROTECTION_HANDOVER = 'protection_failsafe_handover_at'
+
+#: ``orders.extras`` key on a working-order row: the foreign deal the order
+#: netted when it executed, ``{'deal_id': ..., 'conflict': ...}``. The order's
+#: fill is then not the run's exposure.
+EXTRAS_KEY_NETTED_FOREIGN_DEAL = 'netted_foreign_deal'
+
+#: ``orders.extras`` key on a position row: the partial-close commands whose
+#: reduction the run-owned exposure cursor (``filled_qty``) already reflects.
+EXTRAS_KEY_RETIRED_CLOSE_COMMANDS = 'partial_close_retired_commands'
+
+#: ``orders.extras`` key on a position row: the close activities already
+#: attributed for the position, ``{close_id: verdict}`` (see
+#: :func:`_close_identity`). A re-issued activity of the same close — the venue
+#: republishes a level-less row with its level filled in, under a new
+#: fingerprint — reuses the verdict instead of being judged (and booked) again.
+EXTRAS_KEY_CLOSE_VERDICTS = 'close_verdicts'
+
+#: ``orders.extras`` key on a working-order row: the level the bot placed the
+#: order at. The working-order guard judges the venue's ``orderLevel`` against
+#: it (or against ``amended_level`` once an own amend landed).
+EXTRAS_KEY_ORDER_LEVEL = 'order_level'
+
+#: ``orders.extras`` key on a position row: level-independent identities of
+#: the close fills already booked for the position (see :func:`_close_identity`
+#: in ``models.py``). A copy of a booked close is not booked again.
+EXTRAS_KEY_BOOKED_CLOSES = 'booked_close_ids'
+
+#: Booked close identities kept per position row.
+BOOKED_CLOSES_RETAINED = 64
+
+#: ``orders.extras`` key on a working-order row: epoch seconds the bot sent
+#: the ``DELETE /workingorders/{dealId}`` the venue accepted (not "already
+#: gone"). The order was still resting when the venue took the request.
+EXTRAS_KEY_OWN_CANCEL_SENT_AT = 'own_cancel_accepted_sent_at'
+
+#: ``orders.extras`` key on a working-order row: the epoch seconds of every own
+#: ``DELETE /workingorders/{dealId}`` sent and not refused, recorded before the
+#: request leaves. The venue stamps the bot's own cancel ``source=USER`` like
+#: an operator's; one of these explains it.
+EXTRAS_KEY_OWN_CANCEL_REQUESTS = 'own_cancel_requested_at'
+
+#: ``orders.extras`` key on a working-order row: the cancel or expiry of the
+#: resting order the activity feed showed, ``{'by', 'status', 'source',
+#: 'dateUTC'}``; ``by`` is ``'venue'`` (a ``SYSTEM`` cancel, an expiry),
+#: ``'dealer'`` (the dealing desk) or ``'client'`` (a ``USER`` cancel). The
+#: disappearance verdict retires an order the venue or its dealing desk ended
+#: as the venue's, never as an unexpected cancel.
+EXTRAS_KEY_WORKING_ORDER_END = 'working_order_end'
+
+#: Key on an own-close record (:data:`EXTRAS_KEY_OWN_CLOSES`): the run's
+#: exposure cursor already dropped by this partial close, so a process that
+#: adopts the venue size after a restart must not book its activity as a fill.
+OWN_CLOSE_CURSOR_RETIRED = 'cursor_retired'
+
+#: ``orders.extras`` key on a working-order row: the order attributes the bot
+#: never sets that an operator resume accepted as the venue showed them,
+#: ``{'attributes': [[field, value], ...], 'resume_ts_ms': ...}``.
+EXTRAS_KEY_WORKING_ACCEPTED_ATTRIBUTES = 'working_order_accepted_attributes'
+
+#: ``orders.extras`` key on a position or working-order row: the bot's own
+#: writes of the row's protection or order level that the venue did not
+#: refuse, by protection key, ``{key: [[sent_at, done_at], ...]}`` (wall
+#: clock, newest last). The venue stamps each one with a ``USER`` edit
+#: activity, like someone else's edit; one record explains one such activity.
+EXTRAS_KEY_OWN_LEVEL_WRITES = 'own_level_writes'
+
+#: ``orders.extras`` key on a position or working-order row: the confirmed
+#: changes of the row's levels or attributes whose author is still being
+#: read from the activity feed, ``{held id: record}``. A restarted process
+#: picks them up and decides them like the process that confirmed them.
+EXTRAS_KEY_HELD_EDIT_VERDICTS = 'held_edit_verdicts'
+
+#: ``orders.extras`` key on a position or working-order row: per protection
+#: key, the venue time of the venue or dealing-desk edit a verdict accepted.
+#: That edit, and every older one, explains no later change.
+EXTRAS_KEY_LEVEL_EDITS_CONSUMED = 'level_edits_consumed_until'
+
+#: Close verdicts (``_InterventionMixin._attribute_close_activity``): who
+#: closed (part of) a bot position.
+CLOSE_VERDICT_OWN = 'own'
+CLOSE_VERDICT_OWN_NETTING = 'own_netting'
+CLOSE_VERDICT_AMBIGUOUS = 'ambiguous_netting'
+CLOSE_VERDICT_DEALER = 'dealer'
+CLOSE_VERDICT_FOREIGN = 'foreign'
+CLOSE_VERDICT_VENUE = 'venue'
+CLOSE_VERDICT_UNJUDGED = 'unjudged'
+#: Only a resting own working order could explain the close; a later
+#: working-order read decides between ``foreign`` and ``ambiguous_netting``.
+CLOSE_VERDICT_NETTING_PENDING = 'netting_pending'
+
+#: Verdicts whose reduction nothing of the run's own explains: the closed size
+#: leaves the run's exposure cursor.
+EXTERNAL_REDUCTION_VERDICTS = frozenset({
+    CLOSE_VERDICT_FOREIGN, CLOSE_VERDICT_DEALER, CLOSE_VERDICT_VENUE,
+})
 
 # TTL on cached ``_InstrumentRules`` entries. Capital.com widens the
 # bracket-distance minimum during volatile sessions; unbounded
@@ -348,6 +450,36 @@ def _wire_float(value: object, *, finite: bool = False) -> float | None:
     if finite and not math.isfinite(parsed):
         return None
     return parsed
+
+
+def _level_on_tick_grid(level: float, tick: float) -> bool:
+    """Whether ``level`` sits on the ``tick`` price grid, within float noise.
+
+    An unknown grid (``tick`` not positive) counts every level as on it.
+    """
+    if tick <= 0.0 or not math.isfinite(tick):
+        return True
+    steps = level / tick
+    return abs(steps - round(steps)) <= 1e-6
+
+
+def _venue_rendered_level(echoed: object, requested: float, tick: float) -> float | None:
+    """The level a venue answer echoes for a requested order level, when it is that level.
+
+    A level between two ticks is kept on the venue at one of its grid
+    neighbours, which are less than a tick away from it; an echo further
+    away is not this request's rendering.
+
+    :param echoed: The level the venue answer carries (a confirm's ``level``).
+    :param requested: The level the request sent.
+    :param tick: The instrument's price tick.
+    :return: The echoed level, or ``None`` when it is missing or not the
+        request's rendering.
+    """
+    level = _wire_float(echoed, finite=True)
+    if level is None or level <= 0.0 or tick <= 0.0 or not math.isfinite(tick):
+        return None
+    return level if abs(level - requested) < tick * (1.0 - 1e-9) else None
 
 
 def _wire_int(value: object) -> int | None:
@@ -520,3 +652,81 @@ def _size_from_units(units: int, lot_step: float) -> float:
     exponent = Decimal(str(lot_step)).normalize().as_tuple().exponent
     decimals = max(0, -int(exponent))
     return round(units * lot_step, decimals)
+
+
+#: Partial-close commands remembered per position row as already retired.
+_RETIRED_CLOSE_COMMANDS_RETAINED = 64
+
+
+def _mark_own_close_cursor_retired(extras: dict, sent_at: object) -> None:
+    """Flag the own-close record sent at ``sent_at`` as retired from the exposure cursor.
+
+    Called in the same write that lowers the target row's cursor for the
+    close, so the flag and the cursor never disagree.
+
+    :param extras: The target row's extras, mutated in place.
+    :param sent_at: The ``sent_at`` of the own-close record (the partial-close
+        command's ``own_close_sent_at``); nothing happens without one.
+    """
+    if not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
+        return
+    for record in extras.get(EXTRAS_KEY_OWN_CLOSES) or ():
+        if isinstance(record, dict) and record.get('sent_at') == sent_at:
+            record[OWN_CLOSE_CURSOR_RETIRED] = True
+
+
+def _retire_parked_partial_close_exposure(
+        store_ctx: 'RunContext', command: 'OrderRow', units: int, lot_step: float,
+        *, path: str,
+) -> None:
+    """Lower the target's exposure cursor for a parked partial close that settled filled.
+
+    The journal's ``filled_qty`` of a position row doubles as the run-owned
+    exposure cursor. A partial close that returns from its dispatch lowers it
+    right there; one that was parked (``disposition_unknown``) and settles
+    later lowers it here, once per command, whichever path settles it (the
+    poll's resolver or startup recovery).
+
+    :param store_ctx: The run's journal.
+    :param command: The partial-close command row.
+    :param units: The reduction in lot units (the command's ``intent_units``).
+    :param lot_step: The instrument's lot step.
+    :param path: The settling path, for the audit event.
+    """
+    extras = command.extras or {}
+    with store_ctx.transaction():
+        target: OrderRow | None = None
+        target_coid = extras.get('target_coid')
+        if isinstance(target_coid, str):
+            target = store_ctx.get_order(target_coid)
+        if target is None:
+            target_deal_id = _wire_id(extras.get('target_deal_id'))
+            if target_deal_id is not None:
+                target = store_ctx.find_by_ref('deal_id', target_deal_id)
+        if target is None or target.closed_ts_ms is not None or units <= 0:
+            return
+        target_extras = dict(target.extras or {})
+        retired = [str(c) for c in target_extras.get(EXTRAS_KEY_RETIRED_CLOSE_COMMANDS) or ()]
+        if command.client_order_id in retired:
+            return
+        closed_qty = _size_from_units(units, lot_step)
+        remaining = max(0.0, target.filled_qty - closed_qty)
+        target_extras[EXTRAS_KEY_RETIRED_CLOSE_COMMANDS] = [
+            *retired[-_RETIRED_CLOSE_COMMANDS_RETAINED + 1:], command.client_order_id,
+        ]
+        target_extras['partial_close_retired_at'] = epoch_time()
+        _mark_own_close_cursor_retired(target_extras, extras.get('own_close_sent_at'))
+        store_ctx.upsert_order(
+            target.client_order_id, filled_qty=remaining, extras=target_extras,
+        )
+        store_ctx.log_event(
+            'partial_close_journal_retired',
+            client_order_id=target.client_order_id,
+            exchange_order_id=target.exchange_order_id,
+            payload={
+                'retired_exposure': closed_qty,
+                'remaining_exposure': remaining,
+                'command': command.client_order_id,
+                'path': path,
+            },
+        )

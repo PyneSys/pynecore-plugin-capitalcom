@@ -10,12 +10,18 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from pynecore.core.broker.exceptions import ExchangeConnectionError
-from pynecore.core.broker.models import LegType, OrderStatus, OrderType
+from pynecore.core.broker.models import (
+    ExitIntent,
+    LegType,
+    OrderStatus,
+    OrderType,
+    QuarantineKind,
+)
 from pynecore.core.ohlcv import OHLCVReader
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
 from pynecore.testing.broker_lab.reference import ReferenceVenueProfile, VenueOrder
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
-from pynecore_capitalcom.exceptions import CapitalComError
+from pynecore_capitalcom.exceptions import CapitalComError, HistoricalPricesNotFoundError
 
 _RULES = {
     "dealingRules": {
@@ -26,6 +32,11 @@ _RULES = {
     },
     "instrument": {"lotSize": 0.01},
 }
+
+
+def _now_activity_date() -> str:
+    """The venue's ``dateUTC`` format for the current instant."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
 class OfflineCapitalCom(CapitalCom):
@@ -47,8 +58,19 @@ class OfflineCapitalCom(CapitalCom):
         self.profile = profile
         self.run_name = run_name
         self.store_ctx = store_ctx
+        # A resolved account identity, as a logged-in session leaves it: the
+        # netting-safe position writes take the account write lock first.
+        self._account_id = "capitalcom-demo-offline-lab"
+        # The quarantine the engine would latch, recorded per run.
+        self.quarantine_sink = self._record_quarantine
         self.rest_calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self._references: dict[str, str] = {}
+
+    def _record_quarantine(
+        self, reason: str, context: dict[str, Any], *, kind: Any = None
+    ) -> bool:
+        self.profile.quarantines.append((self.run_name, reason, kind))
+        return True
 
     def _matches_fault(self, endpoint: str, method: str) -> bool:
         return (
@@ -74,6 +96,13 @@ class OfflineCapitalCom(CapitalCom):
         raise ExchangeConnectionError("offline post-write response suppression")
 
     async def _call(self, endpoint: str, *, data=None, method: str = "post"):
+        return self._transport(endpoint, data=data, method=method)
+
+    def _call_serialized_write(self, endpoint: str, *, data=None, method: str = "post"):
+        """The account-locked reads and POSTs of the netting-safe writes, offline."""
+        return self._transport(endpoint, data=data, method=method)
+
+    def _transport(self, endpoint: str, *, data=None, method: str = "post"):
         payload = dict(data) if data is not None else None
         self.rest_calls.append((endpoint, method, payload))
         self.profile.transport_calls.append((endpoint, method, payload))
@@ -97,18 +126,22 @@ class OfflineCapitalCom(CapitalCom):
                 },
                 "market": {"epic": payload["epic"]},
             }
-            now = datetime.now(UTC).isoformat()
+            # The ``detailed=true`` activity shape: direction, size and
+            # level ride inside ``details``.
             self.profile.polled_activities.append(
                 {
-                    "dateUTC": now,
+                    "dateUTC": _now_activity_date(),
                     "dealId": deal_id,
-                    "dealReference": ref,
                     "epic": payload["epic"],
-                    "direction": payload["direction"],
-                    "size": payload["size"],
                     "source": "USER",
                     "status": "ACCEPTED",
                     "type": "WORKING_ORDER",
+                    "details": {
+                        "dealReference": ref,
+                        "direction": payload["direction"],
+                        "size": payload["size"],
+                        "level": payload["level"],
+                    },
                 }
             )
             self._raise_post_write_fault(endpoint, method)
@@ -189,6 +222,8 @@ class OfflineCapitalCom(CapitalCom):
 
     async def execute_exit(self, envelope):
         orders = await super().execute_exit(envelope)
+        intent = envelope.intent
+        assert isinstance(intent, ExitIntent)
         for order in orders:
             if order.order_type is OrderType.TRAILING_STOP:
                 leg_type = LegType.TRAILING_STOP
@@ -199,13 +234,13 @@ class OfflineCapitalCom(CapitalCom):
             self.profile.state.orders[order.id] = VenueOrder(
                 order=order,
                 run_name=self.run_name,
-                pine_id=envelope.intent.pine_id,
+                pine_id=intent.pine_id,
                 leg_type=leg_type,
-                intent_key=envelope.intent.intent_key,
-                from_entry=envelope.intent.from_entry,
+                intent_key=intent.intent_key,
+                from_entry=intent.from_entry,
             )
         self.profile.state.calls.append(
-            (self.run_name, "exit", envelope.intent.intent_key)
+            (self.run_name, "exit", intent.intent_key)
         )
         return orders
 
@@ -226,13 +261,11 @@ class OfflineCapitalCom(CapitalCom):
     async def execute_cancel(self, envelope):
         result = await super().execute_cancel(envelope)
         intent = envelope.intent
+        from_entry = getattr(intent, "from_entry", None)
         for record in self.profile.state.orders.values():
             matches = record.run_name == self.run_name and (
                 record.pine_id == intent.pine_id
-                or (
-                    getattr(intent, "from_entry", None) is not None
-                    and record.from_entry == intent.from_entry
-                )
+                or (from_entry is not None and record.from_entry == from_entry)
             )
             if matches and record.order.status in (
                 OrderStatus.OPEN,
@@ -394,7 +427,9 @@ class OfflineWeekendCapitalCom(CapitalCom):
                 ]
             }
         if self.phase == "closed":
-            raise CapitalComError("API error occured: error.prices.not-found")
+            raise HistoricalPricesNotFoundError(
+                "Capital.com historical price range is empty"
+            )
         cursor = datetime.fromisoformat(str(payload["from"]))
         selected = [bar for bar in self.reopen_bars if bar >= cursor]
         return {
@@ -427,6 +462,7 @@ class CapitalComProfile(ReferenceVenueProfile):
         self.fault_consumed = False
         self.fault_before_write = False
         self.fault_barriers: list[tuple[str, str, bool]] = []
+        self.quarantines: list[tuple[str, str, Any]] = []
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCapitalCom:
         return OfflineCapitalCom(self, run_name, store_ctx)
@@ -574,8 +610,10 @@ class CapitalComProfile(ReferenceVenueProfile):
         if step.kind == "capital_concurrent_session_bootstrap":
             import pynecore_capitalcom.rest as capital_rest
 
-            class StubResponse:
+            class SessionStubResponse:
+                status_code = 200
                 is_error = False
+                text = ""
 
                 def __init__(
                     self,
@@ -594,11 +632,11 @@ class CapitalComProfile(ReferenceVenueProfile):
             post_started: list[float] = []
             transport_lock = threading.Lock()
 
-            def fake_get(url: str, **kwargs: Any) -> StubResponse:
+            def fake_get(url: str, **kwargs: Any) -> SessionStubResponse:
                 del url, kwargs
-                return StubResponse({"encryptionKey": "offline", "timeStamp": 1})
+                return SessionStubResponse({"encryptionKey": "offline", "timeStamp": 1})
 
-            def fake_post(url: str, **kwargs: Any) -> StubResponse:
+            def fake_post(url: str, **kwargs: Any) -> SessionStubResponse:
                 del url, kwargs
                 with transport_lock:
                     started = time.monotonic()
@@ -612,7 +650,7 @@ class CapitalComProfile(ReferenceVenueProfile):
                         )
                     post_started.append(started)
                     number = len(post_started)
-                return StubResponse(
+                return SessionStubResponse(
                     {"currentAccountId": "offline-account"},
                     {
                         "CST": f"cst-{number}",
@@ -724,7 +762,7 @@ class CapitalComProfile(ReferenceVenueProfile):
             qty = record.order.qty
             price = float(step.values.get("price", 1.10))
             activity = {
-                "dateUTC": "2026-07-21T10:00:00.000",
+                "dateUTC": _now_activity_date(),
                 "dealId": deal_id,
                 "type": "POSITION",
                 "status": "EXECUTED",
@@ -957,7 +995,7 @@ class CapitalComProfile(ReferenceVenueProfile):
         if step.kind == "capital_weekend_session_refresh_probe":
             import pynecore_capitalcom.rest as capital_rest
 
-            class StubResponse:
+            class HistoryStubResponse:
                 status_code = 200
                 is_error = False
                 headers: dict[str, str] = {}
@@ -979,20 +1017,20 @@ class CapitalComProfile(ReferenceVenueProfile):
             broker.security_token = "security-old"
             broker.cst_token = "cst-old"
             broker._session_token_expiry_ts = capital_rest.epoch_time() + 60
-            events: list[str] = []
+            sequence: list[str] = []
 
             def refresh() -> None:
-                events.append("refresh")
+                sequence.append("refresh")
                 broker.security_token = "security-fresh"
                 broker.cst_token = "cst-fresh"
                 broker._session_token_expiry_ts = capital_rest.epoch_time() + 3600
 
-            def get(_url: str, **kwargs: Any) -> StubResponse:
-                events.append(f"get:{kwargs['headers'].get('CST')}")
-                return StubResponse()
+            def get(_url: str, **kwargs: Any) -> HistoryStubResponse:
+                sequence.append(f"get:{kwargs['headers'].get('CST')}")
+                return HistoryStubResponse()
 
             original_get = capital_rest.httpx.get
-            broker.create_session = refresh
+            broker._perform_session_login = refresh
             capital_rest.httpx.get = get
             try:
                 broker(
@@ -1006,10 +1044,10 @@ class CapitalComProfile(ReferenceVenueProfile):
                 )
             finally:
                 capital_rest.httpx.get = original_get
-            if events != ["refresh", "get:cst-fresh"]:
+            if sequence != ["refresh", "get:cst-fresh"]:
                 raise AssertionError(
                     "Capital.com session refresh did not precede the reopen "
-                    f"history request: {events}"
+                    f"history request: {sequence}"
                 )
             return True
         if step.kind == "capital_shared_ohlcv_reader_gap":
@@ -1120,8 +1158,11 @@ class CapitalComProfile(ReferenceVenueProfile):
             entry_direction = str(entry_activity["details"]["direction"])
             qty = float(step.values.get("qty", entry_activity["details"]["size"]))
             direction = "SELL" if entry_direction == "BUY" else "BUY"
+            # Dated now: the bot's own close is told apart from someone
+            # else's by the own-close record its request left, whose window
+            # is the request's wall-clock time.
             activity = {
-                "dateUTC": "2026-07-21T10:01:00.000",
+                "dateUTC": _now_activity_date(),
                 "dealId": deal_id,
                 "type": "POSITION",
                 "status": "EXECUTED",
@@ -1173,7 +1214,7 @@ class CapitalComProfile(ReferenceVenueProfile):
             if qty <= 0.0:
                 raise AssertionError("Capital.com external close requires exposure")
             activity = {
-                "dateUTC": "2026-07-21T10:02:00.000",
+                "dateUTC": _now_activity_date(),
                 "dealId": deal_id,
                 "type": "POSITION",
                 "status": "EXECUTED",
@@ -1213,6 +1254,17 @@ class CapitalComProfile(ReferenceVenueProfile):
                 raise AssertionError(
                     "Capital.com external close was not observed exactly once: "
                     f"{self.manual_close_events}"
+                )
+            interventions = [
+                quarantine
+                for quarantine in self.quarantines
+                if quarantine[0] == step.run
+                and quarantine[2] is QuarantineKind.EXTERNAL_INTERVENTION
+            ]
+            if len(interventions) != 1 or len(self.quarantines) != 1:
+                raise AssertionError(
+                    "Capital.com external close was not reported as exactly one "
+                    f"external intervention: {self.quarantines}"
                 )
             if runtime.engine._active_intents:
                 raise AssertionError(
@@ -1290,9 +1342,11 @@ class CapitalComProfile(ReferenceVenueProfile):
                 for call in self.transport_calls
                 if call[0].startswith("positions/") and call[1] == "put"
             ]
+            # A PUT replaces every bracket field, so the first clear re-sends
+            # the stop that stays live.
             expected_bodies = [
                 {"profitLevel": 1.20, "stopLevel": 1.05},
-                {"profitLevel": None},
+                {"profitLevel": None, "stopLevel": 1.05},
                 {"stopLevel": None},
             ]
             actual_bodies = [call[2] for call in requests]
@@ -1507,11 +1561,17 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("entry", values={"id": "Long", "side": "buy", "qty": 1.0}),
                 Step("sync", values={"last_price": 1.10}),
                 Step("capital_activity_fill", values={"price": 1.10}),
+                # The engine reverses in two legs: the close leg retires the
+                # own long deal first, the raw entry opens once the book is flat.
                 Step("entry", values={"id": "Short", "side": "sell", "qty": 1.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("expect_capital_close_route", values={"deletes": 1, "posts": 1}),
+                Step("capital_activity_close", values={"qty": 1.0, "price": 1.10}),
+                Step("expect", values={"position": 0.0, "engine_position": 0.0}),
                 Step("sync", values={"last_price": 1.10}),
                 Step(
                     "expect_capital_position_post",
-                    values={"count": 2, "direction": "SELL", "size": 2.0},
+                    values={"count": 2, "direction": "SELL", "size": 1.0},
                 ),
                 Step("capital_activity_fill", values={"price": 1.09}),
                 Step("expect", values={"position": -1.0, "engine_position": -1.0}),
@@ -2019,7 +2079,7 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             ),
         ),
         Scenario(
-            name="capitalcom-shared-netting-runs-adopt-and-close-only-own-ledger",
+            name="capitalcom-shared-netting-runs-own-and-close-only-their-own-deals",
             profile_factory=CapitalComProfile,
             runs=("A", "B"),
             seed=seed,
@@ -2205,7 +2265,7 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             ),
         ),
         Scenario(
-            name="control-capitalcom-foreign-restart-adoption-is-detected",
+            name="control-capitalcom-foreign-deal-store-ownership-is-detected",
             profile_factory=CapitalComProfile,
             runs=("A", "B"),
             seed=seed,

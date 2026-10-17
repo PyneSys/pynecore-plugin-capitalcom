@@ -60,23 +60,27 @@ from pynecore.core.broker.models import (
     PositionLeg,
 )
 from pynecore.core.plugin import override
-from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import (
     CapitalComApiError,
     CapitalComError,
+    ForeignDealBlocksWriteError,
     InvalidStopDistanceError,
     InvalidTakeProfitDistanceError,
     OrderNotFoundError,
+    PositionSnapshotUnavailableError,
 )
 from .helpers import (
+    EXTRAS_KEY_ORDER_LEVEL,
     _extract_reject_reason,
     _is_funds_reject,
     _is_market_closed_reject,
+    _mark_own_close_cursor_retired,
     _parse_iso_timestamp,
     _position_legs_from_payload,
     _size_from_units,
+    _venue_rendered_level,
     _wire_float,
 )
 from .models import _InstrumentRules, _bracket_leg_id
@@ -173,12 +177,18 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         units = round(qty / rules.lot_step)
         return _size_from_units(units, rules.lot_step)
     async def get_position(self, symbol: str) -> ExchangePosition | None:
-        """Return the aggregate position across all rows for ``symbol``.
+        """Return the aggregate position across the run's own rows for ``symbol``.
 
         Capital.com netting opens a fresh row per same-direction entry
         (confirmed empirically after §9 #5 is closed) — aggregation is
         therefore mandatory for Pine's one-way model. Returns ``None``
         when no row exists for the symbol.
+
+        Only the deals this run's journal produced count
+        (:meth:`_owned_deal_ids`): a deal someone else opened on the epic is
+        not the bot's exposure, and counting it would hide an own deal's
+        disappearance behind it. Without a journal (a raw account read)
+        every row counts.
 
         On a hedging-mode account the rows are netted through the core
         :func:`~pynecore.core.broker.emulator.aggregate_positions` instead:
@@ -194,6 +204,11 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             )
         res = await self._call('positions', method='get')
         rows = res.get('positions') or []
+        self._note_foreign_deals(rows, symbol)
+        owned = self._owned_deal_ids(rows)
+        if owned is not None:
+            rows = [row for row in rows
+                    if str((row.get('position') or {}).get('dealId') or '') in owned]
         long_size = 0.0
         short_size = 0.0
         long_notional = 0.0
@@ -252,17 +267,28 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         )
 
     async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
-        """Return every open position row ("leg") for ``symbol``, oldest first.
+        """Return the run's own open position rows ("legs") for ``symbol``, oldest first.
 
         :class:`~pynecore.core.plugin.broker.PositionPort` transport
         primitive: one :class:`PositionLeg` per Capital.com position row
         with ZERO aggregation — the core emulator nets them. Parsing and
         the deterministic ``(open_time, leg_id)`` FIFO ordering live in
-        :func:`~pynecore_capitalcom.helpers._position_legs_from_payload`,
-        shared with the startup adoption pass.
+        :func:`~pynecore_capitalcom.helpers._position_legs_from_payload`.
+
+        Only legs this run's journal produced are returned
+        (:meth:`_owned_deal_ids`): the emulator plans closes, reversals and
+        bracket replication over exactly these, so a leg someone else opened
+        is never closed, amended or netted against the bot's legs. Without a
+        journal every leg is returned.
         """
         res = await self._call('positions', method='get')
-        return _position_legs_from_payload(res, symbol)
+        rows = res.get('positions') or []
+        self._note_foreign_deals(rows, symbol)
+        legs = _position_legs_from_payload(res, symbol)
+        owned = self._owned_deal_ids(rows)
+        if owned is None:
+            return legs
+        return [leg for leg in legs if leg.leg_id in owned]
 
     async def get_volume_quantizer(self, symbol: str) -> 'Callable[[float], int]':
         """Return a sync Pine-units -> lot-step-grid quantizer for ``symbol``.
@@ -327,15 +353,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         fill surfaces through the activity stream as an ordinary natural
         close (``LegType.CLOSE`` on the tracked dealId).
 
-        The error taxonomy deliberately differs from the netting
-        full-close hook: an ambiguous transport fault maps to
-        :class:`OrderDispositionUnknownError`, NOT
-        :class:`BrokerManualInterventionError` — the emulator's close-leg
+        An ambiguous transport fault maps to
+        :class:`OrderDispositionUnknownError`: the emulator's close-leg
         ledger + restart replay reconcile the leg against the live book
-        and re-dispatch only the residual, so the in-session
-        unverifiability that forces the netting path to halt does not
-        apply. A vanished leg is a benign no-op (the close already landed
-        or the row was swept broker-side; the replay finalises the row).
+        and re-dispatch only the residual. A vanished leg is a benign
+        no-op (the close already landed or the row was swept broker-side;
+        the replay finalises the row).
         """
         # ``volume`` is audit-only here: full-leg by contract, and a size is
         # not expressible on the DELETE wire anyway.
@@ -712,6 +735,27 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 "the journal owns persistence and cannot operate without it.",
             )
 
+        # A netting entry nets the oldest opposite deal FIFO when it executes.
+        # Opposite foreign exposure the last poll saw refuses it before
+        # anything is journaled. A market entry is then decided by the final
+        # snapshot under the account write lock (``submit_market_entry``); a
+        # resting entry executes later, so the poll's snapshot is all there
+        # is at placement (an execution that nets a foreign deal anyway is
+        # never booked as the run's, see ``_retire_order_netted_into_foreign_deal``).
+        # A refused entry only drops this signal: the foreign deal is someone
+        # else's separate activity.
+        netted_direction = 'SELL' if intent.side == 'buy' else 'BUY'
+        write = {'entry': intent.pine_id, 'side': intent.side, 'qty': quantized_qty}
+        if not self._hedging_enabled:
+            foreign = self._cached_foreign_deals(intent.symbol, netted_direction)
+            if foreign:
+                raise self._foreign_block_skip(
+                    reason=('foreign_deal_blocks_opposite_entry' if endpoint == 'positions'
+                            else 'foreign_deal_blocks_resting_entry'),
+                    intent_key=intent.intent_key, symbol=intent.symbol,
+                    foreign=foreign, write=write, latch=False,
+                )
+
         hooks = _CapitalComEntryHooks(
             plugin=self,
             endpoint=endpoint,
@@ -721,14 +765,32 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         journal = DispatchJournal(self.store_ctx)
         from pynecore.core.broker.journal import EntryDispatchHooks
 
-        return await journal.run_entry(
-            coid=coid,
-            intent=intent,
-            qty=quantized_qty,
-            kind=kind,
-            hooks=cast(EntryDispatchHooks, hooks),
-            audit_payload={'endpoint': endpoint, 'body': body},
-        )
+        try:
+            return await journal.run_entry(
+                coid=coid,
+                intent=intent,
+                qty=quantized_qty,
+                kind=kind,
+                hooks=cast(EntryDispatchHooks, hooks),
+                audit_payload={'endpoint': endpoint, 'body': body},
+            )
+        except ForeignDealBlocksWriteError as refused:
+            raise self._foreign_block_skip(
+                reason=refused.reason, intent_key=intent.intent_key,
+                symbol=intent.symbol, foreign=refused.foreign_deals,
+                write=write, latch=False,
+            ) from refused
+        except PositionSnapshotUnavailableError as unavailable:
+            # Nothing left the client: the signal is retried on the next sync.
+            # A skip, not an exchange reject, so a read outage never counts
+            # toward the engine's bounded entry-reject budget.
+            raise OrderSkippedByPlugin(
+                f"Skipping {intent.symbol} {intent.side.upper()} entry "
+                f"id={intent.pine_id!r}: {unavailable}; retried next sync.",
+                intent_key=intent.intent_key,
+                reason='entry_preflight_unavailable',
+                context={'symbol': intent.symbol, 'side': intent.side, 'write': write},
+            ) from unavailable
 
     async def _put_bracket_with_notfound_retry(
             self, deal_id: str, body: dict,
@@ -800,6 +862,15 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         """
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
+        # The position's protection changed on the venue and who changed it is
+        # still being read from the activity feed: the bracket waits, it would
+        # replace levels someone else may have set.
+        protected = self._find_active_entry_row(intent.symbol, intent.from_entry)
+        if protected is not None and protected.exchange_order_id:
+            self._defer_protection_write(
+                protected.exchange_order_id, intent_key=intent.intent_key,
+                symbol=intent.symbol,
+            )
         # Fresh market data: ``_get_current_mid_price`` also refreshes the
         # rules cache as a side effect, so the subsequent rules lookup is
         # a single in-process dict read rather than a second REST call.
@@ -1414,13 +1485,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # that Pine entry id. Capital.com keeps same-direction entries as
         # separate ``dealId`` rows, so symbol-wide targeting would turn a
         # keyed close into a partial-close POST against the aggregate and could
-        # reduce another entry's exposure. Startup-adopted rows have no durable
-        # Pine id, so an otherwise unmatched keyed close may own those rows; the
-        # engine deliberately permits that fallback for reconstructed exposure.
-        # Synthetic close producers carry explicit target provenance on the
-        # intent; the Pine-controlled ``pine_id`` is never parsed for authority.
-        # Defensive closes target one exact position COID. Only ``close_all``
-        # (empty pine id) is intentionally symbol-wide.
+        # reduce another entry's exposure. Synthetic close producers carry
+        # explicit target provenance on the intent; the Pine-controlled
+        # ``pine_id`` is never parsed for authority. Defensive closes target
+        # one exact position COID. Only ``close_all`` (empty pine id) is
+        # intentionally symbol-wide — over the run's own rows: a deal the
+        # run's journal did not produce is never a close target.
         live_position_rows: list['OrderRow'] = []
         if self.store_ctx is not None:
             for row in self.store_ctx.iter_live_orders(symbol=intent.symbol):
@@ -1465,24 +1535,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             target_entry_id = intent.pine_id
 
         targets: list['OrderRow'] = []
-        adopted_targets: list['OrderRow'] = []
         for row in live_position_rows:
-            extras = row.extras or {}
             if target_entry_id is not None:
                 if row.pine_entry_id == target_entry_id:
                     targets.append(row)
-                elif (extras.get(ADOPTED_STARTUP_EXTRA_KEY) is True
-                      and row.pine_entry_id is None):
-                    adopted_targets.append(row)
             elif target_position_coid is not None:
                 if (row.client_order_id == target_position_coid
                         and row.exchange_order_id == target_exchange_id):
                     targets.append(row)
             else:
                 targets.append(row)
-
-        if target_entry_id is not None and not targets:
-            targets = adopted_targets
 
         # An orphan defensive close has no persisted position row, but the
         # engine carries the exact venue deal id captured at the bracket-reject
@@ -1666,6 +1728,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             (row.extras or {}).get('orphan_close_synthetic') is True
             for row in targets
         )
+        close_write = {'close': intent.pine_id or '<close_all>',
+                       'side': intent.side, 'qty': intent.qty,
+                       'targets': sorted(row.exchange_order_id or '' for row in targets)}
         if has_orphan_synthetic or reversal_close:
             kind = KIND_FULL_CLOSE
         else:
@@ -1694,31 +1759,73 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # owned by these targets. This keeps the first 100-unit reduction
             # on the opposite-POST path and routes the subsequent residual 100
             # through native DELETE.
+            #
+            # The reduction POST cannot name a ``dealId``: the netting account
+            # applies it FIFO to the oldest deal of the target's direction. A
+            # deal this run did not open as old as the target or older could
+            # be consumed, so a partial close is refused while one exists
+            # (a younger one is never reached: the close never takes the
+            # whole target) — from this fresh read, finally under the account
+            # write lock right before the POST. The last poll's snapshot only
+            # repeats a refusal a fresh read already reported, and only while
+            # that refusal's block clock runs (no extra read for a refusal
+            # that recurs every bar); it never latches a quarantine on its
+            # own, so once the block is old enough to latch, or a block the
+            # poll ended recurs, a fresh read decides again.
             total_live_units = stored_live_units
-            unowned_same_side_deal_ids: set[str] = set()
+            other_same_side_deal_ids: set[str] = set()
+            target_broker_direction = 'BUY' if intent.side == 'sell' else 'SELL'
+            target_deal_ids = {
+                row.exchange_order_id for row in targets
+                if row.exchange_order_id
+            }
             if intent_units != stored_live_units:
+                cached_units = self._cached_deal_units(target_deal_ids, rules.lot_step)
+                foreign = self._cached_exit_blockers(
+                    intent.symbol, target_broker_direction, target_deal_ids,
+                )
+                if foreign and cached_units is not None and cached_units != intent_units:
+                    reason = self._partial_close_block(foreign)
+                    if self._foreign_exit_cached_refusal(reason, intent.intent_key, foreign):
+                        raise self._foreign_exit_skip(
+                            reason=reason, intent_key=intent.intent_key,
+                            symbol=intent.symbol, foreign=foreign, write=close_write,
+                            fresh=False, direction=target_broker_direction,
+                            targets=target_deal_ids,
+                        )
                 raw_positions = await self._call('positions', method='get')
-                target_deal_ids = {
-                    row.exchange_order_id for row in targets
-                    if row.exchange_order_id
-                }
-                symbol_positions = [
-                    raw.get('position') or {}
-                    for raw in (raw_positions.get('positions') or [])
+                symbol_rows = [
+                    raw for raw in (raw_positions.get('positions') or [])
                     if (raw.get('market') or {}).get('epic') == intent.symbol
                 ]
+                symbol_positions = [raw.get('position') or {} for raw in symbol_rows]
                 total_live_units = sum(
                     round(float(position.get('size', 0.0)) / rules.lot_step)
                     if rules.lot_step > 0 else 0
                     for position in symbol_positions
                     if position.get('dealId') in target_deal_ids
                 )
-                target_broker_direction = 'BUY' if intent.side == 'sell' else 'SELL'
-                unowned_same_side_deal_ids = {
+                if intent_units != total_live_units:
+                    foreign = self._exit_blockers(
+                        symbol_rows, intent.symbol, target_broker_direction,
+                        target_deal_ids,
+                    )
+                    if foreign:
+                        raise self._foreign_exit_skip(
+                            reason=self._partial_close_block(foreign),
+                            intent_key=intent.intent_key, symbol=intent.symbol,
+                            foreign=foreign, write=close_write, fresh=True,
+                            direction=target_broker_direction, targets=target_deal_ids,
+                        )
+                # Only the run's own other deals on the side make the close
+                # ambiguous; a younger foreign deal is never reached.
+                owned = self._owned_deal_ids(symbol_rows)
+                other_same_side_deal_ids = {
                     str(position['dealId'])
                     for position in symbol_positions
                     if position.get('dealId')
                     and position.get('dealId') not in target_deal_ids
+                    and (owned is None or str(position['dealId']) in owned)
                     and (position.get('direction') or '').upper()
                     == target_broker_direction
                 }
@@ -1728,30 +1835,58 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 else KIND_PARTIAL_CLOSE
             )
             if (kind == KIND_PARTIAL_CLOSE
-                    and (len(targets) != 1 or unowned_same_side_deal_ids)):
+                    and (len(targets) != 1 or other_same_side_deal_ids)):
                 raise ExchangeOrderRejectedError(
                     "Capital execute_close: a partial close requires one "
                     "exclusive owned position row because the venue reduction "
                     "API cannot target a dealId"
                 )
 
+        # Nothing foreign blocks the exit now: a later block starts its
+        # clock afresh.
+        self._foreign_exit_unblocked(intent.intent_key)
+        close_target_ids = frozenset(
+            row.exchange_order_id for row in targets
+            if row.exchange_order_id
+        )
         hooks = _CapitalComCloseHooks(
             plugin=self,
             rules=rules,
-            target_deal_ids=frozenset(
-                row.exchange_order_id for row in targets
-                if row.exchange_order_id
-            ),
+            target_deal_ids=close_target_ids,
         )
         journal = DispatchJournal(self.store_ctx)
-        exch_order = await journal.run_close(
-            coid=coid,
-            intent=intent,
-            kind=kind,
-            targets=targets,
-            hooks=hooks,
-            audit_payload={'pine_id': intent.pine_id},
-        )
+        try:
+            exch_order = await journal.run_close(
+                coid=coid,
+                intent=intent,
+                kind=kind,
+                targets=targets,
+                hooks=hooks,
+                audit_payload={'pine_id': intent.pine_id},
+            )
+        except ForeignDealBlocksWriteError as refused:
+            # Refused under the account write lock: the command row stays as
+            # the ``rejected`` audit trail; the engine re-evaluates the close
+            # next bar and it goes through once the foreign deal is gone.
+            raise self._foreign_exit_skip(
+                reason=self._partial_close_block(refused.foreign_deals),
+                intent_key=intent.intent_key, symbol=intent.symbol,
+                foreign=refused.foreign_deals, write=close_write, fresh=True,
+                direction='BUY' if intent.side == 'sell' else 'SELL',
+                targets=close_target_ids,
+            ) from refused
+        except PositionSnapshotUnavailableError as unavailable:
+            # The read under the account write lock failed: nothing was sent
+            # and the command row stays as the ``rejected`` audit trail. A
+            # skip, not an exchange reject, so a read outage never counts
+            # toward the engine's close-reject quarantine.
+            raise OrderSkippedByPlugin(
+                f"Capital execute_close {intent.intent_key!r}: {unavailable}; "
+                f"re-evaluated next bar",
+                intent_key=intent.intent_key,
+                reason='close_preflight_unavailable',
+                context={'symbol': intent.symbol, 'write': close_write},
+            ) from unavailable
         if kind == KIND_PARTIAL_CLOSE and targets:
             # The journal's ``filled_qty`` doubles as the run-owned exposure
             # cursor (K3 cycle-end book, adoption clamp, and the fold-netting
@@ -1771,6 +1906,11 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 reduced = max(0.0, refreshed.filled_qty - closed_qty)
                 extras = dict(refreshed.extras or {})
                 extras['partial_close_retired_at'] = epoch_time()
+                command = self.store_ctx.get_order(coid)
+                _mark_own_close_cursor_retired(
+                    extras, (command.extras or {}).get('own_close_sent_at')
+                    if command is not None else None,
+                )
                 self.store_ctx.upsert_order(
                     target.client_order_id,
                     filled_qty=reduced,
@@ -1936,9 +2076,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         outcomes: list[CancelDispositionOutcome] = []
         for coid, deal_id in targets:
             try:
-                await self._call(
-                    f'workingorders/{deal_id}', method='delete',
-                )
+                with self._own_cancel(coid) as sent_at:
+                    await self._call(
+                        f'workingorders/{deal_id}', method='delete',
+                    )
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError) as exc:
                 # Transient — the row stays live so the retry loop re-runs.
@@ -1963,6 +2104,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # absent from both ``/positions`` and ``/workingorders``, stamp
             # ``missing_pending_since``, and eventually raise a false
             # :class:`UnexpectedCancelError`.
+            self._stamp_own_cancel_accepted(coid, sent_at)
             self._finalize_cancel_outcome_row(
                 coid, deal_id, CancelDispositionOutcome.CANCEL_CONFIRMED,
                 intent=intent, already_gone=False,
@@ -2223,6 +2365,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         )
         if target_row is None or not target_row.exchange_order_id:
             return await super().modify_exit(old, new)
+        # Same wait as :meth:`execute_exit`: the amend would replace levels
+        # someone else may have set while who changed them is undecided.
+        self._defer_protection_write(
+            target_row.exchange_order_id, intent_key=new_i.intent_key,
+            symbol=new_i.symbol,
+        )
 
         # Live mid drives the pre-check: Capital.com validates against the
         # current quote, not the entry's confirmed level.
@@ -2597,6 +2745,44 @@ class _CapitalComEntryHooks:
         self._body = body
         self._quantized_qty = quantized_qty
 
+    def _record_order_level(self, coid: str, level: float | None = None) -> None:
+        """Keep the level a working order is placed at on its row.
+
+        The level is the bot's own state the working-order guard judges the
+        venue against. Merged into the row's current extras, so it survives
+        every other extras key.
+
+        :param level: The level to keep: the venue's echo of the placed
+            level once the confirm returned it, else the requested level.
+        """
+        store_ctx = self._plugin.store_ctx
+        if self._endpoint != 'workingorders' or store_ctx is None:
+            return
+        with store_ctx.transaction():
+            existing = store_ctx.get_order(coid)
+            if existing is None:
+                return
+            extras = dict(existing.extras or {})
+            extras[EXTRAS_KEY_ORDER_LEVEL] = (
+                level if level is not None else self._body.get('level'))
+            store_ctx.upsert_order(coid, extras=extras)
+
+    async def _confirmed_order_level(self, symbol: str, confirm: dict) -> float | None:
+        """The level the venue kept a placed working order at, when its confirm says.
+
+        A level between two price ticks is kept at one of its grid
+        neighbours; the confirm's ``level`` is that rendering when it is
+        within a tick of the requested level.
+        """
+        requested = _wire_float(self._body.get('level'), finite=True)
+        if self._endpoint != 'workingorders' or requested is None:
+            return None
+        try:
+            rules = await self._plugin.instrument_rules(symbol)
+        except (BrokerError, CapitalComError, httpx.HTTPError):
+            return None
+        return _venue_rendered_level(confirm.get('level'), requested, rules.price_tick)
+
     async def submit(
             self, *, coid: str, intent: EntryIntent, qty: float,
     ) -> 'SubmitOutcome':
@@ -2619,10 +2805,16 @@ class _CapitalComEntryHooks:
                 f"Entry hook quantity mismatch: captured "
                 f"{self._quantized_qty!r}, journal supplied {qty!r}"
             )
+        self._record_order_level(coid)
         try:
-            resp = await self._plugin.call_api(
-self._endpoint, data=self._body, method='post',
-            )
+            if self._endpoint == 'positions':
+                resp = await self._plugin.submit_market_entry(
+                    coid=coid, symbol=intent.symbol, side=intent.side, body=self._body,
+                )
+            else:
+                resp = await self._plugin.call_api(
+                    self._endpoint, data=self._body, method='post',
+                )
         except (httpx.TimeoutException, httpx.RequestError,
                 ConnectionError, ExchangeConnectionError) as net:
             raise OrderDispositionUnknownError(
@@ -2677,9 +2869,13 @@ self._endpoint, data=self._body, method='post',
         :class:`OrderDispositionUnknownError` so the journal parks the
         already-submitted order for recovery instead of treating it as
         a generic dispatch failure.
+
+        A working order's placed level is recorded again first: the journal
+        replaces the row's whole extras when it records ``server_ref``.
         """
         from pynecore.core.broker.journal import ConfirmOutcome
 
+        self._record_order_level(coid)
         try:
             confirm = await self._plugin.call_api(
 f'confirms/{server_ref}', method='get',
@@ -2734,6 +2930,9 @@ f'confirms/{server_ref}', method='get',
             deal_id = confirm.get('dealId')
         if deal_id is not None:
             deal_id = str(deal_id)
+        confirmed_level = await self._confirmed_order_level(intent.symbol, confirm)
+        if confirmed_level is not None:
+            self._record_order_level(coid, confirmed_level)
 
         level_confirmed = float(confirm.get('level') or 0.0)
         filled_size = float(confirm.get('size') or self._quantized_qty)

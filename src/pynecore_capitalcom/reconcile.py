@@ -21,6 +21,7 @@ into:
 State touched: BrokerStore through ``self.store_ctx``,
 ``_current_poll_id`` (read), ``_disappearance`` (lazy build).
 """
+import logging
 from abc import ABC
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, AsyncIterator
 import httpx
 
 from pynecore.core.broker.disappearance import (
+    MISSING_PENDING_EXTRA,
     DisappearanceTracker,
     MissingConfirmation,
     MissingResolution,
@@ -38,6 +40,7 @@ from pynecore.core.broker.journal import (
     ReconcileOutcome,
 )
 from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REJECTED,
     ExchangeOrder,
     LegType,
     OrderEvent,
@@ -57,8 +60,13 @@ from ._base import _CapitalComBase
 from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
+    EXTRAS_KEY_OWN_CLOSES,
+    EXTRAS_KEY_WORKING_ORDER_END,
+    _ACTIVITY_LAG_S,
     _POLL_INTERVAL_S,
     _extract_reject_reason,
+    _retire_parked_partial_close_exposure,
+    _size_from_units,
     _wire_float,
     _wire_id,
     _wire_int,
@@ -67,6 +75,8 @@ from .models import _compute_cumulative_fill
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
+
+logger = logging.getLogger(__name__)
 
 #: How long a ``natural_close_at``-stamped row stays exempt from the
 #: disappearance tracker. Within the window the activity-poll close
@@ -95,9 +105,10 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         (working → position flip on fill, partial fills via cumulative
         size decrease). Rows whose exchange counterpart has disappeared
         get a ``missing_pending_since`` stamp so the grace tracker can
-        close them out after the grace window. Last, every guarded bot
-        position's SL/TP is judged against the levels the bot set
-        (:meth:`_observe_protection`).
+        close them out after the grace window. Last, every bot position's
+        SL/TP and every resting bot entry order's level is judged against
+        what the bot set (:meth:`_observe_protection`,
+        :meth:`_observe_working_orders`).
 
         :param read_started_at: Wall-clock time the ``/positions`` read
             started; ``None`` judges the snapshot regardless of the last
@@ -358,6 +369,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 # ALREADY ``kind == 'position'`` — limit-fill entries
                 # that surface via this snapshot path are otherwise
                 # never stamped.
+                self._forget_working_order_guard(did)
                 DispatchJournal(self.store_ctx).apply_reconcile_outcome(
                     row.client_order_id,
                     ReconcileOutcome(
@@ -587,6 +599,9 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             now_ts,
         )
         await self._observe_protection(positions_by_deal, read_started_at)
+        await self._observe_working_orders(working_by_deal, read_started_at)
+        self._resolve_held_edit_verdicts()
+        self._resolve_netting_pending(working_by_deal, read_started_at)
 
     async def _vanished_closing_row_fill(
             self, row: 'OrderRow', now_ts: float,
@@ -838,9 +853,10 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 # out now, before the row is promoted to a live working
                 # order the engine would otherwise adopt.
                 try:
-                    await self.call_api(
-                        f'workingorders/{deal_id}', method='delete',
-                    )
+                    with self._own_cancel(coid) as cancel_sent_at:
+                        await self.call_api(
+                            f'workingorders/{deal_id}', method='delete',
+                        )
                 except (httpx.TimeoutException, httpx.RequestError,
                         ConnectionError, ExchangeConnectionError):
                     # Stay parked: the next poll repeats the (idempotent)
@@ -866,6 +882,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                         filled_qty=0.0,
                         fill_price=None,
                     )
+                    self._stamp_own_cancel_accepted(coid, cancel_sent_at)
                     self.store_ctx.close_order(coid)
                     # Pine no longer emits the cancelled entry, so the
                     # ``'rejected'`` resolution only clears the engine's
@@ -907,8 +924,31 @@ class _ReconcileMixin(_CapitalComBase, ABC):
     async def _resolve_partial_close_dispositions(
             self, positions_by_deal: dict[str, dict],
     ) -> None:
-        """Resolve parked partial closes from the exact target snapshot."""
+        """Resolve parked partial closes from the exact target snapshot.
+
+        A target at the exact expected residual settles the close as filled.
+        Otherwise the own-close record the POST left on the target decides:
+        an activity matched to it is the POST's own reduction (filled, booked
+        by the activity stream); no matching activity within
+        :attr:`fill_report_grace_s` means the POST netted nothing (rejected),
+        whether the target still holds its starting size, left the venue, or
+        was reduced by someone else meanwhile (that reduction is booked from
+        its own activity). Only the close's own reverse leg, still listed
+        while its corrective DELETE settles, keeps it parked past the grace.
+        When no confirm named the deals the POST touched and the grace passes
+        without an activity of its own, the one deal of its whole size it may
+        have opened beside a target already gone is its reverse leg
+        (:meth:`_unconfirmed_reverse_leg`): deleted like one the dispatch
+        found, the close parked until it is gone. Other opposite deals the
+        close cannot be shown to own do not keep it parked: it settles all the
+        same, with an ERROR and a
+        ``partial_close_settled_beside_unattributed_opposite`` audit event
+        naming them, and they stay on the venue untouched as deals this run
+        did not open. A close settled as filled lowers the target's exposure
+        cursor by its reduction, as the dispatch would have.
+        """
         assert self.store_ctx is not None
+        now = epoch_time()
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
             if (extras.get('kind') != KIND_PARTIAL_CLOSE
@@ -937,11 +977,16 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 if target_raw is not None else None
             )
             opposite_direction = 'SELL' if target_direction == 'BUY' else 'BUY'
-            opposite_exists = any(
-                ((raw.get('position') or {}).get('direction') or '').upper()
-                == opposite_direction
+            opposite_ids = sorted(
+                str(_wire_id((raw.get('position') or {}).get('dealId')))
                 for raw in positions_by_deal.values()
                 if (raw.get('market') or {}).get('epic') == row.symbol
+                and ((raw.get('position') or {}).get('direction') or '').upper()
+                == opposite_direction
+            )
+            opposite_exists = bool(opposite_ids)
+            corrected_reverse = _wire_id(
+                extras.get('corrected_reverse_deal_id')
             )
             expected_units = pre_units - close_units
             if (current_direction == target_direction
@@ -952,6 +997,10 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     coid=row.client_order_id,
                     kind=KIND_PARTIAL_CLOSE,
                     extra_payload={'recovery_path': 'partial_close_target_reconciled'},
+                )
+                _retire_parked_partial_close_exposure(
+                    self.store_ctx, row, close_units, rules.lot_step,
+                    path='partial_close_target_reconciled',
                 )
                 self.store_ctx.close_order(row.client_order_id)
                 self.store_ctx.record_resolution(row.client_order_id, 'attached')
@@ -966,12 +1015,126 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     },
                 )
                 continue
-            corrected_reverse = _wire_id(
-                extras.get('corrected_reverse_deal_id')
+            record = self._parked_partial_close_record(row)
+            if record is not None and record.get('matched'):
+                mark_close_completed(
+                    self.store_ctx,
+                    coid=row.client_order_id,
+                    kind=KIND_PARTIAL_CLOSE,
+                    extra_payload={'recovery_path': 'partial_close_own_activity_matched'},
+                )
+                _retire_parked_partial_close_exposure(
+                    self.store_ctx, row, close_units, rules.lot_step,
+                    path='partial_close_own_activity_matched',
+                )
+                self.store_ctx.close_order(row.client_order_id)
+                self.store_ctx.record_resolution(row.client_order_id, 'attached')
+                self.store_ctx.log_event(
+                    'partial_close_own_activity_matched',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=target_deal_id,
+                    intent_key=row.intent_key,
+                    payload={'matched': list(record.get('matched') or ()),
+                             'target_units': current_units},
+                )
+                continue
+            sent_at = _wire_float(extras.get('own_close_sent_at'), finite=True)
+            settled_at = _wire_float(
+                (record or {}).get('done_at') or sent_at,
+                finite=True,
             )
+            if (settled_at is not None
+                    and now - settled_at > self.fill_report_grace_s
+                    and (corrected_reverse is None
+                         or corrected_reverse not in positions_by_deal)):
+                # No activity matched the POST's own-close record within the
+                # grace: the POST reduced nothing, whatever the target shows.
+                # A target someone else (or the venue) reduced meanwhile is
+                # booked through that reduction's own activity; the command
+                # must still settle, or the target stays busy and its
+                # protection unjudged for good.
+                if (corrected_reverse is None and opposite_exists and sent_at is not None
+                        and not extras.get('confirm_deal_ids')):
+                    # The POST reduced nothing, yet no confirm says it was
+                    # refused: a deal it opened beside a target that was
+                    # already gone is its own reverse leg.
+                    fitted = self._unconfirmed_reverse_leg(
+                        positions_by_deal.values(), coid=row.client_order_id,
+                        intent_key=row.intent_key, symbol=row.symbol,
+                        direction=opposite_direction, target_deal_id=target_deal_id,
+                        size=_size_from_units(close_units, rules.lot_step),
+                        lot_step=rules.lot_step, sent_at=sent_at,
+                        done_at=_wire_float((record or {}).get('done_at'), finite=True),
+                    )
+                    if fitted is not None:
+                        def corrected(e: dict, deal_id: str = fitted) -> None:
+                            e['corrected_reverse_deal_id'] = deal_id
+                            e['corrective_delete_pending'] = True
+
+                        self._rewrite_extras(row.client_order_id, corrected)
+                        self.store_ctx.log_event(
+                            'partial_close_corrective_delete_dispatched',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=fitted,
+                            intent_key=row.intent_key,
+                        )
+                        current = self.store_ctx.get_order(row.client_order_id) or row
+                        await self._repeat_corrective_delete(current, fitted)
+                        continue
+                target_reduced = (target_raw is not None
+                                  and current_units is not None
+                                  and current_units < pre_units)
+                unattributed = [deal_id for deal_id in opposite_ids
+                                if deal_id != corrected_reverse]
+                if unattributed:
+                    # Nothing shows whose they are (the confirm did not name
+                    # them): never deleted, never booked as the bot's.
+                    logger.error(
+                        "partial close %s of %s: no activity of its own after %.0f s; "
+                        "settled as not executed beside opposite deal(s) %s it cannot "
+                        "be shown to own, left on the venue as deals this run did not "
+                        "open (the close's own reverse leg or someone else's)",
+                        row.client_order_id, row.symbol, now - settled_at, unattributed,
+                    )
+                    self.store_ctx.log_event(
+                        'partial_close_settled_beside_unattributed_opposite',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=','.join(unattributed),
+                        intent_key=row.intent_key,
+                        payload={'opposite_deal_ids': unattributed,
+                                 'target_deal_id': target_deal_id,
+                                 'target_present': target_raw is not None,
+                                 'target_units': current_units,
+                                 'pre_target_units': pre_units,
+                                 'symbol': row.symbol},
+                    )
+                mark_rejected(self.store_ctx, coid=row.client_order_id)
+                self.store_ctx.record_resolution(row.client_order_id, 'rejected')
+                self.store_ctx.log_event(
+                    'partial_close_no_own_reduction',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=target_deal_id,
+                    intent_key=row.intent_key,
+                    payload={'target_units': current_units,
+                             'pre_target_units': pre_units,
+                             'target_present': target_raw is not None,
+                             'target_reduced': target_reduced},
+                )
+                if target_reduced:
+                    logger.error(
+                        "partial close %s of %s: no activity of its own after %.0f s "
+                        "while the target deal %s went from %s to %s units — settled "
+                        "as not executed; the reduction is someone else's or the "
+                        "venue's and is booked from its own activity",
+                        row.client_order_id, row.symbol, now - settled_at,
+                        target_deal_id, pre_units, current_units,
+                    )
+                continue
             if corrected_reverse is None:
                 continue
             if corrected_reverse in positions_by_deal:
+                if extras.get('corrective_delete_pending'):
+                    await self._repeat_corrective_delete(row, corrected_reverse)
                 continue
             if (current_direction == target_direction
                     and current_units == pre_units
@@ -988,6 +1151,56 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                         'target_units': current_units,
                     },
                 )
+
+    async def _repeat_corrective_delete(self, command: 'OrderRow', reverse_id: str) -> None:
+        """DELETE a partial close's own reverse leg again while ``/positions`` lists it.
+
+        The dispatch's DELETE did not land (the venue could not route the
+        fresh deal yet, or its outcome is unknown). Until it lands, the leg is
+        the bot's own unbooked exposure and the close stays parked.
+
+        :param command: The parked partial-close command row.
+        :param reverse_id: The reverse leg's ``dealId``.
+        """
+        assert self.store_ctx is not None
+        try:
+            await self._call(f'positions/{reverse_id}', method='delete')
+        except (BrokerError, CapitalComError) as exc:
+            logger.warning(
+                "partial close %s: the corrective DELETE of its reverse leg %s did not "
+                "land (%s); repeated on the next poll",
+                command.client_order_id, reverse_id, exc,
+            )
+            return
+
+        self._rewrite_extras(
+            command.client_order_id,
+            lambda extras: extras.__setitem__('corrective_delete_pending', False),
+        )
+        self.store_ctx.log_event(
+            'partial_close_corrective_delete',
+            client_order_id=command.client_order_id,
+            exchange_order_id=reverse_id,
+            intent_key=command.intent_key,
+            payload={'reason': 'repeated_while_listed', 'delete_landed': True},
+        )
+
+    def _parked_partial_close_record(self, command: 'OrderRow') -> dict | None:
+        """The own-close record a partial-close command left on its target, if still there."""
+        assert self.store_ctx is not None
+        extras = command.extras or {}
+        sent_at = _wire_float(extras.get('own_close_sent_at'), finite=True)
+        target_coid = extras.get('target_coid')
+        if sent_at is None or not isinstance(target_coid, str):
+            return None
+        target = self.store_ctx.get_order(target_coid)
+        if target is None:
+            return None
+        for record in (target.extras or {}).get(EXTRAS_KEY_OWN_CLOSES) or ():
+            if (isinstance(record, dict)
+                    and _wire_float(record.get('sent_at'), finite=True) == sent_at):
+                return record
+        return None
 
     def _disappearance_tracker(self) -> DisappearanceTracker:
         """The lazily-built core disappearance tracker for this instance.
@@ -1075,23 +1288,56 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         grace window is the genuine disappearance. A
         ``natural_close_at``-stamped row was already known-closed on the
         exchange when the stamp landed, so its disappearance confirms
-        that natural close (benign terminal retire, no policy); anything
-        else is an external cancel.
+        that natural close (benign terminal retire, no policy); a vanished
+        working order is an external cancel, unless its activity showed the
+        venue itself (or its dealing desk) ending it
+        (``_note_working_order_end``): that is a venue-driven cancel, retired
+        without the policy. Without such an activity the verdict on a working
+        order waits until the venue has published every activity dated before
+        it vanished (:data:`~pynecore_capitalcom.helpers._ACTIVITY_LAG_S` after
+        it was first missed), so a late venue cancel is never taken for
+        someone else's.
 
-        Exception: a live POSITION row gets a direct authoritative probe
-        before any terminal verdict. The bulk ``/positions`` snapshot can
-        omit a freshly created position for well past the grace window
-        (measured live: cycle 81 — a STOP entry executed into position
-        deal ``…b486``, the snapshot lagged it, and the absence-only
-        verdict retired the just-promoted row 9 seconds after the
-        promotion; the engine then external-cleared the book and the
-        live venue position ended the run unowned, K3 MISMATCH). Only a
-        definitive ``error.not-found.dealId`` from
-        ``GET /positions/{dealId}`` confirms a position row's
-        disappearance; a transport fault keeps the stamp and defers.
+        A live POSITION row gets a direct authoritative probe before any
+        terminal verdict. The bulk ``/positions`` snapshot can omit a
+        freshly created position for well past the grace window (measured
+        live: cycle 81 — a STOP entry executed into position deal
+        ``…b486``, the snapshot lagged it, and the absence-only verdict
+        retired the just-promoted row 9 seconds after the promotion; the
+        engine then external-cleared the book and the live venue position
+        ended the run unowned, K3 MISMATCH). Only a definitive
+        ``error.not-found.dealId`` from ``GET /positions/{dealId}``
+        confirms a position row's disappearance; a transport fault keeps
+        the stamp and defers.
+
+        A filled bot position that disappeared is never an external cancel:
+        its close is someone's fill, and only the close's own activity can
+        say whose. A TP / SL / stop-out / system close, or a manual close on
+        the bot's ``dealId``, arrives as an activity and is booked (and, when
+        it is someone else's, reported) through the activity stream, which
+        also retires the row. The verdict therefore waits
+        :attr:`fill_report_grace_s` for that activity. A deal still gone
+        without one is retired with an ERROR and a
+        ``position_vanished_unattributed`` audit event, never a quarantine:
+        the evidence cannot show who closed it (a netting consumption is
+        reported on the consuming deal only). The engine's own venue-flat /
+        shrink detector books the change, since the plugin's position view
+        counts own deals only.
         """
         extras = row.extras or {}
         deal_id = row.exchange_order_id
+        if extras.get('natural_close_at') is not None:
+            return MissingConfirmation(MissingResolution.CLOSED)
+        filled_position = (
+            extras.get('kind') == ENTRY_KIND_POSITION
+            and (row.filled_qty > 0.0
+                 or extras.get('entry_filled_at') is not None
+                 or extras.get('partial_close_retired_at') is not None)
+        )
+        if filled_position and deal_id:
+            since = _wire_float(extras.get(MISSING_PENDING_EXTRA), finite=True)
+            if since is not None and epoch_time() - since < self.fill_report_grace_s:
+                return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         if extras.get('kind') == ENTRY_KIND_POSITION and deal_id:
             try:
                 await self.call_api(f'positions/{deal_id}', method='get')
@@ -1130,6 +1376,8 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                         )
                         return MissingConfirmation(
                             MissingResolution.STILL_PRESENT)
+                if filled_position:
+                    return self._unattributed_vanish(row)
                 # fall through to the verdict below
             except (httpx.TimeoutException, httpx.RequestError,
                     ConnectionError, ExchangeConnectionError,
@@ -1137,9 +1385,59 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 return MissingConfirmation(MissingResolution.INCONCLUSIVE)
             else:
                 return MissingConfirmation(MissingResolution.STILL_PRESENT)
-        if extras.get('natural_close_at') is not None:
-            return MissingConfirmation(MissingResolution.CLOSED)
+        end = extras.get(EXTRAS_KEY_WORKING_ORDER_END)
+        if isinstance(end, dict) and end.get('by') in ('venue', 'dealer'):
+            return MissingConfirmation(
+                MissingResolution.CANCELLED, cancel_reason=CANCEL_REASON_VENUE_REJECTED,
+            )
+        if extras.get('kind') == ENTRY_KIND_WORKING and end is None:
+            since = _wire_float(extras.get(MISSING_PENDING_EXTRA), finite=True)
+            if since is not None and epoch_time() - since < _ACTIVITY_LAG_S:
+                return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         return MissingConfirmation(MissingResolution.CANCELLED)
+
+    def _unattributed_vanish(self, row: 'OrderRow') -> MissingConfirmation:
+        """Retire a filled bot position whose deal vanished without a close activity.
+
+        An own DELETE explains a ``closing`` row's disappearance; anything
+        else is logged ERROR and audited, the bracket legs are torn down and
+        the row's exposure leaves the journal. Never reported as an
+        intervention: nothing shows who closed the deal.
+        """
+        assert self.store_ctx is not None
+        own_delete = row.state == 'closing'
+        payload = {
+            'deal_id': row.exchange_order_id,
+            'symbol': row.symbol,
+            'side': row.side,
+            'exposure': row.filled_qty,
+            'missing_since': (row.extras or {}).get(MISSING_PENDING_EXTRA),
+            'grace_s': self.fill_report_grace_s,
+        }
+        if own_delete:
+            self.store_ctx.log_event(
+                'own_close_vanished_without_activity',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload=payload,
+            )
+        else:
+            logger.error(
+                "bot position %s (%s, %s %s) left the venue and no close activity "
+                "arrived within %.0f s: retired, not reported — the venue history "
+                "must show who closed it",
+                row.exchange_order_id, row.symbol, row.side, row.filled_qty,
+                self.fill_report_grace_s,
+            )
+            self.store_ctx.log_event(
+                'position_vanished_unattributed',
+                client_order_id=row.client_order_id,
+                exchange_order_id=row.exchange_order_id,
+                payload=payload,
+            )
+        self._close_bracket_after_natural_close(row)
+        self._retire_netted_journal_exposure(row, row.filled_qty)
+        return MissingConfirmation(MissingResolution.CLOSED)
 
     def _feed_native_failsafe_observed(
             self, parent_ref: str, pos: dict,

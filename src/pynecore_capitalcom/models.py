@@ -172,18 +172,77 @@ class _ProtectionWrite:
 
 
 @dataclass
+class _ForeignExitBlock:
+    """An own partial exit deals this run did not open keep from going out.
+
+    :ivar since: Wall time of the first refusal a fresh read established.
+    :ivar seen_at: Wall time of the newest read (a fresh refusal or a poll
+        snapshot) that still showed the block.
+    :ivar symbol: The epic.
+    :ivar direction: The direction of the deal the exit reduces
+        (``'BUY'`` / ``'SELL'``).
+    :ivar targets: The ``dealId`` values the exit reduces.
+    """
+    since: float
+    seen_at: float
+    symbol: str
+    direction: str
+    targets: frozenset[str]
+
+
+@dataclass
 class _OwnCloseHandle:
     """An own close recorded before its request left.
 
     ``withdraw`` drops the record from the target rows; call :meth:`failed`
     when the venue refused the close, so no later close activity can be
-    attributed to it.
+    attributed to it. ``sent_at`` identifies the record on the target rows.
     """
     withdraw: Callable[[], None]
+    sent_at: float = 0.0
 
     def failed(self) -> None:
         """The venue refused the close."""
         self.withdraw()
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldEditVerdict:
+    """A confirmed change of the bot's levels whose author the feed may not show yet.
+
+    :ivar deal_id: The position or resting order the change is on.
+    :ivar guard_key: The protection key whose own writes bound the edits that
+        can explain the change.
+    :ivar observed_at: Wall time the change was confirmed.
+    :ivar edits_after: Venue time from which an edit can explain the change:
+        the floor of the bot's last own write on ``guard_key`` before it.
+    :ivar venue: Accepts the change as the venue's (or its dealing desk's)
+        own, given the newest explaining edit as ``(venue time, source)`` and
+        whether the bot wrote ``guard_key`` while the verdict waited.
+    :ivar foreign: Reports the change as someone else's, given whether the
+        bot wrote ``guard_key`` while the verdict waited.
+    :ivar unexplained: Decides a change no edit activity explains, given
+        whether the bot wrote ``guard_key`` while the verdict waited; ``None``
+        reports it like :attr:`foreign`.
+    :ivar own_write: Prepares an own write on ``guard_key`` that goes out
+        while the verdict waits; ``None`` when the write needs nothing.
+    :ivar provisional: The bot wrote ``guard_key`` while the verdict waited,
+        after :attr:`own_write` prepared the guard for it.
+    :ivar row_coid: The journal row the verdict is persisted on.
+    :ivar record: The verdict as persisted on that row; a restarted process
+        rebuilds the verdict from it.
+    """
+    deal_id: str
+    guard_key: str
+    observed_at: float
+    edits_after: float
+    venue: Callable[[tuple[float, str], bool], None]
+    foreign: Callable[[bool], None]
+    unexplained: Callable[[bool], None] | None = None
+    own_write: Callable[[], None] | None = None
+    provisional: bool = False
+    row_coid: str | None = None
+    record: dict = field(default_factory=dict)
 
 
 def _bracket_leg_id(deal_id: str, kind: str) -> str:
@@ -269,5 +328,24 @@ def _activity_fingerprint(activity: dict) -> str:
     """
     key = "|".join(str(activity.get(k, '')) for k in (
         'dateUTC', 'dealId', 'type', 'status', 'source', 'level', 'size',
+    ))
+    return hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]
+
+
+def _close_identity(activity: dict) -> str:
+    """Level-independent identity of one close activity.
+
+    The venue can publish a close without its ``level`` and re-issue the same
+    row with the level filled in later: same deal, same ``dateUTC``, same
+    size, a different :func:`_activity_fingerprint`. Every judgement of a
+    close (own or not, booked or not, reported or not) keys on this identity
+    so the re-issued row reuses it instead of counting as a second close.
+    """
+    details = activity.get('details') or {}
+    key = "|".join(str(value) for value in (
+        activity.get('dateUTC', ''), activity.get('dealId', ''),
+        activity.get('type', ''), activity.get('status', ''),
+        activity.get('source', ''),
+        activity.get('size') or details.get('size') or '',
     ))
     return hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]

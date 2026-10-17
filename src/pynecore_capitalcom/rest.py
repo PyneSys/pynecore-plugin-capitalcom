@@ -33,18 +33,21 @@ from pynecore.core.broker.exceptions import (
     ExchangeRateLimitError,
     InsufficientMarginError,
 )
+from pynecore.lib.log import broker_info
 
 from ._base import _CapitalComBase
 from .exceptions import (
     CapitalComApiError,
     CapitalComError,
     CapitalComTransportError,
+    ForeignDealBlocksWriteError,
     HistoricalPricesNotFoundError,
     InvalidStopDistanceError,
     InvalidStopMaxValueError,
     InvalidTakeProfitDistanceError,
     InvalidTakeProfitMaxValueError,
     OrderNotFoundError,
+    PositionSnapshotUnavailableError,
 )
 from .helpers import (
     ENDPOINT_PREFIX,
@@ -60,6 +63,7 @@ from .helpers import (
     _extract_error_code,
     _extract_jwt_expiry,
     _extract_numeric_value,
+    _wire_id,
     encrypt_password,
     rest_url,
 )
@@ -477,6 +481,30 @@ class _RestSessionMixin(_CapitalComBase, ABC):
                 endpoint, data=data, method=method,
             )
 
+    def _locked_positions_snapshot(self, what: str) -> dict:
+        """The ``GET /positions`` a netting POST needs first; the caller holds the write lock.
+
+        A read that fails on the transport or on the rate limit sends
+        nothing: it raises :class:`PositionSnapshotUnavailableError`, a
+        refusal the caller turns into a retry, never an ambiguous dispatch.
+
+        :param what: The write the snapshot guards, for the message.
+        """
+        try:
+            return self._call_serialized_write('positions', method='get')
+        except Exception as read_error:
+            read_fault = (
+                read_error
+                if isinstance(read_error, (ExchangeConnectionError, ExchangeRateLimitError))
+                else self._map_exception(read_error)
+            )
+            if isinstance(read_fault, (ExchangeConnectionError, ExchangeRateLimitError)):
+                raise PositionSnapshotUnavailableError(
+                    f"Capital {what} not sent: the pre-flight positions read "
+                    f"failed ({read_fault})",
+                ) from read_error
+            raise
+
     async def _submit_exclusive_partial_close(
             self, *, coid: str, symbol: str, expected_direction: str,
             target_deal_ids: frozenset[str], body: dict,
@@ -488,28 +516,58 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         using different API keys for the same account share one critical section.
         External manual/API writers remain outside this lock; callers therefore
         reconcile the exact target deal after the POST.
+
+        The venue nets the POST FIFO against the oldest deal of the target's
+        direction, and a partial close never takes the whole target. It is
+        sent only when the target is the one deal of this run on the epic and
+        every other deal there is a deal this run did not open of the same
+        direction, strictly younger than the target (never reached). A
+        foreign deal as old as the target or older raises
+        :class:`ForeignDealBlocksWriteError` (the reduction could consume it);
+        any other second deal raises a plain refusal. A snapshot read that
+        fails raises :class:`PositionSnapshotUnavailableError`: nothing was
+        sent.
         """
         write_lock, lock_path = self._account_write_lock()
 
         def snapshot_and_post() -> tuple[dict, list[dict]]:
             with write_lock, _exclusive_account_file_lock(lock_path):
-                snapshot = self._call_serialized_write('positions', method='get')
+                snapshot = self._locked_positions_snapshot(f"partial close {coid}")
                 rows = [
                     raw for raw in (snapshot.get('positions') or [])
                     if (raw.get('market') or {}).get('epic') == symbol
                 ]
-                positions = [raw.get('position') or {} for raw in rows]
-                deal_ids = {
-                    str(position['dealId'])
-                    for position in positions
-                    if position.get('dealId')
+                targets = [
+                    raw.get('position') or {} for raw in rows
+                    if _wire_id((raw.get('position') or {}).get('dealId')) in target_deal_ids
+                ]
+                blockers = self._exit_blockers(
+                    rows, symbol, expected_direction, target_deal_ids,
+                )
+                if blockers:
+                    raise ForeignDealBlocksWriteError(
+                        "Capital partial close refused: the reduction POST "
+                        "cannot target a dealId and could net deal(s) "
+                        f"{[deal['deal_id'] for deal in blockers]} this run "
+                        "did not open",
+                        reason='foreign_deal_blocks_partial_close',
+                        foreign_deals=blockers,
+                    )
+                younger_foreign = {
+                    str(deal['deal_id'])
+                    for deal in self._foreign_deals(rows, symbol, direction=expected_direction)
                 }
+                others = [
+                    raw.get('position') or {} for raw in rows
+                    if _wire_id((raw.get('position') or {}).get('dealId'))
+                    not in target_deal_ids
+                ]
                 exclusive_target = (
                     len(target_deal_ids) == 1
-                    and len(positions) == 1
-                    and deal_ids == target_deal_ids
-                    and (positions[0].get('direction') or '').upper()
-                    == expected_direction
+                    and len(targets) == 1
+                    and (targets[0].get('direction') or '').upper() == expected_direction
+                    and all(_wire_id(position.get('dealId')) in younger_foreign
+                            for position in others)
                 )
                 if not exclusive_target:
                     raise ExchangeOrderRejectedError(
@@ -517,7 +575,7 @@ class _RestSessionMixin(_CapitalComBase, ABC):
                         "venue position immediately before dispatch because "
                         "the reduction POST cannot target a dealId"
                     )
-                target = positions[0]
+                target = targets[0]
                 target_deal_id = str(target['dealId'])
                 target_direction = (target.get('direction') or '').upper()
                 live_size = float(target.get('size', 0.0))
@@ -544,6 +602,52 @@ class _RestSessionMixin(_CapitalComBase, ABC):
                     'positions', data=body, method='post',
                 )
                 return response, rows
+
+        try:
+            return await asyncio.to_thread(snapshot_and_post)
+        except Exception as exc:
+            mapped = self._map_exception(exc)
+            if mapped is not None:
+                raise mapped from exc
+            raise
+
+    async def _submit_netting_safe_entry(
+            self, *, coid: str, symbol: str, side: str, body: dict,
+    ) -> dict:
+        """POST a netting-account market entry only if it cannot net a foreign deal.
+
+        Under the account write lock: a final ``GET /positions``, then the
+        POST. An entry nets the oldest deal of the opposite direction FIFO, so
+        a deal of that direction this run did not open raises
+        :class:`ForeignDealBlocksWriteError` and nothing is sent. Own opposite
+        deals do not block: netting them is the strategy's own business.
+
+        :param coid: The entry's client order id (audit only).
+        :param symbol: The epic.
+        :param side: The entry side (``'buy'`` / ``'sell'``).
+        :param body: The ``POST /positions`` body, exactly as sent.
+        :raises ForeignDealBlocksWriteError: A foreign deal is on the netted side.
+        :raises PositionSnapshotUnavailableError: The snapshot read failed;
+            nothing was sent.
+        """
+        write_lock, lock_path = self._account_write_lock()
+        netted_direction = 'SELL' if side == 'buy' else 'BUY'
+
+        def snapshot_and_post() -> dict:
+            with write_lock, _exclusive_account_file_lock(lock_path):
+                snapshot = self._locked_positions_snapshot(f"entry {coid}")
+                foreign = self._foreign_deals(
+                    snapshot.get('positions') or [], symbol, direction=netted_direction,
+                )
+                if foreign:
+                    raise ForeignDealBlocksWriteError(
+                        f"Capital {side} market entry {coid} refused: it would net "
+                        f"deal(s) {[deal['deal_id'] for deal in foreign]} this run "
+                        "did not open",
+                        reason='foreign_deal_blocks_opposite_entry',
+                        foreign_deals=foreign,
+                    )
+                return self._call_serialized_write('positions', data=body, method='post')
 
         try:
             return await asyncio.to_thread(snapshot_and_post)
@@ -647,12 +751,25 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         book. A one-way (netting) account leaves ``position_port`` ``None``
         and keeps the direct execute path. ``get_preferences`` is
         instance-cached, so a reconnect re-entry is free and the
-        assignment is idempotent.
+        assignment is idempotent; every new process probes afresh.
+
+        The mode decides which external changes are interventions (an
+        opposite POST of someone else reduces the bot's deal only on a
+        netting account), so a process start logs it and writes an
+        ``account_mode_detected`` audit event.
         """
         prefs = await self.get_preferences()
         self._hedging_enabled = bool(prefs.get('hedgingMode'))
         if self._hedging_enabled:
             self.position_port = self
+        if self._connection_generation == 0:
+            mode = 'hedging' if self._hedging_enabled else 'netting'
+            broker_info("Capital.com account position mode: %s", mode)
+            if self.store_ctx is not None:
+                self.store_ctx.log_event(
+                    'account_mode_detected',
+                    payload={'hedging': self._hedging_enabled, 'mode': mode},
+                )
 
     # --- exception mapping ------------------------------------------------
 

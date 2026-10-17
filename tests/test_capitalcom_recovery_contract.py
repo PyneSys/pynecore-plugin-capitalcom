@@ -569,46 +569,43 @@ def __test_recovery_contract_idempotency__(tmp_path):
     store.close()
 
 
-def __test_startup_adoption_skips_other_instruments__(tmp_path):
-    """The account-wide positions snapshot must not seed foreign-symbol rows.
+def __test_startup_note_is_scoped_to_the_run_epic__(tmp_path):
+    """The account-wide positions snapshot is narrowed to the run's epic.
 
-    This run trades ONE epic; a leg on any other instrument is not ours to
-    route closes for, and an adopted foreign row is copied into every later
-    cycle by same-``run_id`` adoption (observed live: a lane switched from
-    EURUSD to BTCUSD adopted the old instrument's orphaned short into the
-    fresh run's journal).
+    An untracked deal on the run's epic is logged with a
+    ``foreign_deal_on_epic_at_startup`` audit event; a deal on any other
+    instrument is not this run's business at all (observed live: a lane
+    switched from EURUSD to BTCUSD once seeded the old instrument's orphaned
+    short into the fresh run's journal). Neither seeds a row.
     """
     broker, store, ctx = _open_broker(tmp_path)
     broker.symbol = "BTCUSD"
 
-    broker._adopt_untracked_positions({
+    broker._note_untracked_positions_at_startup({
         "positions": [
             {
                 "market": {"epic": "EURUSD"},
-                "position": {"dealId": "deal-foreign", "direction": "SELL",
+                "position": {"dealId": "deal-eur", "direction": "SELL",
                              "size": 200.0},
             },
             {
                 "market": {"epic": "BTCUSD"},
-                "position": {"dealId": "deal-own", "direction": "BUY",
+                "position": {"dealId": "deal-btc", "direction": "BUY",
                              "size": 0.01},
             },
         ],
     })
 
-    # The foreign deal must be absent in ANY shape — not just under its
-    # own-epic coid. A regressed epic filter would seed it under the
-    # run's epic (``__pyne_adopted__BTCUSD__deal-foreign``), so assert on
-    # the deal identity, not on one coid spelling.
-    assert ctx.get_order("__pyne_adopted__EURUSD__deal-foreign") is None
-    assert ctx.find_by_ref("deal_id", "deal-foreign") is None
-    assert not any(
-        row.exchange_order_id == "deal-foreign"
-        for row in ctx.iter_live_orders()
-    )
-    own = ctx.get_order("__pyne_adopted__BTCUSD__deal-own")
-    assert own is not None and own.state == "confirmed"
-    assert own.qty == 0.01 and own.side == "buy"
+    assert list(ctx.iter_live_orders()) == []
+    noted = [
+        row["exchange_order_id"] for row in ctx._store._conn.execute(
+            "SELECT exchange_order_id FROM events "
+            "WHERE run_instance_id = ? AND kind = 'foreign_deal_on_epic_at_startup'",
+            (ctx.run_instance_id,),
+        )
+    ]
+    assert noted == ["deal-btc"]
+    assert broker._foreign_deals_logged == {"deal-btc"}
     store.close()
 
 
