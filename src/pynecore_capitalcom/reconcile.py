@@ -50,7 +50,9 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    KIND_FULL_CLOSE,
     KIND_PARTIAL_CLOSE,
+    STATE_CLOSING,
     mark_close_completed,
     mark_confirmed_with_fill,
     mark_rejected,
@@ -133,6 +135,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         # creates them atomically).
         bracket_resolutions: dict[str, bool] = {}
         await self._resolve_partial_close_dispositions(positions_by_deal)
+        self._complete_full_close_commands(positions_by_deal)
         async for parked_event in self._resolve_parked_submission_dispositions(
                 positions_by_deal):
             yield parked_event
@@ -602,6 +605,41 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         await self._observe_working_orders(working_by_deal, read_started_at)
         self._resolve_held_edit_verdicts()
         self._resolve_netting_pending(working_by_deal, read_started_at)
+
+    def _complete_full_close_commands(self, positions_by_deal: dict[str, dict]) -> None:
+        """End every full-close command whose targets are let go of everywhere.
+
+        The journal leaves a full close ``closing`` once its DELETEs landed;
+        the activity stream books each target's close and ends the target's
+        own row. The command is done once none of its targets is held on the
+        venue or live in the journal any more.
+        """
+        assert self.store_ctx is not None
+        rows = list(self.store_ctx.iter_live_orders())
+        live_deals = {
+            row.exchange_order_id for row in rows
+            if row.exchange_order_id and (row.extras or {}).get('kind') != KIND_FULL_CLOSE
+        }
+        for row in rows:
+            extras = row.extras or {}
+            if extras.get('kind') != KIND_FULL_CLOSE or row.state != STATE_CLOSING:
+                continue
+            targets = [deal for deal in map(_wire_id, extras.get('targets') or [])
+                       if deal is not None]
+            if any(deal in positions_by_deal or deal in live_deals for deal in targets):
+                continue
+            # Left open, the command was carried into every later run instance
+            # of the run and walked on every live-order scan (measured live:
+            # 1433 such rows on the Capital.com lane, the oldest two months old).
+            mark_close_completed(
+                self.store_ctx, coid=row.client_order_id, kind=KIND_FULL_CLOSE,
+                extra_payload={'completed_path': 'targets_released'},
+            )
+            self.store_ctx.close_order(row.client_order_id)
+            self.store_ctx.log_event(
+                'full_close_completed', client_order_id=row.client_order_id,
+                intent_key=row.intent_key, payload={'targets': targets},
+            )
 
     async def _vanished_closing_row_fill(
             self, row: 'OrderRow', now_ts: float,

@@ -861,7 +861,9 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         payload = None
                         rest_indeterminate = True
                     if payload is not None:
-                        broker_warning(
+                        # The venue's own bar replaces the missed event: the
+                        # data stays whole, and a run of them reconnects below
+                        broker_info(
                             "ohlc.event missed for ts=%d (silent %.1fs) "
                             "- injecting bar from REST",
                             missing_ts, ohlc_silent_for,
@@ -1258,7 +1260,9 @@ class _StreamingMixin(_CapitalComBase, ABC):
             )
 
         if reason != "ws_primary":
-            broker_warning(
+            # The venue's REST volume is exact; only an estimate is worth a warning
+            log_fallback = broker_info if rest_vol > 0.0 else broker_warning
+            log_fallback(
                 "WS volume fallback (ts=%d, reason=%s, "
                 "ws=%d, rest=%.1f, median=%.1f)",
                 bar_open_s_int, reason, ws_vol,

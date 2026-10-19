@@ -221,6 +221,10 @@ def _events_for(ctx, coid: str) -> list[tuple[str, dict]]:
     return [(r['kind'], _json.loads(r['payload'] or '{}')) for r in rows]
 
 
+async def _drain(agen):
+    return [ev async for ev in agen]
+
+
 def __test_execute_close_full_happy_path_routes_through_journal__(tmp_path):
     """Full close → command row CONFIRMED→CLOSING + per-target audit events."""
     broker, store, ctx = _make_broker(tmp_path, responses={
@@ -2170,4 +2174,53 @@ def __test_full_close_persists_the_delete_deal_reference_on_the_target__(tmp_pat
     assert (target.extras or {}).get('close_deal_reference') == 'p_close-ref'
     kinds = [(k, p) for k, p in _events_for(ctx, 'coid-entry') if k == 'close_dispatched']
     assert kinds == [('close_dispatched', {'close_deal_reference': 'p_close-ref'})]
+    store.close()
+
+
+def _closed_full_close(tmp_path, *, target_released: bool):
+    """A full close of ``deal-L`` whose DELETE landed, its target row released or not."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'delete'): {},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    env = DispatchEnvelope(
+        intent=CloseIntent(pine_id='Long', symbol='EURUSD', side='sell', qty=1.0),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    asyncio.run(broker.execute_close(env))
+    if target_released:
+        ctx.close_order('coid-entry')
+    return broker, store, ctx, env.client_order_id(KIND_CLOSE)
+
+
+def __test_a_full_close_ends_once_its_targets_are_released__(tmp_path):
+    """The snapshot ends the command a landed full close left ``closing``."""
+    broker, store, ctx, cmd_coid = _closed_full_close(tmp_path, target_released=True)
+
+    asyncio.run(_drain(broker._reconcile_snapshot({}, {}, read_started_at=time.time())))
+
+    assert cmd_coid not in {r.client_order_id for r in ctx.iter_live_orders()}
+    row = ctx.get_order(cmd_coid)
+    assert row is not None and row.state == 'confirmed'
+    assert ('full_close_completed', {'targets': ['deal-L']}) in _events_for(ctx, cmd_coid)
+    store.close()
+
+
+@pytest.mark.parametrize('held_on_venue', [False, True])
+def __test_a_full_close_stays_open_while_a_target_is_held__(tmp_path, held_on_venue):
+    """A target still live in the journal or listed by the venue keeps the command."""
+    broker, store, ctx, cmd_coid = _closed_full_close(
+        tmp_path, target_released=held_on_venue)
+    positions = ({'deal-L': {'market': {'epic': 'EURUSD'},
+                             'position': {'dealId': 'deal-L', 'direction': 'BUY',
+                                          'size': 1.0}}}
+                 if held_on_venue else {})
+
+    broker._complete_full_close_commands(positions)
+
+    row = ctx.get_order(cmd_coid)
+    assert row is not None and row.state == 'closing'
+    assert cmd_coid in {r.client_order_id for r in ctx.iter_live_orders()}
     store.close()

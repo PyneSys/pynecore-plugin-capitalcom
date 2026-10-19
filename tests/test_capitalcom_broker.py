@@ -3,6 +3,7 @@
 """
 import asyncio
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timezone
@@ -6535,7 +6536,7 @@ def __test_connect_reauthenticates_after_session_invalid__(monkeypatch):
     asyncio.run(runner())
 
 
-def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypatch):
+def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypatch, caplog):
     """Repeated REST recovery means the OHLC subscription is stale, not healthy.
 
     A single dropped ``ohlc.event`` is worth patching from REST. Multiple
@@ -6615,9 +6616,13 @@ def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypa
             except asyncio.CancelledError:
                 pass
 
+    caplog.set_level(logging.INFO, logger='pynecore')
     asyncio.run(runner())
 
     assert fetches == [1_060, 1_120]
+    # A bar the venue's REST supplied is whole data: an INFO note, not a warning
+    injected = [rec.levelno for rec in caplog.records if 'ohlc.event missed' in rec.getMessage()]
+    assert injected == [logging.INFO, logging.INFO]
     assert ws.close_calls == [(4001, "ohlc-rest-recovered-stale")]
     assert broker._last_ohlc_event_ts == 1_000.0
     assert broker.take_stream_disconnect_evidence() == (
@@ -13301,7 +13306,7 @@ def __test_ws_volume_low_outlier_triggers_rest__():
     assert list(broker._ws_volume_baseline) == [100] * 6
 
 
-def __test_ws_volume_zero_triggers_rest__():
+def __test_ws_volume_zero_triggers_rest__(caplog):
     """Full-coverage bar with 0 quotes → REST fallback always fires."""
     broker = _make_volume_broker(tf="1")
     bar_open_s = 1_700_000_000
@@ -13318,6 +13323,7 @@ def __test_ws_volume_zero_triggers_rest__():
         "priceType": "bid", "t": bar_open_ms,
         "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
     }
+    caplog.set_level(logging.INFO, logger='pynecore')
     asyncio.run(_run_worker_until_drained(
         broker, [("ohlc", payload)],
         fake_fetch_bar_volume=_fake_fetch,
@@ -13327,6 +13333,9 @@ def __test_ws_volume_zero_triggers_rest__():
     items = _drain_update_queue(broker)
     assert items[0][1]["_volume"] == 42.0
     assert rest_calls == [bar_open_s]
+    # The venue's REST volume is exact: the fallback is an INFO note
+    fallback = [rec.levelno for rec in caplog.records if 'WS volume fallback' in rec.getMessage()]
+    assert fallback == [logging.INFO]
 
 
 def __test_ws_volume_consecutive_bad_bars_force_reconnect__():
@@ -13466,7 +13475,7 @@ def __test_ws_volume_recovered_slot_does_not_count_toward_stale_streak__():
     assert broker._ws_recovered_slots == set()
 
 
-def __test_ws_volume_rest_failed_emits_median__():
+def __test_ws_volume_rest_failed_emits_median__(caplog):
     """Baseline ready, ws=0, REST returns 0 → emit rolling median."""
     import collections as _collections
 
@@ -13488,6 +13497,7 @@ def __test_ws_volume_rest_failed_emits_median__():
         "priceType": "bid", "t": bar_open_ms,
         "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
     }
+    caplog.set_level(logging.INFO, logger='pynecore')
     asyncio.run(_run_worker_until_drained(
         broker, [("ohlc", payload)],
         fake_fetch_bar_volume=_fake_fetch,
@@ -13497,6 +13507,9 @@ def __test_ws_volume_rest_failed_emits_median__():
     items = _drain_update_queue(broker)
     assert items[0][1]["_volume"] == 100.0  # median of [100]*6
     assert rest_calls == [bar_open_s]
+    # An estimated volume stays a warning
+    fallback = [rec.levelno for rec in caplog.records if 'WS volume fallback' in rec.getMessage()]
+    assert fallback == [logging.WARNING]
     assert broker._ws_bad_bar_streak == 0, (
         "REST-failed median estimate must not bump the streak"
     )
