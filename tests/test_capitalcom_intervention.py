@@ -919,6 +919,31 @@ def __test_rejected_leg_cancel_keeps_the_leg_live__(tmp_path):
     store.close()
 
 
+def __test_leg_cancel_on_a_position_the_venue_closed_is_already_gone__(tmp_path):
+    # capitalcom cycle 348: the stop closed the position, the sweep then PUT
+    # its bracket clear and Capital answered REJECTED POSITION_NOT_FOUND.
+    broker, store, ctx, latched = _make_broker(tmp_path, responses={
+        ('confirms/cxl', 'get'): {'dealStatus': 'REJECTED',
+                                  'rejectReason': 'POSITION_NOT_FOUND'},
+    })
+    _seed_position(ctx)
+    _attach(broker, tp=1.20, sl=1.05)
+    broker._responses[('positions/deal-L', 'put')] = {'dealReference': 'cxl'}
+    tp_row = next(r for r in ctx.iter_live_orders()
+                  if (r.extras or {}).get('leg_kind') == 'tp')
+    asyncio.run(_CapitalComCancelHooks(plugin=broker).submit_cancel(
+        coid='cmd-cancel',
+        intent=CancelIntent(pine_id='X', symbol='EURUSD', from_entry='Long'),
+        targets=[tp_row],
+    ))
+    gone = ctx.get_order(tp_row.client_order_id)
+    assert gone is not None and gone.closed_ts_ms is not None
+    kinds = _event_kinds(ctx)
+    assert 'cancel_already_gone' in kinds
+    assert 'cancel_rejected' not in kinds
+    store.close()
+
+
 def __test_unreadable_leg_cancel_confirm_is_ambiguous__(tmp_path):
     broker, store, ctx, latched = _make_broker(tmp_path)
     _seed_position(ctx)

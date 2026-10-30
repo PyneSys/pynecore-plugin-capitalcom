@@ -132,6 +132,10 @@ _FUNDS_REJECT_REASON_SUBSTRINGS = ('MARGIN', 'LEVERAGE', 'FUND', 'RISK', 'BALANC
 # ``rejectReason``.
 _MARKET_CLOSED_REJECT_SUBSTRINGS = ('CURRENTLY CLOSED', 'MARKET IS CLOSED', 'MARKET CLOSED',
                                     'MARKET.CLOSED', 'TRADING HOURS')
+# A ``PUT /positions/{dealId}`` on a position the venue already closed (its
+# stop or limit fired) is answered with a REJECTED confirm carrying this
+# ``rejectReason`` rather than an HTTP 404 (measured live, 2026-10-30).
+_POSITION_GONE_REJECT_REASONS = ('POSITION_NOT_FOUND',)
 
 
 # --- Internal tuning constants ---------------------------------------------
@@ -433,6 +437,13 @@ def _is_market_closed_reject(reason: str) -> bool:
     reject — nothing landed and the venue reopens on its own."""
     reason_uc = reason.upper()
     return any(token in reason_uc for token in _MARKET_CLOSED_REJECT_SUBSTRINGS)
+
+
+def _is_position_gone_reject(reason: str) -> bool:
+    """True when a Capital.com reject reason means the targeted position no
+    longer exists on the venue, so a write that only clears its bracket has
+    nothing left to clear."""
+    return reason.strip().upper() in _POSITION_GONE_REJECT_REASONS
 
 
 def _order_type_from_row(row: 'OrderRow', activity_type: str) -> OrderType:

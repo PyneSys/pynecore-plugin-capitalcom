@@ -55,6 +55,7 @@ from .helpers import (
     _extract_reject_reason,
     _is_funds_reject,
     _is_market_closed_reject,
+    _is_position_gone_reject,
     _venue_rendered_level,
     _wire_float,
     _wire_id,
@@ -540,8 +541,16 @@ class _CapitalComCancelHooks:
                         cause=net if isinstance(net, Exception) else None,
                     ) from net
                 except OrderNotFoundError:
-                    # Position already gone — bracket is gone with it.
                     target_already_gone = True
+                if reject_reason is not None and _is_position_gone_reject(reject_reason):
+                    # The venue closed the position (its stop or limit fired)
+                    # before the sweep reached it: the bracket went with it,
+                    # exactly like the 404 above. Capital answers this with a
+                    # REJECTED confirm; capitalcom cycle 348 died on it.
+                    reject_reason = None
+                    target_already_gone = True
+                if target_already_gone:
+                    # Position already gone — bracket is gone with it.
                     if store_ctx is not None:
                         store_ctx.log_event(
                             'cancel_already_gone',
