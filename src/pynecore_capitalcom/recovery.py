@@ -888,6 +888,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 retired_intent_keys.add(row.intent_key)
             retired_count += 1
 
+        orphaned_exit_keys: set[str] = set()
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
             leg_kind = extras.get('leg_kind')
@@ -925,16 +926,26 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             self.store_ctx.close_order(row.client_order_id)
             # Leg rows persist ``intent_key`` as ``<exit_pine>\0<from_entry>\0TP/SL``;
             # strip the leg suffix to get the exit envelope key that
-            # ``OrderSyncEngine._build_envelope`` looks up. TP and SL
-            # legs share one exit envelope — ``record_complete`` is a
-            # plain DELETE so the second call is a harmless no-op.
+            # ``OrderSyncEngine._build_envelope`` looks up.
             leg_intent_key = row.intent_key
             if leg_intent_key and leg_intent_key.endswith(('\0TP', '\0SL')):
-                exit_intent_key = leg_intent_key[:-3]
-                if exit_intent_key not in retired_intent_keys:
-                    self.store_ctx.record_complete(exit_intent_key)
-                    retired_intent_keys.add(exit_intent_key)
+                orphaned_exit_keys.add(leg_intent_key[:-3])
             retired_count += 1
+
+        # TP and SL legs share one exit envelope, and an exit whose entry
+        # pyramided holds legs on several deals. The envelope is retired only
+        # once none of the exit's legs is left: a deal that closed while no
+        # process ran does not end the exit still protecting its siblings.
+        live_exit_keys = {
+            row.intent_key[:-3]
+            for row in self.store_ctx.iter_live_orders()
+            if (row.extras or {}).get('leg_kind') in ('tp', 'sl')
+            and row.intent_key and row.intent_key.endswith(('\0TP', '\0SL'))
+        }
+        for exit_intent_key in sorted(orphaned_exit_keys - live_exit_keys):
+            if exit_intent_key not in retired_intent_keys:
+                self.store_ctx.record_complete(exit_intent_key)
+                retired_intent_keys.add(exit_intent_key)
 
         if retired_count:
             broker_info(

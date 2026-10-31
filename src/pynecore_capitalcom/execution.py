@@ -22,7 +22,6 @@ import httpx
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     BrokerError,
-    ExchangeCapabilityError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     MarketClosedError,
@@ -31,6 +30,8 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.idempotency import (
+    build_client_order_id,
+    encode_wire_client_order_id,
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
@@ -55,6 +56,7 @@ from pynecore.core.broker.models import (
     ExchangeOrder,
     ExchangePosition,
     ExitIntent,
+    INTENT_KEY_SEP,
     OrderStatus,
     OrderType,
     PositionLeg,
@@ -835,23 +837,33 @@ class _ExecutionMixin(_CapitalComBase, ABC):
     async def execute_exit(
             self, envelope: DispatchEnvelope,
     ) -> list[ExchangeOrder]:
-        """Attach a TP/SL/trailing bracket to an open position.
+        """Attach a TP/SL/trailing bracket to every open deal of the exit's entry.
 
         Capital.com's bracket is a *full-row* attribute on the position
         (``PUT /positions/{dealId}`` with ``profitLevel`` / ``stopLevel``
         / ``trailingStop``) — there is no separate exit order. The plugin
-        synthesises two :class:`ExchangeOrder` objects with composite
-        ``dealId:tp`` / ``dealId:sl`` ids so the sync engine's leg
+        synthesises two :class:`ExchangeOrder` objects per deal with
+        composite ``dealId:tp`` / ``dealId:sl`` ids so the sync engine's leg
         accounting still works.
 
-        ``partial_qty_bracket_exit`` is declared ``False`` in
-        :meth:`get_capabilities`, so core validation rejects
-        ``strategy.exit(qty=N, from_entry='L')`` with ``N < row qty`` at
-        startup. A runtime-safety-net assertion here stays as a
-        belt-and-braces check: the unit count comparison uses the
-        instrument's ``lot_step`` so rounding noise does not falsely trip
-        it, and a stored quantity that disagrees is re-resolved against
-        the live position row before anything is rejected.
+        Every market entry opens its own deal, so a Pine entry id the script
+        pyramids under (``strategy.entry('L1')`` re-issued while ``L1`` is
+        open) holds several deals. A whole-row ``strategy.exit(from_entry=
+        'L1')`` covers every open trade of the id, so the same levels go onto
+        each deal, oldest first, each with its own TP/SL leg rows
+        (:meth:`_attach_bracket_to_deal`). Each deal then carries its own
+        native protection: the venue closes it at the exit's levels while the
+        engine is down, and one deal closing leaves the others protected.
+
+        The deals covered are sized against the exit's quantity by
+        :meth:`_bracket_targets`; a partial-quantity exit never reaches this
+        path (the engine drives it in software).
+
+        A deal that already carries this exit's legs is rewritten in place:
+        the PUT replaces its whole protection atomically and the legs keep
+        their rows, so :meth:`modify_exit` re-runs this method to re-attach
+        an exit whose set of deals changed without clearing any protection
+        first.
 
         Trailing with an activation threshold (Pine ``trail_price``) is
         *deferred*: the plugin sets an ``activating`` state and lets the
@@ -862,11 +874,18 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         """
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
+        # The parent entry row carries ``pine_entry_id == intent.from_entry``
+        # and ``from_entry IS NULL`` (entries have no from_entry), so the
+        # lookup filters by ``symbol`` and disambiguates in Python. Rows
+        # flagged ``natural_close_at`` are skipped: after a TP/SL closes a
+        # deal its entry row stays live, and a later deal opened under the
+        # same ``pine_entry_id`` must not be confused with it (the PUT would
+        # 404 with ``error.not-found.dealId``).
+        targets = self._find_active_entry_rows(intent.symbol, intent.from_entry)
         # The position's protection changed on the venue and who changed it is
         # still being read from the activity feed: the bracket waits, it would
         # replace levels someone else may have set.
-        protected = self._find_active_entry_row(intent.symbol, intent.from_entry)
-        if protected is not None and protected.exchange_order_id:
+        for protected in targets:
             self._defer_protection_write(
                 protected.exchange_order_id, intent_key=intent.intent_key,
                 symbol=intent.symbol,
@@ -877,24 +896,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         mid_price = await self._get_current_mid_price(intent.symbol)
         rules = await self._get_instrument_rules(intent.symbol)
 
-        # --- Resolve target row ---
-        # The parent entry row carries ``pine_entry_id == intent.from_entry``
-        # and ``from_entry IS NULL`` (entries have no from_entry). Filtering
-        # the SQL by ``from_entry`` would wrongly exclude it — filter by
-        # ``symbol`` only and disambiguate in Python.
-        #
-        # Skip rows flagged with ``natural_close_at``: after a TP/SL
-        # closes the position, the entry row stays live in BrokerStore
-        # so subsequent ``modify_exit`` lookups still work for the
-        # *same* entry. Once Pine opens a *new* entry under the same
-        # ``pine_entry_id`` (e.g. ``'Long'`` again), both rows match
-        # the search criteria — without this skip the iteration would
-        # return the old (already-closed-on-the-broker) row and the
-        # PUT would 404 with ``error.not-found.dealId``.
-        target_row: 'OrderRow | None' = self._find_active_entry_row(
-            intent.symbol, intent.from_entry,
-        )
-        if target_row is None or not target_row.exchange_order_id:
+        if not targets:
             # Close-in-flight: the entry row exists but is ``closing`` — a
             # defensive close or a ``strategy.close`` is on its way to the
             # venue and its fill is not booked yet, so the Pine book still
@@ -1051,40 +1053,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 f"Capital execute_exit: no confirmed entry row for "
                 f"from_entry={intent.from_entry!r} symbol={intent.symbol!r}",
             )
-        deal_id = target_row.exchange_order_id
 
-        # Partial-qty runtime safety net (core validation is authoritative).
-        #
-        # ``OrderRow.qty`` is the size that was SUBMITTED, which is not the
-        # size the venue ended up holding. A one-way reversal posts a single
-        # order covering the old exposure plus the new one — long 200 becomes
-        # ``SELL 400`` — and the netting account answers it by closing the old
-        # row and opening a 200-unit one. The bracket attaches to that
-        # 200-unit row, so a perfectly valid full-row exit disagrees with the
-        # stored quantity and would halt the bot on a script core already
-        # cleared. Escalate to the authoritative positions seam exactly as
-        # :meth:`execute_close` does, and reject only on a size difference the
-        # venue itself confirms. A row the venue no longer lists proves
-        # nothing about partiality — let the PUT surface the not-found.
-        row_units = round(target_row.qty / rules.lot_step) if rules.lot_step > 0 else 0
-        intent_units = round(intent.qty / rules.lot_step) if rules.lot_step > 0 else 0
-        if row_units and intent_units and row_units != intent_units:
-            raw_positions = await self._call('positions', method='get')
-            live_size: float | None = None
-            for raw in (raw_positions.get('positions') or []):
-                position = raw.get('position') or {}
-                if str(position.get('dealId') or '') == deal_id:
-                    live_size = float(position.get('size', 0.0))
-                    break
-            if (live_size is not None and rules.lot_step > 0
-                    and round(live_size / rules.lot_step) != intent_units):
-                raise ExchangeCapabilityError(
-                    f"Capital.com bracket is full-row only (deal {deal_id} "
-                    f"holds {live_size}, intent_qty={intent.qty}). Core "
-                    f"validation should have rejected this script at startup.",
-                )
+        targets = await self._bracket_targets(intent, targets, rules)
 
-        # --- Pre-validate bracket distances before assembling the body ---
+        # --- Pre-validate bracket distances before any PUT ---
         # Capital.com checks distance against the live mid quote, not the
         # entry's fill price — using ``confirm_level`` would falsely reject
         # a valid bracket whenever price has drifted away from the entry.
@@ -1093,6 +1065,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # the venue-side attach-reject case below. Classify it identically
         # (the sync engine dispatches a defensive close instead of halting;
         # Pine-wise a level inside the minimum band is at-market anyway).
+        # The levels are the same for every deal, so the check runs once and
+        # names the oldest deal; the re-dispatch next sync reaches the rest.
+        first = targets[0]
         try:
             if intent.sl_price is not None:
                 self._validate_sl_distance(
@@ -1105,12 +1080,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         except ExchangeOrderRejectedError as exc:
             raise BracketAttachAfterFillRejectedError(
                 f"Capital bracket attach rejected after entry fill "
-                f"(deal_id={deal_id}): {exc}",
-                position_deal_id=deal_id,
-                position_coid=target_row.client_order_id,
+                f"(deal_id={first.exchange_order_id}): {exc}",
+                position_deal_id=first.exchange_order_id or '',
+                position_coid=first.client_order_id,
                 symbol=intent.symbol,
-                position_side=target_row.side,
-                qty=target_row.qty,
+                position_side=first.side,
+                qty=first.qty,
                 from_entry=intent.from_entry,
             ) from exc
 
@@ -1127,8 +1102,238 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             body['trailingStop'] = True
             body['stopDistance'] = float(intent.trail_offset)
 
-        tp_coid = envelope.client_order_id(KIND_EXIT_TP)
-        sl_coid = envelope.client_order_id(KIND_EXIT_SL)
+        legs: list[ExchangeOrder] = []
+        shared = len(targets) > 1
+        for target_row in targets:
+            legs.extend(await self._attach_bracket_to_deal(
+                envelope, target_row, body=body, trail_pending=trail_pending,
+                shared=shared,
+            ))
+        return legs
+
+    async def _bracket_targets(
+            self, intent: ExitIntent, rows: list['OrderRow'],
+            rules: _InstrumentRules,
+    ) -> list['OrderRow']:
+        """Pick the deals of ``intent.from_entry`` a whole-row bracket protects.
+
+        The engine sizes a whole-row exit at the total the Pine book holds
+        under the entry id, so the deals it covers normally add up to the
+        exit's quantity and every one of them is protected. The comparison
+        runs in ``lot_step`` units so rounding noise never splits a deal.
+
+        ``OrderRow.qty`` is the size that was SUBMITTED, which is not always
+        the size the venue holds: a one-way reversal posts one order covering
+        the old exposure plus the new one (long 200 becomes ``SELL 400``) and
+        the netting account keeps a 200-unit deal. When the stored sizes
+        disagree with the exit, the live sizes are read from ``/positions``;
+        a deal the venue no longer lists keeps its stored size and the PUT
+        surfaces the not-found.
+
+        * Live deals add up to the exit: all of them.
+        * The venue holds LESS than the exit asks for: an own resting entry
+          order under the same id is still being promoted to a position, so
+          the exit waits (re-evaluated next sync) — protecting only the
+          visible deals now would leave the promoted one bare, as no later
+          exit change would follow to cover it. Without such an order the
+          venue simply holds less (a deal closed under the book's feet), and
+          every live deal is protected.
+        * The venue holds MORE than the exit covers: the Pine book has not
+          booked the newest deals yet. The oldest deals that make up the
+          exit's quantity are protected, the order the Pine book closes the
+          entry's trades in; the next exit change, which follows once the
+          book catches up, covers the rest. An exit that ends inside a deal
+          cannot be expressed on a whole-deal bracket, so that deal is
+          protected whole rather than left bare, and the shortfall is
+          journaled as ``bracket_covers_more_than_intent``.
+
+        :param intent: The whole-row exit.
+        :param rows: The entry's live position rows, oldest first.
+        :param rules: The instrument's dealing rules.
+        :return: The rows to protect, oldest first; never empty.
+        :raises OrderSkippedByPlugin: ``reason='close_in_flight'`` while an
+            own entry order under the id awaits its promotion.
+        """
+        step = rules.lot_step
+        if step <= 0:
+            return rows
+        intent_units = round(intent.qty / step)
+        if intent_units <= 0:
+            return rows
+        if sum(round(row.qty / step) for row in rows) == intent_units:
+            return rows
+        raw_positions = await self._call('positions', method='get')
+        live_units: dict[str, int] = {}
+        for raw in (raw_positions.get('positions') or []):
+            position = raw.get('position') or {}
+            deal_id = str(position.get('dealId') or '')
+            if deal_id:
+                live_units[deal_id] = round(float(position.get('size', 0.0)) / step)
+        sized = [
+            (row, live_units.get(str(row.exchange_order_id), round(row.qty / step)))
+            for row in rows
+        ]
+        total = sum(units for _, units in sized)
+        if total == intent_units:
+            return rows
+        if total < intent_units:
+            if self._entry_promotion_pending(intent.symbol, intent.from_entry):
+                raise OrderSkippedByPlugin(
+                    f"Exit {intent.intent_key} skipped: entry "
+                    f"{intent.from_entry!r} holds {total * step} on the venue "
+                    f"against the exit's {intent.qty} while an entry order under "
+                    f"the same id is mid promotion to a position; re-evaluating "
+                    f"next bar.",
+                    intent_key=intent.intent_key,
+                    reason="close_in_flight",
+                    context={'symbol': intent.symbol,
+                             'from_entry': intent.from_entry},
+                )
+            return rows
+        selected: list['OrderRow'] = []
+        covered = 0
+        for row, units in sized:
+            if covered >= intent_units:
+                break
+            selected.append(row)
+            covered += units
+        if covered != intent_units and self.store_ctx is not None:
+            self.store_ctx.log_event(
+                'bracket_covers_more_than_intent',
+                intent_key=intent.intent_key,
+                payload={'intent_qty': intent.qty,
+                         'covered_qty': covered * step,
+                         'deal_ids': [row.exchange_order_id for row in selected]},
+            )
+        return selected
+
+    def _entry_promotion_pending(self, symbol: str, pine_entry_id: str | None) -> bool:
+        """Whether an own resting entry order under ``pine_entry_id`` is live.
+
+        A STOP / LIMIT working order that executed stays a ``confirmed``
+        working row until the activity poll rewrites it to its position deal.
+
+        :param symbol: The epic.
+        :param pine_entry_id: The Pine entry id.
+        """
+        if self.store_ctx is None:
+            return False
+        return any(
+            row.pine_entry_id == pine_entry_id
+            and row.state == 'confirmed'
+            and (row.extras or {}).get('kind') == ENTRY_KIND_WORKING
+            for row in self.store_ctx.iter_live_orders(symbol=symbol)
+        )
+
+    def _exit_leg_rows(self, intent: ExitIntent, deal_id: str) -> list['OrderRow']:
+        """The live TP/SL leg rows ``intent``'s exit holds on deal ``deal_id``.
+
+        :param intent: The exit; its legs are keyed ``intent_key + '\\0TP'`` /
+            ``'\\0SL'``.
+        :param deal_id: The deal the legs sit on.
+        """
+        if self.store_ctx is None:
+            return []
+        leg_keys = (intent.intent_key + '\0TP', intent.intent_key + '\0SL')
+        return [
+            row for row in self.store_ctx.iter_live_orders(symbol=intent.symbol)
+            if row.intent_key in leg_keys
+            and str((row.extras or {}).get('parent_deal_id') or '') == deal_id
+            and (row.extras or {}).get('natural_close_at') is None
+        ]
+
+    @staticmethod
+    def _bracket_leg_coid(
+            envelope: DispatchEnvelope, kind: str, deal_id: str,
+            existing: 'OrderRow | None', *, shared: bool,
+    ) -> str:
+        """The client order id of one bracket leg on one deal.
+
+        A leg this exit already holds on the deal keeps its row, so a
+        re-attach rewrites it instead of stacking a second live leg on the
+        same deal. An exit on a single deal takes the envelope's own id. When
+        the exit spans several deals, each deal's legs take an id derived
+        from the envelope and the deal id — same run tag, bar and kind, so
+        the journal still reads the dispatch anchor from it.
+
+        :param envelope: The exit dispatch.
+        :param kind: :data:`KIND_EXIT_TP` or :data:`KIND_EXIT_SL`.
+        :param deal_id: The deal the leg sits on.
+        :param existing: This exit's live leg row of the same kind on the deal.
+        :param shared: Whether the exit spans several deals.
+        """
+        if existing is not None:
+            return existing.client_order_id
+        if not shared:
+            return envelope.client_order_id(kind)
+        intent = envelope.intent
+        assert isinstance(intent, ExitIntent)
+        return encode_wire_client_order_id(
+            build_client_order_id(
+                run_tag=envelope.run_tag,
+                pine_id=(f"{intent.pine_id}{INTENT_KEY_SEP}{intent.from_entry}"
+                         f"{INTENT_KEY_SEP}{deal_id}"),
+                bar_ts_ms=envelope.bar_ts_ms,
+                kind=kind,
+                retry_seq=envelope.retry_seq,
+            ),
+            envelope.coid_max_len,
+        )
+
+    async def _attach_bracket_to_deal(
+            self, envelope: DispatchEnvelope, target_row: 'OrderRow', *,
+            body: dict, trail_pending: bool, shared: bool,
+    ) -> list[ExchangeOrder]:
+        """PUT the exit's bracket onto one deal and journal its legs.
+
+        ``PUT /positions/{dealId}`` is full replacement: the body is the whole
+        protection the deal carries afterwards. Legs this exit already holds
+        on the deal are rewritten under their own rows; a leg the new body no
+        longer carries is closed once the PUT landed (``bracket_leg_superseded``).
+        When the exit has nothing for the venue yet (a trailing stop waiting
+        for its activation) but the deal still carries this exit's earlier
+        levels, the PUT clears them.
+
+        :param envelope: The exit dispatch.
+        :param target_row: The deal's position row.
+        :param body: The exit's PUT fields.
+        :param trail_pending: Whether the trailing stop waits for activation.
+        :param shared: Whether the exit spans several deals.
+        :return: The deal's synthetic TP / SL legs.
+        """
+        intent = envelope.intent
+        assert isinstance(intent, ExitIntent)
+        deal_id = str(target_row.exchange_order_id)
+        previous = self._exit_leg_rows(intent, deal_id)
+        tp_coid = self._bracket_leg_coid(
+            envelope, KIND_EXIT_TP, deal_id,
+            next((row for row in previous
+                  if (row.extras or {}).get('leg_kind') == 'tp'), None),
+            shared=shared,
+        )
+        sl_coid = self._bracket_leg_coid(
+            envelope, KIND_EXIT_SL, deal_id,
+            next((row for row in previous
+                  if (row.extras or {}).get('leg_kind') == 'sl'), None),
+            shared=shared,
+        )
+        written: set[str] = set()
+        if intent.tp_price is not None:
+            written.add(tp_coid)
+        if intent.sl_price is not None or intent.trail_offset is not None:
+            written.add(sl_coid)
+        superseded = [row for row in previous if row.client_order_id not in written]
+        body = dict(body)
+        if not body and any(
+                row.tp_level is not None or row.sl_level is not None
+                or row.trailing_stop
+                or (row.extras or {}).get('trail_state') == 'activating'
+                for row in previous):
+            body = {'profitLevel': None, 'stopLevel': None}
+            if any(row.trailing_stop
+                   or (row.extras or {}).get('trail_state') == 'activating'
+                   for row in previous):
+                body['trailingStop'] = False
 
         # --- PERSIST-FIRST the TP leg row ---
         # ``parent_coid`` lets ``_resolve_bracket_leg_disposition`` route
@@ -1399,6 +1604,15 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     'trail_pending': trail_pending,
                 },
             )
+            for row in superseded:
+                self.store_ctx.close_order(row.client_order_id)
+                self.store_ctx.log_event(
+                    'bracket_leg_superseded',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=deal_id,
+                    intent_key=intent.intent_key,
+                    payload={'leg_kind': (row.extras or {}).get('leg_kind')},
+                )
 
         # --- Build canonical ExchangeOrder legs ---
         legs: list[ExchangeOrder] = []
@@ -2331,9 +2545,17 @@ class _ExecutionMixin(_CapitalComBase, ABC):
 
         ``PUT /positions/{dealId}`` re-writes ``profitLevel`` /
         ``stopLevel`` atomically — no cancel window where the position
-        sits unprotected. Size / from_entry changes are semantic, not
-        level changes; those fall through to cancel+create so the
-        bracket row is rebuilt from scratch.
+        sits unprotected. A ``from_entry`` change is a different bracket
+        and falls through to cancel+create.
+
+        The bracket is a per-deal attribute, not a sized order, so a size
+        change only changes which deals of the entry the exit covers: a
+        same-id pyramid add filled (the exit grows over a second deal) or
+        one of the entry's deals closed. That, and any amend of an exit
+        that spans several deals, re-runs :meth:`execute_exit`: every live
+        deal of the entry gets the new levels in one full-replacement PUT,
+        its existing legs are rewritten under their own rows, and no deal
+        is cleared first.
 
         Thin orchestrator over :class:`.dispatch_hooks._CapitalComModifyExitHooks`
         + the Core :class:`~pynecore.core.broker.journal.DispatchJournal`.
@@ -2353,18 +2575,18 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         assert isinstance(old_i, ExitIntent)
         assert isinstance(new_i, ExitIntent)
 
-        if (old_i.from_entry != new_i.from_entry
-                or abs(old_i.qty - new_i.qty) > 1e-9):
+        if old_i.from_entry != new_i.from_entry:
             return await super().modify_exit(old, new)
 
-        # Locate the parent position row via its confirmed entry. Same
+        # Locate the parent position rows via their confirmed entry. Same
         # NULL-vs-from_entry + natural_close_at skip as :meth:`execute_exit`
-        # — see :meth:`_find_active_entry_row`.
-        target_row: 'OrderRow | None' = self._find_active_entry_row(
-            new_i.symbol, new_i.from_entry,
-        )
-        if target_row is None or not target_row.exchange_order_id:
+        # — see :meth:`_find_active_entry_rows`.
+        targets = self._find_active_entry_rows(new_i.symbol, new_i.from_entry)
+        if not targets:
             return await super().modify_exit(old, new)
+        if len(targets) > 1 or abs(old_i.qty - new_i.qty) > 1e-9:
+            return await self.execute_exit(new)
+        target_row = targets[0]
         # Same wait as :meth:`execute_exit`: the amend would replace levels
         # someone else may have set while who changed them is undecided.
         self._defer_protection_write(

@@ -16,7 +16,6 @@ from pynecore.core.broker.exceptions import (
     AuthenticationError,
     BracketAttachAfterFillRejectedError,
     BrokerError,
-    ExchangeCapabilityError,
     ExchangeRateLimitError,
     ExchangeOrderRejectedError,
     VenueWritesQuarantinedError,
@@ -747,11 +746,20 @@ def _venue_positions(*rows):
     ]}
 
 
-def __test_execute_exit_partial_qty_runtime_rejects__(tmp_path):
+def __test_execute_exit_inside_a_deal_protects_the_whole_deal__(tmp_path):
+    """An exit that ends inside a deal never halts the run.
+
+    A whole-row exit smaller than the deal the venue holds cannot be
+    expressed on a whole-deal bracket. It only arises while the Pine book
+    lags the venue, so the deal is protected whole rather than left bare,
+    and the shortfall is journaled.
+    """
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions', 'get'): _venue_positions(
             {'dealId': 'deal-L', 'size': 2.0, 'direction': 'BUY'},
         ),
+        ('positions/deal-L', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
     })
     ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
                      state='confirmed', pine_entry_id='Long',
@@ -763,8 +771,12 @@ def __test_execute_exit_partial_qty_runtime_rejects__(tmp_path):
         ),
         run_tag='test', bar_ts_ms=1700000000000,
     )
-    with pytest.raises(ExchangeCapabilityError):
-        asyncio.run(broker.execute_exit(env))
+    legs = asyncio.run(broker.execute_exit(env))
+    assert [leg.id for leg in legs] == ['deal-L:tp']
+    assert [c[0] for c in broker._calls if c[1] == 'put'] == ['positions/deal-L']
+    kinds = [row['kind'] for row in ctx._store._conn.execute(
+        "SELECT kind FROM events").fetchall()]
+    assert 'bracket_covers_more_than_intent' in kinds
     store.close()
 
 
@@ -3676,8 +3688,8 @@ def __test_execute_exit_no_entry_row_but_open_position_raises_bracket_attach__(
     """Defense-in-depth path for the startup-orphan-race crash.
 
     Reproduces the live scenario where, on a fresh bar after the
-    plugin retired stale orphan rows, ``_find_active_entry_row``
-    returns ``None`` (no live entry row remains) but the exchange
+    plugin retired stale orphan rows, ``_find_active_entry_rows``
+    returns no row (no live entry row remains) but the exchange
     still reports an OPEN position. Without this fix the bot raised
     a plain :class:`ExchangeOrderRejectedError` and halted, leaving
     the unprotected position exposed indefinitely.
@@ -8126,7 +8138,7 @@ def __test_reconcile_snapshot_working_to_position_stamps_kind_and_entry_filled__
     rather than the activity stream), the row's ``kind`` must flip
     from ``'working'`` to ``'position'`` AND ``extras['entry_filled_at']``
     must be stamped. Several downstream paths gate on these fields:
-    :meth:`_find_active_entry_row` (modify_exit lookup),
+    :meth:`_find_active_entry_rows` (modify_exit lookup),
     partial-fill detection, and manual ``USER`` / ``DEALER`` close
     detection. Without the stamps, a manual close activity for a
     limit-fill entry would route as ``LegType.ENTRY`` and
@@ -14706,4 +14718,337 @@ def __test_trailing_monitor_rejected_activation_stays_pending__(tmp_path):
     assert (row.extras or {}).get('trail_state') == 'activating'
     puts = [c for c in broker._calls if c[:2] == ('positions/deal-L', 'put')]
     assert len(puts) == 2
+    store.close()
+
+
+# --- Whole-row exit over a same-id pyramid: one bracket per deal ---
+#
+# Capital.com opens every market entry as its own deal, so a Pine entry id
+# the script pyramids under holds several deals. A whole-row
+# ``strategy.exit(from_entry=...)`` covers every open trade of the id: the
+# same levels go onto each deal (measured live: capitalcom cycle 356, the
+# second ``L1`` fill made the exit grow to 0.01 and the run died on a
+# "full-row only" capability error).
+
+_PYRAMID_ATTACH = {
+    ('positions/deal-1', 'put'): {'dealReference': 'attach'},
+    ('positions/deal-2', 'put'): {'dealReference': 'attach'},
+    ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+}
+
+
+def _seed_pyramid_deal(ctx, coid: str, deal_id: str, qty: float = 1.0) -> None:
+    """A confirmed position row opened under Pine entry id ``Long``."""
+    ctx.upsert_order(coid, symbol='EURUSD', side='buy', qty=qty,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id=deal_id,
+                     extras={'kind': 'position', 'entry_filled_at': 1.0})
+    ctx.add_ref(coid, 'deal_id', deal_id)
+
+
+def _pyramid_exit_env(qty: float, *, tp: float | None = 1.2, sl: float | None = 1.05,
+                      bar_ts_ms: int = 1700000000000) -> DispatchEnvelope:
+    return DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Long-X', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=qty, tp_price=tp, sl_price=sl,
+        ),
+        run_tag='test', bar_ts_ms=bar_ts_ms,
+    )
+
+
+def _bracket_puts(broker) -> list[tuple[str, dict]]:
+    return [(c[0], c[2]) for c in broker._calls
+            if c[0].startswith('positions/') and c[1] == 'put']
+
+
+def _live_legs(ctx) -> dict[tuple[str, str], str]:
+    """``(parent_deal_id, leg_kind) -> client_order_id`` of every live leg row."""
+    legs: dict[tuple[str, str], str] = {}
+    for row in ctx.iter_live_orders(symbol='EURUSD'):
+        extras = row.extras or {}
+        if extras.get('leg_kind') in ('tp', 'sl'):
+            key = (str(extras.get('parent_deal_id')), str(extras.get('leg_kind')))
+            assert key not in legs, f"two live {key} legs on one deal"
+            legs[key] = row.client_order_id
+    return legs
+
+
+def _incident_state(tmp_path):
+    """L1 filled as deal-1 with its bracket, then a same-id add filled as deal-2."""
+    broker, store, ctx = _make_broker(tmp_path, responses=dict(_PYRAMID_ATTACH))
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-1')
+    old_env = _pyramid_exit_env(1.0)
+    asyncio.run(broker.execute_exit(old_env))
+    _seed_pyramid_deal(ctx, 'coid-2', 'deal-2')
+    broker._calls.clear()
+    return broker, store, ctx, old_env
+
+
+def __test_execute_exit_protects_every_deal_of_a_pyramided_entry__(tmp_path):
+    """A whole-row exit over two deals of one entry id brackets both."""
+    broker, store, ctx = _make_broker(tmp_path, responses=dict(_PYRAMID_ATTACH))
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-1')
+    _seed_pyramid_deal(ctx, 'coid-2', 'deal-2')
+
+    legs = asyncio.run(broker.execute_exit(_pyramid_exit_env(2.0)))
+
+    assert [leg.id for leg in legs] == [
+        'deal-1:tp', 'deal-1:sl', 'deal-2:tp', 'deal-2:sl']
+    assert _bracket_puts(broker) == [
+        ('positions/deal-1', {'profitLevel': 1.2, 'stopLevel': 1.05}),
+        ('positions/deal-2', {'profitLevel': 1.2, 'stopLevel': 1.05}),
+    ]
+    live = _live_legs(ctx)
+    assert set(live) == {('deal-1', 'tp'), ('deal-1', 'sl'),
+                         ('deal-2', 'tp'), ('deal-2', 'sl')}
+    assert len(set(live.values())) == 4
+    for (deal_id, _), coid in live.items():
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'confirmed'
+        assert row.extras['parent_coid'] == {'deal-1': 'coid-1', 'deal-2': 'coid-2'}[deal_id]
+    store.close()
+
+
+def __test_modify_exit_over_a_same_id_pyramid_add_brackets_both_deals__(tmp_path):
+    """The cycle-356 shape: the exit grows from one deal to two.
+
+    The modify re-attaches the exit to both deals without clearing the first
+    deal's protection, and the first deal's legs keep their rows.
+    """
+    broker, store, ctx, old_env = _incident_state(tmp_path)
+    before = _live_legs(ctx)
+
+    new_env = _pyramid_exit_env(2.0, tp=1.21, sl=1.06, bar_ts_ms=1700000060000)
+    legs = asyncio.run(broker.modify_exit(old_env, new_env))
+
+    assert [leg.id for leg in legs] == [
+        'deal-1:tp', 'deal-1:sl', 'deal-2:tp', 'deal-2:sl']
+    assert _bracket_puts(broker) == [
+        ('positions/deal-1', {'profitLevel': 1.21, 'stopLevel': 1.06}),
+        ('positions/deal-2', {'profitLevel': 1.21, 'stopLevel': 1.06}),
+    ]
+    live = _live_legs(ctx)
+    assert live[('deal-1', 'tp')] == before[('deal-1', 'tp')]
+    assert live[('deal-1', 'sl')] == before[('deal-1', 'sl')]
+    assert {('deal-2', 'tp'), ('deal-2', 'sl')} <= set(live)
+    tp_row = ctx.get_order(live[('deal-1', 'tp')])
+    assert tp_row is not None and tp_row.tp_level == 1.21
+    store.close()
+
+
+def __test_tp_fill_on_one_deal_keeps_the_sibling_deal_protected__(tmp_path):
+    """One deal's take-profit closes only that deal; its sibling stays protected.
+
+    The fill flags only the closed deal's rows, and the exit shrinking to the
+    surviving deal rewrites that deal's legs in place without clearing them.
+    """
+    broker, store, ctx, old_env = _incident_state(tmp_path)
+    grown = _pyramid_exit_env(2.0, bar_ts_ms=1700000060000)
+    asyncio.run(broker.modify_exit(old_env, grown))
+    deal2_legs = {k: v for k, v in _live_legs(ctx).items() if k[0] == 'deal-2'}
+    broker._calls.clear()
+
+    activity = {
+        'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'deal-1',
+        'type': 'POSITION', 'status': 'EXECUTED', 'source': 'TP',
+        'epic': 'EURUSD', 'direction': 'BUY', 'size': 1.0, 'level': 1.2,
+    }
+
+    async def drain():
+        return [ev async for ev in broker._process_activity([activity])]
+
+    events = asyncio.run(drain())
+    assert [(ev.leg_type, ev.pine_id, ev.order.id) for ev in events] == [
+        (LegType.TAKE_PROFIT, 'Long', 'deal-1')]
+    assert _bracket_puts(broker) == []
+    for coid in deal2_legs.values():
+        row = ctx.get_order(coid)
+        assert row is not None and row.closed_ts_ms is None
+        assert (row.extras or {}).get('natural_close_at') is None
+    assert [r.exchange_order_id for r in
+            broker._find_active_entry_rows('EURUSD', 'Long')] == ['deal-2']
+
+    shrunk = _pyramid_exit_env(1.0, bar_ts_ms=1700000120000)
+    legs = asyncio.run(broker.modify_exit(grown, shrunk))
+    assert [leg.id for leg in legs] == ['deal-2:tp', 'deal-2:sl']
+    assert _bracket_puts(broker) == [
+        ('positions/deal-2', {'profitLevel': 1.2, 'stopLevel': 1.05})]
+    live = _live_legs(ctx)
+    assert {k: v for k, v in live.items() if k[0] == 'deal-2'} == deal2_legs
+    store.close()
+
+
+def __test_level_amend_of_a_pyramided_exit_reaches_every_deal__(tmp_path):
+    """A level-only amend of an exit spanning two deals moves both deals."""
+    broker, store, ctx = _make_broker(tmp_path, responses=dict(_PYRAMID_ATTACH))
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-1')
+    _seed_pyramid_deal(ctx, 'coid-2', 'deal-2')
+    env = _pyramid_exit_env(2.0)
+    asyncio.run(broker.execute_exit(env))
+    before = _live_legs(ctx)
+    broker._calls.clear()
+
+    moved = _pyramid_exit_env(2.0, tp=1.22, sl=1.07, bar_ts_ms=1700000060000)
+    asyncio.run(broker.modify_exit(env, moved))
+
+    assert _bracket_puts(broker) == [
+        ('positions/deal-1', {'profitLevel': 1.22, 'stopLevel': 1.07}),
+        ('positions/deal-2', {'profitLevel': 1.22, 'stopLevel': 1.07}),
+    ]
+    assert _live_legs(ctx) == before
+    store.close()
+
+
+def __test_pyramided_exit_dropping_its_take_profit_retires_the_tp_legs__(tmp_path):
+    """A re-attach without a TP clears it on every deal and closes the TP rows."""
+    broker, store, ctx = _make_broker(tmp_path, responses=dict(_PYRAMID_ATTACH))
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-1')
+    _seed_pyramid_deal(ctx, 'coid-2', 'deal-2')
+    env = _pyramid_exit_env(2.0)
+    asyncio.run(broker.execute_exit(env))
+    tp_coids = [v for k, v in _live_legs(ctx).items() if k[1] == 'tp']
+    broker._calls.clear()
+
+    stop_only = _pyramid_exit_env(2.0, tp=None, bar_ts_ms=1700000060000)
+    asyncio.run(broker.modify_exit(env, stop_only))
+
+    assert _bracket_puts(broker) == [
+        ('positions/deal-1', {'stopLevel': 1.05}),
+        ('positions/deal-2', {'stopLevel': 1.05}),
+    ]
+    assert set(_live_legs(ctx)) == {('deal-1', 'sl'), ('deal-2', 'sl')}
+    for coid in tp_coids:
+        row = ctx.get_order(coid)
+        assert row is not None and row.closed_ts_ms is not None
+    store.close()
+
+
+def __test_cancel_of_a_pyramided_exit_clears_every_deal__(tmp_path):
+    """``strategy.cancel`` of the exit clears the bracket of every deal."""
+    broker, store, ctx, old_env = _incident_state(tmp_path)
+    asyncio.run(broker.modify_exit(
+        old_env, _pyramid_exit_env(2.0, bar_ts_ms=1700000060000)))
+    broker._calls.clear()
+
+    cancel = DispatchEnvelope(
+        intent=CancelIntent(pine_id='Long-X', symbol='EURUSD', from_entry='Long'),
+        run_tag='test', bar_ts_ms=1700000120000,
+    )
+    assert asyncio.run(broker.execute_cancel(cancel)) is True
+
+    puts = _bracket_puts(broker)
+    assert {path for path, _ in puts} == {'positions/deal-1', 'positions/deal-2'}
+    final_by_deal = {path: body for path, body in puts}
+    assert final_by_deal == {
+        'positions/deal-1': {'stopLevel': None},
+        'positions/deal-2': {'stopLevel': None},
+    }
+    assert _live_legs(ctx) == {}
+    store.close()
+
+
+def __test_pyramided_exit_waits_for_a_promoting_entry_order__(tmp_path):
+    """The venue holds less than the exit while a same-id entry order promotes.
+
+    Protecting only the visible deal would leave the promoted one bare: no
+    later exit change follows to cover it. The exit waits, nothing is written.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        **_PYRAMID_ATTACH,
+        ('positions', 'get'): _venue_positions(
+            {'dealId': 'deal-1', 'size': 1.0, 'direction': 'BUY'},
+        ),
+    })
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-1')
+    ctx.upsert_order('coid-wo', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='wo-2', extras={'kind': 'working'})
+
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_exit(_pyramid_exit_env(2.0)))
+    assert exc.value.reason == 'close_in_flight'
+    assert _bracket_puts(broker) == []
+    assert _live_legs(ctx) == {}
+    store.close()
+
+
+def __test_pyramided_exit_covers_the_oldest_deals_while_the_book_lags__(tmp_path):
+    """The venue holds a deal the Pine book has not booked: the oldest are covered."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        **_PYRAMID_ATTACH,
+        ('positions', 'get'): _venue_positions(
+            {'dealId': 'deal-1', 'size': 1.0, 'direction': 'BUY'},
+            {'dealId': 'deal-2', 'size': 1.0, 'direction': 'BUY'},
+        ),
+    })
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-1')
+    _seed_pyramid_deal(ctx, 'coid-2', 'deal-2')
+
+    legs = asyncio.run(broker.execute_exit(_pyramid_exit_env(1.0)))
+
+    assert [leg.id for leg in legs] == ['deal-1:tp', 'deal-1:sl']
+    assert [path for path, _ in _bracket_puts(broker)] == ['positions/deal-1']
+    store.close()
+
+
+def __test_startup_keeps_the_exit_envelope_while_a_sibling_deal_is_protected__(tmp_path):
+    """A deal closed during downtime does not end the exit protecting its sibling."""
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-gone')
+    _seed_pyramid_deal(ctx, 'coid-2', 'deal-live')
+    for coid, deal_id, parent in (('tp-1', 'deal-gone', 'coid-1'),
+                                  ('tp-2', 'deal-live', 'coid-2')):
+        ctx.upsert_order(
+            coid, symbol='EURUSD', side='sell', qty=1.0, state='confirmed',
+            intent_key='Long-X\0Long\0TP', pine_entry_id='Long',
+            from_entry='Long', tp_level=1.2,
+            extras={'leg_kind': 'tp', 'parent_coid': parent,
+                    'parent_deal_id': deal_id},
+        )
+    ctx.record_envelope('Long-X\0Long', bar_ts_ms=1_700_000_000_000, retry_seq=0)
+
+    broker._retire_startup_orphans({'deal-live': {'position': {'dealId': 'deal-live'}}}, {})
+
+    assert set(_live_legs(ctx)) == {('deal-live', 'tp')}
+    envelopes = [row['intent_key'] for row in store._conn.execute(
+        "SELECT intent_key FROM envelopes WHERE run_id = ?", (ctx.run_id,))]
+    assert 'Long-X\0Long' in envelopes
+    store.close()
+
+
+def __test_pyramided_exit_moving_to_a_pending_trail_clears_the_old_levels__(tmp_path):
+    """A re-attach with nothing for the venue yet still clears the old levels.
+
+    A trailing stop waiting for its activation has no PUT of its own, but the
+    deals still carry the exit's earlier TP / SL: full replacement clears
+    them, and the stop legs keep their rows as pending trails.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses=dict(_PYRAMID_ATTACH))
+    _seed_pyramid_deal(ctx, 'coid-1', 'deal-1')
+    _seed_pyramid_deal(ctx, 'coid-2', 'deal-2')
+    env = _pyramid_exit_env(2.0)
+    asyncio.run(broker.execute_exit(env))
+    sl_coids = {k[0]: v for k, v in _live_legs(ctx).items() if k[1] == 'sl'}
+    broker._calls.clear()
+
+    trail = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Long-X', from_entry='Long', symbol='EURUSD', side='sell',
+            qty=2.0, trail_price=1.15, trail_offset=0.005,
+        ),
+        run_tag='test', bar_ts_ms=1700000060000,
+    )
+    asyncio.run(broker.modify_exit(env, trail))
+
+    assert _bracket_puts(broker) == [
+        ('positions/deal-1', {'profitLevel': None, 'stopLevel': None}),
+        ('positions/deal-2', {'profitLevel': None, 'stopLevel': None}),
+    ]
+    live = _live_legs(ctx)
+    assert set(live) == {('deal-1', 'sl'), ('deal-2', 'sl')}
+    for deal_id, coid in sl_coids.items():
+        assert live[(deal_id, 'sl')] == coid
+        row = ctx.get_order(coid)
+        assert row is not None and (row.extras or {}).get('trail_state') == 'pending'
     store.close()

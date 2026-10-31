@@ -1678,25 +1678,31 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 payload={'retired_exposure': retired_exposure},
             )
 
-    def _find_active_entry_row(
+    def _find_active_entry_rows(
             self, symbol: str, pine_entry_id: str | None,
-    ) -> 'OrderRow | None':
-        """Locate the live, ACTIVE entry row for ``pine_entry_id``.
+    ) -> list['OrderRow']:
+        """Every live, ACTIVE position row opened under ``pine_entry_id``, oldest first.
 
-        Used by :meth:`execute_exit` and :meth:`modify_exit` to find
-        the parent position. After a TP/SL natural close the entry row
-        stays live (so further modify_exit lookups for the same entry
-        keep working) but carries an ``extras['natural_close_at']``
-        flag — that row is closed on the broker's side and must NOT
-        be returned. Pine reusing the same ``pine_entry_id`` on a new
-        entry produces two rows with the same id; this helper picks
-        the active one by skipping flagged rows. If multiple active
-        rows match (should not happen in one-way mode) the most
-        recently created wins.
+        Capital.com opens each market entry as its own deal, so one Pine
+        entry id holds several position rows once the script pyramids under
+        that id (``strategy.entry('L1')`` re-issued while ``L1`` is open). A
+        whole-row ``strategy.exit(from_entry='L1')`` covers every open trade
+        of the id, so :meth:`execute_exit` and :meth:`modify_exit` protect
+        each of these rows.
+
+        After a TP/SL natural close the entry row stays live (so further
+        exit lookups for the same entry keep working) but carries an
+        ``extras['natural_close_at']`` flag — that row is closed on the
+        broker's side and is not returned. Rows still closing, never
+        confirmed or without a deal id are not returned either.
+
+        :param symbol: The epic the rows trade.
+        :param pine_entry_id: The Pine entry id the rows were opened under.
+        :return: The rows in creation order, the venue's FIFO order.
         """
         if self.store_ctx is None:
-            return None
-        best: 'OrderRow | None' = None
+            return []
+        rows: list['OrderRow'] = []
         for row in self.store_ctx.iter_live_orders(symbol=symbol):
             if row.state != 'confirmed':
                 continue
@@ -1709,9 +1715,9 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 continue
             if extras.get('natural_close_at') is not None:
                 continue
-            if best is None or row.created_ts_ms > best.created_ts_ms:
-                best = row
-        return best
+            rows.append(row)
+        rows.sort(key=lambda row: row.created_ts_ms)
+        return rows
 
     def _find_bracket_leg_row(
             self, entry_row: 'OrderRow', leg_kind: str,

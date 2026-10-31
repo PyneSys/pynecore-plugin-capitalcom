@@ -355,7 +355,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 # ``kind`` to ``position`` and stamps ``entry_filled_at``
                 # so the rest of the plugin treats this row as a filled
                 # position. Several code paths gate on these fields:
-                #   * :meth:`_find_active_entry_row` requires
+                #   * :meth:`_find_active_entry_rows` requires
                 #     ``kind == 'position'`` — without it, subsequent
                 #     ``modify_exit`` lookups would skip the row.
                 #   * Partial-fill detection later in this same
