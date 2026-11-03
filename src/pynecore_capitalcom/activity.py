@@ -1678,9 +1678,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 payload={'retired_exposure': retired_exposure},
             )
 
-    def _find_active_entry_rows(
-            self, symbol: str, pine_entry_id: str | None,
-    ) -> list['OrderRow']:
+    def _find_active_entry_rows(self, pine_entry_id: str | None) -> list['OrderRow']:
         """Every live, ACTIVE position row opened under ``pine_entry_id``, oldest first.
 
         Capital.com opens each market entry as its own deal, so one Pine
@@ -1696,14 +1694,13 @@ class _ActivityMixin(_CapitalComBase, ABC):
         broker's side and is not returned. Rows still closing, never
         confirmed or without a deal id are not returned either.
 
-        :param symbol: The epic the rows trade.
         :param pine_entry_id: The Pine entry id the rows were opened under.
         :return: The rows in creation order, the venue's FIFO order.
         """
         if self.store_ctx is None:
             return []
         rows: list['OrderRow'] = []
-        for row in self.store_ctx.iter_live_orders(symbol=symbol):
+        for row in self.store_ctx.iter_live_orders():
             if row.state != 'confirmed':
                 continue
             if row.pine_entry_id != pine_entry_id:
@@ -1716,7 +1713,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
             if extras.get('natural_close_at') is not None:
                 continue
             rows.append(row)
-        rows.sort(key=lambda row: row.created_ts_ms)
+        rows.sort(key=lambda entry_row: entry_row.created_ts_ms)
         return rows
 
     def _find_bracket_leg_row(
@@ -1737,7 +1734,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
         """
         if self.store_ctx is None or not entry_row.exchange_order_id:
             return None
-        for r in self.store_ctx.iter_live_orders(symbol=entry_row.symbol):
+        for r in self.store_ctx.iter_live_orders():
             rextras = r.extras or {}
             if (rextras.get('parent_deal_id') == entry_row.exchange_order_id
                     and rextras.get('leg_kind') == leg_kind):

@@ -881,7 +881,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # deal its entry row stays live, and a later deal opened under the
         # same ``pine_entry_id`` must not be confused with it (the PUT would
         # 404 with ``error.not-found.dealId``).
-        targets = self._find_active_entry_rows(intent.symbol, intent.from_entry)
+        targets = self._find_active_entry_rows(intent.from_entry)
         # The position's protection changed on the venue and who changed it is
         # still being read from the activity feed: the bracket waits, it would
         # replace levels someone else may have set.
@@ -907,9 +907,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # after the defensive close). Skip without a venue call — the
             # next sync books the close and re-evaluates freely.
             if self.store_ctx is not None:
-                for row in self.store_ctx.iter_live_orders(
-                        symbol=intent.symbol,
-                ):
+                for row in self.store_ctx.iter_live_orders():
                     extras = row.extras or {}
                     if row.pine_entry_id != intent.from_entry:
                         continue
@@ -977,9 +975,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # to the plain reject (operator intervention).
             has_sibling_position = False
             if self.store_ctx is not None:
-                for row in self.store_ctx.iter_live_orders(
-                        symbol=intent.symbol,
-                ):
+                for row in self.store_ctx.iter_live_orders():
                     if row.state != 'confirmed':
                         continue
                     if not row.exchange_order_id:
@@ -1177,7 +1173,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         if total == intent_units:
             return rows
         if total < intent_units:
-            if self._entry_promotion_pending(intent.symbol, intent.from_entry):
+            if self._entry_promotion_pending(intent.from_entry):
                 raise OrderSkippedByPlugin(
                     f"Exit {intent.intent_key} skipped: entry "
                     f"{intent.from_entry!r} holds {total * step} on the venue "
@@ -1207,13 +1203,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             )
         return selected
 
-    def _entry_promotion_pending(self, symbol: str, pine_entry_id: str | None) -> bool:
+    def _entry_promotion_pending(self, pine_entry_id: str | None) -> bool:
         """Whether an own resting entry order under ``pine_entry_id`` is live.
 
         A STOP / LIMIT working order that executed stays a ``confirmed``
         working row until the activity poll rewrites it to its position deal.
 
-        :param symbol: The epic.
         :param pine_entry_id: The Pine entry id.
         """
         if self.store_ctx is None:
@@ -1222,7 +1217,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             row.pine_entry_id == pine_entry_id
             and row.state == 'confirmed'
             and (row.extras or {}).get('kind') == ENTRY_KIND_WORKING
-            for row in self.store_ctx.iter_live_orders(symbol=symbol)
+            for row in self.store_ctx.iter_live_orders()
         )
 
     def _exit_leg_rows(self, intent: ExitIntent, deal_id: str) -> list['OrderRow']:
@@ -1236,7 +1231,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             return []
         leg_keys = (intent.intent_key + '\0TP', intent.intent_key + '\0SL')
         return [
-            row for row in self.store_ctx.iter_live_orders(symbol=intent.symbol)
+            row for row in self.store_ctx.iter_live_orders()
             if row.intent_key in leg_keys
             and str((row.extras or {}).get('parent_deal_id') or '') == deal_id
             and (row.extras or {}).get('natural_close_at') is None
@@ -1707,7 +1702,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # run's journal did not produce is never a close target.
         live_position_rows: list['OrderRow'] = []
         if self.store_ctx is not None:
-            for row in self.store_ctx.iter_live_orders(symbol=intent.symbol):
+            for row in self.store_ctx.iter_live_orders():
                 extras = row.extras or {}
                 if (row.state == 'confirmed'
                         and row.exchange_order_id
@@ -1878,7 +1873,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # the settled book next sync without a counting error.
             closing_rows: list['OrderRow'] = []
             if self.store_ctx is not None:
-                for row in self.store_ctx.iter_live_orders(symbol=intent.symbol):
+                for row in self.store_ctx.iter_live_orders():
                     extras = row.extras or {}
                     if (row.state == 'closing'
                             and extras.get('kind') == 'position'
@@ -2170,7 +2165,6 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         targets: list['OrderRow'] = []
         if self.store_ctx is not None:
             for row in self.store_ctx.iter_live_orders(
-                    symbol=intent.symbol,
                     from_entry=intent.from_entry,
             ):
                 # Match by entry id always; only match by ``from_entry``
@@ -2267,7 +2261,6 @@ class _ExecutionMixin(_CapitalComBase, ABC):
 
         targets: list[tuple[str, str]] = []
         for row in self.store_ctx.iter_live_orders(
-                symbol=intent.symbol,
                 from_entry=intent.from_entry,
         ):
             matches_pine = row.pine_entry_id == intent.pine_id or (
@@ -2581,7 +2574,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # Locate the parent position rows via their confirmed entry. Same
         # NULL-vs-from_entry + natural_close_at skip as :meth:`execute_exit`
         # — see :meth:`_find_active_entry_rows`.
-        targets = self._find_active_entry_rows(new_i.symbol, new_i.from_entry)
+        targets = self._find_active_entry_rows(new_i.from_entry)
         if not targets:
             return await super().modify_exit(old, new)
         if len(targets) > 1 or abs(old_i.qty - new_i.qty) > 1e-9:
@@ -2638,7 +2631,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 row.from_entry == old_i.from_entry
                 and (row.extras or {}).get('leg_kind') == 'sl'
                 and row.trailing_stop
-                for row in self.store_ctx.iter_live_orders(symbol=old_i.symbol)
+                for row in self.store_ctx.iter_live_orders()
             )
         body: dict = {}
         if new_i.tp_price is not None:

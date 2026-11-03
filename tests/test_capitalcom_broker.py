@@ -2333,7 +2333,7 @@ def __test_cancel_with_outcome_network_error_raises_unknown__(tmp_path):
     with pytest.raises(OrderDispositionUnknownError) as exc:
         asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
     assert isinstance(exc.value.__cause__, httpx.ConnectError)
-    assert len(list(ctx.iter_live_orders(symbol=None))) == 1
+    assert len(list(ctx.iter_live_orders())) == 1
     store.close()
 
 
@@ -6041,7 +6041,7 @@ def __test_seed_added_legs_disposition_unknown_reopens_closed_row__(tmp_path):
     # Visibility check: the reopened seed must show up in
     # iter_live_orders so the snapshot reconcile picks it up.
     assert any(r.client_order_id == tp_coid
-               for r in ctx.iter_live_orders(symbol='EURUSD'))
+               for r in ctx.iter_live_orders())
     store.close()
 
 
@@ -7538,7 +7538,7 @@ def __test_modify_exit_reopens_closed_leg_row_on_amend__(tmp_path):
     assert tp_row.tp_level == pytest.approx(1.18250)
     # Leg must be visible to live-iteration after reopen.
     assert any(r.client_order_id == tp_coid
-               for r in ctx.iter_live_orders(symbol='EURUSD')), (
+               for r in ctx.iter_live_orders()), (
         "reopened TP leg must appear in iter_live_orders('EURUSD'); "
         "otherwise reconcile / fill-fallback can't see it"
     )
@@ -14765,7 +14765,7 @@ def _bracket_puts(broker) -> list[tuple[str, dict]]:
 def _live_legs(ctx) -> dict[tuple[str, str], str]:
     """``(parent_deal_id, leg_kind) -> client_order_id`` of every live leg row."""
     legs: dict[tuple[str, str], str] = {}
-    for row in ctx.iter_live_orders(symbol='EURUSD'):
+    for row in ctx.iter_live_orders():
         extras = row.extras or {}
         if extras.get('leg_kind') in ('tp', 'sl'):
             key = (str(extras.get('parent_deal_id')), str(extras.get('leg_kind')))
@@ -14867,7 +14867,7 @@ def __test_tp_fill_on_one_deal_keeps_the_sibling_deal_protected__(tmp_path):
         assert row is not None and row.closed_ts_ms is None
         assert (row.extras or {}).get('natural_close_at') is None
     assert [r.exchange_order_id for r in
-            broker._find_active_entry_rows('EURUSD', 'Long')] == ['deal-2']
+            broker._find_active_entry_rows('Long')] == ['deal-2']
 
     shrunk = _pyramid_exit_env(1.0, bar_ts_ms=1700000120000)
     legs = asyncio.run(broker.modify_exit(grown, shrunk))

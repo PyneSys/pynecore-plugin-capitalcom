@@ -317,7 +317,7 @@ def _surviving_sister_levels(
     if store_ctx is None:
         return {}
     sister_kind = 'sl' if leg_kind == 'tp' else 'tp'
-    for other in store_ctx.iter_live_orders(symbol=row.symbol):
+    for other in store_ctx.iter_live_orders():
         extras = other.extras or {}
         if (other.client_order_id == row.client_order_id
                 or extras.get('leg_kind') != sister_kind

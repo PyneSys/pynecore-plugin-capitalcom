@@ -156,8 +156,8 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
                 owned.add(deal_id)
         return owned
 
-    def _unconfirmed_own_entries(self, symbol: str) -> list[tuple[str, float]]:
-        """Own entries on ``symbol`` sent to the venue whose ``dealId`` is not known yet.
+    def _unconfirmed_own_entries(self) -> list[tuple[str, float]]:
+        """Own entries sent to the venue whose ``dealId`` is not known yet.
 
         Between the entry ``POST`` and its confirm (or for as long as an
         ambiguous confirm stays parked) the deal the entry opened is on the
@@ -171,7 +171,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         if store_ctx is None:
             return []
         entries: list[tuple[str, float]] = []
-        for row in store_ctx.iter_live_orders(symbol=symbol):
+        for row in store_ctx.iter_live_orders():
             extras = row.extras or {}
             if (row.exchange_order_id
                     or row.state == STATE_REJECTED
@@ -216,7 +216,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
                 continue
             deal = _describe_deal(position)
             if unconfirmed is None:
-                unconfirmed = self._unconfirmed_own_entries(symbol)
+                unconfirmed = self._unconfirmed_own_entries()
             created = _parse_iso_timestamp(str(position.get('createdDateUTC') or ''))
             if any(entry_direction == deal_direction
                    and (created <= 0.0 or abs(created - sent_at) <= _UNCONFIRMED_ENTRY_SKEW_S)
@@ -484,7 +484,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             self._foreign_exit_latched.add(intent_key)
             since = self._foreign_exit_blocks[intent_key].since
             foreign_ids = sorted(str(deal.get('deal_id')) for deal in foreign)
-            other_runs = self._other_run_deal_ids(symbol, foreign_ids)
+            other_runs = self._other_run_deal_ids(foreign_ids)
             latch_message = (
                 f"{reason}: own exit {write} on {symbol} has been blocked for "
                 f"{now - since:.0f} s by deal(s) {foreign_ids} this run did not "
@@ -511,12 +511,12 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             context={'symbol': symbol, 'foreign_deals': foreign, 'write': write},
         )
 
-    def _other_run_deal_ids(self, symbol: str, deal_ids: Iterable[str]) -> list[str]:
+    def _other_run_deal_ids(self, deal_ids: Iterable[str]) -> list[str]:
         """The deals among ``deal_ids`` another Pyne run on this account owns."""
         store_ctx = self.store_ctx
         if store_ctx is None:
             return []
-        owned = store_ctx.foreign_live_exchange_order_ids(symbol=symbol)
+        owned = store_ctx.foreign_live_exchange_order_ids()
         return sorted(deal_id for deal_id in deal_ids if deal_id in owned)
 
     def _promotion_conflict(
@@ -670,7 +670,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         if marker in self._foreign_blocks_reported:
             return message
         self._foreign_blocks_reported.add(marker)
-        other_runs = self._other_run_deal_ids(symbol, foreign_ids)
+        other_runs = self._other_run_deal_ids(foreign_ids)
         if other_runs:
             message += f"; deal(s) {other_runs} are owned by another Pyne run on this account"
         logger.error("%s", message)

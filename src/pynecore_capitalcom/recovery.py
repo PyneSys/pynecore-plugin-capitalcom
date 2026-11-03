@@ -598,7 +598,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         raw_by_deal = {
             str((raw.get('position') or {}).get('dealId')): raw for raw in positions
         }
-        other_runs = store_ctx.foreign_live_exchange_order_ids(symbol=symbol)
+        other_runs = store_ctx.foreign_live_exchange_order_ids()
         for deal in self._foreign_deals(positions, symbol):
             if deal.get('ownership_pending'):
                 # An unconfirmed own entry may have opened it; the poll logs

@@ -2084,7 +2084,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
             return None
         tp_leg: OrderRow | None = None
         sl_leg: OrderRow | None = None
-        for leg in store_ctx.iter_live_orders(symbol=row.symbol):
+        for leg in store_ctx.iter_live_orders():
             extras = leg.extras or {}
             if (str(extras.get('parent_deal_id') or '') != deal_id
                     or leg.state == STATE_REJECTED
@@ -2445,7 +2445,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
             and earliest <= _parse_iso_timestamp(str(deal.get('created') or '')) <= latest
         ]
         other_runs = set(self._other_run_deal_ids(
-            symbol, [str(deal['deal_id']) for deal in candidates]))
+            [str(deal['deal_id']) for deal in candidates]))
         candidates = [deal for deal in candidates if deal['deal_id'] not in other_runs]
         if len(candidates) != 1:
             return None
@@ -2637,7 +2637,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
             0.5 * rules.lot_step if rules is not None else 0.0,
             1e-9 * max(1.0, abs(size or 0.0)),
         )
-        for other in store_ctx.iter_live_orders(symbol=row.symbol):
+        for other in store_ctx.iter_live_orders():
             if other.client_order_id == row.client_order_id or other.side == row.side:
                 continue
             extras = other.extras or {}
@@ -2917,7 +2917,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
         """
         store_ctx = self.store_ctx
         assert store_ctx is not None
-        for other in store_ctx.iter_live_orders(symbol=row.symbol):
+        for other in store_ctx.iter_live_orders():
             for record in (other.extras or {}).get(EXTRAS_KEY_OWN_CLOSES) or ():
                 if not isinstance(record, dict):
                     continue
@@ -2929,7 +2929,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
                           else sent_at + _UNSETTLED_WRITE_S) + _CLOCK_SKEW_S
                 if self._own_close_earliest(sent_at) <= activity_ts <= latest:
                     return f"own close of {other.exchange_order_id or other.client_order_id}"
-        for entry_direction, sent_at in self._unconfirmed_own_entries(row.symbol):
+        for entry_direction, sent_at in self._unconfirmed_own_entries():
             if entry_direction == direction and abs(activity_ts - sent_at) <= _CLOCK_SKEW_S:
                 return "an own entry still waiting for its dealId"
         executed, resting = self._own_netting_candidates(row, activity_ts, None, None)

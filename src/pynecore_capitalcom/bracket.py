@@ -69,7 +69,7 @@ class _BracketMixin(_CapitalComBase, ABC):
             self._forget_protection(deal_id)
         bracket_coids: list[str] = []
         if deal_id:
-            for r in list(self.store_ctx.iter_live_orders(symbol=entry_row.symbol)):
+            for r in list(self.store_ctx.iter_live_orders()):
                 if (r.extras or {}).get('parent_deal_id') == deal_id:
                     bracket_coids.append(r.client_order_id)
         for coid in (*bracket_coids, entry_row.client_order_id):

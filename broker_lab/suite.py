@@ -531,7 +531,7 @@ class CapitalComProfile(ReferenceVenueProfile):
                 )
             rows = [
                 row
-                for row in runtime.store_ctx.iter_live_orders(symbol=self.symbol)
+                for row in runtime.store_ctx.iter_live_orders()
                 if (row.extras or {}).get("kind") == "working"
             ]
             if len(rows) != 1 or rows[0].state != "confirmed":
@@ -578,7 +578,7 @@ class CapitalComProfile(ReferenceVenueProfile):
             }
             actual = {
                 str(row.exchange_order_id)
-                for row in runtime.store_ctx.iter_live_orders(symbol=self.symbol)
+                for row in runtime.store_ctx.iter_live_orders()
                 if row.exchange_order_id
                 and (row.extras or {}).get("kind") == "position"
             }
@@ -1427,7 +1427,7 @@ class CapitalComProfile(ReferenceVenueProfile):
             runtime = runner.runs[step.run]
             trailing_rows = [
                 row
-                for row in runtime.store_ctx.iter_live_orders(symbol=self.symbol)
+                for row in runtime.store_ctx.iter_live_orders()
                 if (row.extras or {}).get("leg_kind") == "sl"
                 and (
                     row.trailing_stop
