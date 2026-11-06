@@ -69,10 +69,16 @@ class InvalidStopDistanceError(ExchangeOrderRejectedError):
     :ivar min_distance: The minimum stop distance (in price units) reported
         by Capital.com for this instrument at the time of the rejection.
         Dynamic — may widen during volatile sessions.
+
+    ``level_crossed`` is set when the level also sits on the triggered side
+    of the quote it was measured against (see
+    :class:`~pynecore.core.broker.exceptions.ExchangeOrderRejectedError`).
     """
 
-    def __init__(self, message: str, *, min_distance: float) -> None:
-        super().__init__(message)
+    def __init__(
+            self, message: str, *, min_distance: float, level_crossed: bool = False,
+    ) -> None:
+        super().__init__(message, level_crossed=level_crossed)
         self.min_distance = min_distance
 
 
@@ -86,8 +92,10 @@ class InvalidTakeProfitDistanceError(ExchangeOrderRejectedError):
         by Capital.com at rejection time.
     """
 
-    def __init__(self, message: str, *, min_distance: float) -> None:
-        super().__init__(message)
+    def __init__(
+            self, message: str, *, min_distance: float, level_crossed: bool = False,
+    ) -> None:
+        super().__init__(message, level_crossed=level_crossed)
         self.min_distance = min_distance
 
 
@@ -109,10 +117,14 @@ class InvalidStopMaxValueError(ExchangeOrderRejectedError):
 
     :ivar max_value: The maximum allowed stop level (price, not
         distance) reported by Capital.com at rejection time.
+
+    Always ``level_crossed``: a stop at or beyond the near side of the
+    quote is already triggered, so the refusal is the market having traded
+    through the level, not a venue that refuses to protect the position.
     """
 
     def __init__(self, message: str, *, max_value: float) -> None:
-        super().__init__(message)
+        super().__init__(message, level_crossed=True)
         self.max_value = max_value
 
 
@@ -120,14 +132,15 @@ class InvalidTakeProfitMaxValueError(ExchangeOrderRejectedError):
     """Capital.com rejected an order because the requested take-profit
     level violates the maximum the instrument's current spread permits.
 
-    Twin of :class:`InvalidStopMaxValueError` for the profit leg.
+    Twin of :class:`InvalidStopMaxValueError` for the profit leg, and
+    likewise always ``level_crossed``.
 
     :ivar max_value: The maximum allowed TP level (price, not distance)
         reported by Capital.com at rejection time.
     """
 
     def __init__(self, message: str, *, max_value: float) -> None:
-        super().__init__(message)
+        super().__init__(message, level_crossed=True)
         self.max_value = max_value
 
 

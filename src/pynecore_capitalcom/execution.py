@@ -99,10 +99,39 @@ class _ExecutionMixin(_CapitalComBase, ABC):
     """Order execution mix-in: every ``execute_*`` and ``modify_*`` path."""
 
     @staticmethod
+    def _level_on_triggered_side(
+            position_side: str | None,
+            reference_price: float,
+            level: float,
+            *,
+            stop: bool,
+    ) -> bool:
+        """Whether a protective level sits at or beyond ``reference_price`` on
+        the side where it is already triggered.
+
+        A long's stop-loss at or above the quote, or its take-profit at or
+        below it, fires immediately; a short mirrors that. Without a
+        ``position_side`` nothing can be said, so the answer is ``False``.
+
+        :param position_side: ``'buy'`` for a long, ``'sell'`` for a short.
+        :param reference_price: The quote the level is measured against.
+        :param level: The requested stop-loss or take-profit price.
+        :param stop: ``True`` for the stop-loss leg, ``False`` for take-profit.
+        """
+        if position_side not in ('buy', 'sell'):
+            return False
+        above = level >= reference_price
+        below = level <= reference_price
+        if position_side == 'buy':
+            return above if stop else below
+        return below if stop else above
+
+    @staticmethod
     def _validate_sl_distance(
             rules: _InstrumentRules,
             reference_price: float | None,
             sl_price: float,
+            position_side: str | None = None,
     ) -> None:
         """Raise :class:`InvalidStopDistanceError` if ``sl_price`` is closer
         than the cached minimum distance to ``reference_price``.
@@ -115,6 +144,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         into a logged skip instead of an exchange-side rejection. When
         ``reference_price`` is missing or non-positive the check is a
         no-op — the REST round-trip remains the authoritative gate.
+
+        With ``position_side`` (``'buy'`` long / ``'sell'`` short) the raised
+        error is ``level_crossed`` when the stop already sits on its
+        triggered side of ``reference_price``.
         """
         if reference_price is None or reference_price <= 0.0:
             return
@@ -128,6 +161,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 f"{rules.epic} is below current minimum {min_distance:.6f} "
                 f"(reference={reference_price}, sl={sl_price}).",
                 min_distance=min_distance,
+                level_crossed=_ExecutionMixin._level_on_triggered_side(
+                    position_side, reference_price, sl_price, stop=True,
+                ),
             )
 
     @staticmethod
@@ -135,6 +171,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             rules: _InstrumentRules,
             reference_price: float | None,
             tp_price: float,
+            position_side: str | None = None,
     ) -> None:
         """Raise :class:`InvalidTakeProfitDistanceError` if ``tp_price`` is
         closer than the cached minimum distance to ``reference_price``.
@@ -143,7 +180,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         both legs — the same threshold gates ``stopLevel`` and
         ``profitLevel`` (the venue field is even named
         ``minStopOrProfitDistance``). See :meth:`_validate_sl_distance`
-        for the anchor-price discussion.
+        for the anchor-price discussion and ``position_side``.
         """
         if reference_price is None or reference_price <= 0.0:
             return
@@ -158,6 +195,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 f"{min_distance:.6f} "
                 f"(reference={reference_price}, tp={tp_price}).",
                 min_distance=min_distance,
+                level_crossed=_ExecutionMixin._level_on_triggered_side(
+                    position_side, reference_price, tp_price, stop=False,
+                ),
             )
 
     @staticmethod
@@ -438,9 +478,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         :class:`OrderDispositionUnknownError` so the ownership row stays
         replayable.
 
-        ``side`` is audit-only — Capital.com levels are absolute prices on
-        the row; no side-dependent anchor is needed (cTrader seeds its
-        trailing anchor from it).
+        ``side`` (the exit side) only tells the pre-check which side of the
+        quote a level is already triggered on — Capital.com levels are
+        absolute prices on the row; no side-dependent anchor is needed
+        (cTrader seeds its trailing anchor from it).
         """
         rules = await self._get_instrument_rules(symbol)
         # Same live-mid pre-check as the netting bracket paths: turns an
@@ -449,10 +490,15 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # ``ExchangeOrderRejectedError``, so the attach path still ends in
         # the defensive flatten rather than a halt.
         mid_price = await self._get_current_mid_price(symbol)
+        position_side = 'buy' if side == 'sell' else 'sell'
         if sl_price is not None:
-            self._validate_sl_distance(rules, mid_price, float(sl_price))
+            self._validate_sl_distance(
+                rules, mid_price, float(sl_price), position_side,
+            )
         if tp_price is not None:
-            self._validate_tp_distance(rules, mid_price, float(tp_price))
+            self._validate_tp_distance(
+                rules, mid_price, float(tp_price), position_side,
+            )
 
         body: dict = {
             'profitLevel': float(tp_price) if tp_price is not None else None,
@@ -1067,11 +1113,11 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         try:
             if intent.sl_price is not None:
                 self._validate_sl_distance(
-                    rules, mid_price, float(intent.sl_price),
+                    rules, mid_price, float(intent.sl_price), first.side,
                 )
             if intent.tp_price is not None:
                 self._validate_tp_distance(
-                    rules, mid_price, float(intent.tp_price),
+                    rules, mid_price, float(intent.tp_price), first.side,
                 )
         except ExchangeOrderRejectedError as exc:
             raise BracketAttachAfterFillRejectedError(
@@ -1083,6 +1129,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 position_side=first.side,
                 qty=first.qty,
                 from_entry=intent.from_entry,
+                level_crossed=exc.level_crossed,
             ) from exc
 
         # --- Build body + decide trailing deferral ---
@@ -1501,6 +1548,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                         position_side=target_row.side,
                         qty=target_row.qty,
                         from_entry=intent.from_entry,
+                        level_crossed=(
+                            isinstance(exc, ExchangeOrderRejectedError)
+                            and exc.level_crossed
+                        ),
                     ) from exc
 
                 new_ref = resp.get('dealReference')
@@ -2599,11 +2650,11 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         try:
             if new_i.sl_price is not None:
                 self._validate_sl_distance(
-                    rules, mid_price, float(new_i.sl_price),
+                    rules, mid_price, float(new_i.sl_price), target_row.side,
                 )
             if new_i.tp_price is not None:
                 self._validate_tp_distance(
-                    rules, mid_price, float(new_i.tp_price),
+                    rules, mid_price, float(new_i.tp_price), target_row.side,
                 )
         except ExchangeOrderRejectedError as exc:
             raise BracketAttachAfterFillRejectedError(
@@ -2615,6 +2666,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 position_side=target_row.side,
                 qty=target_row.qty,
                 from_entry=new_i.from_entry,
+                level_crossed=exc.level_crossed,
             ) from exc
 
         # Pine ``trail_price`` + ``trail_offset`` defers native trailing

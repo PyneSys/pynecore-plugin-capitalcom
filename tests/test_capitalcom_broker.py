@@ -920,6 +920,9 @@ def __test_execute_exit_pre_validates_sl_distance__(tmp_path):
     cause = exc.value.__cause__
     assert isinstance(cause, InvalidStopDistanceError)
     assert abs(cause.min_distance - 0.0001) < 1e-9
+    # The long's SL sits ABOVE the live mid: already triggered, so the
+    # defensive close is Pine's immediate stop exit.
+    assert exc.value.level_crossed is True
     assert not any(
         c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
     ), "PUT must not be issued when pre-check rejects"
@@ -951,6 +954,8 @@ def __test_execute_exit_pre_validates_tp_distance__(tmp_path):
     cause = exc.value.__cause__
     assert isinstance(cause, InvalidTakeProfitDistanceError)
     assert abs(cause.min_distance - 0.0001) < 1e-9
+    # A long's TP above the mid is merely too close, not triggered.
+    assert exc.value.level_crossed is False
     assert not any(
         c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
     )
@@ -1016,9 +1021,37 @@ def __test_modify_exit_pre_validates_distance__(tmp_path):
     with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
         asyncio.run(broker.modify_exit(old_env, new_env))
     assert isinstance(exc.value.__cause__, InvalidStopDistanceError)
+    assert exc.value.level_crossed is False
     assert not any(
         c[0] == 'positions/deal-L' and c[1] == 'put' for c in broker._calls
     )
+    store.close()
+
+
+def __test_modify_exit_pre_check_triggered_stop_is_level_crossed__(tmp_path):
+    """An amend that moves a long's SL just above the live mid is already
+    triggered: the bracket-amend reject carries ``level_crossed``."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.20000, 1.20002),
+        ('positions/deal-L', 'put'): {'dealReference': 'amend'},
+        ('confirms/amend', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L',
+                     extras={'kind': 'position'})
+    old_env = DispatchEnvelope(intent=ExitIntent(
+        pine_id='Br', from_entry='Long', symbol='EURUSD',
+        side='sell', qty=1.0, sl_price=1.19500, tp_price=1.20800,
+    ), run_tag='test', bar_ts_ms=1700000000000)
+    new_env = DispatchEnvelope(intent=ExitIntent(
+        pine_id='Br', from_entry='Long', symbol='EURUSD',
+        side='sell', qty=1.0, sl_price=1.20004, tp_price=1.20800,
+    ), run_tag='test', bar_ts_ms=1700000000000)
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    assert isinstance(exc.value.__cause__, InvalidStopDistanceError)
+    assert exc.value.level_crossed is True
     store.close()
 
 
@@ -3376,6 +3409,7 @@ def __test_map_exception_invalid_stop_maxvalue_carries_max_value__():
     assert isinstance(mapped, InvalidStopMaxValueError)
     assert abs(mapped.max_value - 1.17517) < 1e-9
     assert not isinstance(mapped, InvalidStopDistanceError)
+    assert mapped.level_crossed is True
 
 
 def __test_map_exception_invalid_takeprofit_maxvalue_carries_max_value__():
@@ -3388,6 +3422,7 @@ def __test_map_exception_invalid_takeprofit_maxvalue_carries_max_value__():
     assert isinstance(mapped, InvalidTakeProfitMaxValueError)
     assert abs(mapped.max_value - 1.18000) < 1e-9
     assert not isinstance(mapped, InvalidTakeProfitDistanceError)
+    assert mapped.level_crossed is True
 
 
 def __test_map_exception_not_found_deal_id__():
@@ -4049,6 +4084,7 @@ def __test_execute_exit_bracket_attach_mapped_reject_rolls_back_legs__(tmp_path)
     # Cause chain preserves the original mapped reject for log
     # correlation / risk-layer pattern matching.
     assert isinstance(exc.value.__cause__, InvalidStopDistanceError)
+    assert exc.value.level_crossed is False
 
     # The error carries the parent-position context the sync engine
     # needs to build a defensive CloseIntent.
@@ -4069,6 +4105,75 @@ def __test_execute_exit_bracket_attach_mapped_reject_rolls_back_legs__(tmp_path)
     assert sl_row is not None and sl_row.closed_ts_ms is not None
     assert tp_row.state == 'rejected' and sl_row.state == 'rejected'
     store.close()
+
+
+def __test_execute_exit_bracket_attach_maxvalue_reject_is_level_crossed__(tmp_path):
+    """``error.invalid.stoploss.maxvalue`` on the attach PUT means the market
+    already traded through the stop (live: capitalcom c380, a long's SL
+    75702.3 against a 75636.25 boundary). The bracket-attach reject must
+    carry ``level_crossed`` so the engine books Pine's crossed-level exit
+    instead of logging a failed protection."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/deal-L', 'put'): _FakeBroker(
+            config=_make_config(),
+        )._map_exception(CapitalComError(
+            "API error occured: error.invalid.stoploss.maxvalue: 1.17380",
+        )),
+    })
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+        state='confirmed', pine_entry_id='Long',
+        exchange_order_id='deal-L',
+        extras={'kind': 'position', 'confirm_level': 1.17500},
+    )
+    env = DispatchEnvelope(
+        intent=ExitIntent(
+            pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+            side='sell', qty=1.0, tp_price=1.17900, sl_price=1.17400,
+        ),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    with pytest.raises(BracketAttachAfterFillRejectedError) as exc:
+        asyncio.run(broker.execute_exit(env))
+    assert isinstance(exc.value.__cause__, InvalidStopMaxValueError)
+    assert exc.value.level_crossed is True
+    assert exc.value.position_deal_id == 'deal-L'
+    store.close()
+
+
+def __test_amend_bracket_pre_check_marks_triggered_stop_level_crossed__(tmp_path):
+    """The one-way port's pre-check gets the EXIT side: a long's (exit side
+    ``sell``) stop above the live mid is already triggered, a short's
+    (exit side ``buy``) same stop is merely too close."""
+    for exit_side, crossed in (('sell', True), ('buy', False)):
+        broker, store, _ = _make_broker(tmp_path / exit_side, responses={
+            ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.10000, 1.10002),
+            ('positions/L1', 'put'): {},
+        })
+        with pytest.raises(InvalidStopDistanceError) as exc:
+            asyncio.run(broker.amend_bracket(
+                'EURUSD', 'L1', side=exit_side,
+                tp_price=None, sl_price=1.10005, trail_offset=None, coid='c1',
+            ))
+        assert exc.value.level_crossed is crossed
+        assert not any(c[0] == 'positions/L1' for c in broker._calls)
+        store.close()
+
+
+def __test_level_on_triggered_side_covers_both_legs_and_sides__():
+    """Long: SL at/above the quote and TP at/below it are triggered; a
+    short mirrors both; an unknown side is never triggered."""
+    f = _FakeBroker._level_on_triggered_side
+    assert f('buy', 100.0, 100.0, stop=True)
+    assert f('buy', 100.0, 101.0, stop=True)
+    assert not f('buy', 100.0, 99.0, stop=True)
+    assert f('buy', 100.0, 99.0, stop=False)
+    assert not f('buy', 100.0, 101.0, stop=False)
+    assert f('sell', 100.0, 99.0, stop=True)
+    assert not f('sell', 100.0, 101.0, stop=True)
+    assert f('sell', 100.0, 101.0, stop=False)
+    assert not f('sell', 100.0, 99.0, stop=False)
+    assert not f(None, 100.0, 101.0, stop=True)
 
 
 def __test_execute_exit_bracket_put_stale_notfound_retries_once__(tmp_path):
