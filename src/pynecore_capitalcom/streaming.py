@@ -1208,6 +1208,15 @@ class _StreamingMixin(_CapitalComBase, ABC):
         self._ws_recovered_slots = {
             ts for ts in self._ws_recovered_slots if ts > bar_open_s_int
         }
+        if recovered:
+            # The OHLC watchdog already published this slot from REST, with
+            # the venue's exact ``lastTradedVolume``, before marking it; the
+            # consumer drops a second bar of the same slot anyway. Its late
+            # WS copy has no quote bucket left (``ws_vol == 0``), so
+            # enriching it meant a REST lookup past the synth budget and a
+            # median-estimate warning for a bar nobody uses (capitalcom
+            # cycle 387).
+            return
         baseline = self._ws_volume_baseline
         baseline_ready = (
             len(baseline) >= _WS_VOLUME_MIN_BASELINE_BARS

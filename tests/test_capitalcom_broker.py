@@ -13551,7 +13551,11 @@ def __test_ws_volume_rest_agreeing_low_bars_do_not_force_reconnect__():
 
 
 def __test_ws_volume_recovered_slot_does_not_count_toward_stale_streak__():
-    """A slot the OHLC watchdog injected from REST never bumps the streak."""
+    """A slot the OHLC watchdog injected from REST is not enriched a second time.
+
+    The watchdog already published the slot with REST's exact volume, so the
+    late WS copy is dropped: no REST lookup, no median estimate, no streak.
+    """
     import collections as _collections
 
     broker = _make_volume_broker(tf="1")
@@ -13583,13 +13587,53 @@ def __test_ws_volume_recovered_slot_does_not_count_toward_stale_streak__():
 
     items = [item for item in _drain_update_queue(broker)
              if item is not None]
-    assert len(items) == 2
-    assert all(it[1]["_volume"] == 100.0 for it in items)
-    assert rest_calls == [base_open, base_open + 60]
+    assert items == []
+    assert rest_calls == []
     assert broker._ws.close_calls == []
     assert broker._ws_bad_bar_streak == 0
     # Processed slots are forgotten so the set cannot grow unbounded.
     assert broker._ws_recovered_slots == set()
+
+
+def __test_ws_volume_late_copy_of_a_recovered_bar_is_dropped_quietly__(caplog):
+    """A watchdog-recovered bar reaches the consumer once, with REST's exact volume.
+
+    Live (capitalcom cycle 387, 2026-11-08): the WS ``ohlc.event`` of a slot
+    the watchdog had already injected from REST arrived late, after the synth
+    budget. Its quote bucket was gone, so the worker skipped a REST lookup
+    and emitted a median estimate, both as warnings, for a bar the consumer
+    then dropped as a duplicate.
+    """
+    import collections as _collections
+
+    broker = _make_volume_broker(tf="1")
+    bar_open_s = 1_700_000_000
+    broker._ws_coverage_started_at = float(bar_open_s) - 60.0
+    broker._ws_volume_baseline = _collections.deque(
+        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
+    )
+    broker._ws_recovered_slots = {bar_open_s}
+    bar = {"priceType": "bid", "t": bar_open_s * 1000,
+           "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05}
+    rest_calls: list[int] = []
+
+    def _fake_fetch(ts: int) -> float:
+        rest_calls.append(ts)
+        return 0.0
+
+    caplog.set_level(logging.INFO, logger='pynecore')
+    asyncio.run(_run_worker_until_drained(
+        broker,
+        [(streaming_module._RECOVERED_OHLC_EVENT, {**bar, "_volume": 124.0}),
+         ("ohlc", dict(bar))],
+        fake_fetch_bar_volume=_fake_fetch,
+        now_ts=float(bar_open_s) + 96.0,
+    ))
+
+    items = [item for item in _drain_update_queue(broker) if item is not None]
+    assert [(kind, payload["_volume"]) for kind, payload in items] == [("ohlc", 124.0)]
+    assert rest_calls == []
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
 
 
 def __test_ws_volume_rest_failed_emits_median__(caplog):
