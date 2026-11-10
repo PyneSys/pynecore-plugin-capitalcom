@@ -18,6 +18,7 @@ import os
 import threading
 from abc import ABC
 from contextlib import contextmanager
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Iterator
 from json import JSONDecodeError
@@ -97,6 +98,20 @@ _SESSION_CREATE_LOCKS: dict[bytes, threading.Lock] = {}
 _SESSION_CREATE_LAST_POST: dict[bytes, float] = {}
 _ACCOUNT_WRITE_GUARD = threading.Lock()
 _ACCOUNT_WRITE_LOCKS: dict[bytes, threading.Lock] = {}
+# One pooled HTTP client carries every REST call of the process. The
+# module-level ``httpx.get`` / ``httpx.post`` build a throwaway client per
+# call: a fresh TCP + TLS handshake and a fresh DNS lookup (A + AAAA) for
+# every request, several lookups a second at the REST polling cadence of a
+# live run (measured on the live lab: ~1M resolver queries for the demo host
+# in a day). Kept-alive connections outlast the poll gaps. httpx documents the
+# client as safe to share between threads; it stores no cookies, as the
+# per-call clients never carried one from a request to the next.
+_HTTP_CLIENT = httpx.Client(
+    cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+    limits=httpx.Limits(
+        max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0,
+    ),
+)
 
 
 @contextmanager
@@ -206,7 +221,7 @@ class _RestSessionMixin(_CapitalComBase, ABC):
         # stops the write.
         if method_lc != 'get' and not is_bootstrap:
             self.ensure_venue_writes_allowed(f"{method_lc.upper()} {endpoint}")
-        res: httpx.Response = getattr(httpx, method_lc)(url, **params)
+        res: httpx.Response = getattr(_HTTP_CLIENT, method_lc)(url, **params)
         # A 5xx or a non-JSON body never carries an API verdict: the venue's
         # gateway answered for a backend that did not (measured live: nginx
         # ``504 Gateway Time-out`` HTML on GET /positions during a venue

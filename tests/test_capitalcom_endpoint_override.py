@@ -12,6 +12,7 @@ import httpx
 
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
 from pynecore_capitalcom.helpers import URL, URL_DEMO, WS_URL, rest_url, ws_url
+from pynecore_capitalcom.rest import _HTTP_CLIENT
 
 
 def __test_override_order_is_environment_then_config_then_venue__(monkeypatch):
@@ -38,7 +39,7 @@ def __test_rest_calls_dial_the_override__(monkeypatch):
         dialed.append(url)
         raise httpx.ConnectError("refused")
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
     try:
         asyncio.run(broker._call("positions", method="get"))
     except Exception:  # the mapped connection error is not the point here

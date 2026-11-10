@@ -2,6 +2,7 @@
 @pyne
 """
 from pathlib import Path
+import httpx
 import pytest
 import json
 import logging
@@ -179,6 +180,51 @@ def __test_capitalcom_pagination_non_minute_timeframe__(tmp_path):
 
     expected = [int(b.replace(tzinfo=UTC).timestamp()) * 1000 for b in all_bars]
     assert got == expected
+
+
+@pytest.mark.parametrize("fault", [
+    httpx.ConnectError("[Errno -3] Temporary failure in name resolution"),
+    httpx.ReadTimeout(""),
+    httpx.RemoteProtocolError("Server disconnected without sending a response."),
+])
+def __test_capitalcom_download_transport_fault_is_retryable__(tmp_path, fault):
+    """A request that never reached the venue fails the download with the
+    retryable provider error, keeping the bars written before it.
+
+    Measured after a host reboot: DNS was not up yet, the raw ``ConnectError``
+    escaped ``download_ohlcv`` and ``pyne run`` aborted the start with a
+    traceback instead of waiting for the network.
+    """
+    from datetime import timedelta
+    from pynecore.core.plugin import is_retryable_provider_error
+    from pynecore_capitalcom import CapitalComConfig
+    from pynecore_capitalcom.exceptions import CapitalComTransportError
+
+    cfg = CapitalComConfig(user_email="a@b.c", api_key="k", api_password="p")
+    provider = CapitalCom(symbol="EURUSD", timeframe="1", ohlcv_dir=tmp_path,
+                          config=cfg)
+
+    start = datetime(2025, 1, 6, 9, 0)
+    first_page = [start + timedelta(minutes=i) for i in range(1000)]
+    calls = []
+
+    def fake_get(time_from=None, time_to=None, limit=1000):
+        calls.append(time_from)
+        if len(calls) == 1:
+            return _build_price_page(first_page)
+        raise fault
+
+    provider.get_historical_prices = fake_get  # type: ignore[method-assign]
+
+    with provider:
+        with pytest.raises(CapitalComTransportError) as excinfo:
+            provider.download_ohlcv(start, start + timedelta(minutes=2500))
+
+    assert is_retryable_provider_error(excinfo.value)
+    assert excinfo.value.__cause__ is fault
+    assert "prices/EURUSD" in str(excinfo.value)
+    with OHLCVReader(str(provider.ohlcv_path)) as reader:
+        assert len(list(reader)) == len(first_page)
 
 
 def __test_helper_require_live_opt_in():

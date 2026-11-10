@@ -16,6 +16,8 @@ from time import time as epoch_time
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
@@ -26,7 +28,7 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from ._base import _CapitalComBase
-from .exceptions import HistoricalPricesNotFoundError
+from .exceptions import CapitalComTransportError, HistoricalPricesNotFoundError
 from .helpers import (
     TIMEFRAMES,
     TIMEFRAMES_INV,
@@ -354,6 +356,16 @@ class _ProviderMixin(_CapitalComBase, ABC):
                     # A confirmed empty venue range ends this download while
                     # preserving every bar already written.
                     break
+                except httpx.TransportError as e:
+                    # The request never reached the venue (no DNS yet after a
+                    # host reboot, a refused or dropped connection, a
+                    # timeout). Surfaced as the retryable provider error, so
+                    # ``pyne run`` waits and downloads again instead of
+                    # aborting the start with a traceback.
+                    raise CapitalComTransportError(
+                        f"Capital.com HTTP transport error on prices/{self.symbol}: "
+                        f"{str(e) or type(e).__name__}"
+                    ) from e
                 if not res or not res['prices']:
                     break
                 ps = res['prices']

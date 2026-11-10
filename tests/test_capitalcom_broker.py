@@ -39,7 +39,7 @@ from pynecore_capitalcom.helpers import (
     _parse_iso_timestamp,
 )
 from pynecore_capitalcom.plugin import _activity_fingerprint
-from pynecore_capitalcom.rest import _RestSessionMixin
+from pynecore_capitalcom.rest import _HTTP_CLIENT, _RestSessionMixin
 
 
 def main():
@@ -3452,7 +3452,7 @@ def __test_call_maps_httpx_connect_error_to_exchange_connection_error__(monkeypa
             "[Errno 8] nodename nor servname provided, or not known",
         )
 
-    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
 
     with pytest.raises(ExchangeConnectionError):
         asyncio.run(broker._call('positions', method='get'))
@@ -3479,7 +3479,7 @@ def __test_hung_read_resolves_as_connection_error_within_deadline__(monkeypatch)
         release.wait(1.0)
         raise httpx.ConnectError("released after the deadline fired")
 
-    monkeypatch.setattr(httpx, 'get', hung_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', hung_get)
     monkeypatch.setattr(rest_mod, '_READ_DEADLINE_S', 0.1)
     try:
         with pytest.raises(ExchangeConnectionError,
@@ -3513,7 +3513,7 @@ def __test_write_call_is_not_deadline_bounded__(monkeypatch):
         time.sleep(0.3)
         return _Res()
 
-    monkeypatch.setattr(httpx, 'post', slow_post)
+    monkeypatch.setattr(_HTTP_CLIENT, 'post', slow_post)
     monkeypatch.setattr(rest_mod, '_READ_DEADLINE_S', 0.05)
     res = asyncio.run(broker._call('workingorders', method='post'))
     assert res == {'dealReference': 'ref-1'}
@@ -11601,7 +11601,6 @@ def __test_partial_opaque_rotation_preserves_unchanged_deadline__(monkeypatch):
     header rotation at t=30min would push the unchanged CST's deadline
     from t=50min to t=80min, defeating proactive refresh.
     """
-    import httpx as _httpx
 
     broker = _FakeBroker(config=_make_config())
 
@@ -11618,7 +11617,7 @@ def __test_partial_opaque_rotation_preserves_unchanged_deadline__(monkeypatch):
     # Establish initial session at t=t0: both opaque tokens issued together.
     t0 = 1_000_000.0
     monkeypatch.setattr('pynecore_capitalcom.rest.epoch_time', lambda: t0)
-    monkeypatch.setattr(_httpx, 'get', lambda url, **_kw: _StubResponse(
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', lambda url, **_kw: _StubResponse(
         {'X-SECURITY-TOKEN': 'sec-A', 'CST': 'cst-B'},
     ))
     broker('any/endpoint', method='get')
@@ -11627,7 +11626,7 @@ def __test_partial_opaque_rotation_preserves_unchanged_deadline__(monkeypatch):
     # At t=t0+30min, only X-SECURITY-TOKEN rotates. CST is the same.
     monkeypatch.setattr('pynecore_capitalcom.rest.epoch_time',
                         lambda: t0 + 30 * 60)
-    monkeypatch.setattr(_httpx, 'get', lambda url, **_kw: _StubResponse(
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', lambda url, **_kw: _StubResponse(
         {'X-SECURITY-TOKEN': 'sec-A-prime', 'CST': 'cst-B'},
     ))
     broker('any/endpoint', method='get')
@@ -11647,7 +11646,6 @@ def __test_concurrent_refresh_response_does_not_roll_back_fresh_tokens__(monkeyp
     and apply rotation unconditionally — so a stale response could
     silently roll the session back to expiring tokens.
     """
-    import httpx as _httpx
     from time import time as _time
 
     broker = _FakeBroker(config=_make_config())
@@ -11687,7 +11685,7 @@ def __test_concurrent_refresh_response_does_not_roll_back_fresh_tokens__(monkeyp
         broker._session_generation += 1
         return _StubResponse()
 
-    monkeypatch.setattr(_httpx, 'get', _stub)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', _stub)
     broker('any/endpoint', method='get')
 
     assert broker.security_token == 'sec-NEW'
@@ -11708,7 +11706,6 @@ def __test_concurrent_normal_request_rotation_is_not_discarded__(monkeypatch):
     response" (keep both rotations) — and dropped the second rotation,
     silently keeping the broker on a stale-but-newer token.
     """
-    import httpx as _httpx
     from time import time as _time
 
     broker = _FakeBroker(config=_make_config())
@@ -11738,7 +11735,7 @@ def __test_concurrent_normal_request_rotation_is_not_discarded__(monkeypatch):
         broker.cst_token = 'cst-Y'
         return _StubResponse()
 
-    monkeypatch.setattr(_httpx, 'get', _stub)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', _stub)
     broker('any/endpoint', method='get')
 
     # Our own rotation header (Z) is the latest valid one — the snapshot
@@ -11759,7 +11756,6 @@ def __test_create_session_keeps_old_tokens_visible_during_login__(monkeypatch):
     pings with ``cst=None`` / ``securityToken=None`` and get the live
     stream rejected.
     """
-    import httpx as _httpx
     from time import time as _time
 
     broker = _FakeBroker(config=_make_config())
@@ -11796,8 +11792,8 @@ def __test_create_session_keeps_old_tokens_visible_during_login__(monkeypatch):
         observed.append(('post', broker.security_token, broker.cst_token))
         return _SessionResponse()
 
-    monkeypatch.setattr(_httpx, 'get', _stub_get)
-    monkeypatch.setattr(_httpx, 'post', _stub_post)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', _stub_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'post', _stub_post)
     monkeypatch.setattr('pynecore_capitalcom.rest.encrypt_password',
                         lambda *_a, **_kw: 'fake-encrypted')
 
@@ -11887,8 +11883,8 @@ def __test_concurrent_login_paths_coalesce_without_deadlock__(monkeypatch, first
     broker._session_refresh_condition = _SignalingCondition(
         broker._session_refresh_lock
     )
-    monkeypatch.setattr(httpx, 'get', fake_get)
-    monkeypatch.setattr(httpx, 'post', fake_post)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'post', fake_post)
     monkeypatch.setattr(
         'pynecore_capitalcom.rest.encrypt_password',
         lambda *_args, **_kwargs: 'fake-encrypted',
@@ -11989,8 +11985,8 @@ def __test_direct_login_coalesces_after_owner_installs_session__(monkeypatch):
         broker._session_refresh_lock
     )
     monkeypatch.setattr(broker, '_perform_session_login', perform_and_pause)
-    monkeypatch.setattr(httpx, 'get', fake_get)
-    monkeypatch.setattr(httpx, 'post', fake_post)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'post', fake_post)
     monkeypatch.setattr(
         'pynecore_capitalcom.rest.encrypt_password',
         lambda *_args, **_kwargs: 'fake-encrypted',
@@ -12110,7 +12106,6 @@ def __test_call_does_not_recurse_when_bootstrap_returns_session_token_error__(mo
     triggered ``create_session`` → bootstrap → recovery → ``create_session``
     until ``RecursionError``.
     """
-    import httpx as _httpx
 
     broker = _FakeBroker(config=_make_config())
 
@@ -12128,8 +12123,8 @@ def __test_call_does_not_recurse_when_bootstrap_returns_session_token_error__(mo
         call_count[0] += 1
         return _StubResponse()
 
-    monkeypatch.setattr(_httpx, 'get', _stub)
-    monkeypatch.setattr(_httpx, 'post', _stub)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', _stub)
+    monkeypatch.setattr(_HTTP_CLIENT, 'post', _stub)
 
     with pytest.raises(CapitalComError):
         broker.create_session()
@@ -12196,7 +12191,7 @@ def __test_call_reactive_retry_on_invalid_session_token__(monkeypatch):
     def fake_get(url, **kwargs):
         captured_csts.append(kwargs['headers'].get('CST', ''))
         return responses.pop(0)
-    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
 
     result = broker('positions', method='get')
     assert result == {'positions': []}
@@ -12224,7 +12219,7 @@ def __test_call_reactive_retry_on_session_expired__(monkeypatch):
     def fake_get(url, **kwargs):
         captured_csts.append(kwargs['headers'].get('CST', ''))
         return responses.pop(0)
-    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
 
     result = broker('positions', method='get')
     assert result == {'positions': []}
@@ -12252,7 +12247,7 @@ def __test_call_reactive_retry_on_unseen_security_code__(monkeypatch):
     def fake_get(url, **kwargs):
         captured_csts.append(kwargs['headers'].get('CST', ''))
         return responses.pop(0)
-    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
 
     result = broker('positions', method='get')
     assert result == {'positions': []}
@@ -12287,7 +12282,7 @@ def __test_is_session_error_matches_the_session_family_only__():
 def __test_call_maps_prices_not_found_to_typed_empty_range__(monkeypatch):
     broker = _FakeBroker(config=_make_config())
     monkeypatch.setattr(
-        httpx,
+        _HTTP_CLIENT,
         "get",
         lambda url, **kwargs: _MockHttpResponse(
             404,
@@ -12302,7 +12297,7 @@ def __test_call_maps_prices_not_found_to_typed_empty_range__(monkeypatch):
 def __test_call_rejects_non_object_rest_response_root__(monkeypatch):
     broker = _FakeBroker(config=_make_config())
     monkeypatch.setattr(
-        httpx,
+        _HTTP_CLIENT,
         "get",
         lambda url, **kwargs: _MockHttpResponse(200, [], {}),
     )
@@ -12330,7 +12325,7 @@ def __test_call_proactive_refresh_runs_before_request__(monkeypatch):
     def fake_get(url, **kwargs):
         captured_csts.append(kwargs['headers'].get('CST', ''))
         return _MockHttpResponse(200, {'positions': []}, {})
-    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
 
     broker('positions', method='get')
     assert captured_csts == ['cst-v2'], (
@@ -12351,11 +12346,11 @@ def __test_call_proactive_refresh_skipped_for_bootstrap_endpoints__(monkeypatch)
     monkeypatch.setattr(broker, '_perform_session_login',
                         lambda: refresh_called.append(True))
     monkeypatch.setattr(
-        httpx, 'get',
+        _HTTP_CLIENT, 'get',
         lambda url, **kwargs: _MockHttpResponse(200, {'k': 'v'}, {}),
     )
     monkeypatch.setattr(
-        httpx, 'post',
+        _HTTP_CLIENT, 'post',
         lambda url, **kwargs: _MockHttpResponse(200, {'k': 'v'}, {}),
     )
     broker('session/encryptionKey', method='get')
@@ -12641,7 +12636,7 @@ def __test_call_authenticated_session_method_is_not_treated_as_bootstrap__(monke
         captured_headers.append(dict(kwargs['headers']))
         return _MockHttpResponse(200, {'ok': True}, {})
 
-    monkeypatch.setattr(httpx, 'put', fake_put)
+    monkeypatch.setattr(_HTTP_CLIENT, 'put', fake_put)
     broker('session', data={'accountId': 'X'}, method='put')
 
     assert captured_headers == [{
@@ -12664,7 +12659,7 @@ def __test_call_token_rotation_recomputes_expiry_from_jwt__(monkeypatch):
     new_cst_jwt = _make_jwt({'exp': new_exp})
 
     monkeypatch.setattr(
-        httpx, 'get',
+        _HTTP_CLIENT, 'get',
         lambda url, **kwargs: _MockHttpResponse(
             200, {'positions': []},
             {'CST': new_cst_jwt, 'X-SECURITY-TOKEN': 'new-opaque-x-sec'},
@@ -14556,7 +14551,7 @@ def __test_gateway_error_page_is_a_retryable_transport_error__(monkeypatch):
     from pynecore_capitalcom.exceptions import CapitalComTransportError
 
     broker = CapitalCom(config=_make_config())
-    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _GatewayResponse(504, _NGINX_504))
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', lambda _url, **_kw: _GatewayResponse(504, _NGINX_504))
     with pytest.raises(CapitalComTransportError, match="HTTP 504"):
         broker('positions', method='get')
     try:
@@ -14566,7 +14561,7 @@ def __test_gateway_error_page_is_a_retryable_transport_error__(monkeypatch):
         assert "\r\n" not in str(exc)
 
     # A 200 with a non-JSON body (interstitial) is the same fault.
-    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _GatewayResponse(200, "<html>x</html>"))
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', lambda _url, **_kw: _GatewayResponse(200, "<html>x</html>"))
     with pytest.raises(CapitalComTransportError, match="non-JSON"):
         broker('positions', method='get')
 
@@ -14581,7 +14576,7 @@ def __test_gateway_error_page_reaches_the_engine_as_a_connection_error__(monkeyp
         broker._map_exception(CapitalComTransportError("gateway")),
         ExchangeConnectionError,
     )
-    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _GatewayResponse(504, _NGINX_504))
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', lambda _url, **_kw: _GatewayResponse(504, _NGINX_504))
     with pytest.raises(ExchangeConnectionError, match="HTTP 504"):
         asyncio.run(broker._call('positions', method='get'))
 
@@ -14595,7 +14590,7 @@ def __test_gateway_5xx_with_a_json_body_is_still_a_transport_error__(monkeypatch
             return {'errorCode': 'error.gateway.unavailable'}
 
     broker = CapitalCom(config=_make_config())
-    monkeypatch.setattr(httpx, 'get', lambda _url, **_kw: _JsonGateway(503, '{}'))
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', lambda _url, **_kw: _JsonGateway(503, '{}'))
     with pytest.raises(CapitalComTransportError, match="HTTP 503") as info:
         broker('positions', method='get')
     assert not isinstance(info.value, CapitalComApiError)
@@ -14686,7 +14681,7 @@ def __test_call_refuses_order_writes_while_venue_writes_blocked__(monkeypatch):
         return send
 
     for method in ('get', 'post', 'put', 'delete'):
-        monkeypatch.setattr(httpx, method, recorder(method))
+        monkeypatch.setattr(_HTTP_CLIENT, method, recorder(method))
 
     refused = [
         ('positions', 'post', {'epic': 'EURUSD'}),
@@ -14740,8 +14735,8 @@ def __test_trailing_monitor_stays_pending_while_venue_writes_blocked__(
         assert url.endswith('/confirms/putref')
         return _MockHttpResponse(200, {'dealStatus': 'ACCEPTED'}, {})
 
-    monkeypatch.setattr(httpx, 'put', fake_put)
-    monkeypatch.setattr(httpx, 'get', fake_get)
+    monkeypatch.setattr(_HTTP_CLIENT, 'put', fake_put)
+    monkeypatch.setattr(_HTTP_CLIENT, 'get', fake_get)
     try:
         ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
                          state='confirmed', pine_entry_id='Long',
@@ -14796,7 +14791,7 @@ def __test_call_refuses_write_when_quarantine_latches_during_refresh__(monkeypat
         sent.append(url)
         return _MockHttpResponse(200, {'dealReference': 'ref'}, {})
 
-    monkeypatch.setattr(httpx, 'put', put)
+    monkeypatch.setattr(_HTTP_CLIENT, 'put', put)
     with pytest.raises(VenueWritesQuarantinedError):
         broker('positions/deal-1', data={'stopLevel': 1.0}, method='put')
     assert sent == []
