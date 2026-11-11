@@ -114,6 +114,75 @@ _HTTP_CLIENT = httpx.Client(
 )
 
 
+# Capital.com allows 10 REST requests per second per user and answers the
+# excess with ``error.too-many.requests``. Serial request loops (a reconcile
+# round, the activity poll, a recovery scan) run as fast as the round trip
+# allows: a kept-alive request takes ~65 ms against ~160 ms with a fresh
+# handshake (measured from the live lab), so one loop alone reaches ~15
+# req/s. Every request of every process logged in as the same user takes a
+# start slot from one shared slot file, spaced so the user stays at 8 req/s
+# whatever the number of processes and threads. The slot file holds the next
+# free start time on the system-wide monotonic clock; a value further ahead
+# than any real queue can reach comes from before a reboot and is dropped.
+_REQUEST_MIN_SPACING_S = 0.125
+_REQUEST_SLOT_STALE_S = 60.0
+_REQUEST_SLOT_WIDTH = 32
+_REQUEST_PACE_GUARD = threading.Lock()
+_REQUEST_PACE_SLOTS: dict[bytes, tuple[threading.Lock, int]] = {}
+
+
+def _request_pace_key(user_email: str, api_key: str) -> bytes:
+    """The venue's rate-limit identity: the login user, or the API key without one."""
+    identity = f"user:{user_email.strip().lower()}" if user_email.strip() else f"key:{api_key}"
+    return hashlib.sha256(identity.encode('utf-8')).digest()
+
+
+def _request_pace_slot(pace_key: bytes) -> tuple[threading.Lock, int]:
+    """The thread lock and slot-file descriptor shared by every request of one user."""
+    with _REQUEST_PACE_GUARD:
+        slot = _REQUEST_PACE_SLOTS.get(pace_key)
+        if slot is None:
+            path = Path.home() / '.pynecore' / 'locks' / (
+                f"capitalcom-requests-{pace_key.hex()}.slot"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            slot = (threading.Lock(), os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
+            _REQUEST_PACE_SLOTS[pace_key] = slot
+        return slot
+
+
+def _pace_request(pace_key: bytes) -> None:
+    """Wait for this user's next request slot across all processes on the host.
+
+    The slot is reserved under the lock and waited for outside it, so
+    concurrent callers queue up one spacing apart instead of holding the
+    lock through the wait.
+    """
+    import fcntl
+
+    thread_lock, descriptor = _request_pace_slot(pace_key)
+    with thread_lock:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            now = monotonic()
+            try:
+                reserved = float(os.pread(descriptor, _REQUEST_SLOT_WIDTH, 0))
+            except ValueError:
+                reserved = now
+            if reserved - now > _REQUEST_SLOT_STALE_S:
+                reserved = now
+            start = max(now, reserved)
+            os.pwrite(
+                descriptor,
+                repr(start + _REQUEST_MIN_SPACING_S).encode('ascii').ljust(_REQUEST_SLOT_WIDTH),
+                0,
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    if start > now:
+        sleep(start - now)
+
+
 @contextmanager
 def _exclusive_account_file_lock(path: Path) -> Iterator[None]:
     """Hold one process-shared account write lock on POSIX."""
@@ -211,6 +280,10 @@ class _RestSessionMixin(_CapitalComBase, ABC):
 
         url = rest_url(self._capital_config.demo, self._capital_config.rest_url)
         url += ENDPOINT_PREFIX + endpoint
+
+        _pace_request(_request_pace_key(
+            self._capital_config.user_email, self._capital_config.api_key,
+        ))
 
         # Quarantine chokepoint: every non-GET request except the login
         # mutates orders or positions, and every REST path (engine
