@@ -182,6 +182,46 @@ def __test_capitalcom_pagination_non_minute_timeframe__(tmp_path):
     assert got == expected
 
 
+def __test_capitalcom_download_stores_the_ask_side__(tmp_path):
+    """Every downloaded bar keeps the ask OHLC the ``/prices`` answer carries,
+    in the file's ask columns, with no ``--extra-data`` flag and no sidecar."""
+    from datetime import timedelta
+    from pynecore_capitalcom import CapitalComConfig
+    from pynecore.types.ohlcv import AskOHLC
+
+    cfg = CapitalComConfig(user_email="a@b.c", api_key="k", api_password="p")
+    provider = CapitalCom(symbol="EURUSD", timeframe="1", ohlcv_dir=tmp_path,
+                          config=cfg)
+    start = datetime(2025, 1, 6, 9, 0)
+
+    def fake_get(time_from=None, time_to=None, limit=1000):
+        opens = [start + timedelta(minutes=i) for i in range(2)]
+        return {'prices': [{
+            'snapshotTimeUTC': b.strftime('%Y-%m-%dT%H:%M:%S'),
+            'openPrice': {'bid': 1.1000, 'ask': 1.1002},
+            'highPrice': {'bid': 1.1010, 'ask': 1.1013},
+            'lowPrice': {'bid': 1.0990, 'ask': 1.0991},
+            'closePrice': {'bid': 1.1005, 'ask': 1.1007},
+            'lastTradedVolume': 1.0,
+        } for b in opens if b >= time_from][:limit]}
+
+    provider.get_historical_prices = fake_get  # type: ignore[method-assign]
+
+    with provider:
+        provider.download_ohlcv(start, start + timedelta(minutes=2))
+
+    with OHLCVReader(str(provider.ohlcv_path)) as reader:
+        assert reader.has_ask
+        bars = list(reader)
+    # No tick grid is stamped here, so the f32 deltas read back within f32 noise.
+    expected_ask = AskOHLC(1.1002, 1.1013, 1.0991, 1.1007)
+    for bar in bars:
+        assert bar.close == pytest.approx(1.1005, abs=1e-7)
+        assert bar.ask is not None
+        assert tuple(bar.ask) == pytest.approx(tuple(expected_ask), abs=1e-7)
+    assert not Path(provider.ohlcv_path).with_suffix('.extra.csv').exists()
+
+
 @pytest.mark.parametrize("fault", [
     httpx.ConnectError("[Errno -3] Temporary failure in name resolution"),
     httpx.ReadTimeout(""),

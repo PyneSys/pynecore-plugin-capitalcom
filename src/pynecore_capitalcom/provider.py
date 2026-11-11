@@ -25,7 +25,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.plugin import override
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from pynecore.lib.timeframe import in_seconds
-from pynecore.types.ohlcv import OHLCV
+from pynecore.types.ohlcv import OHLCV, AskOHLC
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComTransportError, HistoricalPricesNotFoundError
@@ -323,9 +323,8 @@ class _ProviderMixin(_CapitalComBase, ABC):
         would have to treat it as an in-place refinement, which makes
         the logged bar_index appear stuck at the warmup boundary.
 
-        The response already carries bid and ask OHLC, so ``with_extra``
-        only gates whether the ask/spread fields are written to the
-        ``.extra.csv`` sidecar (no extra request either way).
+        The response carries bid and ask OHLC together, so every bar is
+        stored with its ask side and ``with_extra`` has nothing to gate.
         """
         tf = time_from.replace(tzinfo=None)
         tt = (time_to if time_to is not None else datetime.now(UTC)).replace(tzinfo=None)
@@ -400,13 +399,7 @@ class _ProviderMixin(_CapitalComBase, ABC):
                         timestamp=bar_open_s * 1000,
                         open=bid_o, high=bid_h, low=bid_l, close=bid_c,
                         volume=float(p['lastTradedVolume']),
-                        extra_fields={
-                            'ask_open': ask_o,
-                            'ask_high': ask_h,
-                            'ask_low': ask_l,
-                            'ask_close': ask_c,
-                            'spread': abs(ask_c - bid_c),
-                        } if with_extra else None,
+                        ask=AskOHLC(ask_o, ask_h, ask_l, ask_c),
                     )
 
                     self.save_ohlcv_data(ohlcv)
