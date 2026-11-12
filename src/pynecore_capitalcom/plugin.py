@@ -310,3 +310,4 @@ class CapitalCom(
         self._foreign_exit_latched: set[str] = set()
         self._netting_retired_orders: dict[str, dict] | None = None
         self._residual_deals_reported: set[str] = set()
+        self._unannounced_fills_seen: dict[str, float] = {}

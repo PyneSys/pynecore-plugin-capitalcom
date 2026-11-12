@@ -16,7 +16,8 @@ into:
   unexpected cancels (dual signal) and the configured
   ``on_unexpected_cancel`` policy is applied — ``stop`` latches the
   engine's external-intervention quarantine through ``quarantine_sink``;
-  ``halt`` (or an unwired sink) raises :class:`UnexpectedCancelError`.
+  ``halt`` (or an unwired sink) raises
+  :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`.
 
 State touched: BrokerStore through ``self.store_ctx``,
 ``_current_poll_id`` (read), ``_disappearance`` (lazy build).
@@ -66,6 +67,7 @@ from .helpers import (
     EXTRAS_KEY_WORKING_ORDER_END,
     _ACTIVITY_LAG_S,
     _POLL_INTERVAL_S,
+    _UNANNOUNCED_FILL_GRACE_S,
     _extract_reject_reason,
     _retire_parked_partial_close_exposure,
     _size_from_units,
@@ -148,7 +150,11 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         # would survive alongside the new rows as duplicate bracket
         # legs under the same parent_deal_id).
         bracket_attached_coids: dict[str, list[str]] = {}
-        for row in list(self.store_ctx.iter_live_orders()):
+        live_rows = list(self.store_ctx.iter_live_orders())
+        live_coids = {row.client_order_id for row in live_rows}
+        for coid in [c for c in self._unannounced_fills_seen if c not in live_coids]:
+            del self._unannounced_fills_seen[coid]
+        for row in live_rows:
             # --- Bracket-leg disposition recovery -------------------------
             # Bracket TP/SL rows store ``parent_deal_id`` in extras and have
             # NO ``exchange_order_id`` of their own (Capital.com brackets are
@@ -410,6 +416,11 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     leg_type=LegType.ENTRY,
                 )
 
+            if pos is not None:
+                unannounced = self._unannounced_entry_fill(row, did, pos, now_ts)
+                if unannounced is not None:
+                    yield unannounced
+
             # Partial fill detection: position size < row.qty - row.filled_qty.
             # Restricted to rows already in ``confirmed`` — any other live
             # state (``closing``, ``cancel_pending``) is owned by a
@@ -605,6 +616,93 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         await self._observe_working_orders(working_by_deal, read_started_at)
         self._resolve_held_edit_verdicts()
         self._resolve_netting_pending(working_by_deal, read_started_at)
+
+    def _unannounced_entry_fill(
+            self, row: 'OrderRow', deal_id: str, pos: dict, now_ts: float,
+    ) -> OrderEvent | None:
+        """Book an own entry fill no activity announced, from the snapshot.
+
+        The confirm of a market entry records the fill on the row
+        (``filled_qty``), but the engine learns of it only from the deal's
+        ``POSITION`` activity. The venue can publish that row after the
+        activity read stopped reaching back to it: the deal then sits on the
+        venue outside the engine's book, the strategy trades as if flat, and
+        every later close of the entry is refused as ambiguous (measured:
+        capitalcom cycle 406, 2026-11-12 — deal ...8a81 opened 07:23:05, its
+        ``POSITION`` row never reached a poll, the close of the next entry was
+        quarantined). Once the deal has been in ``/positions`` for
+        :data:`~pynecore_capitalcom.helpers._UNANNOUNCED_FILL_GRACE_S` with
+        the row still unbooked, the fill is booked here: at the confirm's
+        level, for the confirmed quantity. The ``entry_filled_at`` stamp
+        written first makes the activity, should it still come, a suppressed
+        replay.
+
+        :param row: A live row whose deal the snapshot lists.
+        :param deal_id: The row's ``dealId``.
+        :param pos: The deal's ``/positions`` row.
+        :param now_ts: Wall-clock time of this reconcile pass.
+        :return: The ENTRY fill to emit, or ``None`` while nothing is owed.
+        """
+        assert self.store_ctx is not None
+        coid = row.client_order_id
+        extras = row.extras or {}
+        position = pos.get('position') or {}
+        if (extras.get('kind') != ENTRY_KIND_POSITION
+                or row.state != 'confirmed'
+                or row.filled_qty <= 0.0
+                or extras.get('entry_filled_at') is not None
+                or extras.get('fold_rebased_filled_at') is not None
+                or extras.get('partial_close_retired_at') is not None
+                or str(position.get('direction') or '').upper()
+                != ('BUY' if row.side == 'buy' else 'SELL')
+                or (_wire_float(position.get('size'), finite=True) or 0.0) <= 0.0):
+            self._unannounced_fills_seen.pop(coid, None)
+            return None
+        first_seen = self._unannounced_fills_seen.setdefault(coid, now_ts)
+        if now_ts - first_seen < _UNANNOUNCED_FILL_GRACE_S:
+            return None
+        del self._unannounced_fills_seen[coid]
+        fill_price = (_wire_float(extras.get('confirm_level'), finite=True)
+                      or _wire_float(position.get('level'), finite=True)
+                      or 0.0)
+        current = self.store_ctx.get_order(coid)
+        stamped = dict((current or row).extras or {})
+        stamped['entry_filled_at'] = now_ts
+        self.store_ctx.upsert_order(coid, extras=stamped)
+        self.store_ctx.log_event(
+            'entry_fill_booked_from_snapshot',
+            client_order_id=coid,
+            exchange_order_id=deal_id,
+            intent_key=row.intent_key,
+            payload={'filled_qty': row.filled_qty, 'fill_price': fill_price,
+                     'unannounced_for_s': now_ts - first_seen},
+        )
+        logger.info(
+            "entry %s (deal %s): no activity announced its fill within %.0f s; "
+            "booked from the positions snapshot (%s %s @ %s)",
+            row.pine_entry_id, deal_id, now_ts - first_seen, row.side,
+            row.filled_qty, fill_price,
+        )
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=deal_id, symbol=row.symbol, side=row.side,
+                order_type=OrderType.MARKET,
+                qty=row.qty, filled_qty=row.filled_qty,
+                remaining_qty=max(0.0, row.qty - row.filled_qty),
+                price=None, stop_price=None,
+                average_fill_price=fill_price,
+                status=OrderStatus.FILLED,
+                timestamp=now_ts, fee=0.0, fee_currency='',
+                reduce_only=False, client_order_id=coid,
+            ),
+            event_type='filled',
+            fill_price=fill_price,
+            fill_qty=row.filled_qty,
+            timestamp=now_ts,
+            pine_id=row.pine_entry_id,
+            from_entry=row.from_entry,
+            leg_type=LegType.ENTRY,
+        )
 
     def _complete_full_close_commands(self, positions_by_deal: dict[str, dict]) -> None:
         """End every full-close command whose targets are let go of everywhere.
@@ -1566,8 +1664,8 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         ``ignore`` / ``re_place`` policies, where the event is the ONLY
         signal), while the policy separately decides the operational
         reaction — ``stop`` latches the engine's external-intervention
-        quarantine, ``halt`` raises :class:`UnexpectedCancelError`
-        through the poll loop.
+        quarantine, ``halt`` raises
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` through the poll loop.
         """
         if self.store_ctx is None:
             return

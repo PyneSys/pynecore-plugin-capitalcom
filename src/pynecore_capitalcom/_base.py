@@ -5,17 +5,18 @@ Every mix-in inherits from :class:`_CapitalComBase` so static analysers
 cross-mix-in method calls without warnings. The class declares:
 
 * Every instance attribute the constructor sets, as a class-level type
-  annotation. The runtime ``__init__`` of the final :class:`CapitalCom`
-  class assigns concrete values; the annotations exist purely for the
-  type system.
+  annotation. The runtime ``__init__`` of the final
+  :class:`~pynecore_capitalcom.plugin.CapitalCom` class assigns concrete
+  values; the annotations exist purely for the type system.
 
 * Capital.com–private method signatures that one mix-in calls on another
   (with ``...`` body). The implementation lives in whichever mix-in owns
   the concern; this class declares the surface so call sites type-check
   cleanly.
 
-Methods inherited from :class:`BrokerPlugin` / :class:`LiveProviderPlugin`
-/ :class:`ProviderPlugin` (``execute_entry``, ``watch_ohlcv``,
+Methods inherited from :class:`BrokerPlugin` /
+:class:`~pynecore.core.plugin.live_provider.LiveProviderPlugin` /
+:class:`~pynecore.core.plugin.provider.ProviderPlugin` (``execute_entry``, ``watch_ohlcv``,
 ``connect``, ``update_symbol_info``, etc.) are intentionally *not* re-
 declared here — the parent classes already define them, and re-declaring
 with a slightly different signature would trigger ``reportInvalidOverride``
@@ -429,6 +430,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # the rest of its size that were already reported.
     _netting_retired_orders: dict[str, dict] | None
     _residual_deals_reported: set[str]
+    # Own entry rows whose deal ``/positions`` lists while their confirmed
+    # fill is still unbooked, by client order id: first seen at (see
+    # ``reconcile.py``, ``_unannounced_entry_fill``).
+    _unannounced_fills_seen: dict[str, float]
 
     # --- Account mode ---
     # ``True`` once ``connect()`` reads ``hedgingMode`` from the account

@@ -159,6 +159,13 @@ _POLL_INTERVAL_S = 1.5
 #: the deal it stamps.
 _ACTIVITY_LAG_S = 60
 
+#: How long an own entry deal may sit in ``/positions`` with its confirmed
+#: fill unbooked before the snapshot books it in place of the deal's
+#: ``POSITION`` activity. Measured on 5896 activity rows (2026-10-29 ..
+#: 2026-11-12): first seen a median 1.5 s and a p99 4.6 s after the deal, so
+#: twice the p99 leaves the activity its normal path.
+_UNANNOUNCED_FILL_GRACE_S = 10.0
+
 #: Largest ``lastPeriod`` ``GET /history/activity`` accepts (one day).
 _ACTIVITY_MAX_PERIOD_S = 86400
 
@@ -307,7 +314,7 @@ def _activity_actor(source: object) -> str:
     :param source: The activity's ``source`` field.
     :return: :data:`ACTOR_CLIENT`, :data:`ACTOR_DEALER` or :data:`ACTOR_VENUE`.
     """
-    normalized = str(source or '').upper()
+    normalized = source.upper() if isinstance(source, str) else ''
     if normalized == 'USER':
         return ACTOR_CLIENT
     if normalized == 'DEALER':
@@ -425,7 +432,8 @@ def _is_funds_reject(reason: str) -> bool:
     """True when a Capital.com reject reason means the account cannot fund /
     risk-clear the order (insufficient balance, margin, leverage cap or a
     generic risk-engine veto), so the caller should raise the non-terminal
-    :class:`InsufficientMarginError` rather than a plain reject."""
+    :class:`~pynecore.core.broker.exceptions.InsufficientMarginError` rather than a
+    plain reject."""
     reason_uc = reason.upper()
     return any(token in reason_uc for token in _FUNDS_REJECT_REASON_SUBSTRINGS)
 
@@ -433,8 +441,8 @@ def _is_funds_reject(reason: str) -> bool:
 def _is_market_closed_reject(reason: str) -> bool:
     """True when a Capital.com reject reason means the instrument is not
     tradable right now (scheduled session pause / halt), so the caller should
-    raise the non-terminal :class:`MarketClosedError` rather than a plain
-    reject — nothing landed and the venue reopens on its own."""
+    raise the non-terminal :class:`~pynecore.core.broker.exceptions.MarketClosedError`
+    rather than a plain reject — nothing landed and the venue reopens on its own."""
     reason_uc = reason.upper()
     return any(token in reason_uc for token in _MARKET_CLOSED_REJECT_SUBSTRINGS)
 

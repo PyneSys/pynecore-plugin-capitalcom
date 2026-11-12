@@ -34,6 +34,7 @@ from pynecore_capitalcom import (
 )
 from pynecore_capitalcom.exceptions import HistoricalPricesNotFoundError
 from pynecore_capitalcom.helpers import (
+    _UNANNOUNCED_FILL_GRACE_S,
     _WS_VOLUME_BASELINE_BARS,
     _is_session_error,
     _parse_iso_timestamp,
@@ -8324,6 +8325,114 @@ def __test_reconcile_snapshot_working_to_position_stamps_kind_and_entry_filled__
     assert close_events[0].order.side == 'sell'
     # No own close explains the USER close: it is booked, then reported.
     assert len(quarantined) == 1
+    store.close()
+
+
+def _seed_unannounced_entry(ctx, *, direction_side='buy'):
+    """Seed a confirmed market entry whose fill no activity booked yet."""
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side=direction_side, qty=1.0, filled_qty=1.0,
+        state='confirmed', pine_entry_id='Long', intent_key='Long',
+        exchange_order_id='deal-L',
+        extras={'kind': 'position', 'order_type': 'market', 'confirm_level': 1.17500},
+    )
+    ctx.add_ref('coid-entry', 'deal_id', 'deal-L')
+
+
+_UNANNOUNCED_POSITIONS = {'deal-L': {
+    'market': {'epic': 'EURUSD'},
+    'position': {'dealId': 'deal-L', 'direction': 'BUY', 'size': 1.0, 'level': 1.17510},
+}}
+
+
+def _unannounced_position_activity():
+    """The deal's ``POSITION`` / ``ACCEPTED`` row, in the measured shape
+    (capitalcom deal ...8a81, 2026-11-12)."""
+    return {
+        'dateUTC': '2026-04-21T09:00:00.000', 'dealId': 'deal-L',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'EURUSD',
+        'details': {'direction': 'BUY', 'level': 1.17500, 'size': 1.0,
+                    'dealReference': 'p_deal-L', 'workingOrderId': 'wo-L'},
+    }
+
+
+def _reconcile_events(broker, positions):
+    async def drain():
+        return [ev async for ev in broker._reconcile_snapshot(positions, {})]
+
+    return asyncio.run(drain())
+
+
+def __test_reconcile_snapshot_books_entry_fill_no_activity_announced__(tmp_path):
+    """A confirmed market entry whose ``POSITION`` activity never reaches a
+    poll is booked from the snapshot once its deal sat in ``/positions`` past
+    the grace: an ENTRY fill at the confirm level for the confirmed size, with
+    ``entry_filled_at`` stamped so the activity, arriving late, is a suppressed
+    replay (live: capitalcom cycle 406, deal ...8a81 never booked)."""
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_unannounced_entry(ctx)
+
+    assert _reconcile_events(broker, _UNANNOUNCED_POSITIONS) == [], (
+        "inside the grace the activity keeps its normal path"
+    )
+    assert 'coid-entry' in broker._unannounced_fills_seen
+    broker._unannounced_fills_seen['coid-entry'] -= _UNANNOUNCED_FILL_GRACE_S
+
+    events = _reconcile_events(broker, _UNANNOUNCED_POSITIONS)
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == 'filled'
+    assert event.leg_type == LegType.ENTRY
+    assert event.fill_qty == pytest.approx(1.0)
+    assert event.fill_price == pytest.approx(1.17500), "the confirm level is the fill price"
+    assert event.pine_id == 'Long'
+    row = ctx.get_order('coid-entry')
+    assert row is not None and (row.extras or {}).get('entry_filled_at') is not None
+    assert 'coid-entry' not in broker._unannounced_fills_seen
+    assert _reconcile_events(broker, _UNANNOUNCED_POSITIONS) == [], (
+        "a booked fill is never booked twice"
+    )
+
+    late_activity = _unannounced_position_activity()
+
+    async def drain_activity():
+        return [ev async for ev in broker._process_activity([late_activity])]
+
+    assert asyncio.run(drain_activity()) == [], "the late activity is a replay"
+    store.close()
+
+
+def __test_reconcile_snapshot_leaves_activity_booked_entry_fill__(tmp_path):
+    """An entry the activity booked inside the grace is never booked again,
+    and its first-seen mark is dropped."""
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_unannounced_entry(ctx)
+    assert _reconcile_events(broker, _UNANNOUNCED_POSITIONS) == []
+
+    activity = _unannounced_position_activity()
+
+    async def drain_activity():
+        return [ev async for ev in broker._process_activity([activity])]
+
+    assert len(asyncio.run(drain_activity())) == 1
+    broker._unannounced_fills_seen['coid-entry'] = 0.0
+    assert _reconcile_events(broker, _UNANNOUNCED_POSITIONS) == []
+    assert 'coid-entry' not in broker._unannounced_fills_seen
+    store.close()
+
+
+def __test_reconcile_snapshot_unannounced_fill_needs_matching_deal__(tmp_path):
+    """No fill is booked for a deal of the other direction, and a row that
+    left the live set drops its first-seen mark."""
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_unannounced_entry(ctx, direction_side='sell')
+    broker._unannounced_fills_seen['coid-entry'] = 0.0
+    assert _reconcile_events(broker, _UNANNOUNCED_POSITIONS) == []
+    assert 'coid-entry' not in broker._unannounced_fills_seen
+
+    broker._unannounced_fills_seen['coid-gone'] = 0.0
+    assert _reconcile_events(broker, {}) == []
+    assert 'coid-gone' not in broker._unannounced_fills_seen
     store.close()
 
 
