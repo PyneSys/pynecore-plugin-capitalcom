@@ -626,8 +626,8 @@ class CapitalComProfile(ReferenceVenueProfile):
                 def json(self) -> dict[str, Any]:
                     return self.body
 
-            original_get = capital_rest.httpx.get
-            original_post = capital_rest.httpx.post
+            original_get = capital_rest._HTTP_CLIENT.get
+            original_post = capital_rest._HTTP_CLIENT.post
             original_encrypt = capital_rest.encrypt_password
             post_started: list[float] = []
             transport_lock = threading.Lock()
@@ -673,8 +673,8 @@ class CapitalComProfile(ReferenceVenueProfile):
                 except BaseException as exc:
                     errors.append(exc)
 
-            capital_rest.httpx.get = fake_get
-            capital_rest.httpx.post = fake_post
+            setattr(capital_rest._HTTP_CLIENT, "get", fake_get)
+            setattr(capital_rest._HTTP_CLIENT, "post", fake_post)
             capital_rest.encrypt_password = lambda *_args, **_kwargs: "encrypted"
             try:
                 workers = [
@@ -685,8 +685,8 @@ class CapitalComProfile(ReferenceVenueProfile):
                 for worker in workers:
                     worker.join(timeout=3.0)
             finally:
-                capital_rest.httpx.get = original_get
-                capital_rest.httpx.post = original_post
+                setattr(capital_rest._HTTP_CLIENT, "get", original_get)
+                setattr(capital_rest._HTTP_CLIENT, "post", original_post)
                 capital_rest.encrypt_password = original_encrypt
 
             if errors:
@@ -910,7 +910,7 @@ class CapitalComProfile(ReferenceVenueProfile):
         if step.kind == "capital_weekend_boundary_probe":
             from datetime import time as datetime_time
 
-            from pynecore.cli.commands.run import (
+            from pynecore.core.provider_download import (
                 _classify_missing_slots,
                 _missing_slots,
             )
@@ -1029,9 +1029,9 @@ class CapitalComProfile(ReferenceVenueProfile):
                 sequence.append(f"get:{kwargs['headers'].get('CST')}")
                 return HistoryStubResponse()
 
-            original_get = capital_rest.httpx.get
+            original_get = capital_rest._HTTP_CLIENT.get
             broker._perform_session_login = refresh
-            capital_rest.httpx.get = get
+            setattr(capital_rest._HTTP_CLIENT, "get", get)
             try:
                 broker(
                     "prices/EURUSD",
@@ -1043,7 +1043,7 @@ class CapitalComProfile(ReferenceVenueProfile):
                     method="get",
                 )
             finally:
-                capital_rest.httpx.get = original_get
+                setattr(capital_rest._HTTP_CLIENT, "get", original_get)
             if sequence != ["refresh", "get:cst-fresh"]:
                 raise AssertionError(
                     "Capital.com session refresh did not precede the reopen "
@@ -1051,7 +1051,7 @@ class CapitalComProfile(ReferenceVenueProfile):
                 )
             return True
         if step.kind == "capital_shared_ohlcv_reader_gap":
-            from pynecore.cli.commands.run import _atomic_ohlcv_download_target
+            from pynecore.core.provider_download import _atomic_ohlcv_download_target
 
             start = datetime(2025, 1, 6, 9, 0)
             bars = [start, start + timedelta(minutes=5)]
@@ -1069,22 +1069,26 @@ class CapitalComProfile(ReferenceVenueProfile):
 
             truncated = threading.Event()
             allow_finish = threading.Event()
+            writer_errors: list[BaseException] = []
 
             def rewrite() -> None:
-                second = OfflinePriceCapitalCom(
-                    bars=bars,
-                    requested=[],
-                    ohlcv_dir=shared_dir,
-                )
-                with _atomic_ohlcv_download_target(second):
-                    with second as writer:
-                        writer.truncate()
-                        truncated.set()
-                        if not allow_finish.wait(2.0):
-                            raise AssertionError("OHLCV gap control timed out")
-                        second.download_ohlcv(
-                            start, bars[-1] + timedelta(minutes=5)
-                        )
+                try:
+                    second = OfflinePriceCapitalCom(
+                        bars=bars,
+                        requested=[],
+                        ohlcv_dir=shared_dir,
+                    )
+                    with _atomic_ohlcv_download_target(second):
+                        with second as writer:
+                            writer.truncate()
+                            truncated.set()
+                            if not allow_finish.wait(2.0):
+                                raise AssertionError("OHLCV gap control timed out")
+                            second.download_ohlcv(
+                                start, bars[-1] + timedelta(minutes=5)
+                            )
+                except BaseException as exc:
+                    writer_errors.append(exc)
 
             worker = threading.Thread(target=rewrite, daemon=True)
             worker.start()
@@ -1101,6 +1105,17 @@ class CapitalComProfile(ReferenceVenueProfile):
                 worker.join(2.0)
             if worker.is_alive():
                 raise AssertionError("concurrent OHLCV writer did not finish")
+            if writer_errors:
+                raise AssertionError(
+                    f"concurrent OHLCV writer failed: {writer_errors}"
+                ) from writer_errors[0]
+            with OHLCVReader(str(first.ohlcv_path)) as reader:
+                actual = [bar.timestamp for bar in reader]
+            expected = [int(bar.replace(tzinfo=UTC).timestamp()) * 1000 for bar in bars]
+            if actual != expected:
+                raise AssertionError(
+                    f"concurrent OHLCV rewrite published wrong bars: {actual} != {expected}"
+                )
             return True
         if step.kind == "capital_header_only_ohlcv_control":
             start = datetime(2025, 1, 6, 9, 0)
