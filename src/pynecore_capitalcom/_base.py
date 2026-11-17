@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Protocol, cast
 
 from pynecore.core.broker.exceptions import OrderSkippedByPlugin
 from pynecore.core.broker.models import (
+    CancelDispositionOutcome,
     EntryIntent,
     ExchangeOrder,
     ExitIntent,
@@ -60,6 +61,7 @@ from .models import (
 
 if TYPE_CHECKING:
     from pynecore.core.broker.disappearance import DisappearanceTracker
+    from pynecore.core.broker.parked_dispatch import ParkedDispatchResolver, ParkedVerdict
     from pynecore.core.broker.protection_guard import ProtectionLevelGuard, ProtectionLevels
     from pynecore.core.broker.models import DispatchEnvelope, PositionLeg
     from pynecore.core.broker.storage import OrderRow, RunContext
@@ -125,6 +127,12 @@ class CapitalComHookCollaborator(Protocol):
     def stamp_own_cancel_accepted(self, coid: str, sent_at: float) -> None: ...
 
     def own_cancel(self, coid: str) -> AbstractContextManager[float]: ...
+
+    def hold_take_over_dispatch(self, row: 'OrderRow', action: str) -> None: ...
+
+    def hold_unproven_take_over(self, row: 'OrderRow') -> None: ...
+
+    async def classify_cancel_via_activity(self, deal_id: str) -> CancelDispositionOutcome: ...
 
 
 class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
@@ -253,6 +261,18 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def own_cancel(self, coid: str) -> AbstractContextManager[float]:
         """Record an own working-order ``DELETE`` before it leaves, for a standalone hook."""
         return self._own_cancel(coid)
+
+    def hold_take_over_dispatch(self, row: 'OrderRow', action: str) -> None:
+        """Report a cancel or amend of a held take-over not settled, for a standalone hook."""
+        self._hold_take_over_dispatch(row, action)
+
+    def hold_unproven_take_over(self, row: 'OrderRow') -> None:
+        """Report a held take-over recovery left as it is, for a standalone hook."""
+        self._hold_unproven_take_over(row)
+
+    async def classify_cancel_via_activity(self, deal_id: str) -> CancelDispositionOutcome:
+        """Classify a working order gone on its DELETE by its activity, for a hook."""
+        return await self._classify_cancel_via_activity(deal_id)
 
     if TYPE_CHECKING:
         def __call__(
@@ -430,6 +450,20 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # fill is still unbooked, by client order id: first seen at (see
     # ``reconcile.py``, ``_unannounced_entry_fill``).
     _unannounced_fills_seen: dict[str, float]
+    # Resolver of the entry submissions an earlier process left pending, and
+    # the ones of them already reported as older than the activity history or
+    # as indistinguishable from another pending submission (see
+    # ``reconcile.py``, ``_resolve_inherited_submissions``).
+    _inherited_resolver: 'ParkedDispatchResolver'
+    _inherited_unprovable_reported: set[str]
+    _inherited_ambiguity_reported: set[str]
+    # Take-overs stamped ``take_over_unproven`` that a recovery pass already
+    # reported as held (see ``recovery.py``, ``_hold_unproven_take_over``).
+    _take_over_held_reported: set[str]
+    # Such take-overs whose cancel or amend was already reported as not sent,
+    # by ``(client order id, action)`` (see ``execution.py``,
+    # ``_hold_take_over_dispatch``).
+    _take_over_dispatch_held_reported: set[tuple[str, str]]
 
     # --- Account mode ---
     # ``True`` once ``connect()`` reads ``hedgingMode`` from the account
@@ -540,6 +574,12 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     ) -> None: ...
 
     async def _execute_close_partial(self, *args: Any, **kwargs: Any) -> ExchangeOrder: ...
+
+    def _hold_take_over_dispatch(self, row: 'OrderRow', action: str) -> None: ...
+
+    def _hold_unproven_take_over(self, row: 'OrderRow') -> None: ...
+
+    async def _classify_cancel_via_activity(self, deal_id: str) -> CancelDispositionOutcome: ...
 
     @staticmethod
     def _row_to_exchange_order(
@@ -787,6 +827,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     async def _load_activity_cursor_from_events(self) -> None: ...
 
     async def _recover_in_flight_submissions(self) -> None: ...
+
+    async def _inherited_submission_verdict(self, row: 'OrderRow') -> 'ParkedVerdict': ...
 
     async def _recover_submitted_row(self, *args: Any, **kwargs: Any) -> None: ...
 

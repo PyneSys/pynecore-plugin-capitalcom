@@ -48,6 +48,11 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.parked_dispatch import (
+    ParkedOutcome,
+    ParkedVerdict,
+    awaits_venue_answer,
+)
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
@@ -58,12 +63,15 @@ from pynecore.core.broker.store_helpers import (
     mark_confirmed_with_fill,
     mark_rejected,
 )
+from pynecore.lib.log import broker_warning
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
     EXTRAS_KEY_OWN_CLOSES,
+    EXTRAS_KEY_TAKE_OVER_UNPROVEN,
+    EXTRAS_KEY_TAKEN_OVER_AT,
     EXTRAS_KEY_WORKING_ORDER_END,
     _ACTIVITY_LAG_S,
     _POLL_INTERVAL_S,
@@ -141,6 +149,9 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         async for parked_event in self._resolve_parked_submission_dispositions(
                 positions_by_deal):
             yield parked_event
+        async for inherited_event in self._resolve_inherited_submissions(
+                positions_by_deal):
+            yield inherited_event
         # Mirror tracker for legs that ``_record_bracket_resolution`` flips
         # to ``confirmed`` in this batch — keyed on parent COID. Used by
         # the aggregate flush below to retire ``confirmed`` siblings when
@@ -216,6 +227,24 @@ class _ReconcileMixin(_CapitalComBase, ABC):
 
             if pos is None and work is None:
                 row_kind = (row.extras or {}).get('kind')
+                if (row_kind == ENTRY_KIND_WORKING
+                        and (row.extras or {}).get('entry_filled_at') is None
+                        and (row.extras or {}).get(EXTRAS_KEY_TAKEN_OVER_AT) is not None):
+                    # A taken-over working order gone from ``/workingorders``
+                    # may have executed before its id was known, so no
+                    # activity books its fill: the position that back-links
+                    # it is the only evidence. Until that position surfaces
+                    # the missing-pending grace keeps re-evaluating. A row
+                    # whose position did not prove the fill stays held.
+                    if (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                        continue
+                    promoted = self._find_promoted_deal_id(row, [], positions_by_deal)
+                    if promoted:
+                        booked = self._book_taken_over_execution(
+                            row, promoted, positions_by_deal, now_ts)
+                        if booked is not None:
+                            yield booked
+                        continue
                 if ((row_kind == 'working'
                      and (row.extras or {}).get('entry_filled_at')
                      is not None)
@@ -355,6 +384,16 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     and (row.extras or {}).get('kind') == 'working'):
                 pos_data = pos.get('position') or {}
                 filled = float(pos_data.get('size') or row.qty)
+                if ((row.extras or {}).get(EXTRAS_KEY_TAKEN_OVER_AT) is not None
+                        and (row.extras or {}).get('entry_filled_at') is None):
+                    # A taken-over order may have executed before its id was
+                    # known, and its position reduced since: the fill is
+                    # booked only when the snapshot proves it, and a row held
+                    # for an unproven fill stays held.
+                    proven = self._take_over_fill_proven(row, did, pos_data, now_ts)
+                    if proven is None:
+                        continue
+                    filled = proven
                 # Promote the working row via the journal. The Core
                 # helper owns state + filled_qty + extras merge + audit
                 # event in a single transaction. The extras_patch flips
@@ -842,9 +881,11 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         flat sweep, because the engine-side cancel had no order id to
         target).
 
-        Each poll retries the confirms GET for every live entry row in
-        ``disposition_unknown`` that has a ``deal_reference`` but no
-        ``exchange_order_id``:
+        Each poll retries the confirms GET for every live entry row that has
+        a ``deal_reference`` but no ``exchange_order_id`` and waits for a
+        venue answer (:func:`~pynecore.core.broker.parked_dispatch.awaits_venue_answer`):
+        a ``disposition_unknown`` row, or a row an earlier process left in
+        any pending state:
 
         * confirm ``REJECTED`` → the POST executed nothing; mark the row
           rejected and write a ``'rejected'`` resolution so the engine
@@ -870,8 +911,8 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         now_ts = epoch_time()
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
-            if (row.state != 'disposition_unknown'
-                    or row.exchange_order_id
+            if (row.exchange_order_id
+                    or not awaits_venue_answer(self.store_ctx, row)
                     or extras.get('kind') not in (ENTRY_KIND_POSITION,
                                                   ENTRY_KIND_WORKING)):
                 continue
@@ -912,19 +953,131 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             if deal_id is None:
                 continue
 
-            if extras.get('kind') == ENTRY_KIND_POSITION:
-                pos_data = (positions_by_deal.get(deal_id) or {}) \
-                    .get('position') or {}
-                if not pos_data:
-                    continue
-                filled = float(pos_data.get('size') or row.qty)
-                fill_level = float(pos_data.get('level') or 0.0)
+            async for event in self._take_over_parked_submission(
+                    row, deal_id, positions_by_deal, now_ts, deal_ref=deal_ref):
+                yield event
+
+    async def _resolve_inherited_submissions(
+            self, positions_by_deal: dict[str, dict],
+    ) -> AsyncIterator[OrderEvent]:
+        """Resolve the entry submissions an earlier process left pending.
+
+        Capital.com carries no client order id, so the venue cannot refuse a
+        second POST of the same intent: the engine holds an intent's entry
+        while a dispatch inherited from an earlier process is unresolved
+        (:func:`~pynecore.core.broker.parked_dispatch.inherited_dispatch_in_flight`).
+        The startup pass resolved every such row it could; this pass feeds
+        the rest to the core
+        :class:`~pynecore.core.broker.parked_dispatch.ParkedDispatchResolver`,
+        with the activity history as evidence
+        (:meth:`~pynecore_capitalcom.recovery._RecoveryMixin._inherited_submission_verdict`):
+
+        * landed: the row is handed to the same take-over as a parked
+          submission whose confirm came back
+          (:meth:`_take_over_parked_submission`), so a MARKET entry's fill
+          reaches the engine and a working order is promoted;
+        * absent: the resolver rejects the row once it is older than
+          ``fill_report_grace_s`` and the answer held on three lookups, and
+          the engine dispatches the intent again under a fresh client order
+          id;
+        * inconclusive: the row stays, and so does the hold.
+
+        A trace another pending submission matches as well lands neither of
+        them (:meth:`~pynecore_capitalcom.recovery._CapitalComResumeHooks._trace_contested`):
+        which one opened the deal is unknown, and a wrong guess would book the
+        deal to a submission that opened nothing and send the one that did
+        open it again. Both stay held for the operator. A deal that is
+        already owned by another row when its take-over comes is skipped, so
+        one deal is never taken over by two rows.
+
+        :param positions_by_deal: The poll's ``/positions`` snapshot by deal id.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None or not store_ctx.inherited_dispatch_ids():
+            return
+        landed: dict[str, str] = {}
+
+        async def lookup(pending: 'OrderRow') -> ParkedVerdict:
+            verdict = await self._inherited_submission_verdict(pending)
+            if verdict.outcome is ParkedOutcome.LANDED and verdict.order_id:
+                landed[pending.client_order_id] = verdict.order_id
+            return verdict
+
+        await self._inherited_resolver.resolve(store_ctx, lookup)
+        now_ts = epoch_time()
+        for coid, deal_id in landed.items():
+            row = store_ctx.get_order(coid)
+            if (row is None or row.closed_ts_ms is not None or row.exchange_order_id
+                    or not awaits_venue_answer(store_ctx, row)):
+                continue
+            owner = store_ctx.find_by_ref('deal_id', deal_id)
+            if owner is not None and owner.client_order_id != coid:
+                store_ctx.log_event(
+                    'inherited_submission_deal_claimed',
+                    client_order_id=coid,
+                    exchange_order_id=deal_id,
+                    intent_key=row.intent_key,
+                    payload={'owner': owner.client_order_id},
+                )
+                continue
+            deal_ref = _wire_id((row.extras or {}).get('deal_reference'))
+            async for event in self._take_over_parked_submission(
+                    row, deal_id, positions_by_deal, now_ts, deal_ref=deal_ref):
+                yield event
+
+    async def _take_over_parked_submission(
+            self, row: 'OrderRow', deal_id: str, positions_by_deal: dict[str, dict],
+            now_ts: float, *, deal_ref: str | None,
+    ) -> AsyncIterator[OrderEvent]:
+        """Hand an entry submission the venue took over to the ordinary machinery.
+
+        The venue has the deal ``deal_id`` for the pending entry ``row``:
+
+        * a MARKET entry whose deal is in the ``/positions`` snapshot is
+          confirmed filled, gets an ``'attached'`` resolution, and its fill
+          is emitted here, because no other path would deliver it; a deal
+          not in the snapshot leaves the row pending (fill-then-close within
+          the window is indistinguishable from a confirms/positions race);
+        * a working order cancelled by Pine while pending is DELETEd first;
+        * any other working order is confirmed with its deal id, which
+          ``get_open_orders`` maps back, so the engine promotes its park;
+          it is stamped :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKEN_OVER_AT`,
+          and one that already executed into a position the snapshot
+          back-links is booked onto that position here
+          (:meth:`_book_taken_over_execution`), or by the snapshot loop of
+          the poll whose snapshot first shows the position.
+
+        Either fill is booked only when the snapshot proves it
+        (:meth:`_take_over_fill_proven`); otherwise the row stays unbooked
+        and the entry held.
+
+        :param row: The pending entry row.
+        :param deal_id: The venue's deal id for it.
+        :param positions_by_deal: The poll's ``/positions`` snapshot by deal id.
+        :param now_ts: The poll's wall-clock time.
+        :param deal_ref: The submission's ``dealReference``, when it has one.
+        """
+        assert self.store_ctx is not None
+        coid = row.client_order_id
+        extras = row.extras or {}
+        if extras.get('kind') == ENTRY_KIND_POSITION:
+            pos_data = (positions_by_deal.get(deal_id) or {}) \
+                .get('position') or {}
+            if not pos_data:
+                return
+            filled = self._take_over_fill_proven(row, deal_id, pos_data, now_ts)
+            if filled is None:
+                return
+            fill_level = float(pos_data.get('level') or 0.0)
+            # One transaction: a process that dies part-way must find the
+            # row still pending (and take it over again), never confirmed
+            # with its fill stamped as accounted but unbooked.
+            with self.store_ctx.transaction():
                 # mark_confirmed_with_fill owns the deal_id alias +
-                # exchange_order_id + state + fill in one transaction;
-                # apply_reconcile_outcome would only audit the id, not
-                # persist it. entry_filled_at is patched separately so
-                # manual-close detection treats the row as a live filled
-                # position.
+                # exchange_order_id + state + fill; apply_reconcile_outcome
+                # would only audit the id, not persist it. entry_filled_at
+                # makes manual-close detection treat the row as a live
+                # filled position.
                 mark_confirmed_with_fill(
                     self.store_ctx,
                     coid=coid,
@@ -960,56 +1113,57 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                                  'pine_id': row.pine_entry_id,
                                  'from_entry': row.from_entry},
                     )
-                yield OrderEvent(
-                    order=ExchangeOrder(
-                        id=deal_id, symbol=row.symbol, side=row.side,
-                        order_type=OrderType.MARKET,
-                        qty=row.qty, filled_qty=filled,
-                        remaining_qty=max(0.0, row.qty - filled),
-                        price=None, stop_price=None,
-                        average_fill_price=fill_level,
-                        status=OrderStatus.FILLED,
-                        timestamp=now_ts, fee=0.0, fee_currency='',
-                        reduce_only=False, client_order_id=coid,
-                    ),
-                    event_type='filled',
-                    fill_price=fill_level,
-                    fill_qty=filled,
-                    timestamp=now_ts,
-                    pine_id=row.pine_entry_id,
-                    from_entry=row.from_entry,
-                    leg_type=LegType.ENTRY,
-                )
-                continue
+            yield OrderEvent(
+                order=ExchangeOrder(
+                    id=deal_id, symbol=row.symbol, side=row.side,
+                    order_type=OrderType.MARKET,
+                    qty=row.qty, filled_qty=filled,
+                    remaining_qty=max(0.0, row.qty - filled),
+                    price=None, stop_price=None,
+                    average_fill_price=fill_level,
+                    status=OrderStatus.FILLED,
+                    timestamp=now_ts, fee=0.0, fee_currency='',
+                    reduce_only=False, client_order_id=coid,
+                ),
+                event_type='filled',
+                fill_price=fill_level,
+                fill_qty=filled,
+                timestamp=now_ts,
+                pine_id=row.pine_entry_id,
+                from_entry=row.from_entry,
+                leg_type=LegType.ENTRY,
+            )
+            return
 
-            if extras.get(EXTRAS_KEY_CANCEL_REQUESTED) is not None:
-                # Pine cancelled this entry while it was parked (see
-                # ``_CapitalComCancelHooks.submit_cancel``): the id is
-                # the first thing the DELETE could target, so it goes
-                # out now, before the row is promoted to a live working
-                # order the engine would otherwise adopt.
-                try:
-                    with self._own_cancel(coid) as cancel_sent_at:
-                        await self.call_api(
-                            f'workingorders/{deal_id}', method='delete',
-                        )
-                except (httpx.TimeoutException, httpx.RequestError,
-                        ConnectionError, ExchangeConnectionError):
-                    # Stay parked: the next poll repeats the (idempotent)
-                    # confirm lookup and this DELETE.
-                    continue
-                except OrderNotFoundError:
-                    # Already gone — filled or cancelled venue-side. Fall
-                    # through to persist the id: a fill promotes through
-                    # the activity stream, a vanished order retires
-                    # through the snapshot loop's missing-pending path.
-                    self.store_ctx.log_event(
-                        'cancel_already_gone',
-                        client_order_id=coid,
-                        exchange_order_id=deal_id,
-                        intent_key=row.intent_key,
+        if extras.get(EXTRAS_KEY_CANCEL_REQUESTED) is not None:
+            # Pine cancelled this entry while it was parked (see
+            # ``_CapitalComCancelHooks.submit_cancel``): the id is
+            # the first thing the DELETE could target, so it goes
+            # out now, before the row is promoted to a live working
+            # order the engine would otherwise adopt.
+            try:
+                with self._own_cancel(coid) as cancel_sent_at:
+                    await self.call_api(
+                        f'workingorders/{deal_id}', method='delete',
                     )
-                else:
+            except (httpx.TimeoutException, httpx.RequestError,
+                    ConnectionError, ExchangeConnectionError):
+                # Stay parked: the next poll repeats the (idempotent)
+                # confirm lookup and this DELETE.
+                return
+            except OrderNotFoundError:
+                # Already gone — filled or cancelled venue-side. Fall
+                # through to persist the id: a fill whose position the
+                # snapshot back-links is booked below, a vanished order
+                # retires through the snapshot loop's missing-pending path.
+                self.store_ctx.log_event(
+                    'cancel_already_gone',
+                    client_order_id=coid,
+                    exchange_order_id=deal_id,
+                    intent_key=row.intent_key,
+                )
+            else:
+                with self.store_ctx.transaction():
                     mark_confirmed_with_fill(
                         self.store_ctx,
                         coid=coid,
@@ -1033,14 +1187,24 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                         payload={'cleared_via': 'parked_confirm',
                                  'deal_reference': deal_ref},
                     )
-                    continue
+                return
 
-            # Working order (limit/stop): learning the deal id is
-            # enough. ``get_open_orders`` resolves it back to the COID
-            # on the engine's next ``_verify_pending_dispatches`` pass,
-            # which promotes the parked envelope into ``_order_mapping``
-            # — no plugin-side resolution write, so the engine also
-            # learns the order id it needs for later cancel/amend.
+        # Working order (limit/stop): learning the deal id is
+        # enough. ``get_open_orders`` resolves it back to the COID
+        # on the engine's next ``_verify_pending_dispatches`` pass,
+        # which promotes the parked envelope into ``_order_mapping``
+        # — no plugin-side resolution write, so the engine also
+        # learns the order id it needs for later cancel/amend.
+        # The order may have executed before its id was known: its position
+        # then lives under a fresh deal id that back-links the order in
+        # ``workingOrderId``. Neither the engine's open-order verification
+        # nor the activity stream would book that fill (the execution's
+        # activity was read while no row owned the order). The take-over
+        # stamp makes the snapshot loop follow the back-link on every later
+        # poll that misses the order, so a position that surfaces late is
+        # still booked. It is written with the id: a row confirmed without
+        # it would never look for its position.
+        with self.store_ctx.transaction():
             mark_confirmed_with_fill(
                 self.store_ctx,
                 coid=coid,
@@ -1049,6 +1213,11 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 filled_qty=0.0,
                 fill_price=None,
             )
+            confirmed = self.store_ctx.get_order(coid)
+            if confirmed is None:
+                return
+            self.store_ctx.upsert_order(
+                coid, extras={**(confirmed.extras or {}), EXTRAS_KEY_TAKEN_OVER_AT: now_ts})
             self.store_ctx.log_event(
                 'parked_submission_confirmed_on_retry',
                 client_order_id=coid,
@@ -1056,6 +1225,141 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 intent_key=row.intent_key,
                 payload={'deal_reference': deal_ref},
             )
+        confirmed = self.store_ctx.get_order(coid)
+        promoted = (self._find_promoted_deal_id(confirmed, [], positions_by_deal)
+                    if confirmed is not None else None)
+        if confirmed is None or promoted is None:
+            return
+        event = self._book_taken_over_execution(confirmed, promoted, positions_by_deal, now_ts)
+        if event is not None:
+            yield event
+
+    def _book_taken_over_execution(
+            self, row: 'OrderRow', promoted: str, positions_by_deal: dict[str, dict],
+            now_ts: float,
+    ) -> OrderEvent | None:
+        """Book the execution of a taken-over working order, once.
+
+        The working order ``row`` (stamped :data:`EXTRAS_KEY_TAKEN_OVER_AT`)
+        executed into the position ``promoted``, which back-links it. When
+        the snapshot proves the fill (:meth:`_take_over_fill_proven`), the
+        row moves onto the position and its fill is journalled and returned:
+        ``entry_filled_at`` makes a late activity of the same execution a
+        suppressed replay, and the ``'attached'`` resolution settles the
+        engine's park, which the order's absence from the open orders would
+        never promote. Otherwise nothing is booked and the park stays.
+
+        :param row: The confirmed working entry row, still on its order id.
+        :param promoted: The position's deal id.
+        :param positions_by_deal: The poll's ``/positions`` snapshot by deal id.
+        :param now_ts: The poll's wall-clock time.
+        :return: The ENTRY fill event, or ``None`` when the fill is unproven.
+        """
+        assert self.store_ctx is not None
+        coid = row.client_order_id
+        working_id = row.exchange_order_id
+        pos_data = (positions_by_deal.get(promoted) or {}).get('position') or {}
+        filled = self._take_over_fill_proven(row, promoted, pos_data, now_ts)
+        if filled is None:
+            return None
+        fill_level = float(pos_data.get('level') or 0.0)
+        # One transaction: the promotion stamps the fill as accounted, so a
+        # promotion that outlives a failed fill write would never be booked —
+        # the snapshot loop no longer sees a working row and the activity
+        # replay guard suppresses the entry.
+        with self.store_ctx.transaction():
+            self._promote_working_row_to_position(row, promoted, stamp_entry_filled=True)
+            DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+                coid,
+                ReconcileOutcome(
+                    kind='filled',
+                    reason='working_promoted_position',
+                    new_state='confirmed',
+                    audit_event='working_to_position',
+                    filled_qty=filled,
+                    audit_payload={'filled': filled, 'working_order_id': working_id},
+                    exchange_order_id=promoted,
+                ),
+            )
+            self.store_ctx.record_resolution(coid, 'attached')
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=promoted, symbol=row.symbol, side=row.side,
+                order_type=OrderType.MARKET,
+                qty=row.qty, filled_qty=filled,
+                remaining_qty=0.0,
+                price=None, stop_price=None,
+                average_fill_price=fill_level,
+                status=OrderStatus.FILLED,
+                timestamp=now_ts, fee=0.0, fee_currency='',
+                reduce_only=False, client_order_id=coid,
+            ),
+            event_type='filled',
+            fill_price=fill_level,
+            fill_qty=filled,
+            timestamp=now_ts,
+            pine_id=row.pine_entry_id,
+            from_entry=row.from_entry,
+            leg_type=LegType.ENTRY,
+        )
+
+    def _take_over_fill_proven(
+            self, row: 'OrderRow', deal_id: str, pos_data: dict, now_ts: float,
+    ) -> float | None:
+        """The fill a taken-over entry's snapshot position proves, or ``None``.
+
+        A taken-over entry is booked from the ``/positions`` snapshot alone:
+        its execution's activity was read while no row owned the deal. The
+        snapshot proves the fill only when the position holds exactly the
+        submitted quantity. A smaller position was reduced before the
+        snapshot, and nothing on the venue tells which of the close
+        activities that may still reach the row the snapshot already shows:
+        booking it would deduct such a close twice or drop a later one. A
+        larger or sizeless position is not evidence of this submission's
+        fill either.
+
+        An unproven fill is not booked: the row stays as it is, so the engine
+        keeps the entry held (a pending row by the inherited-dispatch hold, a
+        taken-over working row by its park), and the row is stamped
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`
+        with an operator warning, once. A stamped row stays held for good: a
+        later snapshot at the submitted size does not prove the fill either
+        (the position may have been reduced and topped up again in between),
+        and only the operator settles it.
+
+        :param row: The taken-over entry row.
+        :param deal_id: The position's deal id.
+        :param pos_data: The position's ``position`` object from the snapshot.
+        :param now_ts: The poll's wall-clock time.
+        :return: The proven fill quantity, or ``None``.
+        """
+        assert self.store_ctx is not None
+        coid = row.client_order_id
+        current = self.store_ctx.get_order(coid)
+        extras = dict((current or row).extras or {})
+        if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+            return None
+        size = _wire_float(pos_data.get('size'), finite=True)
+        if size is not None and abs(size - row.qty) <= 1e-9 * max(1.0, abs(row.qty)):
+            return size
+        extras[EXTRAS_KEY_TAKE_OVER_UNPROVEN] = {'deal_id': deal_id, 'size': size, 'at': now_ts}
+        with self.store_ctx.transaction():
+            self.store_ctx.upsert_order(coid, extras=extras)
+            self.store_ctx.log_event(
+                'take_over_fill_unproven',
+                client_order_id=coid,
+                exchange_order_id=deal_id,
+                intent_key=row.intent_key,
+                payload={'submitted': row.qty, 'position_size': size},
+            )
+        broker_warning(
+            "entry submission %s (intent %s) landed as deal %s, but the venue shows "
+            "the position at size %s instead of the submitted %s: what was filled "
+            "and what was closed since cannot be proven, so the fill is not booked "
+            "and the entry stays held — check the account and settle the row by hand",
+            coid, row.intent_key, deal_id, size, row.qty,
+        )
+        return None
 
     async def _resolve_partial_close_dispositions(
             self, positions_by_deal: dict[str, dict],
@@ -1403,8 +1707,15 @@ class _ReconcileMixin(_CapitalComBase, ABC):
           exists, so its absence must never be read as an external
           cancel. A fold with a retained residual stays tracked (its
           deal is live on the venue).
+        * A taken-over working row stamped
+          :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`
+          executed into a position whose fill the snapshot could not prove:
+          its absence from ``/workingorders`` is that execution, and a cancel
+          verdict would release the held entry for a second send.
         """
         extras = row.extras or {}
+        if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+            return True
         natural_close_at = extras.get('natural_close_at')
         if isinstance(natural_close_at, (int, float)):
             return (epoch_time() - float(natural_close_at)

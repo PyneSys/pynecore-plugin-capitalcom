@@ -39,6 +39,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_WORKING,
 )
 from pynecore.core.broker.models import (
+    CancelDispositionOutcome,
     CancelIntent,
     CloseIntent,
     EntryIntent,
@@ -52,6 +53,8 @@ from .exceptions import CapitalComApiError, CapitalComError, OrderNotFoundError
 from ._base import CapitalComHookCollaborator
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
+    EXTRAS_KEY_TAKE_OVER_UNPROVEN,
+    EXTRAS_KEY_TAKEN_OVER_AT,
     _extract_reject_reason,
     _is_funds_reject,
     _is_market_closed_reject,
@@ -295,6 +298,23 @@ class _CapitalComModifyEntryHooks:
         )]
 
 
+def _unbooked_take_over(row: 'OrderRow') -> bool:
+    """Whether ``row`` is a taken-over working entry whose fill is not booked.
+
+    The take-over (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKEN_OVER_AT`)
+    learned the order's id after the order may already have executed; such
+    an execution is booked only by the snapshot loop, once its position
+    surfaces, and only onto this row.
+
+    :param row: The entry row.
+    :return: ``True`` for a taken-over working row without ``entry_filled_at``.
+    """
+    extras = row.extras or {}
+    return (extras.get(EXTRAS_KEY_TAKEN_OVER_AT) is not None
+            and extras.get('kind') == ENTRY_KIND_WORKING
+            and extras.get('entry_filled_at') is None)
+
+
 def _surviving_sister_levels(
         store_ctx: 'RunContext | None', row: 'OrderRow',
         parent_deal_id: str, leg_kind: str,
@@ -370,6 +390,21 @@ class _CapitalComCancelHooks:
     * **Working order without an ``exchange_order_id`` yet** → mark the
       row ``cancel_pending``; the next reconciler / recovery pass
       retries once the id lands.
+    * **Held take-over** (stamped
+      :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`) →
+      silent skip, the row stays live for the operator. A working order
+      the poll stamps while its DELETE is in flight is held the same way
+      when the answer comes back: the row is read again, under the store's
+      write lock, before it is closed, and a held row is left live and
+      listed in :attr:`~_CapitalComCancelHooks.held_coids`. A row whose
+      fill the poll booked while the DELETE was in flight is a filled
+      position by then: ``cancel_noop``, never closed.
+    * **Unbooked take-over** whose DELETE answers 404 → the order may have
+      executed before its id was known, and only the snapshot loop books
+      that fill, onto this row. The row is closed only when the venue's
+      activity shows the order ended without a fill; otherwise it stays
+      live, a ``cancel_unsettled_take_over`` event is logged, and it is
+      listed in :attr:`~_CapitalComCancelHooks.unsettled_coids`.
 
     The hook closes each target row it actively swept (DELETE landed,
     PUT-null landed, or broker reported already-gone). Skipped rows
@@ -385,6 +420,11 @@ class _CapitalComCancelHooks:
             plugin: CapitalComHookCollaborator,
     ) -> None:
         self._plugin = plugin
+        #: Targets found held after their DELETE: the cancel did not settle them.
+        self.held_coids: list[str] = []
+        #: Unbooked take-overs whose DELETE answered 404 without the venue's
+        #: word that the order ended unfilled: left live, the cancel unsettled.
+        self.unsettled_coids: list[str] = []
 
     async def submit_cancel(
             self, *, coid: str, intent: CancelIntent,
@@ -418,6 +458,13 @@ class _CapitalComCancelHooks:
 
         for row in targets:
             extras = row.extras or {}
+            if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                # A take-over whose fill could not be proven: its working
+                # order executed, so the DELETE would answer 404 and the
+                # already-gone path would close the row and release the entry
+                # for a second send. ``execute_cancel`` keeps such rows out of
+                # the sweep; the row stays for the operator.
+                continue
             if (row.state == 'disposition_unknown'
                     and not row.exchange_order_id
                     and extras.get('kind') in (ENTRY_KIND_WORKING,
@@ -660,14 +707,70 @@ class _CapitalComCancelHooks:
                 # The venue still had the order resting when it took the
                 # DELETE: evidence the close attribution may need later.
                 self._plugin.stamp_own_cancel_accepted(row.client_order_id, sent_at)
-            if store_ctx is not None:
-                store_ctx.close_order(row.client_order_id)
-                store_ctx.log_event(
-                    'cancelled',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                    intent_key=intent.intent_key,
+            # A 404 is also what an executed order answers. A taken-over
+            # order may have executed before its id was known: no activity
+            # books that fill, only the snapshot loop does, onto this row,
+            # once the position surfaces. Only the venue's word that the
+            # order ended without a fill retires such a row.
+            gone_outcome: CancelDispositionOutcome | None = None
+            if target_already_gone and _unbooked_take_over(row):
+                gone_outcome = await self._plugin.classify_cancel_via_activity(
+                    str(row.exchange_order_id),
                 )
+            if store_ctx is not None:
+                # The row read before the request is stale. The poll may have
+                # stamped it as a held take-over while the DELETE was in
+                # flight (its order had executed), or booked its fill onto
+                # it: closing it would release the entry for a second send,
+                # or retire a live position.
+                with store_ctx.transaction():
+                    current = store_ctx.get_order(row.client_order_id)
+                    current_extras = (current.extras or {}) if current is not None else {}
+                    held = current_extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None
+                    filled = (current is not None
+                              and current_extras.get('kind') == ENTRY_KIND_POSITION)
+                    unsettled = (not held and not filled and current is not None
+                                 and target_already_gone and _unbooked_take_over(current)
+                                 and gone_outcome not in (
+                                     CancelDispositionOutcome.CANCEL_CONFIRMED,
+                                     CancelDispositionOutcome.TOO_LATE_TO_CANCEL))
+                    if filled and not held:
+                        store_ctx.log_event(
+                            'cancel_noop',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=current.exchange_order_id
+                            if current is not None else None,
+                            intent_key=intent.intent_key,
+                            payload={'reason': 'already_filled',
+                                     'pine_id': intent.pine_id,
+                                     'from_entry': intent.from_entry},
+                        )
+                    elif unsettled:
+                        store_ctx.log_event(
+                            'cancel_unsettled_take_over',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=row.exchange_order_id,
+                            intent_key=intent.intent_key,
+                            payload={'activity_outcome': gone_outcome.value
+                                     if gone_outcome is not None else None},
+                        )
+                    elif not held:
+                        store_ctx.close_order(row.client_order_id)
+                        store_ctx.log_event(
+                            'cancelled',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=row.exchange_order_id,
+                            intent_key=intent.intent_key,
+                        )
+                if held and current is not None:
+                    self._plugin.hold_take_over_dispatch(current, 'cancel')
+                    self.held_coids.append(row.client_order_id)
+                    continue
+                if filled:
+                    continue
+                if unsettled:
+                    self.unsettled_coids.append(row.client_order_id)
+                    continue
             applied.append(row.client_order_id)
             if target_already_gone:
                 already_gone_count += 1

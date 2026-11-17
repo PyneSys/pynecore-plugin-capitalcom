@@ -56,6 +56,7 @@ from .helpers import (
     EXTRAS_KEY_BOOKED_CLOSES,
     EXTRAS_KEY_NETTED_FOREIGN_DEAL,
     EXTRAS_KEY_PROTECTION_ADOPT_AFTER,
+    EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
     _POLL_INTERVAL_S,
@@ -71,6 +72,32 @@ if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
 logger = logging.getLogger(__name__)
+
+
+#: Failed polls between two reminders of an order-poll outage (~5 minutes at
+#: the poll cadence).
+_FAILED_POLL_REMINDER_EVERY = 200
+
+
+def _note_failed_poll(failed_polls: int, error: Exception) -> int:
+    """Log a failed order poll and return the new failure streak.
+
+    The poll is the only order channel the venue has, so its outage must show
+    in the log; at the poll cadence a plain network outage would repeat the
+    same line dozens of times a minute. The first failure of a streak warns,
+    then one reminder per :data:`_FAILED_POLL_REMINDER_EVERY` failures; the
+    rest log at DEBUG.
+
+    :param failed_polls: The streak before this failure.
+    :param error: What failed the poll.
+    :return: The streak including this failure.
+    """
+    streak = failed_polls + 1
+    log = (logger.warning if streak == 1 or streak % _FAILED_POLL_REMINDER_EVERY == 0
+           else logger.debug)
+    log("Capital.com order poll failed (transient, %d consecutive): %s",
+        streak, str(error) or type(error).__name__)
+    return streak
 
 
 class _ActivityMixin(_CapitalComBase, ABC):
@@ -102,28 +129,38 @@ class _ActivityMixin(_CapitalComBase, ABC):
         """
         cadence = _POLL_INTERVAL_S
         consecutive_429 = 0
+        failed_polls = 0
         while True:
+            failure: Exception | None = None
             try:
                 async for ev in self._poll_once():
                     yield ev
                 consecutive_429 = 0
             except asyncio.CancelledError:
                 raise
-            except ExchangeRateLimitError:
+            except ExchangeRateLimitError as e:
                 consecutive_429 += 1
+                failed_polls = _note_failed_poll(failed_polls, e)
                 backoff = min(30.0, cadence * (2 ** min(consecutive_429, 5)))
                 await asyncio.sleep(backoff)
                 continue
             except (ExchangeConnectionError,
                     httpx.TimeoutException, httpx.RequestError,
-                    ConnectionError):
+                    ConnectionError) as e:
                 # Single-cycle hiccup — retry next tick.
-                pass
+                failure = e
             except CapitalComError as e:
                 mapped = self._map_exception(e)
                 if mapped is not None and not isinstance(
                         mapped, (ExchangeConnectionError, ExchangeRateLimitError)):
                     raise mapped from e
+                failure = e
+            if failure is not None:
+                failed_polls = _note_failed_poll(failed_polls, failure)
+            elif failed_polls:
+                logger.warning(
+                    "Capital.com order poll recovered after %d failed poll(s)", failed_polls)
+                failed_polls = 0
             await asyncio.sleep(cadence)
 
     async def _poll_once(self) -> AsyncIterator[OrderEvent]:
@@ -275,6 +312,10 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 continue
 
             row: 'OrderRow | None' = None
+            # A taken-over entry whose fill the snapshot could not prove
+            # (:data:`EXTRAS_KEY_TAKE_OVER_UNPROVEN`) that this activity belongs
+            # to, directly or through the order's back-link.
+            held: 'OrderRow | None' = None
             if deal_id and self.store_ctx is not None:
                 row = self.store_ctx.find_by_ref('deal_id', deal_id)
 
@@ -311,7 +352,13 @@ class _ActivityMixin(_CapitalComBase, ABC):
                         )
                         if wo_row is not None else None
                     )
-                    if wo_row is None:
+                    if (wo_row is not None
+                            and (wo_row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN)
+                            is not None):
+                        # Neither promoted nor reported: the order's execution
+                        # is unproven, and the row stays as it is.
+                        held = wo_row
+                    elif wo_row is None:
                         # The order's execution may have been retired unbooked
                         # as one that only netted a foreign deal (its row is
                         # closed, its refs gone); a deal it opened with the
@@ -331,6 +378,30 @@ class _ActivityMixin(_CapitalComBase, ABC):
                             )
                         row = (self.store_ctx.find_by_ref('deal_id', deal_id)
                                or wo_row)
+
+            if (row is not None
+                    and (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None):
+                held = row
+            if held is not None:
+                # A taken-over entry whose fill the snapshot could not prove
+                # stays held until the operator settles it: none of its
+                # activities is booked. Its execution would book a fill whose
+                # later reduction the snapshot already showed, a close would
+                # reduce a fill never booked, and a cancel would release the
+                # held entry for a second send. Like an unmatched row, the
+                # activity is deferred, not consumed, and audited once.
+                deferred_in_batch = True
+                if (self.store_ctx is not None
+                        and fingerprint not in cursor.external_logged_fingerprints):
+                    cursor.external_logged_fingerprints.add(fingerprint)
+                    self.store_ctx.log_event(
+                        'activity_held_take_over_unproven',
+                        client_order_id=held.client_order_id,
+                        exchange_order_id=deal_id or None,
+                        intent_key=held.intent_key,
+                        payload={'activity': a, 'fingerprint': fingerprint},
+                    )
+                continue
 
             if row is None:
                 # Two cases land here:

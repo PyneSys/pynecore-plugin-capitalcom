@@ -18,10 +18,12 @@ that declares the cross-mix-in surface for static analysers. The
 """
 import asyncio
 import collections
+import logging
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pynecore.core.broker.parked_dispatch import ParkedDispatchResolver
 from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.types.ohlcv import OHLCV
 
@@ -40,7 +42,12 @@ from .exceptions import (
 from .execution import _ExecutionMixin
 from .foreign import _ForeignExposureMixin
 from .intervention import _LEVEL_EDIT_SETTLE_S, _InterventionMixin
-from .helpers import _WS_VOLUME_BASELINE_BARS, _parse_opening_hours_segment
+from .helpers import (
+    _INHERITED_LOOKUP_INTERVAL_S,
+    _UNANNOUNCED_FILL_GRACE_S,
+    _WS_VOLUME_BASELINE_BARS,
+    _parse_opening_hours_segment,
+)
 from .models import (
     _ActivityCursor,
     _ForeignExitBlock,
@@ -56,6 +63,8 @@ from .streaming import _StreamingMixin
 
 if TYPE_CHECKING:
     pass
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'CapitalCom',
@@ -283,3 +292,19 @@ class CapitalCom(
         self._netting_retired_orders: dict[str, dict] | None = None
         self._residual_deals_reported: set[str] = set()
         self._unannounced_fills_seen: dict[str, float] = {}
+        # Resolves the entry submissions an earlier process left pending; the
+        # engine holds their intents' entries meanwhile (see ``reconcile.py``,
+        # ``_resolve_inherited_submissions``). A conclusive absence rejects a
+        # row only once it is older than ``fill_report_grace_s``: the venue
+        # has published an activity 61 s after its deal, so a younger read
+        # may not show the POST's trace yet.
+        self._inherited_resolver = ParkedDispatchResolver(
+            venue=self.plugin_name, log=logger,
+            grace_s=_UNANNOUNCED_FILL_GRACE_S,
+            absent_after_s=self.fill_report_grace_s,
+            lookup_interval_s=_INHERITED_LOOKUP_INTERVAL_S,
+        )
+        self._inherited_unprovable_reported: set[str] = set()
+        self._inherited_ambiguity_reported: set[str] = set()
+        self._take_over_held_reported: set[str] = set()
+        self._take_over_dispatch_held_reported: set[tuple[str, str]] = set()

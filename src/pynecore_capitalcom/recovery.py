@@ -20,6 +20,9 @@ non-terminal row:
   Routes by ``row.state`` to two verdict-builders that read the
   snapshots and return a :class:`ResumeOutcome` carrying the resolution
   route in ``recovery_path``.
+* ``_inherited_submission_verdict`` — the in-run lookup of an entry
+  submission an earlier process left pending and the startup pass could not
+  resolve yet: the same activity matching, against a fresh activity read.
 
 Bracket leg ``disposition_unknown`` rows are NOT handled here — they
 are owned by ``_reconcile_snapshot``'s ``_resolve_bracket_leg_disposition``
@@ -29,13 +32,20 @@ State touched: BrokerStore through ``self.store_ctx``,
 ``_activity_cursor`` (rebuilt).
 """
 import logging
+import math
 from abc import ABC
 from collections.abc import Mapping
 from dataclasses import dataclass
 from time import time as epoch_time
 from typing import TYPE_CHECKING, cast
 
-from pynecore.core.broker.exceptions import BrokerManualInterventionError
+import httpx
+
+from pynecore.core.broker.exceptions import (
+    BrokerManualInterventionError,
+    ExchangeConnectionError,
+    ExchangeRateLimitError,
+)
 from pynecore.core.broker.models import LegType
 from pynecore.core.broker.journal import (
     DispatchJournal,
@@ -43,25 +53,29 @@ from pynecore.core.broker.journal import (
     PendingHooksProvider,
     ResumeOutcome,
 )
+from pynecore.core.broker.parked_dispatch import ParkedOutcome, ParkedVerdict
 from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     KIND_CANCEL,
     KIND_FULL_CLOSE,
     KIND_MODIFY_ENTRY,
     KIND_MODIFY_EXIT,
     KIND_PARTIAL_CLOSE,
+    find_pending_dispatch,
 )
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
-from .exceptions import OrderNotFoundError
+from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import (
     BOOKED_CLOSES_RETAINED,
     CLOSE_VERDICT_FOREIGN,
     CLOSE_VERDICT_VENUE,
     EXTERNAL_REDUCTION_VERDICTS,
     EXTRAS_KEY_BOOKED_CLOSES,
+    EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
     _extract_reject_reason,
@@ -77,6 +91,11 @@ if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
 
 logger = logging.getLogger(__name__)
+
+#: Largest distance between a pending entry row's creation (taken just before
+#: its POST) and the activity of the deal the POST opened, for the activity to
+#: count as that POST's trace.
+_ACTIVITY_MATCH_WINDOW_S = 3.0
 
 #: Fill legs that reduce a position: what a close activity books.
 _CLOSE_LEG_TYPES = frozenset({
@@ -248,6 +267,12 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             leg_kind = (pending_row.extras or {}).get('leg_kind')
             if leg_kind in ('tp', 'sl'):
                 return None  # bracket legs — own resolution path
+            if (pending_row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                # An earlier take-over could not prove this entry's fill: a
+                # trace or snapshot match here would book the very fill it
+                # held back, so the row is left as it is.
+                self._hold_unproven_take_over(pending_row)
+                return None
             return cast(EntryDispatchHooks, resume_hooks)
 
         journal = DispatchJournal(self.store_ctx)
@@ -319,6 +344,93 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         # the book, and the plugin never closes, amends, books or reports it.
         # It is only made visible.
         self._note_untracked_positions_at_startup(positions_resp)
+
+    async def _inherited_submission_verdict(self, row: 'OrderRow') -> ParkedVerdict:
+        """What the venue knows about an entry submission an earlier process left pending.
+
+        The lookup of the core
+        :class:`~pynecore.core.broker.parked_dispatch.ParkedDispatchResolver`
+        for an inherited dispatch
+        (:meth:`~pynecore.core.broker.storage.RunContext.is_inherited_dispatch`)
+        whose POST outcome the startup pass could not tell: its trace may have
+        been published after the startup read, as the venue publishes an
+        activity up to a minute after its deal. The engine holds the intent's
+        entry behind such a row, because Capital.com carries no client order
+        id and a second POST would open a second position.
+
+        The activity history is causal for this venue: a POST that opened a
+        deal or a working order leaves an activity, so a complete read that
+        covers the row's whole life shows whether it landed. The read reaches
+        back from now past the row's creation by :data:`_ACTIVITY_LAG_S`, and
+        is matched like the startup pass matches
+        (:meth:`_CapitalComResumeHooks.inherited_submission_verdict`).
+
+        A row older than the venue's longest activity read cannot be proven
+        either way and stays held; so does a row whose trace another pending
+        submission matches as well. Each is logged once per row. A row stamped
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN` was
+        already traced to its deal: a later read without the trace is never
+        an absence for it.
+
+        :param row: The pending entry row.
+        :return: :attr:`~ParkedOutcome.LANDED`
+            with the deal id, ``ABSENT``, or ``INCONCLUSIVE`` for a row that
+            is not an inherited entry submission, a failed read or an
+            ambiguous match.
+        """
+        store_ctx = self.store_ctx
+        if (store_ctx is None
+                or not store_ctx.is_inherited_dispatch(row.client_order_id)
+                or (row.extras or {}).get('kind') not in (ENTRY_KIND_POSITION,
+                                                          ENTRY_KIND_WORKING)):
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+        age_s = max(0.0, epoch_time() - row.created_ts_ms / 1000.0)
+        period = math.ceil(age_s) + _ACTIVITY_LAG_S
+        if period > _ACTIVITY_MAX_PERIOD_S:
+            if row.client_order_id not in self._inherited_unprovable_reported:
+                self._inherited_unprovable_reported.add(row.client_order_id)
+                broker_warning(
+                    "inherited entry submission %s (intent %s) is older than the "
+                    "venue's activity history (%d s): whether its POST opened a "
+                    "deal cannot be read any more, so its entry stays held — "
+                    "check the account and close the row by hand",
+                    row.client_order_id, row.intent_key, _ACTIVITY_MAX_PERIOD_S,
+                )
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+        try:
+            activity_resp = await self._call(
+                'history/activity',
+                data={'lastPeriod': period, 'detailed': 'true'},
+                method='get',
+            )
+        except (httpx.HTTPError, ConnectionError, ExchangeConnectionError,
+                ExchangeRateLimitError, OrderNotFoundError, CapitalComError):
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+        activities = activity_resp.get('activities')
+        if not isinstance(activities, list):
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+        hooks = _CapitalComResumeHooks(
+            plugin=self, activities=activities, pos_by_ref={}, wo_by_ref={},
+            wo_by_deal_id={}, pos_by_deal_id={},
+        )
+        verdict, ambiguous = hooks.inherited_submission_verdict(row)
+        if ambiguous and row.client_order_id not in self._inherited_ambiguity_reported:
+            self._inherited_ambiguity_reported.add(row.client_order_id)
+            broker_warning(
+                "inherited entry submission %s (intent %s) cannot be told apart from "
+                "another pending submission by the venue's activity history: which "
+                "of them opened the deal is unknown, so its entry stays held — check "
+                "the account and close the row by hand",
+                row.client_order_id, row.intent_key,
+            )
+        if (verdict.outcome is ParkedOutcome.ABSENT
+                and (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None):
+            # An earlier lookup traced this POST to its deal: a read that no
+            # longer shows the trace (the deal claimed by another row, a read
+            # cut short) does not undo that, and a rejection would send the
+            # entry a second time.
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+        return verdict
 
     def _stamp_surviving_entry_fills(
             self, pos_by_deal_id: dict[str, dict],
@@ -394,6 +506,11 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         gap to the deal's present size are the downtime closes
         :meth:`_account_downtime_closes` judges next.
 
+        A row stamped
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN` is
+        not moved: its earlier process could not prove the fill this pass
+        would book, so it stays held (:meth:`_hold_unproven_take_over`).
+
         :param pos_by_deal_id: The startup ``/positions`` rows by ``dealId``.
         :param wo_by_deal_id: The startup ``/workingorders`` rows by ``dealId``.
         :param promoted_coids: Rows the in-flight recovery just resolved.
@@ -409,6 +526,9 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                     or extras.get(ADOPTED_STARTUP_EXTRA_KEY)
                     or extras.get('kind') not in ('position', 'working')
                     or did in pos_by_deal_id or did in wo_by_deal_id):
+                continue
+            if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                self._hold_unproven_take_over(row)
                 continue
             deal_id = self._find_promoted_deal_id(row, [], pos_by_deal_id)
             if deal_id is None:
@@ -433,6 +553,42 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                          'fill_booked_before': not unbooked,
                          'venue_size': venue_size},
             )
+
+    def _hold_unproven_take_over(self, row: 'OrderRow') -> None:
+        """Keep a take-over whose fill an earlier pass could not prove held.
+
+        The row is stamped
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`:
+        its position showed a size other than the submitted quantity. The
+        recovery pass neither confirms, moves nor retires it, so no fill is
+        booked from the evidence that was too weak to book one, and the entry
+        is never released for a second send. The operator is warned with a
+        ``take_over_unproven_held_at_recovery`` audit event, once per row for
+        the process.
+
+        :param row: The stamped entry row.
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        coid = row.client_order_id
+        if coid in self._take_over_held_reported:
+            return
+        self._take_over_held_reported.add(coid)
+        unproven = (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) or {}
+        broker_warning(
+            "entry submission %s (intent %s) is still held: its deal %s showed size %s "
+            "instead of the submitted %s, so recovery does not book, move or retire "
+            "it — check the account and settle the row by hand",
+            coid, row.intent_key, unproven.get('deal_id'), unproven.get('size'), row.qty,
+        )
+        store_ctx.log_event(
+            'take_over_unproven_held_at_recovery',
+            client_order_id=coid,
+            exchange_order_id=row.exchange_order_id,
+            intent_key=row.intent_key,
+            payload={'state': row.state, 'kind': (row.extras or {}).get('kind'),
+                     'submitted': row.qty, 'unproven': unproven},
+        )
 
     def _account_downtime_closes(
             self,
@@ -757,6 +913,10 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         leaves the journal and a later copy of its close activity is never
         booked again.
 
+        A row stamped
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN` is
+        never retired: it stays live and held.
+
         A resting own entry order retired in pass 1 on a fresh start is judged
         against the startup ``activities`` the way a cancel the poll sees is
         (:meth:`_judge_vanished_startup_working_order`); someone else's cancel
@@ -808,6 +968,13 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                     self.store_ctx.record_complete(row.intent_key)
                     retired_intent_keys.add(row.intent_key)
                 retired_count += 1
+                continue
+            if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                # A held take-over: its order is gone because it executed,
+                # and retiring the row would release the entry for a second
+                # send. It stays live and held, like in the process that
+                # stamped it.
+                kept_parent_coids.add(row.client_order_id)
                 continue
             if reconnecting and row.state in ('confirmed', 'closing'):
                 # The engine of this process still tracks the row and waits
@@ -1144,6 +1311,34 @@ class _CapitalComResumeHooks:
     async def resume_pending_dispatch(
             self, *, row: 'OrderRow', refs: Mapping[str, str],
     ) -> ResumeOutcome:
+        """The recovery verdict for one pending row (:meth:`_route_resume`).
+
+        A reconnect's recovery runs while the order poll goes on, and the
+        poll may hold the row as a take-over whose fill could not be proven
+        (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
+        while a verdict read is in flight, or before the journal reaches the
+        row it listed earlier. The verdict comes from reads that do not know
+        that: the row is read again once every read is done, and a held row
+        is left as it is (``still_unknown``, which the journal persists with
+        no further await) and reported to the operator, so recovery never
+        books the fill the poll held back.
+
+        :param row: The pending row, as the journal listed it.
+        :param refs: The row's durable ``order_refs`` alias map.
+        :return: The verdict the journal persists.
+        """
+        outcome = await self._route_resume(row=row, refs=refs)
+        store_ctx = self.plugin.store_ctx
+        current = store_ctx.get_order(row.client_order_id) if store_ctx is not None else None
+        if (current is not None
+                and (current.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None):
+            self.plugin.hold_unproven_take_over(current)
+            return ResumeOutcome(status='still_unknown')
+        return outcome
+
+    async def _route_resume(
+            self, *, row: 'OrderRow', refs: Mapping[str, str],
+    ) -> ResumeOutcome:
         """Route by ``row.state`` to the matching verdict-builder.
 
         ``server_ref_seen`` means the POST landed and the plugin
@@ -1254,7 +1449,10 @@ class _CapitalComResumeHooks:
             return False, 0.0, 0.0
         return True, filled_qty, level
 
-    def _activity_matches_row(self, activity: Mapping, row: 'OrderRow') -> bool:
+    def _activity_matches_row(
+            self, activity: Mapping, row: 'OrderRow', *,
+            window_s: float | None = _ACTIVITY_MATCH_WINDOW_S,
+    ) -> bool:
         """Whether an activity row can be the venue trace of ``row``'s POST.
 
         The ``detailed=true`` payload carries direction and size inside
@@ -1266,6 +1464,11 @@ class _CapitalComResumeHooks:
         ``WORKING_ORDER`` it created (an ``EXECUTED`` working order is a
         market POST's internal order or a fill, never a creation). Deals
         another journal row already tracks are not candidates.
+
+        :param activity: One ``/history/activity`` row.
+        :param row: The pending entry row.
+        :param window_s: Largest distance between the activity's time and the
+            row's creation; ``None`` matches at any time.
         """
         if (activity.get('epic') or '') != row.symbol:
             return False
@@ -1285,7 +1488,7 @@ class _CapitalComResumeHooks:
             return False
         row_created = row.created_ts_ms / 1000.0 if row.created_ts_ms else 0.0
         when = _parse_iso_timestamp(activity.get('dateUTC') or '')
-        if row_created and abs(when - row_created) > 3.0:
+        if window_s is not None and row_created and abs(when - row_created) > window_s:
             return False
         deal_id = _wire_id(activity.get('dealId'))
         store_ctx = self.plugin.store_ctx
@@ -1294,6 +1497,73 @@ class _CapitalComResumeHooks:
             if tracked is not None and tracked.client_order_id != row.client_order_id:
                 return False
         return True
+
+    def _trace_contested(self, activity: Mapping, row: 'OrderRow') -> bool:
+        """Whether another pending entry submission could have left ``activity`` too.
+
+        The match carries no client order id: two entry submissions of the
+        same epic, side, size and kind sent within the match window both
+        match the one deal either of them opened. Which one landed is then
+        unknown, and handing the deal to one of them is a guess: when it is
+        wrong, the deal is booked to a submission that opened nothing, and
+        the one that did open it no longer sees its trace, reads as absent
+        and is sent again.
+
+        :param activity: An activity that matches ``row``.
+        :param row: The pending entry row.
+        :return: Whether a live pending entry row without a deal id, other
+            than ``row``, matches the activity as well.
+        """
+        store_ctx = self.plugin.store_ctx
+        if store_ctx is None:
+            return False
+        for other in find_pending_dispatch(store_ctx):
+            if (other.client_order_id == row.client_order_id
+                    or other.exchange_order_id
+                    or (other.extras or {}).get('kind') not in (ENTRY_KIND_POSITION,
+                                                                ENTRY_KIND_WORKING)):
+                continue
+            if self._activity_matches_row(activity, other):
+                return True
+        return False
+
+    def inherited_submission_verdict(self, row: 'OrderRow') -> tuple[ParkedVerdict, bool]:
+        """Judge an inherited entry submission from a complete activity read.
+
+        * One deal traced inside :data:`_ACTIVITY_MATCH_WINDOW_S` of the row's
+          creation, which no other pending submission could have left
+          (:meth:`_trace_contested`): the POST landed there.
+        * No trace at all: the POST opened nothing.
+        * Anything else is inconclusive: several traced deals, a trace another
+          pending submission matches too, a trace without a deal id, or a
+          matching activity outside the window, which may be the POST's own
+          trace under a venue clock that runs off the local one.
+
+        :param row: The pending entry row; :attr:`activities` must cover its
+            whole life.
+        :return: The verdict, with the deal id when it landed, and whether the
+            trace is ambiguous: several deals, or one another pending
+            submission matches too. An ambiguous row stays held until the
+            operator settles it.
+        """
+        traced: set[str | None] = set()
+        contested = False
+        outside_window = False
+        for activity in self.activities:
+            if self._activity_matches_row(activity, row):
+                traced.add(_wire_id(activity.get('dealId')))
+                contested = contested or self._trace_contested(activity, row)
+            elif self._activity_matches_row(activity, row, window_s=None):
+                outside_window = True
+        ambiguous = contested or len(traced) > 1
+        if len(traced) == 1 and not contested:
+            deal_id = next(iter(traced))
+            if deal_id is not None:
+                return ParkedVerdict(ParkedOutcome.LANDED, order_id=deal_id), False
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE), False
+        if traced or outside_window:
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE), ambiguous
+        return ParkedVerdict(ParkedOutcome.ABSENT), False
 
     def _verdict_submitted(
             self, row: 'OrderRow', refs: Mapping[str, str],
@@ -1360,6 +1630,14 @@ class _CapitalComResumeHooks:
             return ResumeOutcome(
                 status='still_unknown',
                 recovery_path='no_match',
+            )
+        if len(candidates) == 1 and self._trace_contested(candidates[0], row):
+            # Another pending submission matches the same trace: which one
+            # landed is unknown, so neither takes the deal. The row stays
+            # pending and the in-run lookup keeps it held.
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='activity_contested_match',
             )
         if len(candidates) == 1:
             deal_id = _wire_id(candidates[0].get('dealId'))

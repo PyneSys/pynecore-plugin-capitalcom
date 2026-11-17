@@ -62,6 +62,7 @@ from pynecore.core.broker.models import (
     PositionLeg,
 )
 from pynecore.core.plugin import override
+from pynecore.lib.log import broker_warning
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import (
@@ -75,6 +76,7 @@ from .exceptions import (
 )
 from .helpers import (
     EXTRAS_KEY_ORDER_LEVEL,
+    EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _extract_reject_reason,
     _is_funds_reject,
     _is_market_closed_reject,
@@ -2198,6 +2200,22 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         the plugin treats it as already-gone (benign race), logs a
         ``cancel_already_gone`` event, and continues.
 
+        A take-over held because its fill could not be proven
+        (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
+        is never swept: its working order already executed into a live
+        position, so a DELETE answers 404 and closing the row would release
+        the entry for a second send. The row stays as it is, the operator is
+        warned (:meth:`_hold_take_over_dispatch`), and the call returns
+        ``False``: the cancel did not land, so the engine keeps the entry and
+        sends no replacement. The same holds for a row the poll stamps while
+        its DELETE is in flight: the sweep reads it again before closing it
+        and leaves it live. A taken-over working entry whose fill is not
+        booked and whose DELETE answers 404 is not closed either unless the
+        venue's activity shows the order ended without a fill: the order may
+        have executed before its id was known, and its position, once it
+        surfaces, is booked onto the row. Until then the call returns
+        ``False`` too, so no cancel+create sends the entry a second time.
+
         The per-target sweep runs through the Core
         :class:`~pynecore.core.broker.journal.DispatchJournal` so a
         mid-loop crash is recoverable: the cancel command row is
@@ -2214,6 +2232,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         coid = envelope.client_order_id(KIND_CANCEL)
 
         targets: list['OrderRow'] = []
+        held = False
         if self.store_ctx is not None:
             for row in self.store_ctx.iter_live_orders(
                     from_entry=intent.from_entry,
@@ -2227,8 +2246,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     intent.from_entry is not None
                     and row.from_entry == intent.from_entry
                 )
-                if matches_pine:
-                    targets.append(row)
+                if not matches_pine:
+                    continue
+                if (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                    self._hold_take_over_dispatch(row, 'cancel')
+                    held = True
+                    continue
+                targets.append(row)
+
+        if held and not targets:
+            return False
 
         if not targets:
             if self.store_ctx is not None:
@@ -2262,7 +2289,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 'from_entry': intent.from_entry,
             },
         )
-        return True
+        return not held and not hooks.held_coids and not hooks.unsettled_coids
 
     @override
     async def execute_cancel_with_outcome(
@@ -2298,6 +2325,17 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         :attr:`CancelDispositionOutcome.UNKNOWN` rather than fabricating a
         resolution.
 
+        A take-over held because its fill could not be proven
+        (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
+        is not DELETEd and not classified: it stays as it is, the operator is
+        warned, and it counts as
+        :attr:`CancelDispositionOutcome.UNKNOWN`, so the engine neither
+        settles the cancel nor books a fill the venue never proved. A row the
+        poll stamps while its DELETE is in flight counts the same way, and a
+        row whose fill the poll books meanwhile is never closed and counts as
+        :attr:`CancelDispositionOutcome.ALREADY_FILLED`
+        (:meth:`_finalize_cancel_outcome_row` reads it again first).
+
         Aggregation across multiple working-order targets is conservative:
         any ``ALREADY_FILLED`` wins (the engine must restore legs onto a
         position that now exists), then any ``UNKNOWN`` keeps the loop
@@ -2310,6 +2348,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         if self.store_ctx is None:
             return CancelDispositionOutcome.UNKNOWN
 
+        outcomes: list[CancelDispositionOutcome] = []
         targets: list[tuple[str, str]] = []
         for row in self.store_ctx.iter_live_orders(
                 from_entry=intent.from_entry,
@@ -2325,13 +2364,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 continue
             if extras.get('kind', ENTRY_KIND_POSITION) != ENTRY_KIND_WORKING:
                 continue
+            if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                self._hold_take_over_dispatch(row, 'cancel')
+                outcomes.append(CancelDispositionOutcome.UNKNOWN)
+                continue
             if row.exchange_order_id:
                 targets.append((row.client_order_id, row.exchange_order_id))
 
         if not targets:
             return CancelDispositionOutcome.UNKNOWN
 
-        outcomes: list[CancelDispositionOutcome] = []
         for coid, deal_id in targets:
             try:
                 with self._own_cancel(coid) as sent_at:
@@ -2348,11 +2390,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 ) from exc
             except OrderNotFoundError:
                 resolved = await self._classify_cancel_via_activity(deal_id)
-                self._finalize_cancel_outcome_row(
+                outcomes.append(self._finalize_cancel_outcome_row(
                     coid, deal_id, resolved, intent=intent,
                     already_gone=True,
-                )
-                outcomes.append(resolved)
+                ))
                 continue
             # Clean DELETE: the broker order is gone. Close and audit the
             # live working row here — the sync engine's cancel-tentative
@@ -2363,11 +2404,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # ``missing_pending_since``, and eventually raise a false
             # :class:`UnexpectedCancelError`.
             self._stamp_own_cancel_accepted(coid, sent_at)
-            self._finalize_cancel_outcome_row(
+            outcomes.append(self._finalize_cancel_outcome_row(
                 coid, deal_id, CancelDispositionOutcome.CANCEL_CONFIRMED,
                 intent=intent, already_gone=False,
-            )
-            outcomes.append(CancelDispositionOutcome.CANCEL_CONFIRMED)
+            ))
 
         if CancelDispositionOutcome.ALREADY_FILLED in outcomes:
             return CancelDispositionOutcome.ALREADY_FILLED
@@ -2377,11 +2417,48 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             return CancelDispositionOutcome.TOO_LATE_TO_CANCEL
         return CancelDispositionOutcome.CANCEL_CONFIRMED
 
+    def _hold_take_over_dispatch(self, row: 'OrderRow', action: str) -> None:
+        """Report a cancel or amend of a held take-over not sent, or not settled.
+
+        The row is stamped
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`:
+        its working order executed into a position whose fill the snapshot
+        could not prove. Only the operator settles it, so the engine's cancel
+        or amend leaves the row as it is, also when the stamp came while the
+        cancel's DELETE was in flight. The operator is warned with a
+        ``take_over_unproven_dispatch_held`` audit event, once per row and
+        action for the process (the engine retries an unlanded cancel every
+        sync).
+
+        :param row: The stamped entry row.
+        :param action: ``'cancel'`` or ``'modify'``.
+        """
+        coid = row.client_order_id
+        if (coid, action) in self._take_over_dispatch_held_reported:
+            return
+        self._take_over_dispatch_held_reported.add((coid, action))
+        unproven = (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) or {}
+        broker_warning(
+            "%s of entry %s (submission %s) not sent or not settled: its deal %s showed "
+            "size %s instead of the submitted %s, so the entry stays held — check the "
+            "account and settle the row by hand",
+            action, row.intent_key, coid, unproven.get('deal_id'), unproven.get('size'),
+            row.qty,
+        )
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                'take_over_unproven_dispatch_held',
+                client_order_id=coid,
+                exchange_order_id=row.exchange_order_id,
+                intent_key=row.intent_key,
+                payload={'action': action, 'submitted': row.qty, 'unproven': unproven},
+            )
+
     def _finalize_cancel_outcome_row(
             self, coid: str, deal_id: str,
             outcome: CancelDispositionOutcome, *,
             intent: CancelIntent, already_gone: bool,
-    ) -> None:
+    ) -> CancelDispositionOutcome:
         """Close and audit a working row whose cancel resolved terminally.
 
         Mirrors the ``_CapitalComCancelHooks`` working-order sweep so the
@@ -2389,7 +2466,22 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         audit trail and never strands a live :class:`OrderRow` whose deal
         is gone broker-side.
 
-        Only terminal-cancel outcomes close the row:
+        The row is read again under the store's write lock first, because
+        the poll may have changed it while the DELETE was in flight (its
+        order had executed):
+
+        * Stamped
+          :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`:
+          the row is left as it is whatever the outcome, the operator is
+          warned (:meth:`_hold_take_over_dispatch`), and the cancel counts as
+          :attr:`CancelDispositionOutcome.UNKNOWN`.
+        * Its fill booked (``kind`` is a position): the row is a live
+          position and is never closed from a cancel; a ``cancel_noop`` event
+          is logged and the cancel counts as
+          :attr:`CancelDispositionOutcome.ALREADY_FILLED`, whatever the
+          DELETE or the activity said.
+
+        Otherwise only terminal-cancel outcomes close the row:
 
         * :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED` /
           :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL`: the working
@@ -2409,30 +2501,55 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         :param already_gone: ``True`` when the DELETE returned 404 (the
             broker had already removed the order), driving the extra
             ``cancel_already_gone`` audit event.
+        :return: The disposition the cancel reports for this row.
         """
-        if self.store_ctx is None:
-            return
-        if outcome not in (
-                CancelDispositionOutcome.CANCEL_CONFIRMED,
-                CancelDispositionOutcome.TOO_LATE_TO_CANCEL,
-        ):
-            return
-        if already_gone:
-            self.store_ctx.log_event(
-                'cancel_already_gone',
-                client_order_id=coid,
-                exchange_order_id=deal_id,
-                intent_key=intent.intent_key,
-            )
-        self.store_ctx.close_order(coid)
-        self.store_ctx.log_event(
-            'cancelled',
-            client_order_id=coid,
-            exchange_order_id=deal_id,
-            intent_key=intent.intent_key,
-            payload={'via': 'cancel_with_outcome',
-                     'outcome': outcome.value},
-        )
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return outcome
+        with store_ctx.transaction():
+            current = store_ctx.get_order(coid)
+            current_extras = (current.extras or {}) if current is not None else {}
+            booked = (current is not None
+                      and current_extras.get('kind') == ENTRY_KIND_POSITION)
+            if current_extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                held = current
+            elif booked:
+                held = None
+                store_ctx.log_event(
+                    'cancel_noop',
+                    client_order_id=coid,
+                    exchange_order_id=current.exchange_order_id if current is not None else None,
+                    intent_key=intent.intent_key,
+                    payload={'reason': 'already_filled',
+                             'pine_id': intent.pine_id,
+                             'from_entry': intent.from_entry},
+                )
+            else:
+                held = None
+                if outcome in (CancelDispositionOutcome.CANCEL_CONFIRMED,
+                               CancelDispositionOutcome.TOO_LATE_TO_CANCEL):
+                    if already_gone:
+                        store_ctx.log_event(
+                            'cancel_already_gone',
+                            client_order_id=coid,
+                            exchange_order_id=deal_id,
+                            intent_key=intent.intent_key,
+                        )
+                    store_ctx.close_order(coid)
+                    store_ctx.log_event(
+                        'cancelled',
+                        client_order_id=coid,
+                        exchange_order_id=deal_id,
+                        intent_key=intent.intent_key,
+                        payload={'via': 'cancel_with_outcome',
+                                 'outcome': outcome.value},
+                    )
+        if held is not None:
+            self._hold_take_over_dispatch(held, 'cancel')
+            return CancelDispositionOutcome.UNKNOWN
+        if booked:
+            return CancelDispositionOutcome.ALREADY_FILLED
+        return outcome
 
     async def _classify_cancel_via_activity(
             self, deal_id: str,
@@ -2516,6 +2633,15 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         recoverable: the amend command row is written *before* the
         REST call, and recovery on next start verifies the broker's
         view via the same ``deal_reference`` confirm GET path.
+
+        An entry held because its take-over's fill could not be proven
+        (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
+        is neither amended nor cancelled and re-sent: its working order
+        already executed into a live position, so a cancel+create would open
+        the entry a second time. The held row is returned unchanged and the
+        operator is warned (:meth:`_hold_take_over_dispatch`). The same holds
+        when the poll holds the row while the cancel+create runs
+        (:meth:`_cancel_and_replace_entry`).
         """
         from pynecore.core.broker.journal import DispatchJournal
 
@@ -2526,6 +2652,13 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         assert isinstance(old_i, EntryIntent)
         assert isinstance(new_i, EntryIntent)
 
+        if self.store_ctx is not None:
+            for row in self.store_ctx.iter_live_orders():
+                if (row.pine_entry_id == old_i.pine_id
+                        and (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None):
+                    self._hold_take_over_dispatch(row, 'modify')
+                    return [self._row_to_exchange_order(row, old_i)]
+
         rules = await self._get_instrument_rules(new_i.symbol)
         old_units = (
             round(old_i.qty / rules.lot_step) if rules.lot_step > 0 else 0
@@ -2534,7 +2667,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             round(new_i.qty / rules.lot_step) if rules.lot_step > 0 else 0
         )
         if old_units != new_units or old_i.order_type != new_i.order_type:
-            return await super().modify_entry(old, new)
+            return await self._cancel_and_replace_entry(old, new)
 
         target_coid = old.client_order_id(KIND_ENTRY)
         target_row: 'OrderRow | None' = (
@@ -2542,7 +2675,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             if self.store_ctx is not None else None
         )
         if target_row is None or not target_row.exchange_order_id:
-            return await super().modify_entry(old, new)
+            return await self._cancel_and_replace_entry(old, new)
 
         new_level: float | None = None
         if new_i.order_type == OrderType.LIMIT and new_i.limit is not None:
@@ -2580,6 +2713,49 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 'target_exchange_id': target_row.exchange_order_id,
             },
         )
+
+    async def _cancel_and_replace_entry(
+            self, old: DispatchEnvelope, new: DispatchEnvelope,
+    ) -> list[ExchangeOrder]:
+        """Replace an entry the venue cannot amend: cancel it, then send ``new``.
+
+        The replacement goes out only when the cancel landed. The cancel does
+        not land when it meets a take-over held because its fill could not be
+        proven (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`),
+        also one the poll held while the cancel's DELETE was in flight
+        (:meth:`execute_cancel`): its working order already executed into a
+        live position, so the replacement would open the entry a second time.
+        Nor does it land on an unbooked take-over whose order is gone without
+        the venue's word that it ended unfilled (:meth:`execute_cancel`).
+        Then nothing is sent and the entry's rows are returned unchanged; for
+        a held take-over the operator is warned (:meth:`_hold_take_over_dispatch`).
+
+        :param old: The entry as the venue holds it.
+        :param new: The entry Pine wants.
+        :return: The replacement's orders, or the entry's unchanged rows as orders.
+        """
+        old_i = old.intent
+        assert isinstance(old_i, EntryIntent)
+        cancel = DispatchEnvelope(
+            intent=CancelIntent(pine_id=old_i.pine_id, symbol=old_i.symbol),
+            run_tag=new.run_tag,
+            bar_ts_ms=new.bar_ts_ms,
+            retry_seq=new.retry_seq,
+            coid_max_len=new.coid_max_len,
+        )
+        if await self.execute_cancel(cancel):
+            return await self.execute_entry(new)
+        kept: list[ExchangeOrder] = []
+        if self.store_ctx is not None:
+            for row in self.store_ctx.iter_live_orders():
+                extras = row.extras or {}
+                if (row.pine_entry_id != old_i.pine_id
+                        or extras.get('kind') not in (ENTRY_KIND_WORKING, ENTRY_KIND_POSITION)):
+                    continue
+                if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                    self._hold_take_over_dispatch(row, 'modify')
+                kept.append(self._row_to_exchange_order(row, old_i))
+        return kept
 
     @override
     async def modify_exit(

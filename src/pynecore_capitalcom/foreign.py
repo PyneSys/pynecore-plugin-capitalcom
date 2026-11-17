@@ -12,7 +12,9 @@ direction:
   bracketed by the one-way emulator. Each foreign deal is logged once (INFO
   plus a ``foreign_deal_on_epic`` audit event). A deal an own entry still
   waiting for its ``dealId`` may have opened is not provably foreign: it is
-  logged only once that entry resolved elsewhere.
+  logged only once that entry resolved elsewhere. The deal of a take-over held
+  because its fill could not be proven is neither own exposure nor logged: it
+  stays out of every write until the operator settles the row.
 * **Never netted.** A netting ``POST /positions`` cannot name a ``dealId``: the
   venue applies a reduce POST or an opposite market entry FIFO to the oldest
   deal on the side it reduces (measured 2026-05-28, research dossier §9 #13).
@@ -54,6 +56,7 @@ from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 from ._base import _CapitalComBase
 from .helpers import (
     EXTRAS_KEY_NETTED_FOREIGN_DEAL,
+    EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _parse_iso_timestamp,
     _wire_float,
     _wire_id,
@@ -123,7 +126,11 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         own row (a working order, or a market entry the venue executed through
         its working-order machinery under a fresh ``dealId``). Rows a previous
         design seeded for untracked venue deals at startup are not evidence of
-        ownership.
+        ownership, and neither is a take-over held because its fill could not
+        be proven (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`):
+        its deal is not the bot's booked exposure, so the one-way emulator
+        never closes or nets it and the aggregate position leaves it out
+        (:meth:`_held_take_over_refs` keeps it from reading as foreign).
 
         :param positions: ``GET /positions`` rows.
         :return: The owned ``dealId`` values, or ``None`` without a journal
@@ -137,6 +144,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             extras = row.extras or {}
             if (extras.get(EXTRAS_KEY_LEG_KIND) is not None
                     or extras.get(ADOPTED_STARTUP_EXTRA_KEY)
+                    or extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None
                     or extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)):
                 continue
             if row.exchange_order_id:
@@ -183,6 +191,31 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
                             row.created_ts_ms / 1000.0))
         return entries
 
+    def _held_take_over_refs(self) -> set[str]:
+        """The venue ids of the take-overs held because their fill could not be proven.
+
+        Per row stamped
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`: the
+        deal the stamp recorded, and the row's own order id, which the deal of
+        an executed working order back-links. Such a deal is not the bot's
+        booked exposure, and not provably someone else's either: it is never
+        closed, amended or netted, and it is not reported as foreign.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return set()
+        refs: set[str] = set()
+        for row in store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is None:
+                continue
+            if row.exchange_order_id:
+                refs.add(row.exchange_order_id)
+            deal_id = _wire_id((extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) or {}).get('deal_id'))
+            if deal_id is not None:
+                refs.add(deal_id)
+        return refs
+
     def _foreign_deals(
             self, positions: Iterable[dict], symbol: str, *, direction: str | None = None,
     ) -> list[dict]:
@@ -190,7 +223,8 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
 
         A deal that may be the result of an own entry still waiting for its
         ``dealId`` (:meth:`_unconfirmed_own_entries`: same direction, created
-        around the time the entry was sent) is not provably foreign: its dict
+        around the time the entry was sent), or the deal of a held take-over
+        (:meth:`_held_take_over_refs`), is not provably foreign: its dict
         carries ``ownership_pending=True``.
 
         :param positions: ``GET /positions`` rows (account-wide).
@@ -206,6 +240,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             return []
         foreign: list[dict] = []
         unconfirmed: list[tuple[str, float]] | None = None
+        held: set[str] | None = None
         for raw in rows:
             position = raw.get('position') or {}
             deal_id = _wire_id(position.get('dealId'))
@@ -215,6 +250,12 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             if direction is not None and deal_direction != direction:
                 continue
             deal = _describe_deal(position)
+            if held is None:
+                held = self._held_take_over_refs()
+            if deal_id in held or _wire_id(position.get('workingOrderId')) in held:
+                deal['ownership_pending'] = True
+                foreign.append(deal)
+                continue
             if unconfirmed is None:
                 unconfirmed = self._unconfirmed_own_entries()
             created = _parse_iso_timestamp(str(position.get('createdDateUTC') or ''))

@@ -169,12 +169,53 @@ _UNANNOUNCED_FILL_GRACE_S = 10.0
 #: Largest ``lastPeriod`` ``GET /history/activity`` accepts (one day).
 _ACTIVITY_MAX_PERIOD_S = 86400
 
+#: Shortest time between two activity lookups of one inherited entry
+#: submission the engine holds (``reconcile.py``,
+#: ``_resolve_inherited_submissions``). Each lookup is one extra
+#: ``/history/activity`` read beside the poll's own three reads per
+#: :data:`_POLL_INTERVAL_S`; at this spacing the three conclusive absences the
+#: resolver needs come from reads at least 30 s apart, and a held row costs
+#: one extra read per ten polls.
+_INHERITED_LOOKUP_INTERVAL_S = 15.0
+
 #: ``orders.extras`` key stamped on a parked (``disposition_unknown``) entry
 #: row when a cancel intent reached it before the venue handed back a deal
 #: id. The parked-submission resolver honours it the moment the id lands:
 #: a working order is DELETEd right away, a filled market entry makes the
 #: cancel a no-op. Value: ``{'cancel_coid': ..., 'intent_key': ...}``.
 EXTRAS_KEY_CANCEL_REQUESTED = 'cancel_requested'
+
+#: ``orders.extras`` key stamped on a working entry row whose deal id was
+#: learned only after the venue may already have executed it: a parked or
+#: inherited submission taken over (``reconcile.py``,
+#: ``_take_over_parked_submission``). The execution's activity may have been
+#: read while no row owned the order, so until the fill is booked every
+#: snapshot reconcile that misses the order looks for the position that
+#: back-links it. Value: epoch seconds of the take-over.
+EXTRAS_KEY_TAKEN_OVER_AT = 'taken_over_at'
+
+#: ``orders.extras`` key stamped on a taken-over entry row (``reconcile.py``,
+#: ``_take_over_parked_submission``) whose position the ``/positions``
+#: snapshot shows at a size other than the submitted quantity. Such a fill is
+#: not booked: the position may have been reduced before the snapshot, and no
+#: venue evidence tells which of the close activities that may still reach the
+#: row the snapshot already shows. The row stays unbooked, the engine keeps
+#: the entry held, a stamped working row is exempt from the disappearance
+#: tracker (its absence from ``/workingorders`` is the execution, not a
+#: cancel), the activity poll books none of the row's activities (no
+#: promotion, fill or cancel through its order id or a position back-linking
+#: it), the recovery pass of a reconnect or a fresh process neither confirms,
+#: moves nor retires the row (``recovery.py``, ``_hold_unproven_take_over``),
+#: an engine cancel or amend of the entry is not sent and does not settle
+#: (``execution.py``, ``_hold_take_over_dispatch``: the cancel reports not
+#: landed, the amend returns the row unchanged, nothing is re-sent), the
+#: in-run lookup of an inherited row never reads it as absent (``recovery.py``,
+#: ``_inherited_submission_verdict``), its deal is neither own exposure nor
+#: reported as foreign, so no close, reversal or netting write reaches it
+#: (``foreign.py``, ``_held_take_over_refs``), and the operator is warned once,
+#: when the stamp is written.
+#: Value: ``{'deal_id': ..., 'size': ..., 'at': ...}``.
+EXTRAS_KEY_TAKE_OVER_UNPROVEN = 'take_over_unproven'
 
 #: ``orders.extras`` key on a position row: the own closes sent against the
 #: position, each ``{'full', 'size', 'sent_at', 'done_at', 'matched'}``. A

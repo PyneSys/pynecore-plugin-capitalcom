@@ -11,11 +11,13 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
+import pynecore_capitalcom.activity as activity_module
 import pynecore_capitalcom.streaming as streaming_module
 from pynecore.core.broker.exceptions import (
     AuthenticationError,
     BracketAttachAfterFillRejectedError,
     BrokerError,
+    ExchangeConnectionError,
     ExchangeRateLimitError,
     ExchangeOrderRejectedError,
     VenueWritesQuarantinedError,
@@ -14971,3 +14973,43 @@ def __test_pyramided_exit_moving_to_a_pending_trail_clears_the_old_levels__(tmp_
         row = ctx.get_order(coid)
         assert row is not None and (row.extras or {}).get('trail_state') == 'pending'
     store.close()
+
+
+# === Order poll outage visibility ==========================================
+
+def __test_order_poll_outage_is_logged_once_and_its_recovery_too__(monkeypatch, caplog):
+    # The poll is the venue's only order channel: its outage must show in the
+    # plugin's own log, without one line per failed poll.
+    class _Done(Exception):
+        pass
+
+    broker = _FakeBroker(config=_make_config())
+    outcomes = iter([ExchangeConnectionError("venue down")] * 3 + [None, _Done()])
+
+    async def _poll_once():
+        outcome = next(outcomes)
+        if outcome is not None:
+            raise outcome
+        return
+        yield
+
+    async def _no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(broker, '_poll_once', _poll_once)
+    monkeypatch.setattr(activity_module.asyncio, 'sleep', _no_wait)
+
+    async def _run():
+        stream = broker.watch_orders()
+        with pytest.raises(_Done):
+            await stream.__anext__()
+
+    with caplog.at_level(logging.DEBUG, logger='pynecore_capitalcom.activity'):
+        asyncio.run(_run())
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "Capital.com order poll failed (transient, 1 consecutive): venue down",
+        "Capital.com order poll recovered after 3 failed poll(s)",
+    ]
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert len([m for m in debug if 'order poll failed' in m]) == 2
