@@ -19,7 +19,11 @@ updates) over a single WS endpoint. This mix-in owns:
   for a close the socket missed. The plugin itself recovers no bar; it
   declares the venue's history properties instead
   (:attr:`~_StreamingMixin.history_has_idle_bars`,
-  :attr:`~_StreamingMixin.history_publish_lag`).
+  :attr:`~_StreamingMixin.history_publish_lag`,
+  :attr:`~_StreamingMixin.history_revises_before_lag`,
+  :attr:`~_StreamingMixin.stream_closes_match_history`): every closed bar the
+  strategy runs on comes from ``/prices``, the socket's close only stands in when
+  the history has not answered by the close's deadline.
 
 State touched: ``_ws``, ``_update_queue``, ``_listen_task``,
 ``_ping_task``, ``_feed_watchdog_task``, ``_last_payload_ts``,
@@ -102,7 +106,28 @@ class _StreamingMixin(_CapitalComBase, ABC):
     """
 
     history_publish_lag = 10.0
-    """Seconds after a close until ``/prices`` returns the closed bar."""
+    """Seconds after a close until ``/prices`` returns the closed bar with its final values.
+
+    Measured 2026-11-17 on 20 one-minute closes, polled every second: the revision
+    came 7-8 s after the close every time, and the bar did not change again.
+    """
+
+    history_revises_before_lag = True
+    """``/prices`` returns a slot right at its close, then revises it once.
+
+    The bar answered at the close lacks the slot's last price updates; its final
+    values arrive within :attr:`~_StreamingMixin.history_publish_lag`.
+    """
+
+    stream_closes_match_history = False
+    """The ``ohlc.event`` candle is not the ``/prices`` bar.
+
+    The venue builds the socket candle from the throttled ``quote`` stream (it equals
+    the OHLC of the quotes the socket delivered), while ``/prices`` aggregates every
+    price update: measured 2026-11-17, a fifth of the socket closes differed from
+    ``/prices`` in a calm hour and every one in a volatile stretch, by up to hundreds
+    of ticks. The framework therefore takes every closed bar from the history.
+    """
 
     _connection_generation: int = 0
     _last_disconnect_evidence: StreamDisconnectEvidence | None = None

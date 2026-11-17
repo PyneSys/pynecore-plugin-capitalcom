@@ -310,6 +310,9 @@ def __test_capitalcom_declares_its_history__():
     assert issubclass(CapitalCom, LiveProviderPlugin)
     assert CapitalCom.history_has_idle_bars is False
     assert CapitalCom.history_publish_lag == 10.0
+    # ``/prices`` revises a fresh bar, and the socket candle is not the history's
+    assert CapitalCom.history_revises_before_lag is True
+    assert CapitalCom.stream_closes_match_history is False
 
 
 # === (a) Outage bars arrive through the framework's fill ====================
