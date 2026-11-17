@@ -969,13 +969,12 @@ class CapitalComProfile(ReferenceVenueProfile):
                 int(bar.replace(tzinfo=UTC).timestamp())
                 for bar in provider.reopen_bars
             ]
-            provider._last_bar_timestamp = friday_ts
             current_open = reopen_ts[-1] + 60
-            payloads = provider._fetch_reconnect_gap_payloads(current_open)
+            payloads = provider._fetch_closed_bar_payloads(friday_ts, current_open)
             actual = [int(payload["t"] / 1000) for payload in payloads]
             if actual != reopen_ts:
                 raise AssertionError(
-                    "Capital.com weekend reconnect handoff did not replay only "
+                    "Capital.com weekend history backfill did not return only "
                     f"venue-returned reopen bars: {actual} != {reopen_ts}"
                 )
 
@@ -1132,36 +1131,36 @@ class CapitalComProfile(ReferenceVenueProfile):
                         "shared OHLCV reader observed header-only file"
                     )
             return True
-        if step.kind == "capital_reconnect_history_repair_probe":
+        if step.kind == "capital_history_backfill_probe":
             start = datetime(2025, 1, 6, 9, 0)
             bars = [
                 start + timedelta(minutes=5),
                 start + timedelta(minutes=15),
                 start + timedelta(minutes=20),
             ]
-            repair_dir = runner.workdir / "capital-reconnect-history"
-            repair_dir.mkdir(parents=True, exist_ok=True)
+            backfill_dir = runner.workdir / "capital-history-backfill"
+            backfill_dir.mkdir(parents=True, exist_ok=True)
             requested: list[datetime] = []
             provider = OfflinePriceCapitalCom(
                 bars=bars,
                 requested=requested,
-                ohlcv_dir=repair_dir,
+                ohlcv_dir=backfill_dir,
             )
-            provider._last_bar_timestamp = int(start.replace(tzinfo=UTC).timestamp())
+            since = int(start.replace(tzinfo=UTC).timestamp())
             current_open = int(
                 (start + timedelta(minutes=20)).replace(tzinfo=UTC).timestamp()
             )
-            payloads = provider._fetch_reconnect_gap_payloads(current_open)
+            payloads = provider._fetch_closed_bar_payloads(since, current_open)
             actual = [int(payload["t"] / 1000) for payload in payloads]
             expected = [int(bar.replace(tzinfo=UTC).timestamp()) for bar in bars[:2]]
             if actual != expected:
                 raise AssertionError(
-                    "Capital.com reconnect did not restore exact REST history "
+                    "Capital.com history backfill did not return exact REST history "
                     f"without inventing the venue gap: {actual} != {expected}"
                 )
             if requested != [start + timedelta(minutes=5)]:
                 raise AssertionError(
-                    f"Capital.com reconnect history cursor mismatch: {requested}"
+                    f"Capital.com history backfill cursor mismatch: {requested}"
                 )
             return True
         if step.kind == "capital_activity_close":
@@ -1629,10 +1628,10 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             steps=(Step("capital_header_only_ohlcv_control"),),
         ),
         Scenario(
-            name="capitalcom-reconnect-restores-real-history-and-preserves-session-gap",
+            name="capitalcom-history-backfill-returns-real-bars-and-preserves-session-gap",
             profile_factory=CapitalComProfile,
             seed=seed,
-            steps=(Step("capital_reconnect_history_repair_probe"),),
+            steps=(Step("capital_history_backfill_probe"),),
         ),
         Scenario(
             name="capitalcom-weekend-close-open-handoff-preserves-session-gaps",

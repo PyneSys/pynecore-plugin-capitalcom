@@ -307,9 +307,9 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # ``Any`` keeps the annotation portable across versions.
     _ws: Any
     _ws_session_invalid: bool
-    # Bar OPEN of the most recent emitted closed bar, in epoch SECONDS —
-    # the axis every REST call, session-calendar check and watchdog
-    # deadline in this plugin runs on. The emitted
+    # Bar OPEN of the most recent emitted closed bar (or the warmup
+    # tail), in epoch SECONDS — the axis every REST call and
+    # session-calendar check in this plugin runs on. The emitted
     # :class:`~pynecore.types.ohlcv.OHLCV` carries the same instant in
     # milliseconds, so the two must never be compared directly.
     _last_bar_timestamp: int | None
@@ -318,15 +318,11 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     _listen_task: asyncio.Task | None
     _ping_task: asyncio.Task | None
     _feed_watchdog_task: asyncio.Task | None
-    _ohlc_watchdog_task: asyncio.Task | None
     _volume_backfill_task: asyncio.Task | None
     _raw_ohlc_queue: asyncio.Queue | None
     _last_bid: float | None
     _last_ask: float | None
     _last_payload_ts: float
-    _last_ohlc_event_ts: float
-    _last_quote_event_ts: float
-    _last_bar_open_ts: float
 
     # --- WS-primary volume state ---
     # Per-bar quote tick buckets keyed by bar OPEN time (seconds, UTC).
@@ -446,11 +442,11 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     # --- Session calendar cache ---
     # Latest ``SymInfo`` returned by ``update_symbol_info``. Used by the
-    # streaming watchdogs to suppress active WS-close calls (REST recovery
-    # + ohlc-stale reconnect) while the market is in a known-closed
-    # window. ``None`` until ``update_symbol_info`` has run at least once
-    # — watchdogs treat that as 24/7 fallback to preserve legacy
-    # behaviour during early init or for plugins that never call it.
+    # feed-staleness watchdog to suppress its active WS close while the
+    # market is in a known-closed window, and by the intervention path.
+    # ``None`` until ``update_symbol_info`` has run at least once — the
+    # watchdog treats that as 24/7 fallback during early init or for
+    # plugins that never call it.
     _sym_info: SymInfo | None
 
     # ------------------------------------------------------------------

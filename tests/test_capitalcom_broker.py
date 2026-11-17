@@ -6308,9 +6308,7 @@ def __test_listen_loop_sentinel_targets_local_queue_not_successor__(tmp_path):
     assert payload is None
 
 
-def __test_listen_loop_drops_premature_ohlc_without_advancing_liveness__(
-        monkeypatch,
-):
+def __test_listen_loop_drops_premature_ohlc__(monkeypatch):
     broker = _FakeBroker(
         symbol="EURUSD",
         timeframe="1",
@@ -6344,8 +6342,6 @@ def __test_listen_loop_drops_premature_ohlc_without_advancing_liveness__(
     assert event_type == "disconnect"
     assert payload is None
     assert broker._raw_ohlc_queue.empty()
-    assert broker._last_ohlc_event_ts == 1_061.0
-    assert broker._last_bar_open_ts == 1_000.0
 
 
 def __test_listen_loop_defers_near_boundary_ohlc_until_local_close__(
@@ -6372,11 +6368,14 @@ def __test_listen_loop_defers_near_boundary_ohlc_until_local_close__(
         lambda: 1_059.995 + time.monotonic() - started,
     )
 
-    async def runner() -> tuple[float, float, tuple[str, dict], tuple[str, None]]:
+    forwarded_at: list[float] = []
+
+    async def runner() -> tuple[tuple[str, dict], tuple[str, None]]:
         class _ObservedQueue(asyncio.Queue):
             async def put(self, item) -> None:
                 await super().put(item)
                 if item[0] == "ohlc":
+                    forwarded_at.append(streaming_module.epoch_time())
                     released.set()
 
         broker._raw_ohlc_queue = _ObservedQueue()
@@ -6403,12 +6402,12 @@ def __test_listen_loop_defers_near_boundary_ohlc_until_local_close__(
         await broker._listen_loop()
         first = broker._raw_ohlc_queue.get_nowait()
         second = broker._raw_ohlc_queue.get_nowait()
-        return broker._last_ohlc_event_ts, broker._last_bar_open_ts, first, second
+        return first, second
 
-    event_ts, bar_ts, first, second = asyncio.run(runner())
+    first, second = asyncio.run(runner())
 
-    assert event_ts >= 1_060.0
-    assert bar_ts == 1_000.0
+    # Forwarded only once the bar's own close (1_060 s) had passed locally
+    assert len(forwarded_at) == 1 and forwarded_at[0] >= 1_060.0
     assert first[0] == "ohlc"
     assert first[1]["t"] == 1_000_000
     assert second == ("disconnect", None)
@@ -6470,8 +6469,6 @@ def __test_listen_loop_cancels_near_boundary_ohlc_on_generation_change__(
     items = asyncio.run(runner())
 
     assert items == [("disconnect", None)]
-    assert broker._last_ohlc_event_ts == 0.0
-    assert broker._last_bar_open_ts == 0.0
 
 
 def __test_listen_loop_flags_session_invalid_error_frame__():
@@ -6654,292 +6651,6 @@ def __test_connect_reauthenticates_after_session_invalid__(monkeypatch):
     asyncio.run(runner())
 
 
-def __test_ohlc_watchdog_reconnects_after_consecutive_rest_recoveries__(monkeypatch, caplog):
-    """Repeated REST recovery means the OHLC subscription is stale, not healthy.
-
-    A single dropped ``ohlc.event`` is worth patching from REST. Multiple
-    consecutive REST-recovered bars mean the WebSocket can be alive while the
-    OHLC subscription is dead; the watchdog must emit the recovered bars and
-    then force a reconnect instead of resetting the real-event silence timer.
-    """
-    broker = _FakeBroker(
-        symbol="EURUSD",
-        timeframe="1",
-        config=_make_config(),
-    )
-    broker._update_queue = asyncio.Queue()
-    broker._raw_ohlc_queue = asyncio.Queue()
-    broker._last_bar_open_ts = 1_000.0
-    broker._last_ohlc_event_ts = 1_000.0
-
-    class _DummyWS:
-        close_code = None
-
-        def __init__(self):
-            self.close_calls: list[tuple[int | None, str | None]] = []
-
-        async def close(self, code=None, reason=None):
-            self.close_calls.append((code, reason))
-            self.close_code = code
-
-    ws = _DummyWS()
-    broker._ws = ws  # type: ignore[assignment]
-
-    wake_times = iter([1_131.0, 1_191.0, 1_252.0])
-    now = {"t": 1_000.0}
-    original_sleep = asyncio.sleep
-
-    async def fake_sleep(_delay):
-        now["t"] = next(wake_times)
-        broker._last_quote_event_ts = now["t"]
-        await original_sleep(0)
-
-    async def fake_to_thread(func, *args, **kwargs):
-        return func(*args, **kwargs)
-
-    fetches: list[int] = []
-
-    def fake_fetch_bar_payload(timestamp: int) -> dict:
-        fetches.append(timestamp)
-        return {
-            "priceType": "bid",
-            "t": timestamp * 1000,
-            "o": 1.0,
-            "h": 1.1,
-            "l": 0.9,
-            "c": 1.05,
-            "_volume": 123.0,
-        }
-
-    monkeypatch.setattr('pynecore_capitalcom.streaming.epoch_time',
-                        lambda: now["t"])
-    monkeypatch.setattr('pynecore_capitalcom.streaming.asyncio.sleep',
-                        fake_sleep)
-    monkeypatch.setattr('pynecore_capitalcom.streaming.asyncio.to_thread',
-                        fake_to_thread)
-    monkeypatch.setattr(broker, '_fetch_bar_payload',
-                        fake_fetch_bar_payload)
-
-    async def runner():
-        task = asyncio.create_task(broker._ohlc_watchdog_loop())
-        try:
-            for _ in range(10):
-                await original_sleep(0)
-                if ws.close_calls:
-                    break
-        finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-    caplog.set_level(logging.INFO, logger='pynecore')
-    asyncio.run(runner())
-
-    assert fetches == [1_060, 1_120]
-    # A bar the venue's REST supplied is whole data: an INFO note, not a warning
-    injected = [rec.levelno for rec in caplog.records if 'ohlc.event missed' in rec.getMessage()]
-    assert injected == [logging.INFO, logging.INFO]
-    assert ws.close_calls == [(4001, "ohlc-rest-recovered-stale")]
-    assert broker._last_ohlc_event_ts == 1_000.0
-    assert broker.take_stream_disconnect_evidence() == (
-        streaming_module.StreamDisconnectEvidence(
-            streaming_module.StreamDisconnectOrigin.OHLC_WATCHDOG,
-            streaming_module.StreamDisconnectReason.OHLC_REST_RECOVERED_STALE,
-            0,
-        )
-    )
-
-    # Recovered bars enter the raw queue, not the consumer queue: the volume
-    # backfill worker is the single writer of ``_update_queue``, so a bar it
-    # is still enriching cannot be overtaken by a later recovered slot.
-    assert broker._update_queue.empty()
-    recovered = []
-    while not broker._raw_ohlc_queue.empty():
-        event_type, payload = broker._raw_ohlc_queue.get_nowait()
-        recovered.append((event_type, payload["t"]))
-    assert recovered == [
-        (streaming_module._RECOVERED_OHLC_EVENT, 1_060_000),
-        (streaming_module._RECOVERED_OHLC_EVENT, 1_120_000),
-    ]
-
-
-def __test_ohlc_watchdog_keeps_socket_after_exact_rest_absent_slot__(monkeypatch):
-    """One exact REST-absent slot must not be classified as WS degradation."""
-    broker = _FakeBroker(
-        symbol="EURUSD",
-        timeframe="1",
-        config=_make_config(),
-    )
-    broker._update_queue = asyncio.Queue()
-    broker._raw_ohlc_queue = asyncio.Queue()
-    broker._last_bar_open_ts = 1_000.0
-    broker._last_ohlc_event_ts = 1_000.0
-
-    class _DummyWS:
-        close_code = None
-
-        def __init__(self):
-            self.close_calls: list[tuple[int | None, str | None]] = []
-
-        async def close(self, code=None, reason=None):
-            self.close_calls.append((code, reason))
-            self.close_code = code
-
-    ws = _DummyWS()
-    broker._ws = ws  # type: ignore[assignment]
-    wake_times = iter([1_131.0, 1_152.0, 1_191.0])
-    now = {"t": 1_000.0}
-    original_sleep = asyncio.sleep
-
-    async def fake_sleep(_delay):
-        try:
-            now["t"] = next(wake_times)
-        except StopIteration:
-            await asyncio.Event().wait()
-            return
-        broker._last_quote_event_ts = now["t"]
-        await original_sleep(0)
-
-    async def fake_to_thread(func, *args, **kwargs):
-        return func(*args, **kwargs)
-
-    fetches: list[int] = []
-
-    def fake_fetch_bar_payload(timestamp: int) -> dict | None:
-        fetches.append(timestamp)
-        if timestamp != 1_120:
-            return None
-        return {
-            "priceType": "bid",
-            "t": timestamp * 1000,
-            "o": 1.0,
-            "h": 1.1,
-            "l": 0.9,
-            "c": 1.05,
-            "_volume": 123.0,
-        }
-
-    monkeypatch.setattr(
-        "pynecore_capitalcom.streaming.epoch_time",
-        lambda: now["t"],
-    )
-    monkeypatch.setattr(
-        "pynecore_capitalcom.streaming.asyncio.sleep",
-        fake_sleep,
-    )
-    monkeypatch.setattr(
-        "pynecore_capitalcom.streaming.asyncio.to_thread",
-        fake_to_thread,
-    )
-    monkeypatch.setattr(broker, "_fetch_bar_payload", fake_fetch_bar_payload)
-
-    async def runner():
-        task = asyncio.create_task(broker._ohlc_watchdog_loop())
-        try:
-            for _ in range(20):
-                await original_sleep(0)
-                if not broker._raw_ohlc_queue.empty():
-                    break
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    asyncio.run(runner())
-
-    assert fetches == [1_060, 1_060, 1_120]
-    assert ws.close_calls == []
-    event_type, payload = broker._raw_ohlc_queue.get_nowait()
-    assert event_type == streaming_module._RECOVERED_OHLC_EVENT
-    assert payload["t"] == 1_120_000
-    assert broker._last_bar_open_ts == 1_120.0
-
-
-def __test_ohlc_watchdog_reconnects_after_indeterminate_rest_window__(monkeypatch):
-    broker = _FakeBroker(
-        symbol="EURUSD",
-        timeframe="1",
-        config=_make_config(),
-    )
-    broker._update_queue = asyncio.Queue()
-    broker._raw_ohlc_queue = asyncio.Queue()
-    broker._last_bar_open_ts = 1_000.0
-    broker._last_ohlc_event_ts = 1_000.0
-
-    class _DummyWS:
-        close_code = None
-
-        def __init__(self):
-            self.close_calls: list[tuple[int | None, str | None]] = []
-
-        async def close(self, code=None, reason=None):
-            self.close_calls.append((code, reason))
-            self.close_code = code
-
-    websocket = _DummyWS()
-    broker._ws = websocket  # type: ignore[assignment]
-    wake_times = iter([1_131.0, 1_152.0])
-    now = {"t": 1_000.0}
-    original_sleep = asyncio.sleep
-
-    async def fake_sleep(_delay):
-        try:
-            now["t"] = next(wake_times)
-        except StopIteration:
-            await asyncio.Event().wait()
-            return
-        broker._last_quote_event_ts = now["t"]
-        await original_sleep(0)
-
-    async def fake_to_thread(func, *args, **kwargs):
-        return func(*args, **kwargs)
-
-    fetches: list[int] = []
-
-    def fail_fetch(timestamp: int) -> dict | None:
-        fetches.append(timestamp)
-        raise CapitalComError("authentication unavailable")
-
-    monkeypatch.setattr(
-        "pynecore_capitalcom.streaming.epoch_time",
-        lambda: now["t"],
-    )
-    monkeypatch.setattr(
-        "pynecore_capitalcom.streaming.asyncio.sleep",
-        fake_sleep,
-    )
-    monkeypatch.setattr(
-        "pynecore_capitalcom.streaming.asyncio.to_thread",
-        fake_to_thread,
-    )
-    monkeypatch.setattr(broker, "_fetch_bar_payload", fail_fetch)
-
-    async def runner():
-        task = asyncio.create_task(broker._ohlc_watchdog_loop())
-        try:
-            for _ in range(20):
-                await original_sleep(0)
-                if websocket.close_calls:
-                    break
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    asyncio.run(runner())
-
-    assert fetches == [1_060, 1_060]
-    assert websocket.close_calls == [(4002, "ohlc-rest-indeterminate")]
-    assert broker._update_queue.empty()
-    assert broker.take_stream_disconnect_evidence() == (
-        streaming_module.StreamDisconnectEvidence(
-            streaming_module.StreamDisconnectOrigin.OHLC_WATCHDOG,
-            streaming_module.StreamDisconnectReason.OHLC_REST_INDETERMINATE,
-            0,
-        )
-    )
-
-
 def __test_worker_liveness_reconnect_records_closed_reason_and_generation__():
     broker = _FakeBroker(
         symbol="EURUSD",
@@ -6978,14 +6689,14 @@ def __test_worker_liveness_reconnect_records_closed_reason_and_generation__():
     )
 
 
-def __test_late_ws_bar_after_watchdog_rest_recovery_is_deduplicated__():
-    """A late WS event must not repeat a bar already injected from REST."""
+def __test_repeated_ws_close_of_an_emitted_slot_is_dropped__():
+    """A second ``ohlc.event`` for a slot already emitted must not repeat the bar."""
     broker = _FakeBroker(
         symbol="EURUSD",
         timeframe="1",
         config=_make_config(),
     )
-    recovered = {
+    emitted = {
         "priceType": "bid",
         "t": 1_060_000,
         "o": 1.0,
@@ -6994,10 +6705,10 @@ def __test_late_ws_bar_after_watchdog_rest_recovery_is_deduplicated__():
         "c": 1.05,
         "_volume": 123.0,
     }
-    late_ws = {**recovered, "_volume": 124.0}
+    repeated = {**emitted, "_volume": 124.0}
 
-    first = broker._on_ohlc_event(recovered)
-    duplicate = broker._on_ohlc_event(late_ws)
+    first = broker._on_ohlc_event(emitted)
+    duplicate = broker._on_ohlc_event(repeated)
 
     assert first is not None
     assert first.timestamp == 1_060_000
@@ -7049,16 +6760,13 @@ def __test_quote_synth_opens_the_next_slot_not_the_closed_bar__():
     assert (widened.open, widened.high, widened.low, widened.close) == (1.20, 1.25, 1.20, 1.25)
 
 
-def __test_quote_synth_never_opens_a_slot_ahead_of_the_forming_bar__():
-    """A tick for T+1 must not open that bar while T is still forming.
+def __test_quotes_of_the_next_slot_flow_while_a_ws_close_is_missing__():
+    """A missed ``ohlc.event`` of T must not stop the intra-bar updates of T+1.
 
-    Quotes reach the FIFO the instant they arrive; the close of the old
-    period is forwarded only at the bar boundary (or later, when the venue
-    publishes late), so at every boundary the first tick of the new period
-    races the close of the old one. Opening T+1 from that tick hands the
-    runner a forming bar ahead of the closed bar for T, which then executes
-    with the clock running backwards (measured live: Capital.com lane, 2-30
-    inversions per cycle). The spinner holds until the close lands.
+    The framework settles a slot whose close the socket never delivers from the
+    history or from its ticks, and holds later slots' updates until then, so
+    the plugin hands every tick on: a tick of a later slot opens that slot from
+    its own price, never from the levels of a closed bar.
     """
     from pynecore_capitalcom._base import _QuoteSnapshot
 
@@ -7069,39 +6777,86 @@ def __test_quote_synth_never_opens_a_slot_ahead_of_the_forming_bar__():
     })
     assert closed is not None and closed.is_closed
 
-    # Two slots ahead of the last close: the slot in between has not
-    # closed — held.
+    # Slot 1860 forms, but its WS close never arrives.
     assert broker._synth_from_quote(_QuoteSnapshot(
-        bar_open_s=1920, cumulative_volume=1, bid=1.30, ask=1.31,
-    )) is None
-
-    # The very next slot opens as usual.
-    opened = broker._synth_from_quote(_QuoteSnapshot(
         bar_open_s=1860, cumulative_volume=1, bid=1.20, ask=1.21,
-    ))
-    assert opened is not None and opened.timestamp == 1_860_000
+    )) is not None
 
-    # While 1860 is forming, a tick for 1920 is held — its close has not
-    # landed yet.
+    # The ticks of 1920 open and widen that slot from their own prices.
+    opened = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=1, bid=1.30, ask=1.31,
+    ))
+    assert opened is not None and not opened.is_closed
+    assert opened.timestamp == 1_920_000
+    assert (opened.open, opened.high, opened.low, opened.close) == (1.30, 1.30, 1.30, 1.30)
+    widened = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=2, bid=1.27, ask=1.28,
+    ))
+    assert widened is not None and widened.timestamp == 1_920_000
+    assert (widened.open, widened.high, widened.low, widened.close) == (1.30, 1.30, 1.27, 1.27)
+    assert widened.volume == 2.0
+
+    # A late frame of 1860 does not reopen the older slot over 1920.
+    assert broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1860, cumulative_volume=2, bid=1.90, ask=1.91,
+    )) is None
+    after_late = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=3, bid=1.29, ask=1.30,
+    ))
+    assert after_late is not None
+    assert (after_late.open, after_late.high, after_late.low, after_late.close) == (
+        1.30, 1.30, 1.27, 1.29)
+
+
+def __test_late_ws_close_keeps_the_next_slots_forming_bar__():
+    """A late close of T moves the cursor only; T+1's forming bar stays intact."""
+    from pynecore_capitalcom._base import _QuoteSnapshot
+
+    broker = _FakeBroker(symbol="EURUSD", timeframe="1", config=_make_config())
+    assert broker._on_ohlc_event({
+        "priceType": "bid", "t": 1_800_000,
+        "o": 1.10, "h": 1.12, "l": 1.09, "c": 1.11, "_volume": 100.0,
+    }) is not None
     assert broker._synth_from_quote(_QuoteSnapshot(
         bar_open_s=1920, cumulative_volume=1, bid=1.30, ask=1.31,
-    )) is None
-    # ...and the forming bar itself still widens.
-    widened = broker._synth_from_quote(_QuoteSnapshot(
-        bar_open_s=1860, cumulative_volume=2, bid=1.25, ask=1.26,
-    ))
-    assert widened is not None and widened.timestamp == 1_860_000
+    )) is not None
+    assert broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=2, bid=1.35, ask=1.36,
+    )) is not None
 
-    # The close of 1860 lands; the next tick opens 1920.
+    late_close = broker._on_ohlc_event({
+        "priceType": "bid", "t": 1_860_000,
+        "o": 1.20, "h": 1.25, "l": 1.18, "c": 1.24, "_volume": 5.0,
+    })
+    assert late_close is not None and late_close.is_closed
+    assert late_close.timestamp == 1_860_000
+    assert broker._last_bar_timestamp == 1860
+
+    # The next tick of 1920 extends the bar 1920 already formed, not the late
+    # close of 1860.
+    extended = broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1920, cumulative_volume=3, bid=1.28, ask=1.29,
+    ))
+    assert extended is not None and not extended.is_closed
+    assert extended.timestamp == 1_920_000
+    assert (extended.open, extended.high, extended.low, extended.close) == (
+        1.30, 1.35, 1.28, 1.28)
+
+    # Late ticks of the now-closed 1860 stay dropped; its close is not repeated.
+    assert broker._synth_from_quote(_QuoteSnapshot(
+        bar_open_s=1860, cumulative_volume=6, bid=1.50, ask=1.51,
+    )) is None
     assert broker._on_ohlc_event({
         "priceType": "bid", "t": 1_860_000,
-        "o": 1.20, "h": 1.25, "l": 1.20, "c": 1.24, "_volume": 2.0,
-    }) is not None
-    reopened = broker._synth_from_quote(_QuoteSnapshot(
-        bar_open_s=1920, cumulative_volume=1, bid=1.30, ask=1.31,
-    ))
-    assert reopened is not None and reopened.timestamp == 1_920_000
-    assert (reopened.open, reopened.close) == (1.30, 1.30)
+        "o": 1.20, "h": 1.25, "l": 1.18, "c": 1.24, "_volume": 5.0,
+    }) is None
+
+    # The close of 1920 itself replaces its forming bar as usual.
+    closed_1920 = broker._on_ohlc_event({
+        "priceType": "bid", "t": 1_920_000,
+        "o": 1.30, "h": 1.35, "l": 1.28, "c": 1.29, "_volume": 4.0,
+    })
+    assert closed_1920 is not None and broker._last_bar_ohlcv is closed_1920
 
 
 def __test_reopen_drops_stale_previous_session_ws_bar__(monkeypatch):
@@ -7156,7 +6911,6 @@ def __test_reopen_drops_stale_previous_session_ws_bar__(monkeypatch):
 
     asyncio.run(broker._listen_loop())
 
-    assert broker._last_bar_open_ts == 0.0
     assert broker._raw_ohlc_queue.get_nowait() == ("disconnect", None)
 
 
@@ -12469,14 +12223,14 @@ def __test_call_proactive_refresh_skipped_for_bootstrap_endpoints__(monkeypatch)
 
 # noinspection PyProtectedMember
 
-def __test_reconnect_gap_history_omits_wide_to_and_accepts_closed_session__(
+def __test_closed_bar_history_omits_wide_to_and_accepts_closed_session__(
         monkeypatch,
 ):
-    """Reconnect paging must not submit the full weekend range as ``to``."""
+    """History paging must not submit the full weekend range as ``to``."""
     broker = _FakeBroker(
         config=_make_config(), symbol="EURUSD", timeframe="1",
     )
-    broker._last_bar_timestamp = int(
+    since = int(
         datetime(2026, 8, 7, 20, 59, tzinfo=timezone.utc).timestamp()
     )
     requests: list[tuple[datetime | None, datetime | None, int]] = []
@@ -12504,19 +12258,19 @@ def __test_reconnect_gap_history_omits_wide_to_and_accepts_closed_session__(
     current_bar_open = int(
         datetime(2026, 8, 9, 20, 45, tzinfo=timezone.utc).timestamp()
     )
-    assert broker._fetch_reconnect_gap_payloads(current_bar_open) == []
+    assert broker._fetch_closed_bar_payloads(since, current_bar_open) == []
     assert requests == [(datetime(2026, 8, 7, 21, 0), None, 1000)]
     assert warnings == []
 
 
 # noinspection PyProtectedMember
 
-def __test_reconnect_gap_history_pages_from_last_returned_bar__(monkeypatch):
-    """Each reconnect page starts one timeframe after the prior last row."""
+def __test_closed_bar_history_pages_from_last_returned_bar__(monkeypatch):
+    """Each history page starts one timeframe after the prior last row."""
     broker = _FakeBroker(
         config=_make_config(), symbol="EURUSD", timeframe="1",
     )
-    broker._last_bar_timestamp = int(
+    since = int(
         datetime(2026, 8, 7, 20, 59, tzinfo=timezone.utc).timestamp()
     )
     requests: list[tuple[datetime | None, datetime | None, int]] = []
@@ -12554,7 +12308,7 @@ def __test_reconnect_gap_history_pages_from_last_returned_bar__(monkeypatch):
     current_bar_open = int(
         datetime(2026, 8, 9, 21, 3, tzinfo=timezone.utc).timestamp()
     )
-    payloads = broker._fetch_reconnect_gap_payloads(current_bar_open)
+    payloads = broker._fetch_closed_bar_payloads(since, current_bar_open)
 
     assert requests == [
         (datetime(2026, 8, 7, 21, 0), None, 1000),
@@ -12577,14 +12331,14 @@ def __test_reconnect_gap_history_pages_from_last_returned_bar__(monkeypatch):
         ("unordered_page", ValueError, "not strictly ordered"),
     ],
 )
-def __test_reconnect_gap_history_propagates_indeterminate_failures__(
+def __test_closed_bar_history_propagates_indeterminate_failures__(
         monkeypatch, mode, expected_type, message,
 ):
-    """Reconnect must fail before a newer stream can bypass an unknown gap."""
+    """An unanswered history query raises instead of reading as "no bar"."""
     broker = _FakeBroker(
         config=_make_config(), symbol="EURUSD", timeframe="1",
     )
-    broker._last_bar_timestamp = int(
+    since = int(
         datetime(2026, 8, 9, 20, 59, tzinfo=timezone.utc).timestamp()
     )
 
@@ -12621,7 +12375,7 @@ def __test_reconnect_gap_history_propagates_indeterminate_failures__(
     )
 
     with pytest.raises(expected_type, match=message):
-        broker._fetch_reconnect_gap_payloads(current_bar_open)
+        broker._fetch_closed_bar_payloads(since, current_bar_open)
 
 
 def __test_connect_offloads_create_session_to_thread__(monkeypatch):
@@ -12663,7 +12417,7 @@ def __test_connect_offloads_create_session_to_thread__(monkeypatch):
 
 # noinspection PyProtectedMember
 def __test_connect_rolls_back_partial_init_on_subscribe_failure__(monkeypatch):
-    """A failed subscribe inside ``connect()`` must not leak the five
+    """A failed subscribe inside ``connect()`` must not leak the four
     background tasks or the half-open WebSocket.
 
     Regression: ``connect()`` started the listener/ping/watchdog/backfill
@@ -12710,7 +12464,6 @@ def __test_connect_rolls_back_partial_init_on_subscribe_failure__(monkeypatch):
         assert broker._listen_task is None
         assert broker._ping_task is None
         assert broker._feed_watchdog_task is None
-        assert broker._ohlc_watchdog_task is None
         assert broker._volume_backfill_task is None
         assert broker._ws is None
         assert fake_ws.closed
@@ -13231,10 +12984,10 @@ def __test_market_open_now_returns_true_without_calendar__():
 def __test_market_open_now_false_in_closed_window__():
     """Calendar with a 5-minute weekday window outside wall-clock returns False.
 
-    Verifies the helper that gates ``_feed_watchdog_loop`` and
-    ``_ohlc_watchdog_loop``. Without this gate both would actively close
-    the WS during a known-closed market window (FX weekend) and trigger
-    a reconnect storm via the framework's ``live_runner``.
+    Verifies the helper that gates ``_feed_watchdog_loop``. Without this
+    gate it would actively close the WS during a known-closed market window
+    (FX weekend) and trigger a reconnect storm via the framework's
+    ``live_runner``.
     """
     broker = _FakeBroker(
         symbol="EURUSD", timeframe="1", config=_make_config(),
@@ -13387,7 +13140,6 @@ def _make_volume_broker(tf="1"):
     broker._raw_ohlc_queue = asyncio.Queue()
     broker._update_queue = asyncio.Queue()
     broker._ws_quote_buckets = {}
-    broker._ws_recovered_slots = set()
     broker._ws_volume_baseline = _collections.deque(
         maxlen=_WS_VOLUME_BASELINE_BARS,
     )
@@ -13652,92 +13404,6 @@ def __test_ws_volume_rest_agreeing_low_bars_do_not_force_reconnect__():
     assert rest_calls == [base_open, base_open + 60]
     assert broker._ws.close_calls == []
     assert broker._ws_bad_bar_streak == 0
-
-
-def __test_ws_volume_recovered_slot_does_not_count_toward_stale_streak__():
-    """A slot the OHLC watchdog injected from REST is not enriched a second time.
-
-    The watchdog already published the slot with REST's exact volume, so the
-    late WS copy is dropped: no REST lookup, no median estimate, no streak.
-    """
-    import collections as _collections
-
-    broker = _make_volume_broker(tf="1")
-    base_open = 1_700_000_000
-    broker._ws_coverage_started_at = float(base_open) - 60.0
-    broker._ws_volume_baseline = _collections.deque(
-        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
-    )
-    # The watchdog recovered both slots and dropped their quote
-    # buckets; the late WS copies arrive with ws_vol == 0.
-    broker._ws_recovered_slots = {base_open, base_open + 60}
-
-    rest_calls: list[int] = []
-
-    def _fake_fetch(ts: int) -> float:
-        rest_calls.append(ts)
-        return 100.0
-
-    frames = []
-    for off in (0, 60):
-        frames.append(("ohlc", {
-            "priceType": "bid", "t": (base_open + off) * 1000,
-            "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05,
-        }))
-    asyncio.run(_run_worker_until_drained(
-        broker, frames, fake_fetch_bar_volume=_fake_fetch,
-        now_ts=float(base_open) + 65.0,
-    ))
-
-    items = [item for item in _drain_update_queue(broker)
-             if item is not None]
-    assert items == []
-    assert rest_calls == []
-    assert broker._ws.close_calls == []
-    assert broker._ws_bad_bar_streak == 0
-    # Processed slots are forgotten so the set cannot grow unbounded.
-    assert broker._ws_recovered_slots == set()
-
-
-def __test_ws_volume_late_copy_of_a_recovered_bar_is_dropped_quietly__(caplog):
-    """A watchdog-recovered bar reaches the consumer once, with REST's exact volume.
-
-    Live (capitalcom cycle 387, 2026-11-08): the WS ``ohlc.event`` of a slot
-    the watchdog had already injected from REST arrived late, after the synth
-    budget. Its quote bucket was gone, so the worker skipped a REST lookup
-    and emitted a median estimate, both as warnings, for a bar the consumer
-    then dropped as a duplicate.
-    """
-    import collections as _collections
-
-    broker = _make_volume_broker(tf="1")
-    bar_open_s = 1_700_000_000
-    broker._ws_coverage_started_at = float(bar_open_s) - 60.0
-    broker._ws_volume_baseline = _collections.deque(
-        [100] * 6, maxlen=_WS_VOLUME_BASELINE_BARS,
-    )
-    broker._ws_recovered_slots = {bar_open_s}
-    bar = {"priceType": "bid", "t": bar_open_s * 1000,
-           "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05}
-    rest_calls: list[int] = []
-
-    def _fake_fetch(ts: int) -> float:
-        rest_calls.append(ts)
-        return 0.0
-
-    caplog.set_level(logging.INFO, logger='pynecore')
-    asyncio.run(_run_worker_until_drained(
-        broker,
-        [(streaming_module._RECOVERED_OHLC_EVENT, {**bar, "_volume": 124.0}),
-         ("ohlc", dict(bar))],
-        fake_fetch_bar_volume=_fake_fetch,
-        now_ts=float(bar_open_s) + 96.0,
-    ))
-
-    items = [item for item in _drain_update_queue(broker) if item is not None]
-    assert [(kind, payload["_volume"]) for kind, payload in items] == [("ohlc", 124.0)]
-    assert rest_calls == []
-    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
 
 
 def __test_ws_volume_rest_failed_emits_median__(caplog):

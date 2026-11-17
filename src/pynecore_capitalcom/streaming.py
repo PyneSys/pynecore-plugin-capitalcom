@@ -14,6 +14,12 @@ updates) over a single WS endpoint. This mix-in owns:
   ``asyncio.Queue`` consumed by ``watch_ohlcv``.
 * The intra-bar synth pipeline (``_synth_from_quote``) so the live
   spinner sees fresh bid/ask between closed-bar pushes.
+* The closed-bar history query (``backfill_closed_bars``) the framework
+  uses to fill every gap of the stream: at startup, after a reconnect and
+  for a close the socket missed. The plugin itself recovers no bar; it
+  declares the venue's history properties instead
+  (:attr:`~_StreamingMixin.history_has_idle_bars`,
+  :attr:`~_StreamingMixin.history_publish_lag`).
 
 State touched: ``_ws``, ``_update_queue``, ``_listen_task``,
 ``_ping_task``, ``_feed_watchdog_task``, ``_last_payload_ts``,
@@ -37,7 +43,7 @@ from websockets.exceptions import WebSocketException
 
 from pynecore.core.plugin import override
 from pynecore.lib.log import broker_info, broker_warning
-from pynecore.core.session import is_in_session, is_point_in_session
+from pynecore.core.session import is_point_in_session
 from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
@@ -55,20 +61,11 @@ from .helpers import (
 
 _OHLC_CLOSE_CLOCK_SKEW_TOLERANCE_S = 3.0
 
-#: ``_raw_ohlc_queue`` tag for a bar the OHLC watchdog recovered from REST.
-#: The payload already carries an authoritative ``_volume``, so the volume
-#: backfill worker forwards it verbatim (as a plain ``"ohlc"`` update) instead
-#: of resolving volume for it again. Routing recoveries through the raw queue
-#: is what keeps ``_update_queue`` single-writer: a recovered bar can never
-#: overtake an earlier bar the worker is still enriching.
-_RECOVERED_OHLC_EVENT = "ohlc-recovered"
-
 
 class StreamDisconnectOrigin(StrEnum):
     """Closed origin vocabulary for WebSocket disconnect evidence."""
 
     REMOTE = "remote"
-    OHLC_WATCHDOG = "ohlc-watchdog"
     QUOTE_VOLUME_WATCHDOG = "quote-volume-watchdog"
     WORKER_LIVENESS = "worker-liveness"
 
@@ -80,8 +77,6 @@ class StreamDisconnectReason(StrEnum):
     LISTENER_ERROR = "listener-error"
     SESSION_INVALID = "session-invalid"
     FEED_STALE = "feed-stale"
-    OHLC_REST_RECOVERED_STALE = "ohlc-rest-recovered-stale"
-    OHLC_REST_INDETERMINATE = "ohlc-rest-indeterminate"
     QUOTE_VOLUME_STALE = "quote-volume-stale"
     FRESH_STREAM_STALE = "fresh-stream-stale"
 
@@ -97,6 +92,17 @@ class StreamDisconnectEvidence:
 
 class _StreamingMixin(_CapitalComBase, ABC):
     """WebSocket streaming mix-in: connect / listen / ping / watchdog / synth."""
+
+    history_has_idle_bars = False
+    """``/prices`` has no bar for a slot without a price update.
+
+    The venue answers such a slot with ``error.prices.not-found`` or leaves it out
+    of the page, also inside the session, so the framework emits no bar for it
+    either.
+    """
+
+    history_publish_lag = 10.0
+    """Seconds after a close until ``/prices`` returns the closed bar."""
 
     _connection_generation: int = 0
     _last_disconnect_evidence: StreamDisconnectEvidence | None = None
@@ -168,17 +174,15 @@ class _StreamingMixin(_CapitalComBase, ABC):
         Returns True when ``_sym_info`` is unset or its ``opening_hours``
         is empty — preserves legacy behaviour for 24/7 instruments and
         for the early-init window before ``update_symbol_info`` lands a
-        ``SymInfo``. The streaming watchdogs consult this to suppress
-        active WS-close calls (REST recovery + ohlc-stale reconnect)
-        during known-closed windows; if the WS dies on its own anyway
-        (e.g. Capital.com's 10-minute inactivity timeout over a
-        weekend) the framework reconnect loop is itself gated on the
+        ``SymInfo``. The feed-staleness watchdog consults this to suppress
+        its active WS close during known-closed windows; if the WS dies on
+        its own anyway (e.g. Capital.com's 10-minute inactivity timeout over
+        a weekend) the framework reconnect loop is itself gated on the
         same calendar.
 
         Point-in-time semantics: does **not** extend wall-clock by one
         timeframe, so a higher TF (1h, 1D) cannot report the market as
-        already open one TF before its real session start. The slot-
-        aware variant for bar decisions is :meth:`_market_open_at`.
+        already open one TF before its real session start.
         """
         sym_info = self._sym_info
         if sym_info is None or not sym_info.opening_hours:
@@ -190,30 +194,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
         local_dt = datetime.fromtimestamp(epoch_time(), tz=tz)
         return is_point_in_session(sym_info.opening_hours, local_dt,
                                    sym_info.session_corrections)
-
-    def _market_open_at(self, epoch_ts: float) -> bool:
-        """True iff the symbol's opening_hours mark ``epoch_ts`` as open.
-
-        Returns True for the 24/7 fallback (no calendar) so callers can
-        delegate the open/closed decision unconditionally. The slot-
-        aware variant of :meth:`_market_open_now`; the OHLC watchdog
-        consults it for the *missing slot's* calendar state rather than
-        wall-clock now, so a bar dropped just before the session edge
-        still gets REST recovery instead of being treated as
-        out-of-session.
-        """
-        sym_info = self._sym_info
-        if sym_info is None or not sym_info.opening_hours:
-            return True
-        try:
-            tz = ZoneInfo(sym_info.timezone)
-        except (ZoneInfoNotFoundError, ValueError):
-            return True
-        assert self.timeframe is not None
-        tf_seconds = max(1, int(in_seconds(self.timeframe)))
-        local_dt = datetime.fromtimestamp(epoch_ts, tz=tz)
-        return is_in_session(sym_info.opening_hours, local_dt, tf_seconds,
-                             sym_info.session_corrections)
 
     # --- LiveProviderPlugin (WebSocket) ------------------------------------
 
@@ -307,8 +287,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
                     forwarded_at - bar_timestamp,
                 )
                 return
-            self._last_bar_open_ts = bar_timestamp_ms / 1000.0
-            self._last_ohlc_event_ts = forwarded_at
             await raw_q.put(("ohlc", ohlc_payload))
 
         def task_completed(task: asyncio.Task[None]) -> None:
@@ -370,12 +348,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
                             # Ask-side duplicate (Pine OHLC is bid-side);
                             # drop entirely instead of routing through
                             # the backfill worker just to be filtered
-                            # later. Do NOT advance liveness markers
-                            # from an ask payload: if the bid candle
-                            # was dropped server-side but the ask
-                            # duplicate still arrived, advancing here
-                            # would mask the missing bid bar from the
-                            # OHLC watchdog.
+                            # later.
                             continue
                         now = epoch_time()
                         t_ms: int | float | str | None = payload_dict.get("t")
@@ -416,7 +389,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         # read their own bar-scoped bucket, so asynchronous
                         # REST backfill cannot reset or contaminate them.
                         if t_ms is None:
-                            self._last_ohlc_event_ts = now
                             await raw_q.put(("ohlc", payload_dict))
                         elif timestamp_ms is not None:
                             await forward_ohlc_at_close(
@@ -480,12 +452,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
                         else:
                             bar_open_s = None
                             cumulative_volume = 0
-                        # Stamp the quote-liveness anchor so the OHLC
-                        # watchdog can tell "quotes still flowing =>
-                        # token-bound OHLC failure, must reconnect"
-                        # from "quotes also idle => expected
-                        # market-closed gap, do not reconnect".
-                        self._last_quote_event_ts = epoch_time()
                         # Route quotes through the same FIFO queue as
                         # bid bars so the volume backfill worker
                         # preserves stream order: a quote that arrives
@@ -646,395 +612,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
         except asyncio.CancelledError:
             pass
 
-    async def _ohlc_watchdog_loop(self) -> None:
-        """Recover missing OHLC bars via REST before the framework synthesises.
-
-        Capital.com occasionally drops a single ``ohlc.event`` payload
-        while the underlying subscription remains alive (next bar
-        arrives normally). It also has the token-bound death mode where
-        ``OHLCMarketData.subscribe`` stops emitting while the parallel
-        ``marketData.subscribe`` quote stream keeps the TCP pipe alive.
-        Both produce the same observable: ``live_runner`` times out on
-        the missing bar's TF slot, synthesises a V=0 zero-volume bar
-        (which contaminates volume and TP/SL math), and the
-        ``<= last_closed_bar.timestamp`` dedup filter drops the late
-        real bar.
-
-        The deadline is anchored on the *expected close* of the next
-        bar — ``last_bar_open + 2*tf`` — plus a small REST publish-lag
-        margin. Concretely we fire at
-        ``last_bar_open + 2*tf + REST_PUBLISH_LAG_S``; the framework's
-        synth deadline (``+ bar_grace``, where bar_grace >= 15s) sits
-        comfortably further out, so REST query + inject finish before
-        the framework would synth. Anchoring on next-close (not on
-        ``framework_synth_at - lead``) keeps the watchdog independent
-        of the framework's grace formula and removes the narrow timing
-        window where the previous version could miss firing.
-
-        Flow each iteration:
-
-        1. Wait until ``REST_PUBLISH_LAG_S`` past the expected close.
-        2. Query Capital.com REST for the missing bar (capped by
-           ``REST_FETCH_TIMEOUT_S`` so a stalled httpx roundtrip cannot
-           block the watchdog past the framework's synth grace).
-        3. If REST returns the bar - inject it into
-           ``_raw_ohlc_queue`` as if it had come from WS;
-           ``watch_ohlcv`` then returns a real closed bar and the
-           framework's ``wait_for`` never times out. The injection
-           goes through the raw queue (tagged
-           :data:`_RECOVERED_OHLC_EVENT`) rather than straight into
-           ``_update_queue`` so the volume backfill worker stays the
-           single writer of the consumer queue and its FIFO order
-           holds: a bar still waiting on its REST volume lookup is
-           emitted before this later recovered slot instead of being
-           dropped by the consumer's monotonicity filter.
-        4. If REST has no exact-slot bar after ``MAX_REST_WAIT_S``, retain
-           the WebSocket and move only the private probe cursor to the next
-           slot. REST absence does not prove subscription degradation.
-        5. If multiple consecutive bars are recovered from REST, the
-           OHLC subscription itself is stale even though REST can hide
-           the gap. Emit the recovered bar first, then close the WS so
-           the live runner reconnects with a fresh subscription.
-        """
-        assert self.timeframe is not None
-        tf_seconds = float(in_seconds(self.timeframe))
-        rest_publish_lag_s = 10.0
-        max_rest_wait_s = 20.0
-        # Cap the REST roundtrip well below the framework's 15s synth
-        # grace floor. The underlying httpx client uses a 50s request
-        # timeout; without this cap a single stalled fetch would block
-        # the watchdog past the synth deadline, defeating its purpose.
-        rest_fetch_timeout_s = 5.0
-        rest_recovery_reconnect_threshold = 2
-        broker_info(
-            "ohlc watchdog started: tf=%.0fs publish_lag=%.0fs max_wait=%.0fs",
-            tf_seconds, rest_publish_lag_s, max_rest_wait_s,
-        )
-        # Tracks the slot currently considered missing and when we first
-        # noticed it; reset whenever we either inject a bar or step past
-        # the slot. Prevents an indefinite retry loop on publish lag.
-        missing_slot_ts: int | None = None
-        missing_slot_first_seen_at: float = 0.0
-        last_rest_absent_slot_ts: int | None = None
-        consecutive_rest_recoveries = 0
-        last_real_ohlc_event_ts = self._last_ohlc_event_ts
-        try:
-            while True:
-                try:
-                    await asyncio.sleep(1.0)
-                    if self._ws is None or self._ws.close_code is not None:
-                        continue
-                    # Session-gate: gated on the *missing slot's*
-                    # calendar state, not wall-clock now. The slot in
-                    # question is the one immediately after the last
-                    # known bar open (``_last_bar_open_ts + tf_seconds``).
-                    # Using wall-clock would drop REST recovery for a
-                    # valid closing-session bar whose ohlc.event was
-                    # missed: the watchdog deadline lands a moment past
-                    # session close, ``_market_open_now()`` returns
-                    # false, the slot never gets fetched, and
-                    # ``live_runner`` then synthesises a zero-volume bar
-                    # for that still-in-session slot.
-                    #
-                    # Also disarm the anchor here: if we leave
-                    # ``_last_bar_open_ts`` pointing at the pre-close
-                    # bar, on session reopen the quote stream lights up
-                    # before the first ``ohlc.event`` and the watchdog
-                    # probes REST for stale weekend slots, potentially
-                    # forcing a reconnect on an otherwise healthy
-                    # subscription. The next real ``ohlc.event`` after
-                    # reopen re-arms the watchdog via ``_listen_loop``.
-                    #
-                    # No-baseline case (``_last_bar_open_ts == 0.0``)
-                    # falls through to wall-clock: there is no slot to
-                    # gate on, so we use ``_market_open_now`` to keep
-                    # the pre-baseline branch out of REST until quotes
-                    # arrive in-session.
-                    if self._last_bar_open_ts > 0.0:
-                        candidate_missing_ts = (
-                            self._last_bar_open_ts + tf_seconds
-                        )
-                        slot_in_session = self._market_open_at(
-                            candidate_missing_ts
-                        )
-                    else:
-                        slot_in_session = self._market_open_now()
-                    if not slot_in_session:
-                        missing_slot_ts = None
-                        missing_slot_first_seen_at = 0.0
-                        last_rest_absent_slot_ts = None
-                        consecutive_rest_recoveries = 0
-                        self._last_bar_open_ts = 0.0
-                        continue
-                    now = epoch_time()
-                    if self._last_ohlc_event_ts > last_real_ohlc_event_ts:
-                        last_real_ohlc_event_ts = self._last_ohlc_event_ts
-                        last_rest_absent_slot_ts = None
-                        consecutive_rest_recoveries = 0
-                    if self._last_bar_open_ts == 0.0:
-                        # Watchdog is disarmed — either we just connected
-                        # without a baseline, or the session-gap branch
-                        # below cleared the anchor. If quotes are flowing
-                        # (within one TF), re-arm so a quote-alive /
-                        # OHLC-dead state (token-bound subscription
-                        # failure that survives the session edge) still
-                        # escalates to REST inject or reconnect instead
-                        # of letting ``_synth_from_quote`` emit forever
-                        # off the last known closed bar. Anchor one TF
-                        # before the current bar's open so ``missing_ts``
-                        # below resolves to the current in-progress bar
-                        # rather than the next one — otherwise the very
-                        # first missing slot is silently skipped.
-                        if (self._last_quote_event_ts > 0.0
-                                and now - self._last_quote_event_ts < tf_seconds):
-                            current_bar_open = (
-                                (now // tf_seconds) * tf_seconds
-                            )
-                            self._last_bar_open_ts = (
-                                current_bar_open - tf_seconds
-                            )
-                            self._last_ohlc_event_ts = now
-                            last_real_ohlc_event_ts = now
-                            consecutive_rest_recoveries = 0
-                            missing_slot_ts = None
-                            missing_slot_first_seen_at = 0.0
-                            last_rest_absent_slot_ts = None
-                        continue
-                    missing_ts = int(self._last_bar_open_ts + tf_seconds)
-                    if (
-                        last_rest_absent_slot_ts is not None
-                        and last_rest_absent_slot_ts >= missing_ts
-                    ):
-                        missing_ts = last_rest_absent_slot_ts + int(tf_seconds)
-                    if not self._market_open_at(missing_ts):
-                        missing_slot_ts = None
-                        missing_slot_first_seen_at = 0.0
-                        last_rest_absent_slot_ts = None
-                        consecutive_rest_recoveries = 0
-                        self._last_bar_open_ts = 0.0
-                        continue
-                    next_bar_close_at = missing_ts + tf_seconds
-                    if now < next_bar_close_at + rest_publish_lag_s:
-                        # Reset slot tracking - we're still inside the
-                        # normal arrival window for the exact slot being probed.
-                        missing_slot_ts = None
-                        missing_slot_first_seen_at = 0.0
-                        continue
-
-                    if missing_slot_ts != missing_ts:
-                        missing_slot_ts = missing_ts
-                        missing_slot_first_seen_at = now
-                    ohlc_silent_for = now - self._last_ohlc_event_ts
-
-                    rest_indeterminate = False
-                    try:
-                        payload = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self._fetch_bar_payload, missing_ts,
-                            ),
-                            timeout=rest_fetch_timeout_s,
-                        )
-                    except asyncio.TimeoutError:
-                        # The request still owns its worker thread until the
-                        # httpx timeout, but this watchdog remains responsive.
-                        broker_warning(
-                            "ohlc watchdog REST fetch timed out for ts=%d "
-                            "after %.1fs - retrying",
-                            missing_ts, rest_fetch_timeout_s,
-                        )
-                        payload = None
-                        rest_indeterminate = True
-                    except (
-                        CapitalComError,
-                        HTTPError,
-                        KeyError,
-                        OSError,
-                        TypeError,
-                        ValueError,
-                    ) as error:
-                        broker_warning(
-                            "ohlc watchdog REST fetch was indeterminate for "
-                            "ts=%d: %s",
-                            missing_ts,
-                            type(error).__name__,
-                        )
-                        payload = None
-                        rest_indeterminate = True
-                    if payload is not None:
-                        # The venue's own bar replaces the missed event: the
-                        # data stays whole, and a run of them reconnects below
-                        broker_info(
-                            "ohlc.event missed for ts=%d (silent %.1fs) "
-                            "- injecting bar from REST",
-                            missing_ts, ohlc_silent_for,
-                        )
-                        # Bump the bar-time anchor first so a slow
-                        # consumer cannot keep the watchdog re-firing
-                        # on the same slot while the injected bar is
-                        # still in the queue.
-                        self._last_bar_open_ts = float(missing_ts)
-                        # Drop only the recovered slot's quote bucket.
-                        # The injected payload already carries REST's
-                        # authoritative ``lastTradedVolume``; buckets for
-                        # later forming bars must survive while this slot
-                        # is being recovered.
-                        self._ws_quote_buckets.pop(missing_ts, None)
-                        for stale_ts in [
-                            bucket_ts for bucket_ts in self._ws_quote_buckets
-                            if bucket_ts < missing_ts
-                        ]:
-                            self._ws_quote_buckets.pop(stale_ts, None)
-                        # The WS copy of this slot may still arrive; its
-                        # bucket is gone, so the volume worker must not
-                        # read its ``ws_vol == 0`` as a silent quote feed.
-                        self._ws_recovered_slots.add(missing_ts)
-                        consecutive_rest_recoveries += 1
-                        missing_slot_ts = None
-                        missing_slot_first_seen_at = 0.0
-                        last_rest_absent_slot_ts = None
-                        # Publish through the raw queue, NOT straight into
-                        # ``_update_queue``: the volume backfill worker is the
-                        # single writer of the consumer queue, and it is FIFO.
-                        # A bar the WS already delivered but whose REST volume
-                        # lookup is still in flight therefore reaches the
-                        # runner BEFORE this later recovered slot. Writing the
-                        # consumer queue here instead would let this bar
-                        # overtake that one, and ``_on_ohlc_event``'s strict
-                        # monotonicity filter would then silently drop the
-                        # earlier bar - genuine bar loss, not just a reorder.
-                        raw_queue = self._raw_ohlc_queue
-                        if raw_queue is None:
-                            # Connection is being torn down; there is no
-                            # pipeline left to carry the bar in order. The
-                            # reconnect path re-reads this slot from REST.
-                            continue
-                        await raw_queue.put((_RECOVERED_OHLC_EVENT, payload))
-                        if (consecutive_rest_recoveries
-                                >= rest_recovery_reconnect_threshold):
-                            quote_silent_for = (
-                                now - self._last_quote_event_ts
-                                if self._last_quote_event_ts > 0.0 else 0.0
-                            )
-                            broker_warning(
-                                "ohlc.event recovered via REST for %d "
-                                "consecutive slots (last ts=%d, "
-                                "silent %.1fs, quotes silent %.1fs) - "
-                                "forcing WS reconnect to refresh "
-                                "OHLC subscription",
-                                consecutive_rest_recoveries, missing_ts,
-                                ohlc_silent_for, quote_silent_for,
-                            )
-                            self._last_bar_open_ts = 0.0
-                            consecutive_rest_recoveries = 0
-                            self._record_stream_disconnect(
-                                StreamDisconnectOrigin.OHLC_WATCHDOG,
-                                StreamDisconnectReason.OHLC_REST_RECOVERED_STALE,
-                            )
-                            try:
-                                await self._ws.close(
-                                    code=4001,
-                                    reason=(
-                                        StreamDisconnectReason
-                                        .OHLC_REST_RECOVERED_STALE.value
-                                    ),
-                                )
-                            except (WebSocketException, OSError):
-                                pass
-                        continue
-
-                    slot_wait = now - missing_slot_first_seen_at
-                    if rest_indeterminate:
-                        if slot_wait < max_rest_wait_s:
-                            continue
-                        broker_warning(
-                            "ohlc watchdog REST remained indeterminate for "
-                            "ts=%d after %.1fs - forcing WS reconnect",
-                            missing_ts,
-                            slot_wait,
-                        )
-                        self._last_bar_open_ts = 0.0
-                        missing_slot_ts = None
-                        missing_slot_first_seen_at = 0.0
-                        last_rest_absent_slot_ts = None
-                        consecutive_rest_recoveries = 0
-                        self._record_stream_disconnect(
-                            StreamDisconnectOrigin.OHLC_WATCHDOG,
-                            StreamDisconnectReason.OHLC_REST_INDETERMINATE,
-                        )
-                        try:
-                            await self._ws.close(
-                                code=4002,
-                                reason=(
-                                    StreamDisconnectReason
-                                    .OHLC_REST_INDETERMINATE.value
-                                ),
-                            )
-                        except (WebSocketException, OSError):
-                            pass
-                        continue
-                    if slot_wait < max_rest_wait_s:
-                        # A successful exact-slot query found no bar yet;
-                        # retry until the bounded publication-settle window.
-                        continue
-
-                    # Distinguish a token-bound OHLC failure (quotes
-                    # still streaming, OHLC subscription dead — must
-                    # reconnect to revive bars) from an expected
-                    # market-closed/session gap (REST has no bar
-                    # because no trading happened; the quote stream is
-                    # also idle). Reconnecting in the session-gap case
-                    # produces a tight loop: every reconnect re-seeds
-                    # ``_last_bar_open_ts`` from ``_last_bar_timestamp``
-                    # and the watchdog fires again on the same missing
-                    # slot ~30s later.
-                    quote_silent_for = now - self._last_quote_event_ts
-                    quote_idle_threshold_s = max(tf_seconds, 30.0)
-                    if (self._last_quote_event_ts == 0.0
-                            or quote_silent_for >= quote_idle_threshold_s):
-                        # Quote stream is also idle - treat as expected
-                        # no-bar period. Disarm the watchdog so it
-                        # stops re-firing on the same slot; the next
-                        # live ``ohlc.event`` will re-seed
-                        # ``_last_bar_open_ts`` via the listener.
-                        broker_info(
-                            "ohlc.event missed for ts=%d but quotes "
-                            "also idle (%.1fs) and REST has no bar - "
-                            "treating as session gap, disarming watchdog",
-                            missing_ts, quote_silent_for,
-                        )
-                        self._last_bar_open_ts = 0.0
-                        missing_slot_ts = None
-                        missing_slot_first_seen_at = 0.0
-                        last_rest_absent_slot_ts = None
-                        continue
-
-                    broker_info(
-                        "ohlc.event missed for ts=%d (silent %.1fs, "
-                        "quotes alive %.1fs ago) and exact-slot REST has no bar "
-                        "after %.1fs - retaining the WS and probing the next slot",
-                        missing_ts, ohlc_silent_for,
-                        quote_silent_for, slot_wait,
-                    )
-                    # REST absence is venue evidence, not subscription-failure
-                    # evidence. Advance only this watchdog's private probe cursor;
-                    # the emitted-bar cursor remains unchanged until a real WS or
-                    # REST-present bar is delivered.
-                    last_rest_absent_slot_ts = missing_ts
-                    missing_slot_ts = None
-                    missing_slot_first_seen_at = 0.0
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # Log and continue - a single bad iteration must not
-                    # kill the watchdog task silently and leave the
-                    # framework-synth path uncovered.
-                    broker_warning(
-                        "ohlc watchdog iteration failed: %s",
-                        repr(exc),
-                    )
-        except asyncio.CancelledError:
-            pass
-
     async def _volume_backfill_worker_loop(self) -> None:
         """Resolve volume for each bid bar — WS-primary, REST fallback.
 
@@ -1079,11 +656,8 @@ class _StreamingMixin(_CapitalComBase, ABC):
         :attr:`_ws_bad_bar_streak`; a REST value that agrees with the WS
         count resets it. At :data:`_WS_VOLUME_BAD_BAR_RECONNECT_THRESHOLD`
         consecutive hits the WS is closed (``code=4001``,
-        ``reason="quote-volume-stale"``) so the live_runner reconnects
-        — mirrors the OHLC watchdog's stale-subscription recovery.
-        Partial-coverage bars and slots the OHLC watchdog already
-        recovered from REST (their quote bucket was dropped with the
-        injection) NEVER count toward this streak.
+        ``reason="quote-volume-stale"``) so the live_runner reconnects.
+        Partial-coverage bars NEVER count toward this streak.
 
         Quote frames preserve their order relative to in-flight bid bars
         (single-consumer FIFO) and carry immutable bar-open, cumulative-volume,
@@ -1121,14 +695,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
                     # bar has been delivered, then stop.
                     out_q.put_nowait(None)
                     return
-                if event_type == _RECOVERED_OHLC_EVENT:
-                    # OHLC watchdog recovery. ``_fetch_bar_payload`` already
-                    # resolved ``_volume`` from REST, so there is nothing to
-                    # enrich — the only reason it travels this queue is
-                    # ordering: it must leave behind every earlier bar still
-                    # parked here or in flight above.
-                    await out_q.put(("ohlc", payload))
-                    continue
                 if event_type != "ohlc":
                     # The listener already froze this frame's bar, cumulative
                     # count and prices. Forward the immutable snapshot verbatim
@@ -1204,19 +770,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
             self._ws_quote_buckets.pop(stale_ts, None)
 
         is_partial = bar_open_s_int < self._ws_coverage_started_at
-        recovered = bar_open_s_int in self._ws_recovered_slots
-        self._ws_recovered_slots = {
-            ts for ts in self._ws_recovered_slots if ts > bar_open_s_int
-        }
-        if recovered:
-            # The OHLC watchdog already published this slot from REST, with
-            # the venue's exact ``lastTradedVolume``, before marking it; the
-            # consumer drops a second bar of the same slot anyway. Its late
-            # WS copy has no quote bucket left (``ws_vol == 0``), so
-            # enriching it meant a REST lookup past the synth budget and a
-            # median-estimate warning for a bar nobody uses (capitalcom
-            # cycle 387).
-            return
         baseline = self._ws_volume_baseline
         baseline_ready = (
             len(baseline) >= _WS_VOLUME_MIN_BASELINE_BARS
@@ -1283,10 +836,8 @@ class _StreamingMixin(_CapitalComBase, ABC):
         # reports materially more than the WS counted). A low bar
         # that REST confirms is a quiet market, not a silent quote
         # stream, and resets the streak. Partial bars never count —
-        # those are expected after every reconnect — and neither do
-        # slots the OHLC watchdog recovered, whose bucket it dropped.
-        if (rest_attempted and not is_partial and not recovered
-                and rest_vol > 0.0):
+        # those are expected after every reconnect.
+        if rest_attempted and not is_partial and rest_vol > 0.0:
             if ws_vol < rest_vol * _WS_VOLUME_LOW_RATIO:
                 self._ws_bad_bar_streak += 1
             else:
@@ -1384,89 +935,42 @@ class _StreamingMixin(_CapitalComBase, ABC):
         except (CapitalComError, HTTPError, KeyError, OSError, TypeError, ValueError):
             return 0.0
 
-    def _fetch_bar_payload(self, timestamp: int) -> dict | None:
-        """Fetch a single closed bar from REST as an ohlc.event payload.
-
-        Returns a dict in the same shape as ``ohlc.event.payload``
-        (``priceType, t, o, h, l, c``) plus a pre-resolved ``_volume``
-        field, so the existing :meth:`_on_ohlc_event` path consumes it
-        identically to a real WS event that has already been enriched
-        by :meth:`_volume_backfill_worker_loop`. The watchdog inject
-        path travels the same :attr:`_raw_ohlc_queue` as WS bars (see
-        :data:`_RECOVERED_OHLC_EVENT`) so ordering is preserved, but
-        pre-resolving volume here means the worker forwards it without
-        a second REST roundtrip - the consumer path stays REST-free in
-        both code paths.
-
-        Returns ``None`` only after a successful empty/wrong-slot response or
-        the venue's explicit ``error.prices.not-found`` empty-range response.
-        Transport, authentication and schema failures propagate so watchdogs
-        cannot misclassify indeterminate REST state as verified absence.
-        """
-        time_from = datetime.fromtimestamp(
-            timestamp, tz=timezone.utc,
-        ).replace(tzinfo=None)
-        try:
-            res = self.get_historical_prices(time_from=time_from, limit=1)
-        except HistoricalPricesNotFoundError:
-            return None
-        prices = res.get('prices')
-        if not isinstance(prices, list):
-            raise CapitalComError("historical price response schema changed")
-        if not prices:
-            return None
-        bar = prices[0]
-        if not isinstance(bar, dict):
-            raise CapitalComError("historical price row schema changed")
-        snap = bar.get('snapshotTimeUTC')
-        if not isinstance(snap, str):
-            raise CapitalComError("historical price row lacks a timestamp")
-        returned_ts = int(
-            datetime.fromisoformat(snap).replace(
-                tzinfo=timezone.utc,
-            ).timestamp()
-        )
-        if returned_ts != timestamp:
-            return None
-        return {
-            "priceType": "bid",
-            "t": int(timestamp * 1000),
-            "o": float(bar['openPrice']['bid']),
-            "h": float(bar['highPrice']['bid']),
-            "l": float(bar['lowPrice']['bid']),
-            "c": float(bar['closePrice']['bid']),
-            "_volume": float(bar.get('lastTradedVolume') or 0.0),
-        }
-
-    def _fetch_reconnect_gap_payloads(
+    def _fetch_closed_bar_payloads(
         self,
+        since: int,
         current_bar_open: int | None = None,
-        since: int | None = None,
     ) -> list[dict]:
-        """Fetch real closed bars missed since the last emitted bar.
+        """Read the venue's closed bars that opened after ``since``.
 
-        Capital.com's ``/prices`` response is the source of truth here:
-        absent timestamps remain venue session gaps, while returned bars
-        are replayed before the new WS subscription can publish anything.
-        Pages advance by one full timeframe past the last returned row,
-        matching the inclusive ``from`` semantics used by historical
-        downloads.
+        Capital.com's ``/prices`` response is the source of truth here: a slot
+        the venue returns no row for stays absent, and every returned row
+        between ``since`` and the forming bar is handed back. Pages advance by
+        one full timeframe past the last returned row, matching the inclusive
+        ``from`` semantics used by historical downloads.
 
-        :param current_bar_open: Opening second of the bar still forming;
-            defaults to the current wall-clock slot.
-        :param since: Opening second to walk forward from, overriding the
-            plugin's own emitted-bar cursor. Startup recovery needs this: no
-            bar has been emitted yet, so the cursor is still unset.
+        A pure query: it reads no plugin cursor and writes no plugin state, so
+        any number of calls in any order leave the plugin as it was. The
+        venue's explicit ``error.prices.not-found`` answer and a successful
+        empty page end the walk as "no further bar"; every other failure —
+        transport, authentication, a response whose shape or order cannot be
+        trusted — raises, so an unanswered query is never mistaken for an
+        empty history.
+
+        :param since: Opening second of the newest bar the caller holds; only
+            later bars are returned.
+        :param current_bar_open: Opening second of the bar still forming, which
+            is never returned; defaults to the current wall-clock slot.
+        :return: ``ohlc.event``-shaped payloads with a resolved ``_volume``,
+            ascending by opening time.
+        :raises CapitalComError: The plugin has no timeframe to query with.
+        :raises ValueError: A history page whose shape or order is unusable.
         """
-        anchor = self._last_bar_timestamp if since is None else since
-        if anchor is None or self.timeframe is None:
-            return []
+        if self.timeframe is None:
+            raise CapitalComError("closed-bar history needs the plugin timeframe")
         tf_seconds = int(in_seconds(self.timeframe))
         if current_bar_open is None:
             current_bar_open = int(epoch_time() // tf_seconds * tf_seconds)
-        cursor = anchor + tf_seconds
-        if cursor >= current_bar_open:
-            return []
+        cursor = since + tf_seconds
 
         payloads: dict[int, dict] = {}
         while cursor < current_bar_open:
@@ -1482,16 +986,16 @@ class _StreamingMixin(_CapitalComBase, ABC):
                 break
             prices = res.get('prices')
             if not isinstance(prices, list):
-                raise ValueError("Capital.com reconnect history prices schema changed")
+                raise ValueError("Capital.com closed-bar history prices schema changed")
             if not prices:
                 break
             last_returned_ts: int | None = None
             for bar in prices:
                 if not isinstance(bar, dict):
-                    raise ValueError("Capital.com reconnect history bar schema changed")
+                    raise ValueError("Capital.com closed-bar history bar schema changed")
                 snap = bar.get('snapshotTimeUTC')
                 if not isinstance(snap, str):
-                    raise ValueError("Capital.com reconnect history timestamp is missing")
+                    raise ValueError("Capital.com closed-bar history timestamp is missing")
                 timestamp = int(
                     datetime.fromisoformat(snap).replace(
                         tzinfo=timezone.utc,
@@ -1499,14 +1003,14 @@ class _StreamingMixin(_CapitalComBase, ABC):
                 )
                 if timestamp < cursor:
                     raise ValueError(
-                        "Capital.com reconnect history page did not reach its cursor"
+                        "Capital.com closed-bar history page did not reach its cursor"
                     )
                 if last_returned_ts is not None and timestamp <= last_returned_ts:
                     raise ValueError(
-                        "Capital.com reconnect history page is not strictly ordered"
+                        "Capital.com closed-bar history page is not strictly ordered"
                     )
                 last_returned_ts = timestamp
-                if not anchor < timestamp < current_bar_open:
+                if not since < timestamp < current_bar_open:
                     continue
                 payloads[timestamp] = {
                     "priceType": "bid",
@@ -1518,7 +1022,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
                     "_volume": float(bar.get('lastTradedVolume') or 0.0),
                 }
             if last_returned_ts is None:
-                raise ValueError("Capital.com reconnect history page was not consumed")
+                raise ValueError("Capital.com closed-bar history page was not consumed")
             cursor = last_returned_ts + tf_seconds
         return [payloads[timestamp] for timestamp in sorted(payloads)]
 
@@ -1526,48 +1030,27 @@ class _StreamingMixin(_CapitalComBase, ABC):
     async def backfill_closed_bars(
         self, symbol: str, timeframe: str, since_ms: int,
     ) -> list[OHLCV]:
-        """Fetch bars that closed between the warmup history and the stream.
+        """Return the venue's closed bars that opened after ``since_ms``.
 
-        Reuses the reconnect gap reader with an explicit anchor, since no bar
-        has been emitted yet at startup. ``extra_fields`` is deliberately left
-        empty: the bid/ask snapshot describes the current instant, not the
-        instant these bars closed at.
+        The framework calls this for every gap of the stream — the startup
+        seam, the outage of a reconnect, a close the socket missed — any
+        number of times while connected. It is a pure ``/prices`` query (see
+        :meth:`_fetch_closed_bar_payloads`): an empty list is the venue's
+        answer that it has no such bar, and a query the venue did not answer
+        raises. ``extra_fields`` is left empty: the bid/ask snapshot describes
+        the current instant, not the instant these bars closed at.
 
         :param symbol: Provider-format symbol (unused; the plugin is bound to
             its own instrument).
         :param timeframe: Timeframe in TradingView format (unused; the plugin
             is bound to its own resolution).
         :param since_ms: Opening of the last bar the framework already holds.
-        :return: Closed bars strictly after ``since_ms``, ascending.
+        :return: Closed bars strictly after ``since_ms``, ascending; the bar
+            still forming is never included.
         """
-        since_s = since_ms // 1000
         payloads = await asyncio.to_thread(
-            self._fetch_reconnect_gap_payloads, None, since_s,
+            self._fetch_closed_bar_payloads, since_ms // 1000,
         )
-        # ``connect()`` already read this very window into the update queue
-        # on its own, and the framework splices the bars returned here in
-        # ahead of the live stream — so without advancing the emitted-bar
-        # cursor every startup-gap bar would reach the runner twice, the
-        # second time behind a newer one. Never backwards: the stream may
-        # have closed a newer bar while this query ran. With nothing
-        # returned the warmup tail itself is the newest bar anyone holds.
-        newest = int(payloads[-1]["t"]) // 1000 if payloads else since_s
-        if self._last_bar_timestamp is None or self._last_bar_timestamp < newest:
-            self._last_bar_timestamp = newest
-        if self._last_bar_open_ts == 0.0:
-            # ``connect()`` ran before the framework handed over the warmup
-            # tail, so its watchdog seed saw no baseline and stayed
-            # disarmed. A bar that closed in the seconds around connect is
-            # published by REST only a little later — this query can
-            # legitimately come back empty for it — and the WS delivers
-            # closes only from the subscription onwards, so nobody would
-            # ever fetch that bar (measured live: capitalcom cycle 174,
-            # started 14:18:59 UTC, warmup tail 14:17, first WS bar 14:19,
-            # the 14:18 bar reached the strategy as a DATA_GAP). Arming the
-            # watchdog on the tail makes it probe the next slot and inject
-            # the bar from REST once the venue publishes it.
-            self._last_bar_open_ts = float(self._last_bar_timestamp)
-            self._last_ohlc_event_ts = epoch_time()
         return [
             OHLCV(
                 timestamp=int(payload["t"]),
@@ -1575,7 +1058,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
                 high=float(payload["h"]),
                 low=float(payload["l"]),
                 close=float(payload["c"]),
-                volume=float(payload.get("_volume", 0.0)),
+                volume=float(payload["_volume"]),
                 is_closed=True,
             )
             for payload in payloads
@@ -1630,9 +1113,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
             await self._recover_in_flight_submissions()
 
         assert self.timeframe is not None and self.symbol is not None
-        reconnect_payloads = await asyncio.to_thread(
-            self._fetch_reconnect_gap_payloads,
-        )
 
         # WS ping/pong cadence: default `websockets` is 20s/20s = up to
         # 40s before a half-open connection is dropped. On a 1-minute
@@ -1644,8 +1124,7 @@ class _StreamingMixin(_CapitalComBase, ABC):
         self._connection_generation += 1
         self._last_disconnect_evidence = None
 
-        update_queue: asyncio.Queue = asyncio.Queue()
-        self._update_queue = update_queue
+        self._update_queue = asyncio.Queue()
         self._raw_ohlc_queue = asyncio.Queue()
         # WS-primary volume state. Buckets restart per-connect because
         # they key on the THIS connection's quote stream; baseline is
@@ -1654,80 +1133,21 @@ class _StreamingMixin(_CapitalComBase, ABC):
         # otherwise mix pre- and post-reconnect counts that came from
         # different feed-health epochs.
         self._ws_quote_buckets = {}
-        self._ws_recovered_slots = set()
         self._ws_coverage_started_at = epoch_time()
         self._ws_volume_baseline = collections.deque(
             maxlen=_WS_VOLUME_BASELINE_BARS,
         )
         self._ws_bad_bar_streak = 0
         self._ws_quote_timestamp_warned = False
-        repaired_through: int | None = None
-        for payload in reconnect_payloads:
-            update_queue.put_nowait(("ohlc", payload))
-        if reconnect_payloads:
-            repaired_timestamp = int(reconnect_payloads[-1]["t"] / 1000)
-            repaired_through = repaired_timestamp
-            self._last_bar_open_ts = float(repaired_timestamp)
-            broker_warning(
-                "reconnect restored %d closed bar(s) from REST through ts=%d",
-                len(reconnect_payloads),
-                repaired_timestamp,
-            )
-        # Seed the bar-time anchor from the warmup baseline if the
-        # provider already loaded one. Without this, the OHLC
-        # watchdog stays disarmed (``_last_bar_open_ts == 0.0`` short-
-        # circuits its loop) until the first live ``ohlc.event``
-        # arrives - and if ``OHLCMarketData.subscribe`` is dead from
-        # the start while the parallel quote stream keeps the feed
-        # watchdog quiet, the watchdog would never probe REST and the
-        # live stream would stall indefinitely. Seeding here arms the
-        # watchdog on the very next expected bar boundary so a
-        # subscribe-side failure is caught even before any real OHLC
-        # event lands. ``_last_ohlc_event_ts`` is paired-seeded with
-        # the current wallclock so the watchdog's "silent for" log
-        # line measures from connect rather than from the Unix epoch.
-        #
-        # Stale-baseline guard: after a market/session gap the cached
-        # ``_last_bar_timestamp`` can be hours old. Seeding from it
-        # would point the watchdog at a non-trading slot inside the
-        # gap; REST has no bar for that slot, and if quotes have
-        # already resumed (so the session-gap disarm branch does not
-        # trigger) the watchdog would force a reconnect on a healthy
-        # subscription before the first new OHLC event can arrive.
-        #
-        # ``_last_bar_timestamp`` stores the OPEN time of the most
-        # recent closed bar, so even a perfectly fresh
-        # warmup-to-live handoff has ``now - baseline ~= tf_seconds``
-        # (the bar opened one TF ago and just closed). Accept up to
-        # two TFs of age so the normal startup path arms the
-        # watchdog, while a session gap (hours old on any reasonable
-        # TF) still falls through to the disarmed branch. The
-        # watchdog's own session-gap detection (quote silence) is the
-        # second line of defence if a "fresh" baseline still happens
-        # to point inside an unexpected gap.
-        now_ts = epoch_time()
-        tf_seconds = float(in_seconds(self.timeframe))
-        if (self._last_bar_timestamp is not None
-                and now_ts - float(self._last_bar_timestamp)
-                < 2.0 * tf_seconds):
-            self._last_bar_open_ts = float(self._last_bar_timestamp)
-            self._last_ohlc_event_ts = now_ts
-        else:
-            self._last_bar_open_ts = 0.0
-            self._last_ohlc_event_ts = 0.0
-        if repaired_through is not None:
-            self._last_bar_open_ts = float(repaired_through)
-            self._last_ohlc_event_ts = now_ts
 
         self._listen_task = asyncio.create_task(self._listen_loop())
         self._ping_task = asyncio.create_task(self._ping_loop())
         self._feed_watchdog_task = asyncio.create_task(self._feed_watchdog_loop())
-        self._ohlc_watchdog_task = asyncio.create_task(self._ohlc_watchdog_loop())
         self._volume_backfill_task = asyncio.create_task(
             self._volume_backfill_worker_loop()
         )
 
-        # The five background tasks above are already running; if the
+        # The four background tasks above are already running; if the
         # subscribe handshake fails, the exception propagates to the
         # live runner's retry loop and its next ``connect()`` would
         # overwrite the task references — the old tasks would keep
@@ -1753,14 +1173,14 @@ class _StreamingMixin(_CapitalComBase, ABC):
         """Tear down a partially initialised connection.
 
         Only used by :meth:`connect` when the subscribe handshake fails
-        after the background tasks were started. Cancels all five tasks
+        after the background tasks were started. Cancels all four tasks
         and clears their references first (so nothing keeps consuming
         the dying WS), then closes the WebSocket and drops the queues.
         No unsubscribe frames are sent — the subscription never
         completed and the socket is likely broken anyway.
         """
         for attr in ("_listen_task", "_ping_task", "_feed_watchdog_task",
-                     "_ohlc_watchdog_task", "_volume_backfill_task"):
+                     "_volume_backfill_task"):
             task: asyncio.Task | None = getattr(self, attr)
             if task is not None:
                 task.cancel()
@@ -1799,9 +1219,6 @@ class _StreamingMixin(_CapitalComBase, ABC):
         if self._feed_watchdog_task:
             self._feed_watchdog_task.cancel()
             self._feed_watchdog_task = None
-        if self._ohlc_watchdog_task:
-            self._ohlc_watchdog_task.cancel()
-            self._ohlc_watchdog_task = None
 
         # Close the WS before cancelling the listener so its ``async
         # for`` exits naturally; the listener's ``finally`` then posts
@@ -1861,16 +1278,10 @@ class _StreamingMixin(_CapitalComBase, ABC):
         self._update_queue = None
         self._raw_ohlc_queue = None
         # ``_last_bar_timestamp`` is intentionally NOT cleared on
-        # disconnect: ``connect()`` seeds ``_last_bar_open_ts`` from it
-        # (when it is still fresh — within one TF of wallclock) so the
-        # OHLC watchdog is armed on the very next bar boundary after a
-        # quick reconnect, even if the new subscription is dead from the
-        # start. Clearing it here would force the watchdog to wait for
-        # the first live ``ohlc.event`` before arming, which is exactly
-        # the failure mode the seed branch exists to prevent. When the
-        # baseline has gone stale (reconnect after a market/session
-        # gap), ``connect()`` discards it on its own and the quote-alive
-        # re-arm branch inside ``_ohlc_watchdog_loop`` takes over.
+        # disconnect: it is the open of the newest closed bar this plugin
+        # handed on, and keeping it across the reconnect is what stops the
+        # new subscription from emitting a closed bar at or before one the
+        # previous connection already emitted.
         self._last_bar_ohlcv = None
         self._last_bid = None
         self._last_ask = None
@@ -1908,12 +1319,10 @@ class _StreamingMixin(_CapitalComBase, ABC):
             if event_type == "ohlc":
                 # ``_on_ohlc_event`` returns None for ask-side duplicates;
                 # skip and wait for the next event in that case. Bars
-                # reach this point already enriched with REST volume by
-                # :meth:`_volume_backfill_worker_loop` (or by
-                # :meth:`_fetch_bar_payload` on the watchdog inject
-                # path), so no REST call happens on the consumer path
-                # and ``live_runner``'s ``wait_for(timeout=2.0)``
-                # cannot trip on backfill latency.
+                # reach this point already enriched with volume by
+                # :meth:`_volume_backfill_worker_loop`, so no REST call
+                # happens on the consumer path and ``live_runner``'s
+                # ``wait_for(timeout=2.0)`` cannot trip on backfill latency.
                 result = self._on_ohlc_event(payload)
             else:
                 # Quote arrived before any OHLC baseline yields None;
@@ -1993,6 +1402,16 @@ class _StreamingMixin(_CapitalComBase, ABC):
         ask payloads keeps :meth:`watch_ohlcv` looping for the next
         event instead of double-emitting the bar close.
 
+        A bar at or before :attr:`~_CapitalComBase._last_bar_timestamp` (the
+        newest closed bar this plugin emitted, or the warmup tail) is
+        dropped, so the stream never goes backwards, a reconnect included.
+        Only this method and the warmup download move that cursor.
+
+        A close that lands after the next slot's quotes already opened that
+        slot's forming bar (the venue published it late, or the framework
+        settled the slot from the history meanwhile) only moves the cursor: the
+        later slot's forming bar stays the base its next tick extends.
+
         Intra-bar updates (spinner, tick hooks) come exclusively from
         :meth:`_synth_from_quote`.
         """
@@ -2006,11 +1425,9 @@ class _StreamingMixin(_CapitalComBase, ABC):
             and timestamp <= self._last_bar_timestamp
         ):
             return None
-        # The payload is pre-enriched with ``_volume`` by either
-        # :meth:`_volume_backfill_worker_loop` (regular WS path) or
-        # :meth:`_fetch_bar_payload` (watchdog REST-inject path). Quote
-        # volume is bar-scoped, so this method must not mutate any later
-        # forming bar's bucket.
+        # The payload is pre-enriched with ``_volume`` by
+        # :meth:`_volume_backfill_worker_loop`. Quote volume is bar-scoped,
+        # so this method must not mutate any later forming bar's bucket.
         volume = float(payload.get("_volume", 0.0))
         closed = OHLCV(
             timestamp=timestamp_ms,
@@ -2023,7 +1440,9 @@ class _StreamingMixin(_CapitalComBase, ABC):
             is_closed=True,
         )
         self._last_bar_timestamp = timestamp
-        self._last_bar_ohlcv = closed
+        if (self._last_bar_ohlcv is None
+                or self._last_bar_ohlcv.timestamp <= timestamp_ms):
+            self._last_bar_ohlcv = closed
         return closed
 
     def _synth_from_quote(self, quote: _QuoteSnapshot) -> OHLCV | None:
@@ -2054,11 +1473,20 @@ class _StreamingMixin(_CapitalComBase, ABC):
         therefore OPENS that bar (O=H=L=C=bid) instead of inheriting the
         previous bar's levels; later ticks in the same slot widen H/L.
 
-        Returns ``None`` if no OHLC baseline or bid has been received yet, or
-        if the quote belongs to a slot the feed has already closed — the
-        caller then waits for the next event. The snapshot still updates the
-        latest quote state before those gates so the first later close can
-        expose bid/ask fields even if no forming baseline existed yet.
+        A tick of a later slot opens that slot even while the close of the slot
+        before it has not arrived: at every boundary the first tick of the new
+        period races the old period's close, and a close the socket never
+        delivers is settled by the framework from the history or from its
+        ticks. Ordering the forming bar behind the unsettled slot is the
+        framework's job (it holds updates of later slots until the awaited one
+        is settled), so the feed never loses a slot's intra-bar updates here.
+
+        Returns ``None`` if no OHLC baseline or bid has been received yet, if
+        the quote belongs to a slot the feed has already closed, or if it is a
+        late frame of a slot older than the bar already forming — the caller
+        then waits for the next event. The snapshot still updates the latest
+        quote state before those gates so the first later close can expose
+        bid/ask fields even if no forming baseline existed yet.
         """
         if quote.bid is not None:
             self._last_bid = quote.bid
@@ -2076,28 +1504,11 @@ class _StreamingMixin(_CapitalComBase, ABC):
             # ``_last_bar_timestamp`` holds the open time of the most recent
             # CLOSED bar — this tick is a late frame for a settled slot.
             return None
-        tf_seconds = (int(in_seconds(self.timeframe))
-                      if self.timeframe is not None else 0)
-        if tf_seconds > 0:
-            last_slot = self._last_bar_ohlcv.timestamp // 1000
-            open_slot = (last_slot if not self._last_bar_ohlcv.is_closed
-                         else last_slot + tf_seconds)
-            if bar_open_s > open_slot:
-                # The tick is ahead of the slot the feed may open next: the
-                # bar before it is still forming, its ``ohlc.event`` not yet
-                # here. Quotes reach the FIFO the instant they arrive while
-                # the close is forwarded only at the bar boundary (or later,
-                # when the venue publishes late), so at every boundary the
-                # first tick of the new period races the close of the old
-                # one. Opening the new slot from that tick would hand the
-                # runner a forming bar for T+1 ahead of the closed bar for
-                # T; the closed bar then executes with the clock running
-                # backwards (measured live: Capital.com lane, 2-30 such
-                # inversions per cycle). Hold the spinner instead — the
-                # close (or the watchdog's REST recovery of a genuinely
-                # missed slot) settles the bar, and the next tick opens
-                # the period behind it.
-                return None
+        if bar_open_s * 1000 < self._last_bar_ohlcv.timestamp:
+            # A later slot is already forming: reopening this older one would
+            # make the next tick of the later slot open it afresh, losing the
+            # open, high and low it accumulated.
+            return None
         new_close = quote.bid
         if bar_open_s * 1000 != self._last_bar_ohlcv.timestamp:
             synth = OHLCV(

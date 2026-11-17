@@ -1,27 +1,32 @@
 """
 @pyne
 
-Deterministic fault injection for the Capital.com live feed: every closed bar
-of an outage window must reach the runner, in order and exactly once.
+Deterministic fault injection for the Capital.com live feed under the
+framework's stream recovery: the plugin streams only what the WebSocket
+pushes, and every gap is filled through the pure ``backfill_closed_bars``
+history query.
 
 The venue is faked at three seams — ``websockets.connect`` (a socket that
 never speaks), ``create_session`` (no login) and ``get_historical_prices``
-(a bar book) — so the real ``connect`` / ``disconnect`` / reconnect-replay /
-``watch_ohlcv`` code runs. Live closed bars are placed on ``_update_queue``
-in the exact ``("ohlc", payload)`` shape the volume worker forwards, and a
-transport death as the plain ``None`` sentinel the listener posts.
+(a bar book) — so the real ``connect`` / ``disconnect`` / ``watch_ohlcv`` /
+``backfill_closed_bars`` code runs. Live closed bars are placed on
+``_update_queue`` in the exact ``("ohlc", payload)`` shape the volume worker
+forwards, and a transport death as the plain ``None`` sentinel the listener
+posts.
 """
 import asyncio
 import json
 from datetime import datetime, time, timezone
 
+import pytest
 import websockets
 
+from pynecore.core.plugin.live_provider import LiveProviderPlugin
 from pynecore.core.syminfo import SymInfo, SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
 
 import pynecore_capitalcom.streaming as streaming_module
-from pynecore_capitalcom import CapitalCom, CapitalComConfig
+from pynecore_capitalcom import CapitalCom, CapitalComConfig, CapitalComError
 from pynecore_capitalcom.exceptions import HistoricalPricesNotFoundError
 
 
@@ -139,6 +144,18 @@ class _Venue(CapitalCom):
         """Let the venue hold every scenario bar up to (excluding) ``upto``."""
         self.book = {_bar(k) for k in range(upto)}
 
+    def state(self) -> dict[str, tuple[int, str]]:
+        """Identity and contents of every plugin attribute, for purity checks.
+
+        The fake's own bookkeeping of history requests is left out: it records
+        the calls under test, it is not plugin state.
+        """
+        return {
+            name: (id(value), repr(value))
+            for name, value in vars(self).items()
+            if name != "price_calls"
+        }
+
     # --- fake REST ---------------------------------------------------------
 
     def get_historical_prices(self, time_from=None, time_to=None, limit=1000):
@@ -163,10 +180,10 @@ class _Venue(CapitalCom):
 # === Runner-side simulation =================================================
 
 class _Runner:
-    """Mimics the core live loop's consumption of the provider stream.
+    """Mimics the core live loop's closed-bar cursor over the provider stream.
 
-    ``dropped`` collects the closed bars the core monotonicity guard had to
-    throw away — a non-empty list means the PLUGIN re-served settled history.
+    ``dropped`` collects the closed bars the core cursor threw away: bars the
+    stream handed on although the runner already held that slot.
     """
 
     def __init__(self):
@@ -199,12 +216,6 @@ async def _live_close(provider: _Venue, runner: _Runner, opening: int) -> None:
     runner.feed(await provider.watch_ohlcv("EURUSD", "1"))
 
 
-async def _take(provider: _Venue, runner: _Runner, count: int) -> None:
-    """Consume exactly ``count`` updates already queued on the provider."""
-    for _ in range(count):
-        runner.feed(await provider.watch_ohlcv("EURUSD", "1"))
-
-
 async def _drain(provider: _Venue, runner: _Runner) -> None:
     """Consume everything queued, terminated by the stream-death sentinel.
 
@@ -227,8 +238,8 @@ async def _reconnect(provider: _Venue, runner: _Runner,
     """Replay the live runner's reconnect loop verbatim.
 
     ``disconnect`` -> ``connect`` -> ``on_reconnect``, retried on any
-    exception. Capital.com repairs the gap inside ``connect`` itself, so
-    ``on_reconnect`` is the framework's no-op here.
+    exception, then the framework's reconnect fill: the bars after the
+    runner's newest closed bar, read through ``backfill_closed_bars``.
 
     :return: The number of attempts the reconnect took.
     """
@@ -245,26 +256,28 @@ async def _reconnect(provider: _Venue, runner: _Runner,
             continue
         queue = provider._update_queue
         assert queue is not None
-        await _take(provider, runner, queue.qsize())
+        assert queue.empty(), "connect() must not queue bars of its own"
+        assert runner.last_confirmed is not None
+        try:
+            filled = await provider.backfill_closed_bars(
+                "EURUSD", "1", runner.last_confirmed,
+            )
+        except Exception:  # noqa: BLE001 - the framework reconnects again
+            continue
+        for bar in filled:
+            runner.feed(bar)
         return attempt
     raise AssertionError("reconnect never succeeded")
 
 
-def _run(scenario, monkeypatch, *, before_thread=None) -> None:
-    """Run ``scenario(provider, runner)`` against the faked venue.
-
-    :param before_thread: Optional async hook awaited with the callable of
-        every offloaded REST call before it executes. Scenarios that need a
-        lookup to stall mid-pipeline park on their own event inside it.
-    """
+def _run(scenario, monkeypatch) -> None:
+    """Run ``scenario(provider, runner)`` against the faked venue."""
     provider = _Venue()
     runner = _Runner()
     monkeypatch.setattr(websockets, 'connect', provider.open_socket)
     monkeypatch.setattr(streaming_module, 'epoch_time', lambda: provider.now_s)
 
     async def _to_thread(func, /, *args, **kwargs):
-        if before_thread is not None:
-            await before_thread(func)
         return func(*args, **kwargs)
 
     monkeypatch.setattr(streaming_module.asyncio, 'to_thread', _to_thread)
@@ -290,10 +303,36 @@ async def _start_live(provider: _Venue, runner: _Runner) -> None:
     assert runner.closed == [_bar(1) * 1000]
 
 
-# === (a) Outage bars arrive via the reconnect replay ========================
+# === Declared history properties ============================================
 
-def __test_capitalcom_outage_bars_replayed_in_order__(monkeypatch):
-    """Bars that close during an outage are delivered once, in order."""
+def __test_capitalcom_declares_its_history__():
+    """Gap recovery is the framework's; the plugin declares its history."""
+    assert issubclass(CapitalCom, LiveProviderPlugin)
+    assert CapitalCom.history_has_idle_bars is False
+    assert CapitalCom.history_publish_lag == 10.0
+
+
+# === (a) Outage bars arrive through the framework's fill ====================
+
+def __test_capitalcom_connect_reads_no_history__(monkeypatch):
+    """A reconnect over an outage neither queues bars nor reads history."""
+
+    async def scenario(provider, runner):
+        await _start_live(provider, runner)
+        provider.advance_to(4)
+        provider.fill_book(5)
+        await provider.disconnect()
+        await provider.connect()
+
+        assert provider.price_calls == []
+        assert provider._update_queue is not None
+        assert provider._update_queue.empty()
+
+    _run(scenario, monkeypatch)
+
+
+def __test_capitalcom_outage_bars_arrive_once_in_order__(monkeypatch):
+    """Bars that close during an outage reach the runner once, in order."""
 
     async def scenario(provider, runner):
         await _start_live(provider, runner)
@@ -313,66 +352,6 @@ def __test_capitalcom_outage_bars_replayed_in_order__(monkeypatch):
 
     _run(scenario, monkeypatch)
 
-
-# === (b) Replay re-serving bars already delivered ===========================
-
-def __test_capitalcom_startup_replay_not_double_emitted__(monkeypatch):
-    """The startup gap is fetched twice but reaches the runner once.
-
-    ``connect`` repairs the gap from REST on its own, and the framework then
-    asks for the very same window through ``backfill_closed_bars``. Both
-    read the same bars, so the plugin has to suppress its own queued copies
-    rather than leave the core monotonicity guard to clean up after it.
-    """
-
-    async def scenario(provider, runner):
-        provider.advance_to(3)
-        provider.fill_book(3)
-        provider._last_bar_timestamp = _bar(0)
-        await provider.connect()
-        # ``connect`` queued the gap bars; the framework now asks for the
-        # same window and splices what it gets in ahead of the live stream.
-        recovered = await provider.backfill_closed_bars(
-            "EURUSD", "1", _bar(0) * 1000,
-        )
-        assert [bar.timestamp for bar in recovered] == [
-            _bar(1) * 1000, _bar(2) * 1000,
-        ]
-        for bar in recovered:
-            runner.feed(bar)
-        await _drain(provider, runner)
-
-        assert runner.closed == [_bar(1) * 1000, _bar(2) * 1000]
-        assert runner.dropped == []
-
-    _run(scenario, monkeypatch)
-
-
-def __test_capitalcom_seam_bar_emitted_exactly_once__(monkeypatch):
-    """The bar spanning the reconnect boundary is neither lost nor doubled.
-
-    Bar 2 closes and is delivered live moments before the drop; the venue
-    still holds it, so the replay window must start past it.
-    """
-
-    async def scenario(provider, runner):
-        await _start_live(provider, runner)
-        provider.advance_to(3, offset_s=0.0)
-        await _live_close(provider, runner, _bar(2))
-
-        provider.advance_to(4)
-        provider.fill_book(5)
-        await _reconnect(provider, runner)
-
-        assert runner.closed == [_bar(k) * 1000 for k in (1, 2, 3)]
-        assert runner.dropped == []
-        # The already-delivered bar was never even requested.
-        assert all(start > _bar(2) for start in provider.price_calls[-1:])
-
-    _run(scenario, monkeypatch)
-
-
-# === (c) Repeated failed reconnect attempts =================================
 
 def __test_capitalcom_no_bar_lost_across_failed_reconnects__(monkeypatch):
     """Two dead dials and a dead history read later, the gap is intact."""
@@ -401,228 +380,179 @@ def __test_capitalcom_no_bar_lost_across_failed_reconnects__(monkeypatch):
     _run(scenario, monkeypatch)
 
 
-def __test_capitalcom_failed_replay_keeps_the_whole_gap__(monkeypatch):
-    """A history failure mid-replay re-reads the entire gap on the retry.
+# === (b) The history query is pure ==========================================
 
-    The replay only reaches the update queue once ``connect`` returns, and
-    a failed ``connect`` throws that queue away — so the cursor must not
-    have moved for any page that never reached the runner.
-    """
+def __test_capitalcom_backfill_is_a_pure_query__(monkeypatch):
+    """Repeated queries, in any order, leave the plugin exactly as it was."""
 
     async def scenario(provider, runner):
         await _start_live(provider, runner)
+        provider.advance_to(5)
+        provider.fill_book(6)
+        before = provider.state()
+
+        first = await provider.backfill_closed_bars("EURUSD", "1", _bar(1) * 1000)
+        older = await provider.backfill_closed_bars("EURUSD", "1", _bar(0) * 1000)
+        again = await provider.backfill_closed_bars("EURUSD", "1", _bar(1) * 1000)
+
+        assert provider.state() == before
+        assert [bar.timestamp for bar in first] == [_bar(k) * 1000 for k in (2, 3, 4)]
+        assert [bar.timestamp for bar in older] == [_bar(k) * 1000 for k in (1, 2, 3, 4)]
+        assert again == first
+        assert all(bar.is_closed for bar in first)
+
+    _run(scenario, monkeypatch)
+
+
+def __test_capitalcom_backfill_is_strictly_after_since_ascending_without_forming_bar__(
+        monkeypatch):
+    """Only closed bars after ``since_ms``, oldest first; the forming bar never."""
+
+    async def scenario(provider, runner):
+        await _start_live(provider, runner)
+        # The venue already lists bar 6, the one forming right now.
         provider.advance_to(6)
         provider.fill_book(7)
-        provider.price_faults = [ConnectionError("prices endpoint down")]
 
-        assert await _reconnect(provider, runner) == 2
-        assert runner.closed == [_bar(k) * 1000 for k in (1, 2, 3, 4, 5)]
+        bars = await provider.backfill_closed_bars("EURUSD", "1", _bar(2) * 1000)
+
+        assert [bar.timestamp for bar in bars] == [_bar(k) * 1000 for k in (3, 4, 5)]
+        assert [bar.volume for bar in bars] == [5.0, 5.0, 5.0]
+        assert all(bar.extra_fields is None for bar in bars)
+
+    _run(scenario, monkeypatch)
+
+
+def _no_prices_list(provider: _Venue) -> None:
+    """Make the history answer with a body that has no ``prices`` list."""
+    provider.get_historical_prices = lambda **_kwargs: {}  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize("breaker", [
+    lambda provider: provider.price_faults.append(ConnectionError("prices endpoint down")),
+    lambda provider: provider.price_faults.append(CapitalComError("authentication unavailable")),
+    _no_prices_list,
+], ids=["transport", "venue-error", "schema"])
+def __test_capitalcom_backfill_raises_on_an_unanswered_query__(monkeypatch, breaker):
+    """A failed or unreadable history read raises, it is never an empty answer."""
+
+    async def scenario(provider, runner):
+        await _start_live(provider, runner)
+        provider.advance_to(5)
+        provider.fill_book(6)
+        before = provider.state()
+        breaker(provider)
+
+        with pytest.raises((ConnectionError, CapitalComError, ValueError)):
+            await provider.backfill_closed_bars("EURUSD", "1", _bar(1) * 1000)
+
+        # The failure left nothing behind either
+        state = provider.state()
+        state.pop("get_historical_prices", None)
+        assert state == before
+
+    _run(scenario, monkeypatch)
+
+
+def __test_capitalcom_backfill_empty_only_on_the_venues_own_answer__(monkeypatch):
+    """``error.prices.not-found`` and an empty page are the venue saying "no bar"."""
+
+    async def scenario(provider, runner):
+        await _start_live(provider, runner)
+        provider.advance_to(5)
+        # The book holds nothing past bar 1: the fake answers not-found.
+        assert await provider.backfill_closed_bars("EURUSD", "1", _bar(1) * 1000) == []
+
+        provider.get_historical_prices = (  # type: ignore[method-assign]
+            lambda **_kwargs: {'prices': []}
+        )
+        assert await provider.backfill_closed_bars("EURUSD", "1", _bar(1) * 1000) == []
+
+    _run(scenario, monkeypatch)
+
+
+def __test_capitalcom_seam_bar_published_late_is_returned_by_a_later_query__(monkeypatch):
+    """A bar REST publishes only after the first query is there on the next one.
+
+    Replays capitalcom cycle 174 (2026-09-18): the warmup tail was bar 0 and
+    bar 1 closed while the subscription came up, but REST did not list it yet
+    when the seam was first asked for. The framework asks again for a close
+    the stream misses; the plugin must answer from the venue each time.
+    """
+
+    async def scenario(provider, _runner):
+        provider.fill_book(1)
+        provider.advance_to(2, offset_s=1.0)
+        provider._last_bar_timestamp = _bar(0)
+        await provider.connect()
+        assert await provider.backfill_closed_bars("EURUSD", "1", _bar(0) * 1000) == []
+
+        provider.fill_book(2)
+        provider.advance_to(2, offset_s=11.0)
+        recovered = await provider.backfill_closed_bars("EURUSD", "1", _bar(0) * 1000)
+
+        assert [bar.timestamp for bar in recovered] == [_bar(1) * 1000]
+
+    _run(scenario, monkeypatch)
+
+
+# === (c) The socket hands on what the venue pushes ==========================
+
+def __test_capitalcom_ws_after_reconnect_never_emits_an_older_close__(monkeypatch):
+    """A new subscription re-sending settled closes cannot move the stream back."""
+
+    async def scenario(provider, runner):
+        await _start_live(provider, runner)
+        provider.advance_to(3, offset_s=0.0)
+        await _live_close(provider, runner, _bar(2))
+
+        provider.advance_to(3)
+        await provider.disconnect()
+        await provider.connect()
+        queue = provider._update_queue
+        assert queue is not None
+        for k in (1, 2, 3):
+            queue.put_nowait(("ohlc", _payload(_bar(k))))
+        await _drain(provider, runner)
+
+        assert runner.closed == [_bar(k) * 1000 for k in (1, 2, 3)]
         assert runner.dropped == []
 
     _run(scenario, monkeypatch)
 
 
-# === (d) Drop exactly on a bar boundary =====================================
+def __test_capitalcom_ws_close_after_history_recovery_is_handed_on__(monkeypatch):
+    """The history query moves no plugin cursor: a late WS close still goes on.
 
-def __test_capitalcom_drop_at_bar_boundary_delivers_once__(monkeypatch):
-    """A bar closing at the very moment of the drop arrives exactly once.
-
-    Two variants of the same instant: the ``ohlc.event`` slips through just
-    before the socket dies (the replay must not repeat it), and it does not
-    (the replay must supply it).
+    The framework took bar 2 from the history; the socket's own close of bar 2
+    arrives afterwards. Dropping it is the framework cursor's job, so the
+    plugin hands it on unchanged.
     """
-
-    async def event_arrived(provider, runner):
-        await _start_live(provider, runner)
-        provider.advance_to(3, offset_s=0.0)
-        await _live_close(provider, runner, _bar(2))
-        provider.fill_book(4)
-        provider.advance_to(4, offset_s=0.0)
-        await _reconnect(provider, runner)
-
-        assert runner.closed == [_bar(k) * 1000 for k in (1, 2, 3)]
-        assert runner.dropped == []
-
-    async def event_lost(provider, runner):
-        await _start_live(provider, runner)
-        # Same instant, but the close event died with the socket.
-        provider.fill_book(4)
-        provider.advance_to(4, offset_s=0.0)
-        await _reconnect(provider, runner)
-
-        assert runner.closed == [_bar(k) * 1000 for k in (1, 2, 3)]
-        assert runner.dropped == []
-
-    _run(event_arrived, monkeypatch)
-    _run(event_lost, monkeypatch)
-
-
-# === (e) Watchdog recovery racing an in-flight volume lookup =================
-
-#: Captured before any test can replace ``asyncio.sleep`` with a fast stand-in.
-_REAL_SLEEP = asyncio.sleep
-
-
-class _Stall:
-    """Holds the REST volume lookup open until the scenario releases it."""
-
-    def __init__(self):
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def hook(self, func) -> None:
-        """``before_thread`` hook: park only the per-bar volume lookup."""
-        if getattr(func, "__name__", "") != "_fetch_bar_volume":
-            return
-        self.entered.set()
-        await self.release.wait()
-
-
-async def _fast_sleep(_delay: float) -> None:
-    """Stand-in for the watchdog's 1s poll: yield instead of waiting."""
-    await _REAL_SLEEP(0)
-
-
-async def _until(predicate, *, what: str, spins: int = 500) -> None:
-    """Yield to the loop until ``predicate`` holds, or fail loudly."""
-    for _ in range(spins):
-        if predicate():
-            return
-        await _REAL_SLEEP(0)
-    raise AssertionError(f"timed out waiting for {what}")
-
-
-def _ws_payload(opening: int) -> dict:
-    """A raw ``ohlc.event`` bid payload — no volume resolved yet."""
-    payload = _payload(opening)
-    del payload["_volume"]
-    return payload
-
-
-async def _arm_pipeline(provider: _Venue, *, emitted: int, anchor: int) -> None:
-    """Start the live pipeline around hand-built queues, without ``connect``.
-
-    ``connect`` is bypassed on purpose: its reconnect replay, keepalive and
-    feed watchdog play no part in bar ordering, while their real waits would
-    make the scenario depend on wall-clock timing. Everything ordering does
-    depend on — the raw queue, the volume worker and the OHLC watchdog — is
-    the production code, running as the production tasks.
-
-    :param emitted: Opening second of the newest bar the runner already has.
-    :param anchor: Opening second the watchdog probes the next slot from.
-    """
-    provider._ws = await provider.open_socket()  # type: ignore[assignment]
-    provider._update_queue = asyncio.Queue()
-    provider._raw_ohlc_queue = asyncio.Queue()
-    provider._last_bar_timestamp = emitted
-    provider._last_bar_open_ts = float(anchor)
-    provider._last_ohlc_event_ts = provider.now_s
-    provider._last_quote_event_ts = provider.now_s
-    # Full WS coverage from the first scenario bar: the volume worker must
-    # take the REST path because the quote bucket is empty, not because the
-    # bar predates the subscription.
-    provider._ws_coverage_started_at = float(_bar(0))
-    provider._volume_backfill_task = asyncio.create_task(
-        provider._volume_backfill_worker_loop()
-    )
-    provider._ohlc_watchdog_task = asyncio.create_task(
-        provider._ohlc_watchdog_loop()
-    )
-    await _REAL_SLEEP(0)
-
-
-async def _consume_until_death(provider: _Venue, runner: _Runner) -> None:
-    """Feed the runner everything the pipeline still has to deliver."""
-    while True:
-        try:
-            runner.feed(await provider.watch_ohlcv("EURUSD", "1"))
-        except ConnectionError:
-            return
-
-
-def __test_capitalcom_watchdog_recovery_waits_for_in_flight_bar__(monkeypatch):
-    """A stalled volume lookup must not let the watchdog's bar pass it.
-
-    Bar 2 arrives on the WebSocket and parks in the volume worker on a REST
-    lookup that outlives the watchdog's publish lag. Bar 3's ``ohlc.event``
-    never arrives, so the watchdog recovers it from REST while bar 2 is still
-    in flight. Both bars must reach the runner, in order, exactly once — with
-    a second writer on the consumer queue bar 3 overtakes bar 2 and the
-    plugin's own monotonicity filter then swallows bar 2 without a trace.
-    """
-    stall = _Stall()
-    monkeypatch.setattr(streaming_module.asyncio, 'sleep', _fast_sleep)
 
     async def scenario(provider, runner):
-        provider.fill_book(4)
-        # Bar 2 closed a second ago and its ohlc.event just landed.
-        provider.advance_to(3, offset_s=1.0)
-        await _arm_pipeline(provider, emitted=_bar(1), anchor=_bar(2))
-        raw = provider._raw_ohlc_queue
-        queue = provider._update_queue
-        assert raw is not None and queue is not None
-        try:
-            raw.put_nowait(("ohlc", _ws_payload(_bar(2))))
-            await _until(lambda: stall.entered.is_set(),
-                         what="the volume lookup of bar 2")
+        await _start_live(provider, runner)
+        provider.advance_to(3, offset_s=15.0)
+        provider.fill_book(3)
+        assert runner.last_confirmed is not None
+        for bar in await provider.backfill_closed_bars("EURUSD", "1", runner.last_confirmed):
+            runner.feed(bar)
+        assert runner.closed == [_bar(1) * 1000, _bar(2) * 1000]
 
-            # Bar 3's event is never pushed. The watchdog fires 10s past bar
-            # 4's open, with bar 2 still parked on its volume lookup.
-            provider.advance_to(4, offset_s=11.0)
-            await _until(lambda: provider.price_calls == [_bar(3)],
-                         what="the watchdog's REST read of bar 3")
-            await _until(lambda: raw.qsize() >= 1 or not queue.empty(),
-                         what="the recovered bar to be published")
-            assert queue.empty(), (
-                "the recovered bar overtook the bar still being enriched"
-            )
-        finally:
-            # Unblock the pipeline even on failure, so the teardown does not
-            # have to wait the lookup's real timeout out.
-            stall.release.set()
-        raw.put_nowait(("disconnect", None))
-        await _consume_until_death(provider, runner)
+        assert provider._update_queue is not None
+        provider._update_queue.put_nowait(("ohlc", _payload(_bar(2))))
+        late = await provider.watch_ohlcv("EURUSD", "1")
+        assert late.is_closed and late.timestamp == _bar(2) * 1000
+        runner.feed(late)
 
-        assert runner.closed == [_bar(2) * 1000, _bar(3) * 1000]
-        assert runner.dropped == []
-        # The recovery really did run while the volume lookup was parked.
-        assert provider.price_calls == [_bar(3), _bar(2)]
-
-    _run(scenario, monkeypatch, before_thread=stall.hook)
-
-
-def __test_capitalcom_watchdog_recovery_delivered_without_in_flight_bar__(
-        monkeypatch):
-    """The plain recovery path still delivers when nothing is in flight."""
-    monkeypatch.setattr(streaming_module.asyncio, 'sleep', _fast_sleep)
-
-    async def scenario(provider, runner):
-        provider.fill_book(4)
-        provider.advance_to(4, offset_s=11.0)
-        await _arm_pipeline(provider, emitted=_bar(2), anchor=_bar(2))
-        raw = provider._raw_ohlc_queue
-        queue = provider._update_queue
-        assert raw is not None and queue is not None
-        # The sentinel may only be queued once the recovery is in the
-        # pipeline, otherwise the worker would exit ahead of it.
-        await _until(lambda: raw.qsize() >= 1 or not queue.empty(),
-                     what="the watchdog recovery of bar 3")
-
-        raw.put_nowait(("disconnect", None))
-        await _consume_until_death(provider, runner)
-
-        assert runner.closed == [_bar(3) * 1000]
-        assert runner.dropped == []
-        # Recovered bars carry REST volume already; the worker adds no lookup.
-        assert provider.price_calls == [_bar(3)]
-        assert provider._last_bar_open_ts == float(_bar(3))
+        assert runner.closed == [_bar(1) * 1000, _bar(2) * 1000]
+        assert runner.dropped == [_bar(2) * 1000]
 
     _run(scenario, monkeypatch)
 
 
 # === Sanity: no reconnect, no history reads =================================
 
-def __test_capitalcom_clean_stream_never_replays__(monkeypatch):
+def __test_capitalcom_clean_stream_never_reads_history__(monkeypatch):
     """Without a drop the subscription serves everything — no history reads."""
 
     async def scenario(provider, runner):
@@ -634,44 +564,5 @@ def __test_capitalcom_clean_stream_never_replays__(monkeypatch):
         assert runner.closed == [_bar(k) * 1000 for k in (1, 2, 3, 4)]
         assert runner.dropped == []
         assert provider.price_calls == []
-
-    _run(scenario, monkeypatch)
-
-
-def __test_capitalcom_startup_seam_bar_published_late_is_still_recovered__(monkeypatch):
-    """A seam bar REST publishes only after the startup backfill is not lost.
-
-    Replays capitalcom cycle 174 (2026-09-18): the process started one
-    second before a minute boundary, the warmup tail was bar 0, the bar
-    that closed while the subscription came up (bar 1) was not yet in REST
-    when the framework asked for the seam, and the WS only delivered from
-    bar 2 on — bar 1 reached the strategy as a DATA_GAP. The empty backfill
-    must arm the watchdog on the warmup tail so it probes bar 1 and injects
-    it once the venue publishes it.
-    """
-    monkeypatch.setattr(streaming_module.asyncio, 'sleep', _fast_sleep)
-
-    async def scenario(provider, runner):
-        provider.fill_book(1)
-        provider.advance_to(2, offset_s=11.0)
-        await provider.connect()
-        assert provider._last_bar_open_ts == 0.0
-        recovered = await provider.backfill_closed_bars("EURUSD", "1", _bar(0) * 1000)
-        assert recovered == []
-        assert provider._last_bar_timestamp == _bar(0)
-        assert provider._last_bar_open_ts == float(_bar(0))
-
-        # The venue publishes bar 1 a moment later; the watchdog probes it.
-        provider.fill_book(2)
-        raw = provider._raw_ohlc_queue
-        queue = provider._update_queue
-        assert raw is not None and queue is not None
-        await _until(lambda: raw.qsize() >= 1 or not queue.empty(),
-                     what="the watchdog recovery of the seam bar")
-        raw.put_nowait(("disconnect", None))
-        await _consume_until_death(provider, runner)
-
-        assert runner.closed == [_bar(1) * 1000]
-        assert runner.dropped == []
 
     _run(scenario, monkeypatch)
