@@ -105,11 +105,14 @@ class _StreamingMixin(_CapitalComBase, ABC):
     either.
     """
 
-    history_publish_lag = 10.0
+    history_publish_lag = 15.0
     """Seconds after a close until ``/prices`` returns the closed bar with its final values.
 
-    Measured 2026-11-17 on 20 one-minute closes, polled every second: the revision
-    came 7-8 s after the close every time, and the bar did not change again.
+    The usual revision comes 7-8 s after the close, rare late price updates change
+    the bar after that. Measured 2026-11-19 on 1440 one-minute BTCUSD bars against
+    the bar read 15 minutes later: asked 10 s after the close 20 bars differed (by
+    up to 1144 ticks), asked 15 s or 20 s after it 8 did (by up to 32 ticks), asked
+    30 s after it none.
     """
 
     history_revises_before_lag = True
