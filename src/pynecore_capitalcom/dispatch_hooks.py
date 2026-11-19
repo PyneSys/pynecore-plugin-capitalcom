@@ -63,7 +63,7 @@ from .helpers import (
     _wire_float,
     _wire_id,
 )
-from .models import _bracket_leg_id
+from .models import _DealVerdict, _bracket_leg_id
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow, RunContext
@@ -894,64 +894,114 @@ class _CapitalComCloseHooks:
         snapshot. Treating the same condition as manual intervention would
         permanently halt the engine even when the DELETE landed and the venue
         is already flat.
+
+        A not-found DELETE counts the target as swept only when the deal is
+        gone (:meth:`~pynecore_capitalcom.identity._DealIdentityMixin._resolve_own_deal`).
+        A target that moved onto another ``dealId`` is closed there; one the
+        venue lists or that is still materialising, but cannot route a close
+        to, raises :class:`OrderDispositionUnknownError`: nothing closed, and
+        reporting the close as landed would let the engine book a close the
+        venue never made (measured live: capitalcom cycle 442, the DELETE on
+        the confirm's working-order ``dealId`` answered not-found, the
+        position under its fresh ``dealId`` stayed open and unprotected).
         """
         store_ctx = self._plugin.store_ctx
         applied_targets: list[str] = []
         for row in targets:
             close_ref: str | None = None
-            try:
-                with self._plugin.own_close(
-                        [row.exchange_order_id or ''], full=True, size=None,
-                ):
-                    resp = await self._plugin.call_api(
-                        f'positions/{row.exchange_order_id}', method='delete',
-                    )
-                if isinstance(resp, dict):
-                    close_ref = _wire_id(resp.get('dealReference'))
-            except (httpx.TimeoutException, httpx.RequestError,
-                    ConnectionError, ExchangeConnectionError) as net:
-                raise OrderDispositionUnknownError(
-                    f"Capital DELETE positions/{row.exchange_order_id} "
-                    f"ambiguous during full close: {net}",
-                    client_order_id=coid,
-                    cause=net if isinstance(net, Exception) else None,
-                ) from net
-            except CapitalComApiError as exc:
-                # The venue evaluated the DELETE and refused it: nothing
-                # landed, the target is untouched. A session-pause refusal
-                # (measured live: the 21:00 UTC maintenance break) is
-                # non-terminal — the engine retries once trading resumes;
-                # any other verdict is a definitive reject. Letting the raw
-                # provider error escape killed the run through the engine's
-                # generic dispatch net.
-                if _is_market_closed_reject(str(exc)):
-                    raise MarketClosedError(
-                        f"Capital DELETE positions/{row.exchange_order_id} "
-                        f"declined, market closed: {exc}",
+            deal_id = row.exchange_order_id or ''
+            # A not-found is judged by the deal's identity before the target
+            # counts as swept: the row may hold another deal by now (the
+            # confirm named the executed working order, the position opened
+            # under a fresh ``dealId``), or a deal the venue does not list
+            # yet. One more DELETE goes to the deal the row holds.
+            for attempt in range(2):
+                try:
+                    with self._plugin.own_close([deal_id], full=True, size=None):
+                        resp = await self._plugin.call_api(
+                            f'positions/{deal_id}', method='delete',
+                        )
+                    if isinstance(resp, dict):
+                        close_ref = _wire_id(resp.get('dealReference'))
+                    break
+                except (httpx.TimeoutException, httpx.RequestError,
+                        ConnectionError, ExchangeConnectionError) as net:
+                    raise OrderDispositionUnknownError(
+                        f"Capital DELETE positions/{deal_id} "
+                        f"ambiguous during full close: {net}",
+                        client_order_id=coid,
+                        cause=net if isinstance(net, Exception) else None,
+                    ) from net
+                except CapitalComApiError as exc:
+                    # The venue evaluated the DELETE and refused it: nothing
+                    # landed, the target is untouched. A session-pause refusal
+                    # (measured live: the 21:00 UTC maintenance break) is
+                    # non-terminal — the engine retries once trading resumes;
+                    # any other verdict is a definitive reject. Letting the raw
+                    # provider error escape killed the run through the engine's
+                    # generic dispatch net.
+                    if _is_market_closed_reject(str(exc)):
+                        raise MarketClosedError(
+                            f"Capital DELETE positions/{deal_id} "
+                            f"declined, market closed: {exc}",
+                        ) from exc
+                    raise ExchangeOrderRejectedError(
+                        f"Capital DELETE positions/{deal_id} "
+                        f"rejected: {exc}",
                     ) from exc
-                raise ExchangeOrderRejectedError(
-                    f"Capital DELETE positions/{row.exchange_order_id} "
-                    f"rejected: {exc}",
-                ) from exc
-            except OrderNotFoundError:
-                # Target vanished between local snapshot and the DELETE
-                # (broker-side natural close, manual intervention, or
-                # another stale dispatch already swept it). The user's
-                # close intent is satisfied either way — count the
-                # target as swept so the journal's ``mark_closing``
-                # path records it. Letting ``OrderNotFoundError`` (a
-                # subclass of :class:`ExchangeOrderRejectedError`)
-                # escape would mark the entire close dispatch
-                # ``rejected`` — terminal, no recovery, stale position
-                # row left behind. Mirrors the cancel hook's
-                # ``already_gone`` semantics.
-                if store_ctx is not None:
-                    store_ctx.log_event(
-                        'close_already_gone',
-                        client_order_id=row.client_order_id,
-                        exchange_order_id=row.exchange_order_id,
-                        intent_key=intent.intent_key,
-                    )
+                except OrderNotFoundError as missing:
+                    try:
+                        verdict, current = await self._plugin.resolve_own_deal(row, deal_id)
+                    except (httpx.TimeoutException, httpx.RequestError,
+                            ConnectionError, ExchangeConnectionError) as net:
+                        raise OrderDispositionUnknownError(
+                            f"Capital DELETE positions/{deal_id} not found and "
+                            f"the deal could not be judged: {net}",
+                            client_order_id=coid,
+                            cause=net if isinstance(net, Exception) else None,
+                        ) from net
+                    if verdict is _DealVerdict.GONE:
+                        # The target vanished between the local snapshot and
+                        # the DELETE (broker-side natural close, manual
+                        # intervention, or another stale dispatch already
+                        # swept it). The user's close intent is satisfied
+                        # either way — count the target as swept so the
+                        # journal's ``mark_closing`` path records it. Letting
+                        # ``OrderNotFoundError`` (a subclass of
+                        # :class:`ExchangeOrderRejectedError`) escape would
+                        # mark the entire close dispatch ``rejected`` —
+                        # terminal, no recovery, stale position row left
+                        # behind. Mirrors the cancel hook's ``already_gone``
+                        # semantics.
+                        if store_ctx is not None:
+                            store_ctx.log_event(
+                                'close_already_gone',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=deal_id,
+                                intent_key=intent.intent_key,
+                            )
+                        break
+                    if verdict is _DealVerdict.MATERIALISING or attempt == 1:
+                        # The deal is the run's and is not gone, but the
+                        # venue cannot route a close to it yet. Nothing
+                        # closed: the command parks, and the position keeps
+                        # counting the deal until the venue shows it.
+                        if store_ctx is not None:
+                            store_ctx.log_event(
+                                'close_target_not_addressable',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=deal_id,
+                                intent_key=intent.intent_key,
+                                payload={'verdict': verdict.value, 'deal_id': current},
+                            )
+                        raise OrderDispositionUnknownError(
+                            f"Capital DELETE positions/{deal_id} not found while "
+                            f"the deal is {verdict.value} (the entry holds "
+                            f"{current}): the close did not land",
+                            client_order_id=coid,
+                            cause=missing,
+                        ) from missing
+                    deal_id = current
             if store_ctx is not None:
                 store_ctx.set_order_state(row.client_order_id, 'closing')
                 if close_ref is not None:
@@ -962,21 +1012,20 @@ class _CapitalComCloseHooks:
                 store_ctx.log_event(
                     'close_dispatched',
                     client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
+                    exchange_order_id=deal_id,
                     intent_key=intent.intent_key,
                     payload=(
                         {'close_deal_reference': close_ref}
                         if close_ref is not None else None
                     ),
                 )
-            applied_targets.append(row.exchange_order_id or '')
+            applied_targets.append(deal_id)
 
-        primary = targets[0]
         return CloseOutcome(
             mode='full',
             applied_targets=applied_targets,
             deal_reference=None,
-            exchange_id=primary.exchange_order_id or '',
+            exchange_id=applied_targets[0] if applied_targets else '',
             filled_qty=intent.qty,
         )
 

@@ -30,7 +30,7 @@ import asyncio
 import collections
 import threading
 from abc import ABC
-from collections.abc import Iterable
+from collections.abc import Container, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +52,7 @@ from .config import CapitalComConfig
 from .helpers import _size_from_units
 from .models import (
     _ActivityCursor,
+    _DealVerdict,
     _ForeignExitBlock,
     _HeldEditVerdict,
     _InstrumentRules,
@@ -133,6 +134,10 @@ class CapitalComHookCollaborator(Protocol):
     def hold_unproven_take_over(self, row: 'OrderRow') -> None: ...
 
     async def classify_cancel_via_activity(self, deal_id: str) -> CancelDispositionOutcome: ...
+
+    async def resolve_own_deal(
+            self, row: 'OrderRow', deal_id: str,
+    ) -> tuple[_DealVerdict, str]: ...
 
 
 class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
@@ -273,6 +278,12 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     async def classify_cancel_via_activity(self, deal_id: str) -> CancelDispositionOutcome:
         """Classify a working order gone on its DELETE by its activity, for a hook."""
         return await self._classify_cancel_via_activity(deal_id)
+
+    async def resolve_own_deal(
+            self, row: 'OrderRow', deal_id: str,
+    ) -> tuple[_DealVerdict, str]:
+        """Judge an own entry's deal after a not-found on ``deal_id``, for a hook."""
+        return await self._resolve_own_deal(row, deal_id)
 
     if TYPE_CHECKING:
         def __call__(
@@ -436,6 +447,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # Every deal a ``/positions`` read showed recently: ``dealId`` ->
     # ``(createdDateUTC epoch, direction, last seen at)``.
     _seen_position_deals: dict[str, tuple[float, str, float]]
+    # Entry fills this process booked whose deal no ``/positions`` read listed
+    # yet, by client order id: wall time the fill was booked (see
+    # ``identity.py``).
+    _unlisted_fills: dict[str, float]
     # Own partial exits deals this run did not open block, by intent key; and
     # the ones whose block latched.
     _foreign_exit_blocks: dict[str, _ForeignExitBlock]
@@ -732,6 +747,19 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             self, working_by_deal: dict[str, dict],
             read_started_at: float | None,
     ) -> None: ...
+
+    # --- Deal identity (identity.py) ---
+    def _note_entry_fill_unlisted(self, coid: str) -> None: ...
+
+    def _materialising(self, row: 'OrderRow', listed: Container[str] = ()) -> bool: ...
+
+    def _materialising_position_rows(
+            self, positions: Iterable[dict], symbol: str,
+    ) -> list[dict]: ...
+
+    async def _resolve_own_deal(
+            self, row: 'OrderRow', deal_id: str,
+    ) -> tuple[_DealVerdict, str]: ...
 
     # --- Foreign exposure (foreign.py) ---
     def _owned_deal_ids(self, positions: Iterable[dict]) -> set[str] | None: ...

@@ -87,7 +87,7 @@ from .helpers import (
     _venue_rendered_level,
     _wire_float,
 )
-from .models import _InstrumentRules, _bracket_leg_id
+from .models import _DealVerdict, _InstrumentRules, _bracket_leg_id
 
 if TYPE_CHECKING:
     from pynecore.core.broker.journal import (
@@ -95,6 +95,24 @@ if TYPE_CHECKING:
         SubmitOutcome,
     )
     from pynecore.core.broker.storage import OrderRow
+
+
+class _PositionDealPending(Exception):
+    """A bracket ``PUT`` found the entry's deal not addressable yet.
+
+    The row now holds another deal (:attr:`~pynecore_capitalcom.models._DealVerdict.REKEYED`)
+    or the deal is still materialising
+    (:attr:`~pynecore_capitalcom.models._DealVerdict.MATERIALISING`): the
+    exit is retried on the next sync, never answered with a defensive close.
+
+    :ivar verdict: The deal verdict.
+    :ivar deal_id: The deal the entry row holds now.
+    """
+
+    def __init__(self, verdict: _DealVerdict, deal_id: str) -> None:
+        super().__init__(f"position deal {verdict.value}, entry holds {deal_id}")
+        self.verdict = verdict
+        self.deal_id = deal_id
 
 
 class _ExecutionMixin(_CapitalComBase, ABC):
@@ -232,7 +250,13 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         (:meth:`_owned_deal_ids`): a deal someone else opened on the epic is
         not the bot's exposure, and counting it would hide an own deal's
         disappearance behind it. Without a journal (a raw account read)
-        every row counts.
+        every row counts. An own deal whose fill the venue confirmed but
+        that ``/positions`` does not list yet counts from the journal
+        (:meth:`~pynecore_capitalcom.identity._DealIdentityMixin._materialising_position_rows`):
+        the read lagging the venue is no close, and a position that left it
+        out would let the engine book one (measured live: capitalcom cycle
+        442, a defensive close settled against a read that omitted the deal
+        it never reached).
 
         On a hedging-mode account the rows are netted through the core
         :func:`~pynecore.core.broker.emulator.aggregate_positions` instead:
@@ -243,8 +267,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         coexist).
         """
         if self._hedging_enabled:
+            legs = await self.fetch_raw_positions(symbol)
+            unlisted = self._materialising_position_rows(
+                [{'position': {'dealId': leg.leg_id}} for leg in legs], symbol,
+            )
             return aggregate_positions(
-                symbol, await self.fetch_raw_positions(symbol),
+                symbol, legs + _position_legs_from_payload({'positions': unlisted}, symbol),
             )
         res = await self._call('positions', method='get')
         rows = res.get('positions') or []
@@ -253,6 +281,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         if owned is not None:
             rows = [row for row in rows
                     if str((row.get('position') or {}).get('dealId') or '') in owned]
+        rows = rows + self._materialising_position_rows(res.get('positions') or [], symbol)
         long_size = 0.0
         short_size = 0.0
         long_notional = 0.0
@@ -816,7 +845,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         from pynecore.core.broker.journal import EntryDispatchHooks
 
         try:
-            return await journal.run_entry(
+            orders = await journal.run_entry(
                 coid=coid,
                 intent=intent,
                 qty=quantized_qty,
@@ -841,36 +870,49 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 reason='entry_preflight_unavailable',
                 context={'symbol': intent.symbol, 'side': intent.side, 'write': write},
             ) from unavailable
+        if any(order.filled_qty > 0.0 for order in orders):
+            # The confirm reported the fill: the deal is the run's from here
+            # on, listed by ``/positions`` or not (see ``identity.py``).
+            self._note_entry_fill_unlisted(coid)
+        return orders
 
     async def _put_bracket_with_notfound_retry(
-            self, deal_id: str, body: dict,
+            self, target_row: 'OrderRow', deal_id: str, body: dict,
     ) -> dict:
-        """PUT the bracket, retrying ONCE when a not-found races the fill.
+        """PUT the bracket, judging a not-found by the deal's identity first.
 
         Measured (cycle 65, pyramid, 3 events): the ``positions/{deal_id}``
         PUT issued immediately after the entry fill 404'd with
         ``error.not-found.dealId`` while the deal demonstrably existed — the
         defensive close's DELETE on the very same id landed seconds later.
-        The confirm→positions materialisation is eventually consistent
-        across backend routes, so one verification read decides: if the
-        deal IS listed in ``/positions`` the 404 was stale routing and the
-        PUT is retried once; if it is absent (or the retry fails too) the
-        error propagates to the defensive-close path unchanged. A network
-        failure during the verify read escapes as a connection error and
-        lands in the caller's ambiguous-PUT branch (disposition-unknown
-        park), which the reconcile machinery resolves.
+        And the confirm's ``dealId`` may not be the position's at all
+        (cycle 442: the confirm named the executed working order, the
+        position opened under a fresh ``dealId``). The not-found is judged
+        by :meth:`~pynecore_capitalcom.identity._DealIdentityMixin._resolve_own_deal`:
+
+        * the deal is listed: the 404 was stale routing, the PUT is retried
+          once;
+        * the row now holds another deal, or the deal is still
+          materialising: :class:`_PositionDealPending` — the exit waits for
+          the next sync, which protects the row's current deal; flattening
+          a just-filled entry for a venue view that has not caught up would
+          close the position for nothing, or not at all;
+        * the deal is gone: the error propagates to the defensive-close
+          path unchanged.
+
+        A network failure during a verify read escapes as a connection
+        error and lands in the caller's ambiguous-PUT branch
+        (disposition-unknown park), which the reconcile machinery resolves.
         """
         try:
             return await self._call(
                 f'positions/{deal_id}', data=body, method='put',
             )
         except OrderNotFoundError:
-            raw_positions = await self._call('positions', method='get')
-            listed = any(
-                str((raw.get('position') or {}).get('dealId') or '') == deal_id
-                for raw in (raw_positions.get('positions') or [])
-            )
-            if not listed:
+            verdict, current = await self._resolve_own_deal(target_row, deal_id)
+            if verdict in (_DealVerdict.REKEYED, _DealVerdict.MATERIALISING):
+                raise _PositionDealPending(verdict, current)
+            if verdict is not _DealVerdict.PRESENT:
                 raise
             if self.store_ctx is not None:
                 self.store_ctx.log_event(
@@ -1483,8 +1525,33 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             with self._protection_write(deal_id, body) as protection:
                 try:
                     resp = await protection.send(
-                        self._put_bracket_with_notfound_retry(deal_id, body),
+                        self._put_bracket_with_notfound_retry(target_row, deal_id, body),
                     )
+                except _PositionDealPending as pending:
+                    # Nothing attached: the deal the PUT named cannot be
+                    # reached yet. The legs go, and the exit is re-sent next
+                    # sync against the row's current deal.
+                    protection.refused()
+                    self._rollback_bracket_legs(
+                        intent=intent, parent_coid=target_row.client_order_id,
+                        deal_id=deal_id,
+                        tp_coid=tp_coid if intent.tp_price is not None else None,
+                        sl_coid=sl_coid if has_sl_leg else None,
+                        reason=f'position_deal_{pending.verdict.value}',
+                    )
+                    raise OrderSkippedByPlugin(
+                        f"Exit {intent.intent_key} skipped: the deal of entry "
+                        f"{intent.from_entry!r} is not addressable yet "
+                        f"({deal_id} {pending.verdict.value}, the entry holds "
+                        f"{pending.deal_id}); re-evaluating next sync.",
+                        intent_key=intent.intent_key,
+                        reason='position_deal_pending',
+                        context={'symbol': intent.symbol,
+                                 'from_entry': intent.from_entry,
+                                 'deal_id': deal_id,
+                                 'verdict': pending.verdict.value,
+                                 'current_deal_id': pending.deal_id},
+                    ) from pending
                 except (httpx.TimeoutException, httpx.RequestError,
                         ConnectionError, ExchangeConnectionError) as net:
                     self._mark_bracket_legs_disposition_unknown(
@@ -1802,8 +1869,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 if row.pine_entry_id == target_entry_id:
                     targets.append(row)
             elif target_position_coid is not None:
+                # The deal the defensive close was cut for may have moved
+                # onto the position's own ``dealId`` since (a market entry
+                # executed through the venue's working-order machinery, see
+                # ``identity.py``): the row then names the old deal as the
+                # one it was promoted from.
                 if (row.client_order_id == target_position_coid
-                        and row.exchange_order_id == target_exchange_id):
+                        and target_exchange_id is not None
+                        and target_exchange_id in (
+                            row.exchange_order_id,
+                            (row.extras or {}).get('promoted_from_working_order_id'))):
                     targets.append(row)
             else:
                 targets.append(row)

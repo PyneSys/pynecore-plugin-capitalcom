@@ -41,6 +41,7 @@ from .exceptions import (
 )
 from .execution import _ExecutionMixin
 from .foreign import _ForeignExposureMixin
+from .identity import _DealIdentityMixin
 from .intervention import _LEVEL_EDIT_SETTLE_S, _InterventionMixin
 from .helpers import (
     _INHERITED_LOOKUP_INTERVAL_S,
@@ -88,6 +89,7 @@ class CapitalCom(
     _RecoveryMixin,
     _InterventionMixin,
     _ForeignExposureMixin,
+    _DealIdentityMixin,
     _ReconcileMixin,
     _BracketMixin,
     _ActivityMixin,
@@ -287,6 +289,8 @@ class CapitalCom(
         self._foreign_blocks_reported: set[tuple] = set()
         self._positions_snapshot: tuple[float, dict[str, dict]] | None = None
         self._seen_position_deals: dict[str, tuple[float, str, float]] = {}
+        # Deal identity of own entries (see ``identity.py``).
+        self._unlisted_fills: dict[str, float] = {}
         self._foreign_exit_blocks: dict[str, _ForeignExitBlock] = {}
         self._foreign_exit_latched: set[str] = set()
         self._netting_retired_orders: dict[str, dict] | None = None

@@ -41,6 +41,7 @@ from pynecore.core.broker.models import (
     OrderStatus,
     QuarantineKind,
 )
+from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
 from pynecore.core.plugin import override
 
 from ._base import _CapitalComBase
@@ -372,7 +373,15 @@ class _ActivityMixin(_CapitalComBase, ABC):
                             wo_row, wo_id, deal_id, conflict, positions_by_deal,
                         )
                     elif wo_row.exchange_order_id == wo_id:
-                        if (wo_row.extras or {}).get('kind') == 'working':
+                        # A position row is the same shape one step later:
+                        # the venue ran a MARKET entry through its
+                        # working-order machinery, the confirm named the
+                        # executed order and the position opened under this
+                        # fresh ``dealId`` (measured 2026-08-28, cycle 84,
+                        # and cycle 442, where the bracket PUT and the
+                        # defensive DELETE both went to the order's id).
+                        if (wo_row.extras or {}).get('kind') in (
+                                ENTRY_KIND_WORKING, ENTRY_KIND_POSITION):
                             self._promote_working_row_to_position(
                                 wo_row, deal_id, stamp_entry_filled=False,
                             )
@@ -1703,6 +1712,9 @@ class _ActivityMixin(_CapitalComBase, ABC):
             exchange_order_id=new_deal_id,
             extras=base_extras,
         )
+        # The promoted deal is the run's from here on; a read may not list it
+        # yet (see ``identity.py``).
+        self._note_entry_fill_unlisted(wo_row.client_order_id)
         self.store_ctx.log_event(
             'working_order_promoted_to_position',
             client_order_id=wo_row.client_order_id,

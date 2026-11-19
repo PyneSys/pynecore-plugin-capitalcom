@@ -1776,6 +1776,11 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         deal_id = row.exchange_order_id
         if extras.get('natural_close_at') is not None:
             return MissingConfirmation(MissingResolution.CLOSED)
+        if self._materialising(row):
+            # A fill this process booked whose deal no read has listed yet:
+            # its absence is the venue's views lagging, not a close
+            # (see ``identity.py``).
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         filled_position = (
             extras.get('kind') == ENTRY_KIND_POSITION
             and (row.filled_qty > 0.0

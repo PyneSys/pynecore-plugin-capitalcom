@@ -9,6 +9,7 @@ all stateless, all required cross-mixin.
 import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TypeVar
 
 from pynecore.core.broker.exceptions import (
@@ -32,6 +33,22 @@ _VENUE_REFUSALS: tuple[type[Exception], ...] = (
     VenueWritesQuarantinedError,
     CapitalComApiError,
 )
+
+
+class _DealVerdict(Enum):
+    """What the venue's views say about an own entry's deal after a not-found.
+
+    See :meth:`~pynecore_capitalcom.identity._DealIdentityMixin._resolve_own_deal`.
+    """
+
+    #: ``/positions`` lists the deal: the not-found was stale routing.
+    PRESENT = 'present'
+    #: The row now holds another deal, one that back-links the old one.
+    REKEYED = 'rekeyed'
+    #: Neither listed nor back-linked, but still materialising: not gone.
+    MATERIALISING = 'materialising'
+    #: Neither listed nor back-linked nor materialising: the deal is gone.
+    GONE = 'gone'
 
 
 @dataclass(frozen=True)
