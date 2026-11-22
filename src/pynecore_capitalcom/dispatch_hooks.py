@@ -37,6 +37,7 @@ from pynecore.core.broker.journal import (
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    PENDING_DISPATCH_STATES,
 )
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
@@ -387,9 +388,13 @@ class _CapitalComCancelHooks:
     * **Filled position** (``kind == 'position'``) → silent
       ``cancel_noop`` audit event; never DELETE a filled position from
       a cancel intent.
-    * **Working order without an ``exchange_order_id`` yet** → mark the
-      row ``cancel_pending``; the next reconciler / recovery pass
-      retries once the id lands.
+    * **Entry submission without a deal id yet** (a pending dispatch
+      state: ``submitted``, ``server_ref_seen``, ``disposition_unknown``)
+      → the cancel is stamped on the row
+      (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_CANCEL_REQUESTED`)
+      and the row stays pending, so the resolver that learns its deal id
+      DELETEs the working order instead of promoting it, and one that
+      finds it never landed rejects it.
     * **Held take-over** (stamped
       :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`) →
       silent skip, the row stays live for the operator. A working order
@@ -465,22 +470,27 @@ class _CapitalComCancelHooks:
                 # for a second send. ``execute_cancel`` keeps such rows out of
                 # the sweep; the row stays for the operator.
                 continue
-            if (row.state == 'disposition_unknown'
+            if (row.state in PENDING_DISPATCH_STATES
                     and not row.exchange_order_id
                     and extras.get('kind') in (ENTRY_KIND_WORKING,
                                                ENTRY_KIND_POSITION)):
-                # A parked submission: the POST may well have landed, but
-                # the confirms glitch left the row without a deal id, so
-                # there is nothing to DELETE yet. Skipping it would LOSE
-                # the cancel — the parked-submission resolver later learns
-                # the id and the order goes live although Pine already
-                # cancelled it (measured live: Capital.com resting lane,
-                # cycle 136 — a stop entry POSTed into a 504 outage was
-                # cancelled three bars later as ``noop``, confirmed on the
-                # retry and filled). Stamp the request on the row; the
-                # resolver DELETEs the working order the moment the id
-                # lands (a market entry that turns out filled makes the
-                # cancel a no-op, as after any other fill).
+                # A pending submission: the POST may well have landed, but
+                # its answer never came (a confirms glitch, or a process
+                # that ended before it), so there is no deal id to DELETE
+                # yet. Skipping it would LOSE the cancel — the resolver
+                # later learns the id and the order goes live although
+                # Pine already cancelled it (measured live: Capital.com
+                # resting lane, cycle 136 — a stop entry POSTed into a 504
+                # outage was cancelled three bars later as ``noop``,
+                # confirmed on the retry and filled). Moving the row to a
+                # state of its own loses it as well: no resolver looks a
+                # row up outside the pending states (measured live,
+                # 2026-08-17: an inherited ``submitted`` stop moved to
+                # ``cancel_pending`` stayed live for three months). Stamp
+                # the request on the row and leave its state; the resolver
+                # DELETEs the working order the moment the id lands (a
+                # market entry that turns out filled makes the cancel a
+                # no-op, as after any other fill).
                 if store_ctx is not None:
                     merged = dict(extras)
                     merged[EXTRAS_KEY_CANCEL_REQUESTED] = {
@@ -649,13 +659,8 @@ class _CapitalComCancelHooks:
                 continue
 
             if not row.exchange_order_id:
-                # No exchange id yet — recovery will clear this on the next
-                # reconcile; marking ``cancel_pending`` prevents a duplicate
-                # DELETE once the id finally lands.
-                if store_ctx is not None:
-                    store_ctx.set_order_state(
-                        row.client_order_id, 'cancel_pending',
-                    )
+                # Only a pending submission lacks its deal id on this venue,
+                # and the branch above stamped it: there is nothing to DELETE.
                 continue
 
             kind = extras.get('kind', 'working')

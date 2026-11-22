@@ -75,6 +75,7 @@ from .helpers import (
     CLOSE_VERDICT_VENUE,
     EXTERNAL_REDUCTION_VERDICTS,
     EXTRAS_KEY_BOOKED_CLOSES,
+    EXTRAS_KEY_CANCEL_REQUESTED,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
@@ -272,6 +273,12 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 # trace or snapshot match here would book the very fill it
                 # held back, so the row is left as it is.
                 self._hold_unproven_take_over(pending_row)
+                return None
+            if (pending_row.extras or {}).get(EXTRAS_KEY_CANCEL_REQUESTED) is not None:
+                # Pine cancelled the entry while its submission was pending.
+                # A confirm here would make the landed order a live one the
+                # cancel never reaches; left pending, the in-run resolver
+                # DELETEs it once its deal id is known, or rejects it.
                 return None
             return cast(EntryDispatchHooks, resume_hooks)
 

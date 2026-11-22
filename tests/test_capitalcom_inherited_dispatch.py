@@ -1270,3 +1270,89 @@ def __test_a_parked_submission_of_this_process_is_not_looked_up_by_activity__(tm
     row = ctx.get_order(__test_helper_COID)
     assert row is not None and row.state == STATE_DISPOSITION_UNKNOWN
     store.close()
+
+
+@pytest.mark.parametrize('state', ['submitted', STATE_SERVER_REF_SEEN, STATE_DISPOSITION_UNKNOWN])
+def __test_a_cancelled_inherited_working_submission_is_deleted_once_it_lands__(tmp_path, state):
+    # Pine cancels an entry whose POST an earlier process never saw answered.
+    # The row has no deal id to DELETE, so the cancel is stamped on it and the
+    # row stays pending: the hold on the intent and the resolver's lookups
+    # stay with it, and the order is DELETEd the moment the venue shows it
+    # landed. Measured live (Capital.com lane, 2026-08-17): the cancel moved
+    # such a row to ``cancel_pending``, a state nothing resolves, and the row
+    # was adopted on every restart for three months, counted as an own
+    # opposite-side netting candidate.
+    created_s = epoch_time() - __test_helper_AGE_S
+    broker, store, ctx, _created = __test_helper_crashed_entry(
+        tmp_path, kind=ENTRY_KIND_WORKING, state=state, responses={
+            ('history/activity', 'get'): {'activities': [
+                __test_helper_activity(created_s + 0.4, deal_id='deal-W',
+                                       activity_type='WORKING_ORDER'),
+            ]},
+            ('workingorders/deal-W', 'delete'): {},
+        })
+    env = DispatchEnvelope(
+        intent=CancelIntent(pine_id='L', symbol='EURUSD'),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+    assert asyncio.run(broker.execute_cancel(env)) is True
+
+    assert not any(method == 'delete' for _endpoint, method, _data in broker._calls)
+    row = ctx.get_order(__test_helper_COID)
+    assert row is not None and row.state == state and row.closed_ts_ms is None
+    assert (row.extras or {})[EXTRAS_KEY_CANCEL_REQUESTED]['intent_key'] == 'L'
+    assert inherited_dispatch_in_flight(ctx, 'L') == __test_helper_COID
+
+    assert __test_helper_pass(broker) == []
+
+    assert ('workingorders/deal-W', 'delete') in [
+        (endpoint, method) for endpoint, method, _data in broker._calls]
+    row = ctx.get_order(__test_helper_COID)
+    assert row is not None and row.closed_ts_ms is not None
+    assert not any(r.client_order_id == __test_helper_COID for r in ctx.iter_live_orders())
+    assert 'cancelled' in base._event_kinds(ctx, __test_helper_COID)
+    store.close()
+
+
+def __test_the_startup_pass_leaves_a_cancelled_submission_to_the_resolver__(tmp_path):
+    # The startup pass would confirm the landed working order and make it a
+    # live order the cancel never reaches. A submission Pine already
+    # cancelled stays pending instead; the in-run resolver's take-over
+    # DELETEs it.
+    created_s = epoch_time() - __test_helper_AGE_S
+    landed = __test_helper_activity(created_s + 0.4, deal_id='deal-W',
+                                    activity_type='WORKING_ORDER')
+    broker, store, ctx, _created = __test_helper_crashed_entry(
+        tmp_path, kind=ENTRY_KIND_WORKING, responses={
+            ('positions', 'get'): {'positions': []},
+            ('workingorders', 'get'): {'workingOrders': [{
+                'marketData': {'epic': 'EURUSD'},
+                'workingOrderData': {'dealId': 'deal-W', 'epic': 'EURUSD',
+                                     'direction': 'BUY', 'orderSize': 1.0,
+                                     'orderType': 'LIMIT', 'orderLevel': 1.1},
+            }]},
+            ('history/activity', 'get'): {'activities': [landed]},
+            ('workingorders/deal-W', 'delete'): {},
+        })
+    row = ctx.get_order(__test_helper_COID)
+    assert row is not None
+    ctx.upsert_order(__test_helper_COID, extras={
+        **(row.extras or {}),
+        EXTRAS_KEY_CANCEL_REQUESTED: {'cancel_coid': 'cancel-l', 'intent_key': 'L'},
+    })
+
+    asyncio.run(broker._recover_in_flight_submissions())
+
+    row = ctx.get_order(__test_helper_COID)
+    assert row is not None and row.state == 'submitted' and row.closed_ts_ms is None
+    assert row.exchange_order_id is None
+
+    assert __test_helper_pass(broker) == []
+
+    assert ('workingorders/deal-W', 'delete') in [
+        (endpoint, method) for endpoint, method, _data in broker._calls]
+    row = ctx.get_order(__test_helper_COID)
+    assert row is not None and row.closed_ts_ms is not None
+    assert 'cancelled' in base._event_kinds(ctx, __test_helper_COID)
+    store.close()
