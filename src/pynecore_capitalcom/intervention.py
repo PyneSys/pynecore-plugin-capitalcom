@@ -2606,7 +2606,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
         """The own opposite-direction orders that may have netted ``row`` down.
 
         On a netting account an opposite entry — a resting working order
-        that executed, a ``strategy.order``, a stop-fired market — reduces
+        that executed, a ``strategy.order``, a triggered entry — reduces
         the existing position under the existing ``dealId``, and the venue
         logs that reduction like a close. Such an entry row exists before the
         reduction, is filled no earlier than it, and reduces the position by

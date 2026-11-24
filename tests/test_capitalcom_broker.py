@@ -23,7 +23,7 @@ from pynecore.core.broker.exceptions import (
     VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.models import (
-    CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType, QuarantineKind,
+    CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType, QuarantineKind, Quote,
 )
 from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
 from pynecore.core.broker.run_identity import RunIdentity
@@ -389,8 +389,8 @@ def __test_map_exception_validation_codes_are_order_rejections__():
     """``error.validation.*`` must classify as an order rejection.
 
     The venue's synchronous request-validation family (live incident:
-    ``error.validation.stop.price`` on a stop entry inside the min
-    distance) is a definitive refusal exactly like ``error.invalid.*``.
+    ``error.validation.stop.price`` on a stop entry whose trigger the quote
+    already crossed) is a definitive refusal exactly like ``error.invalid.*``.
     Unmapped it escaped as a raw provider error and the engine's generic
     dispatch net killed the whole run over one rejected entry signal.
     """
@@ -635,6 +635,37 @@ def __test_execute_entry_synchronous_api_reject_is_not_a_crash__(tmp_path):
     with pytest.raises(ExchangeOrderRejectedError) as exc:
         asyncio.run(broker.execute_entry(env))
     assert isinstance(exc.value.__cause__, CapitalComApiError)
+    store.close()
+
+
+@pytest.mark.parametrize(("order_type", "levels", "code", "crossed"), [
+    (OrderType.STOP, {'stop': 1.2050}, 'error.validation.stop.price', True),
+    (OrderType.LIMIT, {'limit': 1.2050}, 'error.validation.limit.price', True),
+    (OrderType.LIMIT, {'limit': 1.2050}, 'error.validation.stop.price', False),
+    (OrderType.STOP, {'stop': 1.2050}, 'error.validation.size', False),
+])
+def __test_execute_entry_crossed_working_order_reject_flags_level_crossed__(
+        tmp_path, order_type, levels, code, crossed,
+):
+    """A working-order entry refused for its crossed level carries ``level_crossed``.
+
+    Measured on the demo: a STOP on the triggered side of the quote is
+    refused with ``error.validation.stop.price``, a marketable LIMIT with
+    ``error.validation.limit.price``. The flag lets the engine send the entry
+    at market, as Pine fills a crossed entry at once; any other code, or the
+    code of the other order type, is a plain reject.
+    """
+    from pynecore_capitalcom.exceptions import CapitalComApiError
+
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('error', 'workingorders', 'post'): CapitalComApiError(
+            f"API error occured: {code}", error_code=code,
+        ),
+    })
+    env = _entry_envelope(order_type=order_type, **levels)
+    with pytest.raises(ExchangeOrderRejectedError) as exc:
+        asyncio.run(broker.execute_entry(env))
+    assert exc.value.level_crossed is crossed
     store.close()
 
 
@@ -891,6 +922,26 @@ def _rules_resp_with_snapshot(bid: float, offer: float) -> dict:
     """Variant of :data:`_RULES_RESP` carrying a ``snapshot`` block so the
     plugin's pre-check can read a live mid quote during pre-validation tests."""
     return {**_RULES_RESP, 'snapshot': {'bid': bid, 'offer': offer}}
+
+
+def __test_get_quote_reads_a_fresh_snapshot__(tmp_path):
+    """``get_quote`` returns the market snapshot's bid and offer, read fresh
+    on every call (never a cached or streamed value)."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.10000, 1.10002),
+    })
+    assert asyncio.run(broker.get_quote('EURUSD')) == Quote(bid=1.10000, ask=1.10002)
+    assert asyncio.run(broker.get_quote('EURUSD')) == Quote(bid=1.10000, ask=1.10002)
+    assert len([c for c in broker._calls if c[0] == 'markets/EURUSD']) == 2
+    assert broker.get_capabilities().stop_limit_order is CapabilityLevel.SOFTWARE
+
+
+def __test_get_quote_without_a_snapshot_is_unknown__(tmp_path):
+    """A market reply without a tradable snapshot gives no quote."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+    })
+    assert asyncio.run(broker.get_quote('EURUSD')) is None
 
 
 def __test_execute_exit_pre_validates_sl_distance__(tmp_path):

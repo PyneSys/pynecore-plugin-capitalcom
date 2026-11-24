@@ -488,6 +488,32 @@ def _is_market_closed_reject(reason: str) -> bool:
     return any(token in reason_uc for token in _MARKET_CLOSED_REJECT_SUBSTRINGS)
 
 
+_CROSSED_WORKING_ORDER_CODES: dict[str, str] = {
+    'STOP': 'error.validation.stop.price',
+    'LIMIT': 'error.validation.limit.price',
+}
+
+
+def _is_crossed_working_order_reject(error_code: str | None, order_type: str | None) -> bool:
+    """True when the venue refused a working-order entry because its level is
+    already crossed by the current quote.
+
+    Measured on the Capital.com demo (2026-11-23, ETHUSD): a working order
+    carries no minimum distance — a BUY STOP one tick above the ask is
+    accepted — but a STOP on the triggered side of the quote (a BUY STOP at
+    or below the ask, a SELL STOP at or above the bid) is refused with
+    ``error.validation.stop.price``, and a marketable LIMIT (a BUY LIMIT above
+    the ask, a SELL LIMIT below the bid) with ``error.validation.limit.price``.
+    Each code belongs to its own order type, so a code of the other type is
+    not read as a crossed level.
+
+    :param error_code: The ``errorCode`` the venue answered the POST with.
+    :param order_type: The ``type`` field of the ``workingorders`` body.
+    """
+    return (error_code is not None and order_type is not None
+            and _CROSSED_WORKING_ORDER_CODES.get(order_type) == error_code)
+
+
 def _is_position_gone_reject(reason: str) -> bool:
     """True when a Capital.com reject reason means the targeted position no
     longer exists on the venue, so a write that only clears its bracket has

@@ -21,6 +21,7 @@ import httpx
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
+    Quote,
 )
 from pynecore.core.plugin import override
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
@@ -459,6 +460,10 @@ class _ProviderMixin(_CapitalComBase, ABC):
         - ``trailing_stop = NATIVE`` — server-side, points-only via
           ``trailingStop=true, stopDistance``. Mutually exclusive with
           ``guaranteedStop``.
+        - ``stop_limit_order = SOFTWARE`` — a working order is a plain STOP
+          or LIMIT; there is no stop-limit type. The sync engine watches the
+          stop on the chart price (BID bars) and sends the LIMIT when it
+          triggers.
         - ``oca_cancel = SOFTWARE`` — Capital.com has no exchange-side OCA
           group between independent working orders; the sync engine emits
           cancels itself when one leg fills. The position-attribute bracket
@@ -508,20 +513,22 @@ class _ProviderMixin(_CapitalComBase, ABC):
             fetch_position=CapabilityLevel.NATIVE,
             idempotency=CapabilityLevel.SOFTWARE,
             short_selling=CapabilityLevel.NATIVE,
+            stop_limit_order=CapabilityLevel.SOFTWARE,
         )
 
     async def _fetch_market(
             self, epic: str,
-    ) -> tuple[_InstrumentRules, float | None]:
+    ) -> tuple[_InstrumentRules, Quote | None]:
         """Pull ``/markets/{epic}`` once and parse out everything callers
         need.
 
         Returns the parsed :class:`_InstrumentRules` (also stored in the
-        TTL cache under ``epic``) plus the snapshot mid quote derived from
-        ``snapshot.bid`` / ``snapshot.offer`` — ``None`` when the response
-        omits a tradable snapshot. The two consumers split here:
+        TTL cache under ``epic``) plus the snapshot quote
+        (``snapshot.bid`` / ``snapshot.offer``) — ``None`` when the response
+        omits a tradable snapshot. The consumers split here:
         :meth:`_get_instrument_rules` only takes the rules, while
-        :meth:`_get_current_mid_price` only takes the mid; sharing this
+        :meth:`_get_current_mid_price` and :meth:`get_quote` only take the
+        quote; sharing this
         single call keeps the bracket-distance pre-check from doubling
         the network round-trip when both are needed in the same flow.
 
@@ -584,10 +591,10 @@ class _ProviderMixin(_CapitalComBase, ABC):
         self._instrument_rules_cache[epic] = rules
         bid_raw = snapshot.get('bid')
         offer_raw = snapshot.get('offer')
-        mid: float | None = None
+        quote: Quote | None = None
         if isinstance(bid_raw, (int, float)) and isinstance(offer_raw, (int, float)):
-            mid = (float(bid_raw) + float(offer_raw)) / 2.0
-        return rules, mid
+            quote = Quote(bid=float(bid_raw), ask=float(offer_raw))
+        return rules, quote
 
     async def _get_instrument_rules(self, epic: str) -> _InstrumentRules:
         """Return cached dealing rules for ``epic``, fetching on first use
@@ -626,5 +633,16 @@ class _ProviderMixin(_CapitalComBase, ABC):
         the :class:`_InstrumentRules` cache, so a subsequent
         :meth:`_get_instrument_rules` in the same flow is a cache hit.
         """
-        _, mid = await self._fetch_market(epic)
-        return mid
+        _, quote = await self._fetch_market(epic)
+        return (quote.bid + quote.ask) / 2.0 if quote is not None else None
+
+    async def get_quote(self, symbol: str) -> Quote | None:
+        """Fresh ``snapshot.bid`` / ``snapshot.offer`` of ``symbol``'s market.
+
+        Read before the engine sends a limit entry that the venue refused
+        as marketable (``error.validation.limit.price``) at market: the
+        market order may only go while the quote is still within the limit.
+        Always a REST read, never the streamed quote.
+        """
+        _, quote = await self._fetch_market(symbol)
+        return quote

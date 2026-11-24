@@ -35,7 +35,7 @@ from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
-    KIND_ENTRY_STOP,
+    KIND_ENTRY_TRIGGERED,
     KIND_EXIT_SL,
     KIND_EXIT_TP,
     KIND_MODIFY_ENTRY,
@@ -78,6 +78,7 @@ from .helpers import (
     EXTRAS_KEY_ORDER_LEVEL,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _extract_reject_reason,
+    _is_crossed_working_order_reject,
     _is_funds_reject,
     _is_market_closed_reject,
     _mark_own_close_cursor_retired,
@@ -764,13 +765,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         """
         intent = envelope.intent
         assert isinstance(intent, EntryIntent)
-        # The stop-fired MARKET of a both-set entry uses a distinct
-        # client-order-id from the native LIMIT leg (which already holds the
-        # KIND_ENTRY id for the same pine_id) — otherwise the broker's local
-        # idempotency dedup would treat the market POST as a duplicate of the
-        # just-cancelled limit and skip it.
+        # The order the engine sends for a triggered entry (a stop-limit's
+        # LIMIT, a crossed entry's re-send) uses its own client-order-id
+        # kind, distinct from the entry's KIND_ENTRY id for the same pine_id,
+        # so the broker's local idempotency dedup never takes it for that one.
         coid = envelope.client_order_id(
-            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
+            KIND_ENTRY_TRIGGERED if intent.triggered_entry else KIND_ENTRY,
         )
 
         rules = await self._get_instrument_rules(intent.symbol)
@@ -3353,8 +3353,14 @@ class _CapitalComEntryHooks:
                     f"Capital POST {self._endpoint} declined, market closed "
                     f"(coid={coid}): {exc}",
                 ) from exc
+            # A STOP / LIMIT entry whose level the quote already crossed is
+            # Pine's immediate fill, not a refused signal: ``level_crossed``
+            # lets the engine send it at market instead of dropping it.
             raise ExchangeOrderRejectedError(
                 f"Capital POST {self._endpoint} rejected (coid={coid}): {exc}",
+                level_crossed=(self._endpoint == 'workingorders'
+                               and _is_crossed_working_order_reject(
+                                   exc.error_code, self._body.get('type'))),
             ) from exc
         except CapitalComError as exc:
             # A response arrived but could not be parsed (JSON error /

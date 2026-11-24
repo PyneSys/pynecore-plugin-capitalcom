@@ -43,6 +43,7 @@ from pynecore.core.broker.models import (
     ExchangeOrder,
     ExitIntent,
     OrderEvent,
+    Quote,
 )
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.core.syminfo import SymInfo
@@ -537,7 +538,7 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def get_single_market_details(self) -> dict: ...
 
-    async def _fetch_market(self, epic: str) -> tuple[_InstrumentRules, float | None]: ...
+    async def _fetch_market(self, epic: str) -> tuple[_InstrumentRules, Quote | None]: ...
 
     async def _get_instrument_rules(self, epic: str) -> _InstrumentRules: ...
 

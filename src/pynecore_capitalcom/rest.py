@@ -948,8 +948,8 @@ class _RestSessionMixin(_CapitalComBase, ABC):
                 return ExchangeOrderRejectedError(str(raw))
             # ``error.validation.*`` is the venue's synchronous request-
             # validation family (``error.validation.stop.price`` on a stop
-            # entry whose trigger sits inside the min distance, size /
-            # level variants alike) — a definitive refusal of the order,
+            # entry whose trigger the quote already crossed, size / level
+            # variants alike) — a definitive refusal of the order,
             # exactly like ``error.invalid.*``. Left unmapped it escaped as
             # a raw provider error and the engine's generic dispatch net
             # killed the whole run over one rejected entry signal.

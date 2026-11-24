@@ -113,10 +113,10 @@ class CapitalCom(
     through the :class:`~pynecore.core.plugin.broker.PositionPort`
     primitives, presenting Pine one-way semantics over the multi-row
     book. Stop orders and server-side trailing stops are supported. A
-    both-set Pine entry (``limit`` and ``stop``) is not a stop-limit
-    order: the sync engine rests the limit leg natively and fires a
-    market order on the stop side via a software price-watch, so the
-    plugin only ever sees plain market / limit / stop entries. Partial
+    Pine stop-limit order (``limit`` and ``stop``) has no venue
+    counterpart: the sync engine watches its stop in software and sends
+    the LIMIT when the stop triggers, so the plugin only ever sees plain
+    market / limit / stop entries. Partial
     closes are emulated via opposite-direction posts on a netting
     account; on a hedging account a partial close is a loud non-halting
     skip (``DELETE /positions/{dealId}`` is full-row only). Size changes
