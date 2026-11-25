@@ -85,14 +85,34 @@ the optional `symbol_map` translation table in the config:
 
 ## Account-mode notes
 
+**Use a one-way (netting) account** — switch hedging mode off in the
+Capital.com account settings before you start a bot. Pine strategies are
+one-way, and on a netting account the venue itself nets every order against
+the open position, so partial closes, resting opposite-side orders and
+protection all behave as the script expects. A hedging account works for
+strategies that only open and fully close positions, with the limits below.
+
 - **Hedging mode** is detected at connect time (`GET /accounts/preferences`)
   and handled transparently: closes, reversals, and brackets are decomposed
   per position row by the core one-way emulator.
-- **Partial closes on a hedging account are not supported**:
+- **A partial close on a hedging account closes the whole position row.**
   `DELETE /positions/{dealId}` is full-row only (it ignores any `size`
-  parameter), so a fractional `strategy.close(qty=...)` becomes a loud,
-  non-halting skip. Use a one-way (netting) account for partial closes —
-  there the plugin emulates them via opposite-direction orders.
+  parameter), so a close that asks for part of a row — a fractional
+  `strategy.close(qty=...)`, a partial `strategy.exit`, an opposite order
+  smaller than the position — closes that row in full and logs a warning
+  with the asked and the closed quantity. The position ends up smaller
+  than the script asked for, never larger. To scale out in steps on a
+  hedging account, enter in several smaller orders (each becomes its own
+  row) and close whole rows. Use a one-way (netting) account for exact
+  partial closes — there the plugin emulates them via opposite-direction
+  orders.
+- **Opposite positions on a hedging account stay open side by side.** A
+  position you open by hand against the bot's, or a resting limit / stop
+  order on the opposite side that fills, becomes its own row instead of
+  reducing the existing one. While such a row partly offsets a position,
+  that position carries no stop-loss / take-profit (a whole-row bracket
+  would close more than the net exposure); the bot logs an error once and
+  keeps running. Neither happens on a netting account.
 - **Deferred trailing activation** (Pine `trail_price` + `trail_points`)
   is only available on netting accounts; on a hedging account the trailing
   stop arms immediately at the given offset (logged as a warning).
