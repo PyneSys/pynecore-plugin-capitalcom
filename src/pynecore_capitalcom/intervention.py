@@ -1296,6 +1296,41 @@ class _InterventionMixin(_CapitalComBase, ABC):
             return None
         return row
 
+    def _held_protection(self, deal_id: str) -> ProtectionLevels | None:
+        """The protection the bot knows ``deal_id`` carries, without a venue read.
+
+        The guard's confirmed write of the position (a write the venue
+        confirmed, or the levels a view of the venue showed), as persisted on
+        its row. Unknown (``None``) unless that is all the venue can carry: no
+        guarded position row (:meth:`_protected_entry_row`), no confirmed
+        write, an own write in flight or of unknown outcome (the venue may
+        carry its levels instead), or an operator resume re-baselining the
+        row (the venue may carry the operator's levels).
+
+        :param deal_id: The position.
+        """
+        row = self._protected_entry_row(deal_id)
+        if row is None:
+            return None
+        key = _protection_key(deal_id)
+        if self._protection_in_flight.get(key):
+            return None
+        saved = (row.extras or {}).get(PROTECTION_LEVELS_EXTRA)
+        if (not isinstance(saved, dict) or saved.get('key') != key
+                or saved.get('rebaseline') or saved.get('unresolved')):
+            return None
+        confirmed = saved.get('confirmed')
+        if confirmed is None:
+            return None
+        for gen, levels in saved.get('writes') or []:
+            if gen != confirmed:
+                continue
+            try:
+                return ProtectionLevels.from_list(levels)
+            except (TypeError, ValueError):
+                return None
+        return None
+
     @contextmanager
     def _protection_write(self, deal_id: str, body: dict) -> Iterator[_ProtectionWrite]:
         """Record one own ``PUT /positions/{deal_id}`` on the guard.

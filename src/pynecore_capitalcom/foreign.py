@@ -136,10 +136,34 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         :return: The owned ``dealId`` values, or ``None`` without a journal
             (a raw read, every deal counts).
         """
+        owned = self._owned_deal_entries(positions)
+        return None if owned is None else set(owned)
+
+    def _owned_deal_entries(self, positions: Iterable[dict]) -> dict[str, str | None] | None:
+        """The deals among ``positions`` this run's journal produced, with their Pine entry.
+
+        The ownership is :meth:`_owned_deal_ids`'s. Each owned deal maps to
+        the Pine entry id (``orders.pine_entry_id``, written from the entry
+        intent by the dispatch journal) of the own rows that tie the deal to
+        them: the row whose ``exchange_order_id`` is the deal (the confirm's
+        ``dealId``, or the deal a promotion or a back-link moved the row
+        onto), or the row of the working order the deal's ``workingOrderId``
+        names. The entry id is ``None`` when the rows that tie the deal name
+        more than one entry, or none: an exit bound to an entry must never
+        protect a deal on a guess. A row the plugin seeded for an orphan
+        deal a defensive close flattens
+        (``extras['orphan_close_synthetic']``) carries the closing exit's
+        ``from_entry``, not a dispatch of the entry, so it attributes
+        nothing.
+
+        :param positions: ``GET /positions`` rows.
+        :return: ``{dealId: entry id or None}`` per owned deal, or ``None``
+            without a journal (a raw read, every deal counts).
+        """
         store_ctx = self.store_ctx
         if store_ctx is None:
             return None
-        own_ids: set[str] = set()
+        own_ids: dict[str, set[str | None]] = {}
         for row in store_ctx.iter_live_orders():
             extras = row.extras or {}
             if (extras.get(EXTRAS_KEY_LEG_KIND) is not None
@@ -147,21 +171,26 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
                     or extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None
                     or extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)):
                 continue
+            entry_id = (None if extras.get('orphan_close_synthetic') is True
+                        else row.pine_entry_id or None)
             if row.exchange_order_id:
-                own_ids.add(row.exchange_order_id)
+                own_ids.setdefault(row.exchange_order_id, set()).add(entry_id)
             promoted_from = _wire_id(extras.get('promoted_from_working_order_id'))
             if promoted_from is not None:
-                own_ids.add(promoted_from)
-        owned: set[str] = set()
+                own_ids.setdefault(promoted_from, set()).add(entry_id)
+        owned: dict[str, str | None] = {}
         for raw in positions:
             position = raw.get('position') or {}
             deal_id = _wire_id(position.get('dealId'))
             if deal_id is None:
                 continue
             working_order_id = _wire_id(position.get('workingOrderId'))
-            if (deal_id in own_ids
-                    or (working_order_id is not None and working_order_id in own_ids)):
-                owned.add(deal_id)
+            entries = own_ids.get(deal_id, set()) | (
+                own_ids.get(working_order_id, set()) if working_order_id is not None else set()
+            )
+            if not entries:
+                continue
+            owned[deal_id] = next(iter(entries)) if len(entries) == 1 else None
         return owned
 
     def _unconfirmed_own_entries(self) -> list[tuple[str, float]]:

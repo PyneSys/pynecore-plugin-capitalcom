@@ -26,8 +26,10 @@ from pynecore.core.broker.models import (
     CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType, QuarantineKind, Quote,
 )
 from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
+from pynecore.core.broker.one_way_emulator import OneWayEmulator
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from pynecore_capitalcom import (
     CapitalCom,
@@ -14010,6 +14012,344 @@ def __test_amend_bracket_transport_maps_to_disposition_unknown__(tmp_path):
             'EURUSD', 'L1', side='sell',
             tp_price=1.2, sl_price=None, trail_offset=None, coid='c1',
         ))
+    store.close()
+
+
+def _quote_with_min_distance(mid: float) -> dict:
+    """A market reply quoting ``mid`` with a 0.005 bracket-distance minimum
+    and a 0.00001 price tick."""
+    return {
+        'dealingRules': {
+            'minStepDistance': {'value': 0.00001},
+            'minSizeIncrement': {'value': 0.01},
+            'minDealSize': {'value': 0.01},
+            'minNormalStopOrLimitDistance': {'value': 0.005},
+        },
+        'instrument': {'lotSize': 0.01},
+        'snapshot': {'bid': mid, 'offer': mid},
+    }
+
+
+def _guarded_leg_broker(tmp_path, *, sl, tp, mid=1.10000):
+    """A broker whose own position row ``L1`` holds a confirmed bracket of
+    ``sl`` / ``tp``, set while the quote was ``mid``."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _quote_with_min_distance(mid),
+        ('positions/L1', 'put'): {'dealReference': 'am'},
+        ('confirms/am', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='L1', extras={'kind': 'position'})
+    ctx.add_ref('coid-entry', 'deal_id', 'L1')
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell', tp_price=tp, sl_price=sl,
+        trail_offset=None, coid='c-attach'))
+    broker._calls.clear()
+    return broker, store
+
+
+def _amend_puts(broker) -> list:
+    return [c[2] for c in broker._calls if c[0] == 'positions/L1' and c[1] == 'put']
+
+
+def __test_amend_bracket_does_not_check_a_stop_a_trail_supersedes__(tmp_path):
+    """A merged amend can carry one exit's ``sl_price`` and another's
+    ``trail_offset``: the trail takes the stop slot and the fixed stop is
+    never sent, so its distance is no reason to refuse the amend."""
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _quote_with_min_distance(1.10000),
+        ('positions/L1', 'put'): {},
+    })
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell',
+        tp_price=None, sl_price=1.09990, trail_offset=0.002, coid='c1',
+    ))
+    [body] = _amend_puts(broker)
+    assert body['trailingStop'] is True and 'stopLevel' not in body
+    store.close()
+
+
+def __test_amend_bracket_restating_a_held_stop_skips_the_distance_check__(tmp_path):
+    """The leg holds exit A's stop 1.09; the price has since moved to 1.093,
+    inside the minimum distance. Retiring a take-profit-only co-owner re-sends
+    the stop unchanged: it sets nothing new, so the pre-check must not refuse
+    it, and the PUT restates it."""
+    broker, store = _guarded_leg_broker(tmp_path, sl=1.09, tp=1.12)
+    broker._responses[('markets/EURUSD', 'get')] = _quote_with_min_distance(1.093)
+
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.09,
+        trail_offset=None, coid='c-retire'))
+
+    assert _amend_puts(broker) == [
+        {'profitLevel': None, 'trailingStop': False, 'stopLevel': 1.09}]
+    store.close()
+
+
+def __test_amend_bracket_restating_a_held_take_profit_skips_the_distance_check__(
+        tmp_path):
+    """The same for the take-profit: an unchanged ``profitLevel`` the price
+    has come close to is restated, not refused."""
+    broker, store = _guarded_leg_broker(tmp_path, sl=1.08, tp=1.097, mid=1.09)
+    broker._responses[('markets/EURUSD', 'get')] = _quote_with_min_distance(1.095)
+
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell', tp_price=1.097, sl_price=None,
+        trail_offset=None, coid='c-retire'))
+
+    assert _amend_puts(broker) == [
+        {'profitLevel': 1.097, 'trailingStop': False, 'stopLevel': None}]
+    store.close()
+
+
+def __test_amend_bracket_still_checks_a_changed_level__(tmp_path):
+    """Only the level the leg holds is exempt: a new stop inside the minimum
+    distance is refused before the PUT, as is a stop on a leg whose levels
+    are not known."""
+    broker, store = _guarded_leg_broker(tmp_path, sl=1.09, tp=1.12)
+    broker._responses[('markets/EURUSD', 'get')] = _quote_with_min_distance(1.093)
+
+    with pytest.raises(InvalidStopDistanceError):
+        asyncio.run(broker.amend_bracket(
+            'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.0905,
+            trail_offset=None, coid='c-new'))
+    with pytest.raises(InvalidStopDistanceError):
+        asyncio.run(broker.amend_bracket(
+            'EURUSD', 'L2', side='sell', tp_price=None, sl_price=1.09,
+            trail_offset=None, coid='c-unknown'))
+
+    assert _amend_puts(broker) == []
+    store.close()
+
+
+def __test_amend_bracket_venue_reject_of_a_restated_level_still_raises__(tmp_path):
+    """Whether the venue accepts a restated level the price has come close to
+    is its own call: its reject is mapped like any other, never swallowed."""
+    broker, store = _guarded_leg_broker(tmp_path, sl=1.09, tp=1.12)
+    broker._responses[('markets/EURUSD', 'get')] = _quote_with_min_distance(1.093)
+    broker._responses[('confirms/am', 'get')] = {
+        'dealStatus': 'REJECTED', 'reason': 'distance too small'}
+
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.amend_bracket(
+            'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.09,
+            trail_offset=None, coid='c-retire'))
+    store.close()
+
+
+def __test_amend_bracket_checks_the_distance_of_the_fresh_market_reply__(tmp_path):
+    """The cached rules still quote a 0.005 minimum distance, but the fresh
+    market reply the pre-check reads its quote from has lowered it to 0.001:
+    a stop 0.003 from that quote is checked against the fresh minimum and
+    sent, not refused against the stale one."""
+    broker, store, _ = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _quote_with_min_distance(1.10000),
+        ('positions/L1', 'put'): {'dealReference': 'am'},
+        ('confirms/am', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    stale = asyncio.run(broker._get_instrument_rules('EURUSD'))
+    assert stale.min_stop_or_limit_distance == 0.005
+    fresh = _quote_with_min_distance(1.10000)
+    fresh['dealingRules']['minNormalStopOrLimitDistance'] = {'value': 0.001}
+    broker._responses[('markets/EURUSD', 'get')] = fresh
+
+    asyncio.run(broker.amend_bracket(
+        'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.09700,
+        trail_offset=None, coid='c1'))
+
+    assert _amend_puts(broker) == [
+        {'profitLevel': None, 'trailingStop': False, 'stopLevel': 1.09700}]
+    store.close()
+
+
+def _position_row(deal_id, *, direction='BUY', size=1.0, created_s=0,
+                  working_order_id=None):
+    position = {'dealId': deal_id, 'direction': direction, 'size': size,
+                'level': 1.10, 'upl': 0.0,
+                'createdDateUTC': f'2026-07-10T10:00:{created_s:02d}.000'}
+    if working_order_id is not None:
+        position['workingOrderId'] = working_order_id
+    return {'market': {'epic': 'EURUSD'}, 'position': position}
+
+
+def _own_entry_row(ctx, coid, pine_entry_id, exchange_order_id, *, kind='position',
+                   extras=None):
+    ctx.upsert_order(
+        coid, symbol='EURUSD', side='buy', qty=1.0, state='confirmed',
+        pine_entry_id=pine_entry_id, exchange_order_id=exchange_order_id,
+        filled_qty=1.0 if kind == 'position' else 0.0,
+        extras={'kind': kind, 'entry_filled_at': 1700000000.0, **(extras or {})},
+    )
+    ctx.add_ref(coid, 'deal_id', exchange_order_id)
+
+
+def __test_fetch_raw_positions_attributes_each_own_leg_to_its_entry__(tmp_path):
+    """A hedging leg carries the Pine entry whose own dispatch opened it.
+
+    The deal is tied to the entry row through the confirm's ``dealId`` (the
+    row's ``exchange_order_id``), or through the working order the deal's
+    ``workingOrderId`` back-links. A deal the journal ties to two entries, to
+    a row without an entry id, or only to an orphan-close seed row is left
+    unattributed; a deal no own row produced is not returned at all.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            _position_row('D1', created_s=1),
+            _position_row('D2', created_s=2, working_order_id='WO2'),
+            _position_row('D3', created_s=3, working_order_id='WO3'),
+            _position_row('D4', created_s=4),
+            _position_row('D5', created_s=5),
+            _position_row('MANUAL', created_s=6),
+            _position_row('ADOPTED', created_s=7),
+        ]},
+    })
+    _hedged(broker)
+    _own_entry_row(ctx, 'c1', 'L1', 'D1')
+    _own_entry_row(ctx, 'c2', 'L2', 'WO2', kind='working')
+    # Two own rows tie D3 to two different entries: ambiguous.
+    _own_entry_row(ctx, 'c3a', 'L3', 'D3')
+    _own_entry_row(ctx, 'c3b', 'L4', 'WO3', kind='working')
+    _own_entry_row(ctx, 'c4', None, 'D4')
+    _own_entry_row(ctx, 'c5', 'Exit-From', 'D5', extras={'orphan_close_synthetic': True})
+    _own_entry_row(ctx, 'c7', 'L7', 'ADOPTED', extras={ADOPTED_STARTUP_EXTRA_KEY: True})
+    legs = asyncio.run(broker.fetch_raw_positions('EURUSD'))
+    assert {leg.leg_id: leg.entry_id for leg in legs} == {
+        'D1': 'L1', 'D2': 'L2', 'D3': None, 'D4': None, 'D5': None,
+    }
+    store.close()
+
+
+def __test_fetch_raw_positions_attributes_legs_of_one_entry_alike__(tmp_path):
+    """Several deals of one entry (a pyramided id, or one working order) all carry it."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [
+            _position_row('D1', created_s=1),
+            _position_row('D2', created_s=2),
+            _position_row('D3', created_s=3, working_order_id='WO'),
+            _position_row('D4', created_s=4, working_order_id='WO'),
+        ]},
+    })
+    _hedged(broker)
+    _own_entry_row(ctx, 'c1', 'Long', 'D1')
+    _own_entry_row(ctx, 'c2', 'Long', 'D2')
+    _own_entry_row(ctx, 'c3', 'Long', 'WO', kind='working')
+    legs = asyncio.run(broker.fetch_raw_positions('EURUSD'))
+    assert [(leg.leg_id, leg.entry_id) for leg in legs] == [
+        ('D1', 'Long'), ('D2', 'Long'), ('D3', 'Long'), ('D4', 'Long'),
+    ]
+    store.close()
+
+
+def __test_fetch_raw_positions_leaves_legs_unattributed_off_hedging__(tmp_path):
+    """Outside hedging mode (no one-way emulator) no leg is attributed."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [_position_row('D1')]},
+    })
+    _own_entry_row(ctx, 'c1', 'L1', 'D1')
+    legs = asyncio.run(broker.fetch_raw_positions('EURUSD'))
+    assert [(leg.leg_id, leg.entry_id) for leg in legs] == [('D1', None)]
+    store.close()
+
+
+def __test_fetch_raw_positions_attribution_survives_a_restart__(tmp_path):
+    """A fresh process of the run adopts the live entry rows, and with them the attribution."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [_position_row('D1')]},
+    })
+    _hedged(broker)
+    _own_entry_row(ctx, 'c1', 'L1', 'D1')
+    store.close()
+    store, reopened = _open_store_ctx(tmp_path, broker)
+    assert reopened.run_instance_id != ctx.run_instance_id
+    legs = asyncio.run(broker.fetch_raw_positions('EURUSD'))
+    assert [(leg.leg_id, leg.entry_id) for leg in legs] == [('D1', 'L1')]
+    store.close()
+
+
+_PYRAMID_LEVELS = {'L1': (1.30, 1.00), 'L2': (1.25, 1.05), 'L3': (1.20, 1.08)}
+
+
+def _pyramid_broker(tmp_path, *, extra_legs=()):
+    deals = ['D1', 'D2', 'D3', *extra_legs]
+    responses = {
+        ('positions', 'get'): {'positions': [
+            _position_row(deal, created_s=n) for n, deal in enumerate(deals, start=1)
+        ]},
+    }
+    responses.update({(f'positions/{deal}', 'put'): {} for deal in deals})
+    broker, store, ctx = _make_broker(tmp_path, responses=responses)
+    _hedged(broker)
+    for n in (1, 2, 3):
+        _own_entry_row(ctx, f'c{n}', f'L{n}', f'D{n}')
+    return broker, store, ctx
+
+
+def _exit_env(entry, tp, sl):
+    return DispatchEnvelope(
+        intent=ExitIntent(pine_id=f'{entry}-X', from_entry=entry, symbol='EURUSD',
+                          side='sell', qty=1.0, tp_price=tp, sl_price=sl),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+
+def _cancel_env(entry):
+    return DispatchEnvelope(
+        intent=CancelIntent(pine_id=f'{entry}-X', symbol='EURUSD', from_entry=entry),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+
+
+def _leg_puts(broker):
+    return [(c[0].removeprefix('positions/'), c[2]) for c in broker._calls
+            if c[1] == 'put' and c[0].startswith('positions/')]
+
+
+def _put(tp, sl):
+    return {'profitLevel': tp, 'trailingStop': False, 'stopLevel': sl}
+
+
+def __test_hedged_pyramid_each_deal_carries_its_own_exits_levels__(tmp_path):
+    """Three pyramided entries, one deal each: every deal gets its own exit's levels.
+
+    Retiring one exit clears only its own deal; the other deals are not written.
+    """
+    broker, store, ctx = _pyramid_broker(tmp_path)
+    eng = OneWayEmulator(store_ctx=ctx)
+    for entry, (tp, sl) in _PYRAMID_LEVELS.items():
+        res = asyncio.run(eng.run_exit_bracket(_exit_env(entry, tp, sl), broker))
+        assert res.legs == (f'D{entry.removeprefix("L")}',)
+    assert _leg_puts(broker) == [
+        ('D1', _put(1.30, 1.00)), ('D2', _put(1.25, 1.05)), ('D3', _put(1.20, 1.08)),
+    ]
+    broker._calls.clear()
+    res = asyncio.run(eng.run_exit_bracket_clear(_cancel_env('L2'), broker))
+    assert res.legs == ('D2',)
+    assert _leg_puts(broker) == [('D2', _put(None, None))]
+    store.close()
+
+
+def __test_hedged_unattributed_deal_keeps_remaining_exits_levels_on_retire__(tmp_path):
+    """A deal no single entry owns carries the merge of every exit; retiring one re-asserts the rest.
+
+    The retirement's amend carries levels (not the all-``None`` clear) and is
+    written as the deal's whole protection.
+    """
+    broker, store, ctx = _pyramid_broker(tmp_path, extra_legs=('D4',))
+    _own_entry_row(ctx, 'c4', None, 'D4')
+    eng = OneWayEmulator(store_ctx=ctx)
+    asyncio.run(eng.run_exit_bracket(_exit_env('L1', 1.30, 1.00), broker))
+    asyncio.run(eng.run_exit_bracket(_exit_env('L3', 1.20, 1.08), broker))
+    assert _leg_puts(broker) == [
+        ('D1', _put(1.30, 1.00)), ('D4', _put(1.30, 1.00)),
+        ('D3', _put(1.20, 1.08)), ('D4', _put(1.20, 1.08)),
+    ]
+    broker._calls.clear()
+    res = asyncio.run(eng.run_exit_bracket_clear(_cancel_env('L3'), broker))
+    assert set(res.legs) == {'D3', 'D4'}
+    assert sorted(_leg_puts(broker)) == [
+        ('D3', _put(None, None)), ('D4', _put(1.30, 1.00)),
+    ]
     store.close()
 
 

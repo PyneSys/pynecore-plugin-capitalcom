@@ -671,6 +671,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _forget_protection(self, deal_id: str) -> None: ...
 
+    def _held_protection(self, deal_id: str) -> 'ProtectionLevels | None': ...
+
     def _claim_failsafe_protection(self, deal_ids: Iterable[str]) -> None: ...
 
     async def _observe_protection(
@@ -764,6 +766,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     # --- Foreign exposure (foreign.py) ---
     def _owned_deal_ids(self, positions: Iterable[dict]) -> set[str] | None: ...
+
+    def _owned_deal_entries(self, positions: Iterable[dict]) -> dict[str, str | None] | None: ...
 
     def _foreign_deals(
             self, positions: Iterable[dict], symbol: str, *, direction: str | None = None,

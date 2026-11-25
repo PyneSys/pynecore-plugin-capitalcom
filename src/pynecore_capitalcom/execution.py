@@ -14,6 +14,7 @@ leaves an auditable row that ``_recover_in_flight_submissions`` can
 replay on restart).
 """
 from abc import ABC
+from dataclasses import replace
 from time import time as epoch_time
 from typing import TYPE_CHECKING, Callable, cast
 
@@ -146,6 +147,17 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         if position_side == 'buy':
             return above if stop else below
         return below if stop else above
+
+    @staticmethod
+    def _same_level(held: float | None, level: float, tick: float) -> bool:
+        """Whether a level the row holds is ``level``, within half a price tick.
+
+        :param held: The level the row carries, ``None`` when it carries none.
+        :param level: The requested level.
+        :param tick: The instrument's price tick; ``0.0`` (not quoted) compares
+            exactly.
+        """
+        return held is not None and abs(held - level) <= tick / 2.0
 
     @staticmethod
     def _validate_sl_distance(
@@ -354,15 +366,27 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         bracket replication over exactly these, so a leg someone else opened
         is never closed, amended or netted against the bot's legs. Without a
         journal every leg is returned.
+
+        On a hedging account each leg carries
+        :attr:`~pynecore.core.broker.models.PositionLeg.entry_id`, the Pine
+        entry whose own dispatch opened it
+        (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._owned_deal_entries`),
+        so the core emulator replicates a ``from_entry`` exit onto that
+        entry's legs only. It stays ``None`` when the journal ties the deal
+        to no single entry, without a journal, and on a netting account: the
+        emulator, its only reader, runs on hedging accounts alone, and
+        ``None`` is the contract's always-safe value.
         """
         res = await self._call('positions', method='get')
         rows = res.get('positions') or []
         self._note_foreign_deals(rows, symbol)
         legs = _position_legs_from_payload(res, symbol)
-        owned = self._owned_deal_ids(rows)
+        owned = self._owned_deal_entries(rows)
         if owned is None:
             return legs
-        return [leg for leg in legs if leg.leg_id in owned]
+        if not self._hedging_enabled:
+            return [leg for leg in legs if leg.leg_id in owned]
+        return [replace(leg, entry_id=owned[leg.leg_id]) for leg in legs if leg.leg_id in owned]
 
     async def get_volume_quantizer(self, symbol: str) -> 'Callable[[float], int]':
         """Return a sync Pine-units -> lot-step-grid quantizer for ``symbol``.
@@ -493,7 +517,13 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         replacement* (verified on demo 2026-05-29): every bracket field is
         sent explicitly — a float to arm, JSON ``null`` / ``false`` to
         clear — so the all-``None`` call clears the whole bracket instead
-        of no-oping on an empty body. A ``trail_offset`` maps to the
+        of no-oping on an empty body. Every call is the leg's WHOLE
+        protection (the core merges the levels of every exit owning the
+        leg), so the body never merges with what the row carried before,
+        and nothing here tells an attach from a clear: an exit's retirement
+        may re-assert the remaining owners' levels under its cancel coid,
+        and is written, confirmed and classified like any other amend.
+        A ``trail_offset`` maps to the
         native ``trailingStop`` + ``stopDistance`` pair and takes the stop
         slot: Capital.com carries ONE stop per row, so a coexisting fixed
         ``sl_price`` is superseded, and the netting path's deferred
@@ -514,20 +544,37 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         quote a level is already triggered on — Capital.com levels are
         absolute prices on the row; no side-dependent anchor is needed
         (cTrader seeds its trailing anchor from it).
+
+        The distance pre-check covers only a level the body sets: the
+        ``stopLevel`` it writes (never an ``sl_price`` a ``trail_offset``
+        supersedes) and the ``profitLevel``, and neither when the row already
+        carries that exact level (:meth:`~_InterventionMixin._held_protection`):
+        restating a level the leg holds sets nothing new, so the price having
+        moved inside the minimum distance since it was set is no reason to
+        refuse the amend. Whether the venue accepts such a restated level is
+        its own call; its reject propagates like any other.
         """
-        rules = await self._get_instrument_rules(symbol)
         # Same live-mid pre-check as the netting bracket paths: turns an
         # obviously-rejectable level into the typed distance error before
         # the round-trip. Distance violations subclass
         # ``ExchangeOrderRejectedError``, so the attach path still ends in
-        # the defensive flatten rather than a halt.
+        # the defensive flatten rather than a halt. The quote read refreshes
+        # the rules cache, so the rules are read after it: the minimum
+        # distance checked is the one the same market response carried.
         mid_price = await self._get_current_mid_price(symbol)
+        rules = await self._get_instrument_rules(symbol)
         position_side = 'buy' if side == 'sell' else 'sell'
-        if sl_price is not None:
+        held = self._held_protection(leg_id)
+        tick = rules.price_tick
+        if (sl_price is not None and trail_offset is None
+                and not (held is not None and not held.trailing
+                         and self._same_level(held.stop, float(sl_price), tick))):
             self._validate_sl_distance(
                 rules, mid_price, float(sl_price), position_side,
             )
-        if tp_price is not None:
+        if (tp_price is not None
+                and not (held is not None
+                         and self._same_level(held.limit, float(tp_price), tick))):
             self._validate_tp_distance(
                 rules, mid_price, float(tp_price), position_side,
             )
