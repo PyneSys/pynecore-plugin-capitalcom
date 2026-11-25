@@ -22,7 +22,9 @@ those wrapper rows:
 
 State touched: BrokerStore through ``self.store_ctx``.
 """
+import logging
 from abc import ABC
+from collections.abc import Callable
 from time import time as epoch_time
 from typing import TYPE_CHECKING
 
@@ -31,12 +33,19 @@ from pynecore.core.broker.models import ExitIntent
 
 from ._base import _CapitalComBase
 from .exceptions import CapitalComError
-from .helpers import _extract_reject_reason, _wire_float
+from .helpers import (
+    EXTRAS_KEY_TRAIL_COMMAND,
+    _extract_reject_reason,
+    _trail_activation_key,
+    _wire_float,
+)
 from .intervention import _protection_key
 
 if TYPE_CHECKING:
     from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
     from pynecore.core.broker.storage import OrderRow
+
+logger = logging.getLogger(__name__)
 
 
 class _BracketMixin(_CapitalComBase, ABC):
@@ -108,21 +117,24 @@ class _BracketMixin(_CapitalComBase, ABC):
         if self.store_ctx is None:
             return
         coids = [c for c in (tp_coid, sl_coid) if c is not None]
-        for coid in coids:
-            row = self.store_ctx.get_order(coid)
-            if row is None:
-                continue
-            self.store_ctx.set_order_state(coid, 'rejected')
-            self.store_ctx.close_order(coid)
-        self.store_ctx.log_event(
-            'bracket_attach_rollback',
-            client_order_id=parent_coid,
-            exchange_order_id=deal_id,
-            intent_key=intent.intent_key,
-            payload={'reason': reason, 'tp_coid': tp_coid, 'sl_coid': sl_coid,
-                     'tp_level': intent.tp_price, 'sl_level': intent.sl_price,
-                     'trail_offset': intent.trail_offset},
-        )
+        # One transaction: a leg flipped ``rejected`` but left live would
+        # read as a protective leg nothing retries.
+        with self.store_ctx.transaction():
+            for coid in coids:
+                row = self.store_ctx.get_order(coid)
+                if row is None:
+                    continue
+                self.store_ctx.set_order_state(coid, 'rejected')
+                self.store_ctx.close_order(coid)
+            self.store_ctx.log_event(
+                'bracket_attach_rollback',
+                client_order_id=parent_coid,
+                exchange_order_id=deal_id,
+                intent_key=intent.intent_key,
+                payload={'reason': reason, 'tp_coid': tp_coid, 'sl_coid': sl_coid,
+                         'tp_level': intent.tp_price, 'sl_level': intent.sl_price,
+                         'trail_offset': intent.trail_offset},
+            )
 
     def _mark_bracket_legs_disposition_unknown(
             self, *, intent: 'ExitIntent', parent_coid: str, deal_id: str,
@@ -320,11 +332,30 @@ class _BracketMixin(_CapitalComBase, ABC):
             non-snapshot callers (e.g. unit tests).
         """
         assert self.store_ctx is not None  # caller guards this
-        if attached:
-            self.store_ctx.set_order_state(row.client_order_id, 'confirmed')
-        else:
-            self.store_ctx.set_order_state(row.client_order_id, 'rejected')
-            self.store_ctx.close_order(row.client_order_id)
+        # One transaction: the leg leaves ``disposition_unknown`` here, the
+        # only state its resolver picks up, so a leg flipped without its
+        # close or park resolution would never be resolved again. The
+        # in-memory aggregate is fed only once the leg's writes committed.
+        with self.store_ctx.transaction():
+            if attached:
+                self.store_ctx.set_order_state(row.client_order_id, 'confirmed')
+            else:
+                self.store_ctx.set_order_state(row.client_order_id, 'rejected')
+                self.store_ctx.close_order(row.client_order_id)
+            if parent_coid is not None and bracket_resolutions is None:
+                self.store_ctx.record_resolution(
+                    parent_coid, 'attached' if attached else 'rejected',
+                )
+            self.store_ctx.log_event(
+                'bracket_disposition_resolved',
+                client_order_id=row.client_order_id,
+                exchange_order_id=parent_deal_id,
+                payload={
+                    'leg_kind': leg_kind,
+                    'resolution': resolution_label,
+                    'parent_coid': parent_coid,
+                },
+            )
         if parent_coid is not None:
             if bracket_resolutions is not None:
                 # AND-aggregate: any rejected leg wins over attached.
@@ -345,20 +376,6 @@ class _BracketMixin(_CapitalComBase, ABC):
                     bracket_attached_coids.setdefault(
                         parent_coid, [],
                     ).append(row.client_order_id)
-            else:
-                self.store_ctx.record_resolution(
-                    parent_coid, 'attached' if attached else 'rejected',
-                )
-        self.store_ctx.log_event(
-            'bracket_disposition_resolved',
-            client_order_id=row.client_order_id,
-            exchange_order_id=parent_deal_id,
-            payload={
-                'leg_kind': leg_kind,
-                'resolution': resolution_label,
-                'parent_coid': parent_coid,
-            },
-        )
 
     async def _trailing_activation_monitor(
             self, positions_by_deal: dict[str, dict],
@@ -416,7 +433,9 @@ class _BracketMixin(_CapitalComBase, ABC):
                 crossed = mid <= act_price
 
             if state == 'pending':
-                if not crossed:
+                activation_key = _trail_activation_key(
+                    row.client_order_id, (row.extras or {}).get(EXTRAS_KEY_TRAIL_COMMAND))
+                if not crossed or activation_key in self._deferred_parks:
                     continue
                 if not await self._venue_protection_is_own(str(parent_deal_id), pos):
                     continue
@@ -466,17 +485,21 @@ class _BracketMixin(_CapitalComBase, ABC):
                 except BrokerError:
                     # Stay in pending; next tick re-tries.
                     continue
-                new_extras = dict(row.extras or {})
-                new_extras['trail_state'] = 'activating'
-                self.store_ctx.upsert_order(
-                    row.client_order_id, extras=new_extras,
+                # The venue took the trailing pair. A journal write that fails
+                # is kept and retried at the start of every poll, before the
+                # amend resolvers judge the venue's native trail
+                # (:meth:`_park_after_venue_write`); meanwhile the activation is
+                # not sent again and counts as the bot's own.
+                self._park_after_venue_write(
+                    activation_key,
+                    self._activation_journal_write(
+                        row.client_order_id, row.exchange_order_id,
+                        (row.extras or {}).get(EXTRAS_KEY_TRAIL_COMMAND),
+                        mid, act_price,
+                    ),
                 )
-                self.store_ctx.log_event(
-                    'trailing_activation_triggered',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                    payload={'mid': mid, 'activation_price': act_price},
-                )
+                if activation_key in self._deferred_parks:
+                    continue
 
             # state 'activating' (possibly just transitioned) — verify
             # from the snapshot and promote to active on confirmation.
@@ -486,18 +509,58 @@ class _BracketMixin(_CapitalComBase, ABC):
                     k: v for k, v in (row.extras or {}).items()
                     if k not in ('trail_state', 'trail_activation_price')
                 }
-                self.store_ctx.set_risk(
-                    row.client_order_id, trailing_stop=True,
+                with self.store_ctx.transaction():
+                    self.store_ctx.set_risk(
+                        row.client_order_id, trailing_stop=True,
+                    )
+                    self.store_ctx.upsert_order(
+                        row.client_order_id, extras=new_extras,
+                    )
+                    self.store_ctx.log_event(
+                        'trailing_activated',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=row.exchange_order_id,
+                        payload={'distance': row.trailing_distance},
+                    )
+
+    def _activation_journal_write(
+            self, coid: str, exchange_order_id: str | None, command_coid: str | None,
+            mid: float, activation_price: float,
+    ) -> Callable[[], None]:
+        """The one transaction that books an accepted trailing activation.
+
+        It journals ``trailing_activation_triggered`` with the amend that wrote
+        the pending trail (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TRAIL_COMMAND`)
+        and moves the leg to ``activating``. Run again after a storage failure,
+        it reads the leg first: only a leg still pending under the same amend
+        moves, so a retry never touches a trail a later amend wrote.
+
+        :param coid: The stop leg's COID.
+        :param exchange_order_id: The leg's exchange order id, for the audit event.
+        :param command_coid: The amend that wrote the pending trail.
+        :param mid: The mid price that crossed the activation price.
+        :param activation_price: The pending trail's activation price.
+        :return: The transaction.
+        """
+        def write() -> None:
+            store_ctx = self.store_ctx
+            if store_ctx is None:
+                return
+            with store_ctx.transaction():
+                current = store_ctx.get_order(coid)
+                extras = (current.extras or {}) if current is not None else {}
+                if (current is not None and current.closed_ts_ms is None
+                        and extras.get('trail_state') == 'pending'
+                        and extras.get(EXTRAS_KEY_TRAIL_COMMAND) == command_coid):
+                    store_ctx.upsert_order(coid, extras={**extras, 'trail_state': 'activating'})
+                store_ctx.log_event(
+                    'trailing_activation_triggered',
+                    client_order_id=coid,
+                    exchange_order_id=exchange_order_id,
+                    payload={'mid': mid, 'activation_price': activation_price,
+                             EXTRAS_KEY_TRAIL_COMMAND: command_coid},
                 )
-                self.store_ctx.upsert_order(
-                    row.client_order_id, extras=new_extras,
-                )
-                self.store_ctx.log_event(
-                    'trailing_activated',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                    payload={'distance': row.trailing_distance},
-                )
+        return write
 
     def _own_take_profit(self, parent_deal_id: str) -> float | None:
         """The take-profit level of the bot's own live TP leg on ``parent_deal_id``."""

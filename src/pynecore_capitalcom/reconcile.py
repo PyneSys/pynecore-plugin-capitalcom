@@ -23,9 +23,10 @@ State touched: BrokerStore through ``self.store_ctx``,
 ``_current_poll_id`` (read), ``_disappearance`` (lazy build).
 """
 import logging
+import sqlite3
 from abc import ABC
 from time import time as epoch_time
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator, Callable
 
 import httpx
 
@@ -57,10 +58,16 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     KIND_FULL_CLOSE,
+    KIND_MODIFY_ENTRY,
+    KIND_MODIFY_EXIT,
     KIND_PARTIAL_CLOSE,
     STATE_CLOSING,
+    STATE_DISPOSITION_UNKNOWN,
+    STATE_REJECTED,
     mark_close_completed,
+    mark_closing,
     mark_confirmed_with_fill,
+    mark_modify_completed,
     mark_rejected,
 )
 from pynecore.lib.log import broker_warning
@@ -69,6 +76,7 @@ from ._base import _CapitalComBase
 from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
+    EXTRAS_KEY_NETTED_RESIDUAL_PENDING,
     EXTRAS_KEY_OWN_CLOSES,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     EXTRAS_KEY_TAKEN_OVER_AT,
@@ -77,7 +85,12 @@ from .helpers import (
     _POLL_INTERVAL_S,
     _UNANNOUNCED_FILL_GRACE_S,
     _extract_reject_reason,
+    _mirror_amended_level,
+    _modify_entry_snapshot_verdict,
+    _modify_exit_dispatch,
+    _modify_exit_snapshot_verdict,
     _retire_parked_partial_close_exposure,
+    _settle_vanished_full_close_targets,
     _size_from_units,
     _wire_float,
     _wire_id,
@@ -102,6 +115,41 @@ _NATURAL_CLOSE_RETIRE_AFTER_S = 60.0
 
 class _ReconcileMixin(_CapitalComBase, ABC):
     """Snapshot reconcile + missing-pending tracker mix-in."""
+
+    def _park_after_venue_write(self, key: str, write: Callable[[], None]) -> None:
+        """Commit the park of a venue write whose journal write failed, or keep it.
+
+        The venue accepted a write, but the journal write that books it
+        failed. ``write`` is the one transaction that parks the dispatch
+        (``disposition_unknown`` with everything the poll's resolvers need to
+        settle it from venue data). When it cannot commit either, it is kept
+        under ``key`` and retried at the start of every poll
+        (:meth:`_retry_deferred_parks`) until it commits, so the running
+        process, not only a restart, settles the dispatch.
+
+        :param key: The parked row's client order id.
+        :param write: The park transaction.
+        """
+        try:
+            write()
+        except sqlite3.Error as failed:
+            logger.error(
+                "the park of %s could not be journaled (%s); retried on every poll",
+                key, failed,
+            )
+            self._deferred_parks[key] = write
+        else:
+            self._deferred_parks.pop(key, None)
+
+    def _retry_deferred_parks(self) -> None:
+        """Retry every park write a storage failure left uncommitted, before the resolvers run."""
+        for key, write in list(self._deferred_parks.items()):
+            try:
+                write()
+            except sqlite3.Error as failed:
+                logger.error("the park of %s is still not journaled (%s)", key, failed)
+                continue
+            del self._deferred_parks[key]
 
     async def _reconcile_snapshot(
             self,
@@ -144,8 +192,12 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         # ``iter_live_orders`` together because :meth:`execute_exit`
         # creates them atomically).
         bracket_resolutions: dict[str, bool] = {}
+        self._retry_deferred_parks()
         await self._resolve_partial_close_dispositions(positions_by_deal)
+        self._resolve_full_close_dispositions(positions_by_deal)
         self._complete_full_close_commands(positions_by_deal)
+        self._resolve_modify_entry_dispositions(working_by_deal)
+        self._resolve_modify_exit_dispositions(positions_by_deal)
         async for parked_event in self._resolve_parked_submission_dispositions(
                 positions_by_deal):
             yield parked_event
@@ -165,40 +217,166 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         live_coids = {row.client_order_id for row in live_rows}
         for coid in [c for c in self._unannounced_fills_seen if c not in live_coids]:
             del self._unannounced_fills_seen[coid]
+        # --- Bracket-leg disposition recovery -------------------------
+        # Bracket TP/SL rows store ``parent_deal_id`` in extras and have
+        # NO ``exchange_order_id`` of their own (Capital.com brackets are
+        # position attributes — there is no separate order id to track).
+        # When ``execute_exit``'s PUT or confirm GET times out we flip
+        # them to ``disposition_unknown`` and raise
+        # ``OrderDispositionUnknownError``; the engine then parks the
+        # envelope. ``_verify_pending_dispatches`` only queries
+        # ``get_open_orders`` which never returns brackets, and the
+        # snapshot loop below skips rows without ``exchange_order_id``,
+        # so without this branch the leg rows would be stuck in
+        # ``disposition_unknown`` forever even when the bracket actually
+        # attached. We resolve the disposition deterministically from
+        # the parent position's ``profitLevel`` / ``stopLevel`` (or
+        # ``trailingStop`` + ``stopDistance`` for trailing legs): if it
+        # matches what we tried to set, the bracket is attached
+        # (``confirmed``); otherwise it is definitively absent
+        # (``rejected``). The aggregated resolution is written once every
+        # leg is judged (see ``bracket_resolutions``) to the persisted
+        # park row keyed on the *parent* entry COID — the engine's
+        # :meth:`_verify_pending_dispatches` consumes it on the next
+        # sync, clearing the parked envelope and (for ``rejected``) the
+        # active ExitIntent so the next sync re-dispatches the
+        # protective order.
+        # The leg verdicts and the aggregated parent resolutions are one
+        # transaction, taken before the per-row pass: a leg leaves
+        # ``disposition_unknown`` (the only state this resolver reads) only
+        # together with the resolution of its parent's park, so a failed
+        # write can never leave terminal legs beside a parent the engine
+        # waits on for good.
+        with self.store_ctx.transaction():
+            for row in live_rows:
+                rextras = row.extras or {}
+                leg_kind = rextras.get('leg_kind')
+                if (leg_kind in ('tp', 'sl')
+                        and row.state == 'disposition_unknown'):
+                    self._resolve_bracket_leg_disposition(
+                        row, leg_kind, positions_by_deal,
+                        bracket_resolutions=bracket_resolutions,
+                        bracket_attached_coids=bracket_attached_coids,
+                    )
+            # Flush aggregated bracket resolutions: one ``record_resolution``
+            # per parent COID, written AFTER every leg of that bracket has
+            # been inspected this poll. ``True`` (all legs attached) ->
+            # ``'attached'``; any leg ``False`` -> ``'rejected'`` (the engine
+            # then drops the active ExitIntent and re-dispatches on the next
+            # sync). Single write per parent eliminates the per-leg race
+            # against ``_consume_plugin_resolutions`` described above.
+            if bracket_resolutions:
+                # Index live pending-trail SL rows by ``parent_coid``. These
+                # rows are seeded as ``confirmed`` synchronously by
+                # :meth:`attach_bracket` / :meth:`modify_exit` whenever Pine
+                # combines ``trail_offset`` + ``trail_price`` (the PUT body
+                # carries the TP only — the pending-trail SL is purely
+                # local, owned by :meth:`_trailing_activation_monitor`), so
+                # they never flow through :meth:`_record_bracket_resolution`
+                # and therefore never appear in ``bracket_attached_coids``.
+                # If the parent later resolves ``rejected`` (e.g. TP attach
+                # was ambiguous and the next snapshot shows the broker did
+                # not attach it), the engine drops the parent dispatch's
+                # mapping and re-dispatches with fresh COIDs — leaving the
+                # old pending-trail SL row live with the same
+                # ``parent_deal_id``. The activation monitor would then PUT
+                # ``trailingStop=true`` against the stale row when the
+                # threshold crosses, racing the freshly seeded row.
+                pending_trail_by_parent: dict[str, list[str]] = {}
+                for live_row in self.store_ctx.iter_live_orders():
+                    lextras = live_row.extras or {}
+                    if lextras.get('leg_kind') != 'sl':
+                        continue
+                    if lextras.get('trail_state') not in ('pending', 'activating'):
+                        continue
+                    pcoid = lextras.get('parent_coid')
+                    if pcoid is None:
+                        continue
+                    pending_trail_by_parent.setdefault(str(pcoid), []).append(
+                        live_row.client_order_id,
+                    )
+                for parent_coid, all_attached in bracket_resolutions.items():
+                    if not all_attached:
+                        journal = DispatchJournal(self.store_ctx)
+                        # Mixed bracket: any leg row that an earlier
+                        # _record_bracket_resolution call promoted to
+                        # ``confirmed`` in this same batch must be retired
+                        # before the engine sees the parent ``rejected``.
+                        # The engine's modify-rejected branch (also driving
+                        # the entry-rejected path) drops the parent
+                        # dispatch's mapping and re-dispatches the exit
+                        # with a fresh envelope (new TP/SL COIDs); leaving
+                        # the confirmed sibling alive would seed duplicate
+                        # bracket leg rows under the same parent_deal_id —
+                        # later fill / cancel lookups by parent could pick
+                        # stale rows over the new dispatch's entries.
+                        for sibling_coid in bracket_attached_coids.get(parent_coid, ()):
+                            sibling = self.store_ctx.get_order(sibling_coid)
+                            if sibling is None or sibling.closed_ts_ms is not None:
+                                continue
+                            sibling_extras = sibling.extras or {}
+                            journal.apply_reconcile_outcome(
+                                sibling_coid,
+                                ReconcileOutcome(
+                                    kind='terminal_close',
+                                    reason='bracket_sibling_retired_on_mixed_rejection',
+                                    new_state='rejected',
+                                    audit_event='bracket_sibling_retired_on_mixed_rejection',
+                                    close_row=True,
+                                    audit_payload={
+                                        'sibling_coid': sibling_coid,
+                                        'parent_coid': parent_coid,
+                                        'leg_kind': sibling_extras.get('leg_kind'),
+                                        'reason': 'mixed_bracket_rejected',
+                                    },
+                                    exchange_order_id=sibling_extras.get(
+                                        'parent_deal_id'
+                                    ),
+                                ),
+                            )
+                        # Pending-trail SL siblings: same parent rejection
+                        # consequences (engine re-dispatches with fresh
+                        # COIDs), but the row was promoted to ``confirmed``
+                        # outside _record_bracket_resolution, so it is not
+                        # in ``bracket_attached_coids``. Walk the pre-built
+                        # index and retire it through the same retirement
+                        # path so the activation monitor cannot fire against
+                        # the stale row.
+                        for sibling_coid in pending_trail_by_parent.get(parent_coid, ()):
+                            sibling = self.store_ctx.get_order(sibling_coid)
+                            if sibling is None or sibling.closed_ts_ms is not None:
+                                continue
+                            sibling_extras = sibling.extras or {}
+                            journal.apply_reconcile_outcome(
+                                sibling_coid,
+                                ReconcileOutcome(
+                                    kind='terminal_close',
+                                    reason='pending_trail_parent_rejected',
+                                    new_state='rejected',
+                                    audit_event='bracket_sibling_retired_on_mixed_rejection',
+                                    close_row=True,
+                                    audit_payload={
+                                        'sibling_coid': sibling_coid,
+                                        'parent_coid': parent_coid,
+                                        'leg_kind': sibling_extras.get('leg_kind'),
+                                        'reason': 'pending_trail_parent_rejected',
+                                        'trail_state': sibling_extras.get(
+                                            'trail_state'
+                                        ),
+                                    },
+                                    exchange_order_id=sibling_extras.get(
+                                        'parent_deal_id'
+                                    ),
+                                ),
+                            )
+                    self.store_ctx.record_resolution(
+                        parent_coid,
+                        'attached' if all_attached else 'rejected',
+                    )
+
         for row in live_rows:
-            # --- Bracket-leg disposition recovery -------------------------
-            # Bracket TP/SL rows store ``parent_deal_id`` in extras and have
-            # NO ``exchange_order_id`` of their own (Capital.com brackets are
-            # position attributes — there is no separate order id to track).
-            # When ``execute_exit``'s PUT or confirm GET times out we flip
-            # them to ``disposition_unknown`` and raise
-            # ``OrderDispositionUnknownError``; the engine then parks the
-            # envelope. ``_verify_pending_dispatches`` only queries
-            # ``get_open_orders`` which never returns brackets, and the
-            # snapshot loop below skips rows without ``exchange_order_id``,
-            # so without this branch the leg rows would be stuck in
-            # ``disposition_unknown`` forever even when the bracket actually
-            # attached. We resolve the disposition deterministically from
-            # the parent position's ``profitLevel`` / ``stopLevel`` (or
-            # ``trailingStop`` + ``stopDistance`` for trailing legs): if it
-            # matches what we tried to set, the bracket is attached
-            # (``confirmed``); otherwise it is definitively absent
-            # (``rejected``). The aggregated resolution is also written
-            # AFTER the loop (see ``bracket_resolutions``) to the persisted
-            # park row keyed on the *parent* entry COID — the engine's
-            # :meth:`_verify_pending_dispatches` consumes it on the next
-            # sync, clearing the parked envelope and (for ``rejected``) the
-            # active ExitIntent so the next sync re-dispatches the
-            # protective order.
-            rextras = row.extras or {}
-            leg_kind = rextras.get('leg_kind')
-            if (leg_kind in ('tp', 'sl')
+            if ((row.extras or {}).get('leg_kind') in ('tp', 'sl')
                     and row.state == 'disposition_unknown'):
-                self._resolve_bracket_leg_disposition(
-                    row, leg_kind, positions_by_deal,
-                    bracket_resolutions=bracket_resolutions,
-                    bracket_attached_coids=bracket_attached_coids,
-                )
                 continue
             did = row.exchange_order_id
             if not did:
@@ -224,6 +402,21 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             # bracket-leg rows never reach here (no ``exchange_order_id``).
             if pos is not None:
                 self._feed_native_failsafe_observed(row.client_order_id, pos)
+
+            if (pos is not None
+                    and (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is not None):
+                # An own execution held until the size of the deal it opened
+                # is known: the listed deal, net of the reductions the read
+                # reflects, tells it. Until it is booked, no
+                # other fill path may read the unbooked deal as a fill of its
+                # own (the partial-fill check below would book it as one).
+                settled = self._settle_netted_residual_from_snapshot(
+                    row, pos, now_ts=now_ts,
+                    read_started_at=0.0 if read_started_at is None else read_started_at,
+                )
+                if settled is not None:
+                    yield settled
+                continue
 
             if pos is None and work is None:
                 row_kind = (row.extras or {}).get('kind')
@@ -298,11 +491,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     # (measured on the Capital.com lane, 2026-08-16: a
                     # ``strategy.close`` fill 78s before the cycle-end
                     # stop landed on this branch and stopped the lane).
-                    retired_exposure = row.filled_qty
-                    self._close_bracket_after_natural_close(row)
-                    self._retire_netted_journal_exposure(
-                        row, retired_exposure,
-                    )
+                    self._tear_down_natural_close(row)
                     continue
                 if (row.state == 'closing'
                         and row_kind == ENTRY_KIND_POSITION
@@ -324,11 +513,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                         row, now_ts,
                     )
                     if close_event is not None:
-                        retired_exposure = row.filled_qty
-                        self._close_bracket_after_natural_close(row)
-                        self._retire_netted_journal_exposure(
-                            row, retired_exposure,
-                        )
+                        self._tear_down_natural_close(row)
                         yield close_event
                     continue
                 # No breadcrumb: the disappearance is the core tracker's
@@ -449,6 +634,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     event_type='filled',
                     fill_price=float(pos_data.get('level') or 0.0),
                     fill_qty=filled,
+                    journal_fill_qty=filled,
                     timestamp=now_ts,
                     pine_id=row.pine_entry_id,
                     from_entry=row.from_entry,
@@ -516,127 +702,12 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                         event_type='partial',
                         fill_price=float(pos_data.get('level') or 0.0),
                         fill_qty=cumulative - row.filled_qty,
+                        journal_fill_qty=cumulative - row.filled_qty,
                         timestamp=now_ts,
                         pine_id=row.pine_entry_id,
                         from_entry=row.from_entry,
                         leg_type=LegType.ENTRY,
                     )
-
-        # Flush aggregated bracket resolutions: one ``record_resolution``
-        # per parent COID, written AFTER every leg of that bracket has
-        # been inspected this poll. ``True`` (all legs attached) ->
-        # ``'attached'``; any leg ``False`` -> ``'rejected'`` (the engine
-        # then drops the active ExitIntent and re-dispatches on the next
-        # sync). Single write per parent eliminates the per-leg race
-        # against ``_consume_plugin_resolutions`` described above.
-        if bracket_resolutions:
-            # Index live pending-trail SL rows by ``parent_coid``. These
-            # rows are seeded as ``confirmed`` synchronously by
-            # :meth:`attach_bracket` / :meth:`modify_exit` whenever Pine
-            # combines ``trail_offset`` + ``trail_price`` (the PUT body
-            # carries the TP only — the pending-trail SL is purely
-            # local, owned by :meth:`_trailing_activation_monitor`), so
-            # they never flow through :meth:`_record_bracket_resolution`
-            # and therefore never appear in ``bracket_attached_coids``.
-            # If the parent later resolves ``rejected`` (e.g. TP attach
-            # was ambiguous and the next snapshot shows the broker did
-            # not attach it), the engine drops the parent dispatch's
-            # mapping and re-dispatches with fresh COIDs — leaving the
-            # old pending-trail SL row live with the same
-            # ``parent_deal_id``. The activation monitor would then PUT
-            # ``trailingStop=true`` against the stale row when the
-            # threshold crosses, racing the freshly seeded row.
-            pending_trail_by_parent: dict[str, list[str]] = {}
-            for live_row in self.store_ctx.iter_live_orders():
-                lextras = live_row.extras or {}
-                if lextras.get('leg_kind') != 'sl':
-                    continue
-                if lextras.get('trail_state') not in ('pending', 'activating'):
-                    continue
-                pcoid = lextras.get('parent_coid')
-                if pcoid is None:
-                    continue
-                pending_trail_by_parent.setdefault(str(pcoid), []).append(
-                    live_row.client_order_id,
-                )
-            for parent_coid, all_attached in bracket_resolutions.items():
-                if not all_attached:
-                    journal = DispatchJournal(self.store_ctx)
-                    # Mixed bracket: any leg row that an earlier
-                    # _record_bracket_resolution call promoted to
-                    # ``confirmed`` in this same batch must be retired
-                    # before the engine sees the parent ``rejected``.
-                    # The engine's modify-rejected branch (also driving
-                    # the entry-rejected path) drops the parent
-                    # dispatch's mapping and re-dispatches the exit
-                    # with a fresh envelope (new TP/SL COIDs); leaving
-                    # the confirmed sibling alive would seed duplicate
-                    # bracket leg rows under the same parent_deal_id —
-                    # later fill / cancel lookups by parent could pick
-                    # stale rows over the new dispatch's entries.
-                    for sibling_coid in bracket_attached_coids.get(parent_coid, ()):
-                        sibling = self.store_ctx.get_order(sibling_coid)
-                        if sibling is None or sibling.closed_ts_ms is not None:
-                            continue
-                        sibling_extras = sibling.extras or {}
-                        journal.apply_reconcile_outcome(
-                            sibling_coid,
-                            ReconcileOutcome(
-                                kind='terminal_close',
-                                reason='bracket_sibling_retired_on_mixed_rejection',
-                                new_state='rejected',
-                                audit_event='bracket_sibling_retired_on_mixed_rejection',
-                                close_row=True,
-                                audit_payload={
-                                    'sibling_coid': sibling_coid,
-                                    'parent_coid': parent_coid,
-                                    'leg_kind': sibling_extras.get('leg_kind'),
-                                    'reason': 'mixed_bracket_rejected',
-                                },
-                                exchange_order_id=sibling_extras.get(
-                                    'parent_deal_id'
-                                ),
-                            ),
-                        )
-                    # Pending-trail SL siblings: same parent rejection
-                    # consequences (engine re-dispatches with fresh
-                    # COIDs), but the row was promoted to ``confirmed``
-                    # outside _record_bracket_resolution, so it is not
-                    # in ``bracket_attached_coids``. Walk the pre-built
-                    # index and retire it through the same retirement
-                    # path so the activation monitor cannot fire against
-                    # the stale row.
-                    for sibling_coid in pending_trail_by_parent.get(parent_coid, ()):
-                        sibling = self.store_ctx.get_order(sibling_coid)
-                        if sibling is None or sibling.closed_ts_ms is not None:
-                            continue
-                        sibling_extras = sibling.extras or {}
-                        journal.apply_reconcile_outcome(
-                            sibling_coid,
-                            ReconcileOutcome(
-                                kind='terminal_close',
-                                reason='pending_trail_parent_rejected',
-                                new_state='rejected',
-                                audit_event='bracket_sibling_retired_on_mixed_rejection',
-                                close_row=True,
-                                audit_payload={
-                                    'sibling_coid': sibling_coid,
-                                    'parent_coid': parent_coid,
-                                    'leg_kind': sibling_extras.get('leg_kind'),
-                                    'reason': 'pending_trail_parent_rejected',
-                                    'trail_state': sibling_extras.get(
-                                        'trail_state'
-                                    ),
-                                },
-                                exchange_order_id=sibling_extras.get(
-                                    'parent_deal_id'
-                                ),
-                            ),
-                        )
-                self.store_ctx.record_resolution(
-                    parent_coid,
-                    'attached' if all_attached else 'rejected',
-                )
 
         # Presence diff for the disappearance state machine: stamp rows
         # whose deal vanished from BOTH namespaces, clear rows that came
@@ -700,22 +771,27 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         first_seen = self._unannounced_fills_seen.setdefault(coid, now_ts)
         if now_ts - first_seen < _UNANNOUNCED_FILL_GRACE_S:
             return None
-        del self._unannounced_fills_seen[coid]
         fill_price = (_wire_float(extras.get('confirm_level'), finite=True)
                       or _wire_float(position.get('level'), finite=True)
                       or 0.0)
-        current = self.store_ctx.get_order(coid)
-        stamped = dict((current or row).extras or {})
-        stamped['entry_filled_at'] = now_ts
-        self.store_ctx.upsert_order(coid, extras=stamped)
-        self.store_ctx.log_event(
-            'entry_fill_booked_from_snapshot',
-            client_order_id=coid,
-            exchange_order_id=deal_id,
-            intent_key=row.intent_key,
-            payload={'filled_qty': row.filled_qty, 'fill_price': fill_price,
-                     'unannounced_for_s': now_ts - first_seen},
-        )
+        # The stamp and its audit event are one transaction: a stamp
+        # committed without the fill reaching the engine would turn the next
+        # reconcile and the late activity into suppressed replays. The
+        # elapsed grace is dropped only once the booking is committed.
+        with self.store_ctx.transaction():
+            current = self.store_ctx.get_order(coid)
+            stamped = dict((current or row).extras or {})
+            stamped['entry_filled_at'] = now_ts
+            self.store_ctx.upsert_order(coid, extras=stamped)
+            self.store_ctx.log_event(
+                'entry_fill_booked_from_snapshot',
+                client_order_id=coid,
+                exchange_order_id=deal_id,
+                intent_key=row.intent_key,
+                payload={'filled_qty': row.filled_qty, 'fill_price': fill_price,
+                         'unannounced_for_s': now_ts - first_seen},
+            )
+        del self._unannounced_fills_seen[coid]
         logger.info(
             "entry %s (deal %s): no activity announced its fill within %.0f s; "
             "booked from the positions snapshot (%s %s @ %s)",
@@ -737,11 +813,294 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             event_type='filled',
             fill_price=fill_price,
             fill_qty=row.filled_qty,
+            journal_fill_qty=row.filled_qty,
             timestamp=now_ts,
             pine_id=row.pine_entry_id,
             from_entry=row.from_entry,
             leg_type=LegType.ENTRY,
         )
+
+    def _resolve_full_close_dispositions(self, positions_by_deal: dict[str, dict]) -> None:
+        """Settle every parked full close whose targets the snapshot no longer lists.
+
+        A full close parks (``disposition_unknown``) when its DELETE timed out,
+        or landed while the target's ``closing`` state could not be journaled.
+        Either way the target row may still read ``confirmed``, and a deal that
+        vanished without its close activity (the venue does not always publish
+        one, measured 2026-09-05, cycle 122) would then book no close fill.
+        The startup recovery's judgement
+        (:func:`~pynecore_capitalcom.helpers._settle_vanished_full_close_targets`)
+        moves the row of every target the snapshot no longer lists to
+        ``closing``: the per-row pass below books each vanished target's close
+        once, as after a fully journaled dispatch, even while another target
+        is still listed. Once every target is gone, the command goes
+        ``closing`` and its park is resolved ``attached`` in the same
+        transaction; until then it stays parked. A failed write leaves the
+        command parked for the next poll.
+        """
+        assert self.store_ctx is not None
+        for row in list(self.store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            if (extras.get('kind') != KIND_FULL_CLOSE
+                    or row.state != STATE_DISPOSITION_UNKNOWN):
+                continue
+            targets = [str(deal) for deal in extras.get('targets') or ()]
+            try:
+                with self.store_ctx.transaction():
+                    still_alive, swept, mirrored = _settle_vanished_full_close_targets(
+                        self.store_ctx, row, positions_by_deal,
+                        path='full_close_parked_targets_vanished',
+                    )
+                    if still_alive:
+                        continue
+                    mark_closing(
+                        self.store_ctx, coid=row.client_order_id, kind=KIND_FULL_CLOSE,
+                        targets=targets,
+                    )
+                    self.store_ctx.record_resolution(row.client_order_id, 'attached')
+                    self.store_ctx.log_event(
+                        'full_close_parked_targets_vanished',
+                        client_order_id=row.client_order_id,
+                        intent_key=row.intent_key,
+                        payload={'applied_targets': swept,
+                                 'mirrored_target_coids': mirrored},
+                    )
+            except sqlite3.Error as failed:
+                logger.error(
+                    "parked full close %s: its targets %s left the venue, but the "
+                    "settlement could not be journaled (%s); retried on the next poll",
+                    row.client_order_id, targets, failed,
+                )
+
+    def _resolve_modify_entry_dispositions(self, working_by_deal: dict[str, dict]) -> None:
+        """Settle every parked entry amend the working-order snapshot proves.
+
+        An amend parks (``disposition_unknown``) under its own command id when
+        its PUT or confirm was ambiguous, or the venue took it but its level
+        could not be mirrored onto the working order's row. The engine's
+        verification cannot promote such a park: the venue lists the order
+        under the working order's id. Once the target's working order holds
+        the requested level (the startup recovery's judgement,
+        :func:`~pynecore_capitalcom.helpers._modify_entry_snapshot_verdict`),
+        the level is mirrored onto the row, the command completes and its
+        park is resolved ``attached``, in one transaction. Any other verdict
+        leaves the amend parked, as on restart. A failed write leaves it
+        parked for the next poll.
+        """
+        assert self.store_ctx is not None
+        for row in list(self.store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            if (extras.get('kind') != KIND_MODIFY_ENTRY
+                    or row.state != STATE_DISPOSITION_UNKNOWN):
+                continue
+            path, target_deal_id, level = _modify_entry_snapshot_verdict(
+                self.store_ctx, row, working_by_deal,
+            )
+            if path != 'modify_entry_snapshot_match' or level is None:
+                continue
+            try:
+                with self.store_ctx.transaction():
+                    _mirror_amended_level(self.store_ctx, extras.get('target_coid'), level)
+                    mark_modify_completed(
+                        self.store_ctx, coid=row.client_order_id,
+                        extra_payload={'echoed_level': level, 'recovery_path': path},
+                    )
+                    self.store_ctx.log_event(
+                        'confirmed',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=target_deal_id,
+                        intent_key=row.intent_key,
+                        payload={'new_level': level, 'recovery_path': path},
+                    )
+                    self.store_ctx.close_order(row.client_order_id)
+                    self.store_ctx.record_resolution(row.client_order_id, 'attached')
+            except sqlite3.Error as failed:
+                logger.error(
+                    "parked entry amend %s: the venue holds its level %s, but the "
+                    "settlement could not be journaled (%s); retried on the next poll",
+                    row.client_order_id, level, failed,
+                )
+
+    def _resolve_modify_exit_dispositions(self, positions_by_deal: dict[str, dict]) -> None:
+        """Complete every parked bracket amend the positions snapshot proves.
+
+        A bracket amend whose PUT the venue accepted but whose legs could not
+        be mirrored parks its command row ``disposition_unknown``; its legs
+        are parked as well and settled by the bracket-leg resolver below,
+        which also releases the engine's park on the position's entry. Once
+        the target position carries the requested bracket (the startup
+        recovery's judgement,
+        :func:`~pynecore_capitalcom.helpers._modify_exit_snapshot_verdict`),
+        the command completes and leaves the live set, in one transaction;
+        when no leg of the position waits for the snapshot, the same
+        transaction resolves the engine's park on the entry as attached.
+        Once no leg of the target waits for the snapshot any more and the
+        snapshot refused a leg of the amend
+        (:meth:`_modify_exit_legs_refused`), or the legs already carry the
+        requested bracket (:meth:`_modify_exit_legs_hold_request`: the
+        restart of an amend whose mirror committed hands no leg to the leg
+        resolver), any other verdict ends the command as well: the venue does
+        not hold the requested bracket (the refusal has the engine retry the
+        amend under a new command, and with no leg at the leg resolver the
+        same transaction resolves the engine's park on the entry as
+        rejected). A position that is gone ends the command once no leg of it
+        waits for the snapshot, whatever its legs hold, and resolves the
+        engine's park on the entry as rejected, as the leg resolver does for
+        the parked legs of a vanished position. Left live, the command would
+        keep the protection guard off the position for good. A failed write
+        leaves it parked for the next poll.
+        """
+        assert self.store_ctx is not None
+        rows = list(self.store_ctx.iter_live_orders())
+        waiting_parents = {
+            (row.extras or {}).get('parent_coid') for row in rows
+            if (row.extras or {}).get('leg_kind') in ('tp', 'sl')
+            and row.state == STATE_DISPOSITION_UNKNOWN
+        }
+        for row in rows:
+            extras = row.extras or {}
+            if (extras.get('kind') != KIND_MODIFY_EXIT
+                    or row.state != STATE_DISPOSITION_UNKNOWN):
+                continue
+            path, target_deal_id, levels = _modify_exit_snapshot_verdict(
+                self.store_ctx, row, positions_by_deal,
+                unjournaled_activations=self._deferred_parks.keys(),
+            )
+            target_coid = extras.get('target_coid')
+            vanished = path == 'modify_exit_target_vanished'
+            if path != 'modify_exit_snapshot_match' and (
+                    target_coid in waiting_parents
+                    or not (vanished
+                            or self._modify_exit_legs_refused(row)
+                            or self._modify_exit_legs_hold_request(row))):
+                continue
+            payload = {**levels, 'recovery_path': path}
+            try:
+                with self.store_ctx.transaction():
+                    refused = path == 'modify_exit_snapshot_mismatch'
+                    if refused:
+                        mark_rejected(self.store_ctx, coid=row.client_order_id)
+                        if isinstance(target_coid, str) and target_coid not in waiting_parents:
+                            # The engine retries a refused amend under a new
+                            # command; with no leg of it at the leg resolver
+                            # (the legs hold the request already), nothing
+                            # else releases its park on the entry.
+                            self.store_ctx.record_resolution(target_coid, 'rejected')
+                    else:
+                        mark_modify_completed(
+                            self.store_ctx, coid=row.client_order_id,
+                            extra_payload=payload,
+                        )
+                        self.store_ctx.close_order(row.client_order_id)
+                        if vanished and isinstance(target_coid, str):
+                            # The position is gone and no leg of it waits for
+                            # the snapshot (a restart retires the legs of a
+                            # vanished position unsettled): the amend landed
+                            # on nothing, as the leg resolver rules for parked
+                            # legs, so the engine's park on the entry ends
+                            # refused.
+                            self.store_ctx.record_resolution(target_coid, 'rejected')
+                        if (path == 'modify_exit_snapshot_match' and isinstance(target_coid, str)
+                                and target_coid not in waiting_parents):
+                            # No leg of the amend goes to the leg resolver (a
+                            # local pending trail, a removed leg, legs the
+                            # mirror already wrote): the venue holding the
+                            # requested bracket releases the engine's park on
+                            # the entry here.
+                            self.store_ctx.record_resolution(target_coid, 'attached')
+                    self.store_ctx.log_event(
+                        'rejected' if refused else 'confirmed',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=target_deal_id,
+                        intent_key=row.intent_key,
+                        payload=payload,
+                    )
+            except sqlite3.Error as failed:
+                logger.error(
+                    "parked bracket amend %s (%s): the settlement could not be "
+                    "journaled (%s); retried on the next poll",
+                    row.client_order_id, path, failed,
+                )
+
+    def _modify_exit_legs_refused(self, command: 'OrderRow') -> bool:
+        """Whether the snapshot refused a leg the modify-exit ``command`` writes.
+
+        The legs are the ones its dispatch names
+        (:func:`~pynecore_capitalcom.helpers._modify_exit_dispatch`); a leg
+        the snapshot found not attached, or whose position is gone, is
+        ``rejected``.
+        """
+        assert self.store_ctx is not None
+        submitted = _modify_exit_dispatch(self.store_ctx, command.client_order_id) or {}
+        for key in ('tp_coid', 'sl_coid'):
+            coid = submitted.get(key)
+            leg = self.store_ctx.get_order(coid) if isinstance(coid, str) else None
+            if leg is not None and leg.state == STATE_REJECTED:
+                return True
+        return False
+
+    def _modify_exit_legs_hold_request(self, command: 'OrderRow') -> bool:
+        """Whether the live legs of the amend's position carry the bracket it requests.
+
+        Only the mirror of an amend the venue accepted, or the leg resolver
+        settling legs parked at the attempted target against a snapshot that
+        held it, writes the requested bracket onto the legs: the venue took
+        the amend, and the command's outcome is no longer open. The take-profit
+        leg holds ``new_tp`` (none when the amend removes it); the stop leg
+        holds ``new_sl`` as a fixed stop, ``new_trail`` as a native trailing
+        distance, or, for a pending trailing stop, ``new_trail`` and
+        ``new_trail_price`` while pending or activating, or the distance alone
+        once the activation monitor sent it (none when the amend removes the
+        stop). A command whose extras name no level at all requests nothing a
+        leg could prove.
+
+        :param command: The ``modify_exit`` command row.
+        :return: ``True`` when every leg carries the requested bracket.
+        """
+        assert self.store_ctx is not None
+        extras = command.extras or {}
+        if not any(key in extras for key in ('new_tp', 'new_sl', 'new_trail', 'new_trail_price')):
+            return False
+        new_tp = _wire_float(extras.get('new_tp'), finite=True)
+        new_sl = _wire_float(extras.get('new_sl'), finite=True)
+        new_trail = _wire_float(extras.get('new_trail'), finite=True)
+        new_trail_price = _wire_float(extras.get('new_trail_price'), finite=True)
+        target_coid = extras.get('target_coid')
+        legs: dict[str, list['OrderRow']] = {'tp': [], 'sl': []}
+        for row in self.store_ctx.iter_live_orders():
+            leg_kind = (row.extras or {}).get('leg_kind')
+            if leg_kind in legs and (row.extras or {}).get('parent_coid') == target_coid:
+                legs[leg_kind].append(row)
+        if len(legs['tp']) > 1 or len(legs['sl']) > 1:
+            return False
+
+        def same(held: float | None, wanted: float | None) -> bool:
+            return held is not None and wanted is not None and abs(held - wanted) < 1e-9
+
+        tp_leg = legs['tp'][0] if legs['tp'] else None
+        if new_tp is None:
+            if tp_leg is not None:
+                return False
+        elif tp_leg is None or not same(tp_leg.tp_level, new_tp):
+            return False
+        sl_leg = legs['sl'][0] if legs['sl'] else None
+        if new_sl is None and new_trail is None:
+            return sl_leg is None
+        if sl_leg is None:
+            return False
+        sl_extras = sl_leg.extras or {}
+        if new_trail is None:
+            return (same(sl_leg.sl_level, new_sl) and not sl_leg.trailing_stop
+                    and sl_extras.get('trail_state') is None)
+        if not same(sl_leg.trailing_distance, new_trail):
+            return False
+        if new_trail_price is None:
+            return bool(sl_leg.trailing_stop)
+        trail_state = sl_extras.get('trail_state')
+        if trail_state in ('pending', 'activating'):
+            return same(_wire_float(sl_extras.get('trail_activation_price'), finite=True),
+                        new_trail_price)
+        return trail_state is None and bool(sl_leg.trailing_stop)
 
     def _complete_full_close_commands(self, positions_by_deal: dict[str, dict]) -> None:
         """End every full-close command whose targets are let go of everywhere.
@@ -768,15 +1127,18 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             # Left open, the command was carried into every later run instance
             # of the run and walked on every live-order scan (measured live:
             # 1433 such rows on the Capital.com lane, the oldest two months old).
-            mark_close_completed(
-                self.store_ctx, coid=row.client_order_id, kind=KIND_FULL_CLOSE,
-                extra_payload={'completed_path': 'targets_released'},
-            )
-            self.store_ctx.close_order(row.client_order_id)
-            self.store_ctx.log_event(
-                'full_close_completed', client_order_id=row.client_order_id,
-                intent_key=row.intent_key, payload={'targets': targets},
-            )
+            # One transaction: a ``confirmed`` command left live by a failed
+            # close would never be picked up again (only ``closing`` is).
+            with self.store_ctx.transaction():
+                mark_close_completed(
+                    self.store_ctx, coid=row.client_order_id, kind=KIND_FULL_CLOSE,
+                    extra_payload={'completed_path': 'targets_released'},
+                )
+                self.store_ctx.close_order(row.client_order_id)
+                self.store_ctx.log_event(
+                    'full_close_completed', client_order_id=row.client_order_id,
+                    intent_key=row.intent_key, payload={'targets': targets},
+                )
 
     async def _vanished_closing_row_fill(
             self, row: 'OrderRow', now_ts: float,
@@ -853,6 +1215,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             event_type='filled',
             fill_price=price,
             fill_qty=fill_qty,
+            journal_fill_qty=fill_qty,
             timestamp=now_ts,
             pine_id=row.pine_entry_id,
             from_entry=row.from_entry,
@@ -931,17 +1294,21 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             coid = row.client_order_id
             deal_status = (confirm.get('dealStatus') or '').upper()
             if deal_status == 'REJECTED':
-                mark_rejected(self.store_ctx, coid=coid)
-                self.store_ctx.record_resolution(coid, 'rejected')
-                self.store_ctx.log_event(
-                    'parked_submission_rejected_on_retry',
-                    client_order_id=coid,
-                    intent_key=row.intent_key,
-                    payload={
-                        'deal_reference': deal_ref,
-                        'reason': _extract_reject_reason(confirm),
-                    },
-                )
+                # One transaction: a row flipped ``rejected`` without its
+                # close or park resolution is never retried (only parked rows
+                # are) and the engine's park would never clear.
+                with self.store_ctx.transaction():
+                    mark_rejected(self.store_ctx, coid=coid)
+                    self.store_ctx.record_resolution(coid, 'rejected')
+                    self.store_ctx.log_event(
+                        'parked_submission_rejected_on_retry',
+                        client_order_id=coid,
+                        intent_key=row.intent_key,
+                        payload={
+                            'deal_reference': deal_ref,
+                            'reason': _extract_reject_reason(confirm),
+                        },
+                    )
                 continue
 
             deal_id: str | None = None
@@ -1128,6 +1495,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 event_type='filled',
                 fill_price=fill_level,
                 fill_qty=filled,
+                journal_fill_qty=filled,
                 timestamp=now_ts,
                 pine_id=row.pine_entry_id,
                 from_entry=row.from_entry,
@@ -1163,29 +1531,40 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     intent_key=row.intent_key,
                 )
             else:
-                with self.store_ctx.transaction():
-                    mark_confirmed_with_fill(
-                        self.store_ctx,
-                        coid=coid,
-                        exchange_id=deal_id,
-                        is_filled=False,
-                        filled_qty=0.0,
-                        fill_price=None,
-                    )
-                    self._stamp_own_cancel_accepted(coid, cancel_sent_at)
-                    self.store_ctx.close_order(coid)
-                    # Pine no longer emits the cancelled entry, so the
-                    # ``'rejected'`` resolution only clears the engine's
-                    # park (a still-armed active intent would already
-                    # have been dropped by the cancel itself).
-                    self.store_ctx.record_resolution(coid, 'rejected')
-                    self.store_ctx.log_event(
-                        'cancelled',
-                        client_order_id=coid,
-                        exchange_order_id=deal_id,
-                        intent_key=row.intent_key,
-                        payload={'cleared_via': 'parked_confirm',
-                                 'deal_reference': deal_ref},
+                try:
+                    with self.store_ctx.transaction():
+                        mark_confirmed_with_fill(
+                            self.store_ctx,
+                            coid=coid,
+                            exchange_id=deal_id,
+                            is_filled=False,
+                            filled_qty=0.0,
+                            fill_price=None,
+                        )
+                        self._stamp_own_cancel_accepted(coid, cancel_sent_at)
+                        self.store_ctx.close_order(coid)
+                        # Pine no longer emits the cancelled entry, so the
+                        # ``'rejected'`` resolution only clears the engine's
+                        # park (a still-armed active intent would already
+                        # have been dropped by the cancel itself).
+                        self.store_ctx.record_resolution(coid, 'rejected')
+                        self.store_ctx.log_event(
+                            'cancelled',
+                            client_order_id=coid,
+                            exchange_order_id=deal_id,
+                            intent_key=row.intent_key,
+                            payload={'cleared_via': 'parked_confirm',
+                                     'deal_reference': deal_ref},
+                        )
+                except sqlite3.Error as failed:
+                    # The DELETE landed but nothing of it is journaled: the
+                    # row stays parked, and the next poll repeats the confirm
+                    # lookup and the DELETE, whose not-found persists the id
+                    # for the ordinary settlement below.
+                    logger.error(
+                        "deferred cancel of parked entry %s landed on %s, but it "
+                        "could not be journaled (%s); retried on the next poll",
+                        coid, deal_id, failed,
                     )
                 return
 
@@ -1297,6 +1676,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             event_type='filled',
             fill_price=fill_level,
             fill_qty=filled,
+            journal_fill_qty=filled,
             timestamp=now_ts,
             pine_id=row.pine_entry_id,
             from_entry=row.from_entry,
@@ -1429,54 +1809,60 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 extras.get('corrected_reverse_deal_id')
             )
             expected_units = pre_units - close_units
+            # Every settlement below is one transaction: the resolver picks up
+            # only ``disposition_unknown`` commands, so a command flipped
+            # terminal without its cursor retirement, close or park
+            # resolution would never be settled again.
             if (current_direction == target_direction
                     and current_units == expected_units
                     and not opposite_exists):
-                mark_close_completed(
-                    self.store_ctx,
-                    coid=row.client_order_id,
-                    kind=KIND_PARTIAL_CLOSE,
-                    extra_payload={'recovery_path': 'partial_close_target_reconciled'},
-                )
-                _retire_parked_partial_close_exposure(
-                    self.store_ctx, row, close_units, rules.lot_step,
-                    path='partial_close_target_reconciled',
-                )
-                self.store_ctx.close_order(row.client_order_id)
-                self.store_ctx.record_resolution(row.client_order_id, 'attached')
-                self.store_ctx.log_event(
-                    'partial_close_target_reconciled',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=target_deal_id,
-                    intent_key=row.intent_key,
-                    payload={
-                        'target_units': current_units,
-                        'expected_units': expected_units,
-                    },
-                )
+                with self.store_ctx.transaction():
+                    mark_close_completed(
+                        self.store_ctx,
+                        coid=row.client_order_id,
+                        kind=KIND_PARTIAL_CLOSE,
+                        extra_payload={'recovery_path': 'partial_close_target_reconciled'},
+                    )
+                    _retire_parked_partial_close_exposure(
+                        self.store_ctx, row, close_units, rules.lot_step,
+                        path='partial_close_target_reconciled',
+                    )
+                    self.store_ctx.close_order(row.client_order_id)
+                    self.store_ctx.record_resolution(row.client_order_id, 'attached')
+                    self.store_ctx.log_event(
+                        'partial_close_target_reconciled',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=target_deal_id,
+                        intent_key=row.intent_key,
+                        payload={
+                            'target_units': current_units,
+                            'expected_units': expected_units,
+                        },
+                    )
                 continue
             record = self._parked_partial_close_record(row)
             if record is not None and record.get('matched'):
-                mark_close_completed(
-                    self.store_ctx,
-                    coid=row.client_order_id,
-                    kind=KIND_PARTIAL_CLOSE,
-                    extra_payload={'recovery_path': 'partial_close_own_activity_matched'},
-                )
-                _retire_parked_partial_close_exposure(
-                    self.store_ctx, row, close_units, rules.lot_step,
-                    path='partial_close_own_activity_matched',
-                )
-                self.store_ctx.close_order(row.client_order_id)
-                self.store_ctx.record_resolution(row.client_order_id, 'attached')
-                self.store_ctx.log_event(
-                    'partial_close_own_activity_matched',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=target_deal_id,
-                    intent_key=row.intent_key,
-                    payload={'matched': list(record.get('matched') or ()),
-                             'target_units': current_units},
-                )
+                with self.store_ctx.transaction():
+                    mark_close_completed(
+                        self.store_ctx,
+                        coid=row.client_order_id,
+                        kind=KIND_PARTIAL_CLOSE,
+                        extra_payload={'recovery_path': 'partial_close_own_activity_matched'},
+                    )
+                    _retire_parked_partial_close_exposure(
+                        self.store_ctx, row, close_units, rules.lot_step,
+                        path='partial_close_own_activity_matched',
+                    )
+                    self.store_ctx.close_order(row.client_order_id)
+                    self.store_ctx.record_resolution(row.client_order_id, 'attached')
+                    self.store_ctx.log_event(
+                        'partial_close_own_activity_matched',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=target_deal_id,
+                        intent_key=row.intent_key,
+                        payload={'matched': list(record.get('matched') or ()),
+                                 'target_units': current_units},
+                    )
                 continue
             sent_at = _wire_float(extras.get('own_close_sent_at'), finite=True)
             settled_at = _wire_float(
@@ -1493,31 +1879,42 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 # booked through that reduction's own activity; the command
                 # must still settle, or the target stays busy and its
                 # protection unjudged for good.
-                if (corrected_reverse is None and opposite_exists and sent_at is not None
-                        and not extras.get('confirm_deal_ids')):
+                if corrected_reverse is None and opposite_exists and sent_at is not None:
                     # The POST reduced nothing, yet no confirm says it was
                     # refused: a deal it opened beside a target that was
-                    # already gone is its own reverse leg.
-                    fitted = self._unconfirmed_reverse_leg(
-                        positions_by_deal.values(), coid=row.client_order_id,
-                        intent_key=row.intent_key, symbol=row.symbol,
-                        direction=opposite_direction, target_deal_id=target_deal_id,
-                        size=_size_from_units(close_units, rules.lot_step),
-                        lot_step=rules.lot_step, sent_at=sent_at,
-                        done_at=_wire_float((record or {}).get('done_at'), finite=True),
-                    )
+                    # already gone is its own reverse leg. Without a confirm
+                    # naming its deals the leg is found by its fit; with one,
+                    # it is the one listed opposite deal the confirm says the
+                    # POST opened (its id was not journaled by the dispatch).
+                    fitted: str | None = None
+                    if not extras.get('confirm_deal_ids'):
+                        fitted = self._unconfirmed_reverse_leg(
+                            positions_by_deal.values(), coid=row.client_order_id,
+                            intent_key=row.intent_key, symbol=row.symbol,
+                            direction=opposite_direction, target_deal_id=target_deal_id,
+                            size=_size_from_units(close_units, rules.lot_step),
+                            lot_step=rules.lot_step, sent_at=sent_at,
+                            done_at=_wire_float((record or {}).get('done_at'), finite=True),
+                        )
+                    else:
+                        opened = {str(deal) for deal in extras.get('confirm_opened_ids') or ()}
+                        named = [deal for deal in opposite_ids
+                                 if deal in opened and deal != target_deal_id]
+                        if len(named) == 1:
+                            fitted = named[0]
                     if fitted is not None:
                         def corrected(e: dict, deal_id: str = fitted) -> None:
                             e['corrected_reverse_deal_id'] = deal_id
                             e['corrective_delete_pending'] = True
 
-                        self._rewrite_extras(row.client_order_id, corrected)
-                        self.store_ctx.log_event(
-                            'partial_close_corrective_delete_dispatched',
-                            client_order_id=row.client_order_id,
-                            exchange_order_id=fitted,
-                            intent_key=row.intent_key,
-                        )
+                        with self.store_ctx.transaction():
+                            self._rewrite_extras(row.client_order_id, corrected)
+                            self.store_ctx.log_event(
+                                'partial_close_corrective_delete_dispatched',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=fitted,
+                                intent_key=row.intent_key,
+                            )
                         current = self.store_ctx.get_order(row.client_order_id) or row
                         await self._repeat_corrective_delete(current, fitted)
                         continue
@@ -1536,30 +1933,32 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                         "open (the close's own reverse leg or someone else's)",
                         row.client_order_id, row.symbol, now - settled_at, unattributed,
                     )
+                with self.store_ctx.transaction():
+                    if unattributed:
+                        self.store_ctx.log_event(
+                            'partial_close_settled_beside_unattributed_opposite',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=','.join(unattributed),
+                            intent_key=row.intent_key,
+                            payload={'opposite_deal_ids': unattributed,
+                                     'target_deal_id': target_deal_id,
+                                     'target_present': target_raw is not None,
+                                     'target_units': current_units,
+                                     'pre_target_units': pre_units,
+                                     'symbol': row.symbol},
+                        )
+                    mark_rejected(self.store_ctx, coid=row.client_order_id)
+                    self.store_ctx.record_resolution(row.client_order_id, 'rejected')
                     self.store_ctx.log_event(
-                        'partial_close_settled_beside_unattributed_opposite',
+                        'partial_close_no_own_reduction',
                         client_order_id=row.client_order_id,
-                        exchange_order_id=','.join(unattributed),
+                        exchange_order_id=target_deal_id,
                         intent_key=row.intent_key,
-                        payload={'opposite_deal_ids': unattributed,
-                                 'target_deal_id': target_deal_id,
-                                 'target_present': target_raw is not None,
-                                 'target_units': current_units,
+                        payload={'target_units': current_units,
                                  'pre_target_units': pre_units,
-                                 'symbol': row.symbol},
+                                 'target_present': target_raw is not None,
+                                 'target_reduced': target_reduced},
                     )
-                mark_rejected(self.store_ctx, coid=row.client_order_id)
-                self.store_ctx.record_resolution(row.client_order_id, 'rejected')
-                self.store_ctx.log_event(
-                    'partial_close_no_own_reduction',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=target_deal_id,
-                    intent_key=row.intent_key,
-                    payload={'target_units': current_units,
-                             'pre_target_units': pre_units,
-                             'target_present': target_raw is not None,
-                             'target_reduced': target_reduced},
-                )
                 if target_reduced:
                     logger.error(
                         "partial close %s of %s: no activity of its own after %.0f s "
@@ -1579,18 +1978,19 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             if (current_direction == target_direction
                     and current_units == pre_units
                     and not opposite_exists):
-                mark_rejected(self.store_ctx, coid=row.client_order_id)
-                self.store_ctx.record_resolution(row.client_order_id, 'rejected')
-                self.store_ctx.log_event(
-                    'partial_close_target_unchanged_after_correction',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=target_deal_id,
-                    intent_key=row.intent_key,
-                    payload={
-                        'corrected_reverse_deal_id': corrected_reverse,
-                        'target_units': current_units,
-                    },
-                )
+                with self.store_ctx.transaction():
+                    mark_rejected(self.store_ctx, coid=row.client_order_id)
+                    self.store_ctx.record_resolution(row.client_order_id, 'rejected')
+                    self.store_ctx.log_event(
+                        'partial_close_target_unchanged_after_correction',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=target_deal_id,
+                        intent_key=row.intent_key,
+                        payload={
+                            'corrected_reverse_deal_id': corrected_reverse,
+                            'target_units': current_units,
+                        },
+                    )
 
     async def _repeat_corrective_delete(self, command: 'OrderRow', reverse_id: str) -> None:
         """DELETE a partial close's own reverse leg again while ``/positions`` lists it.
@@ -1613,17 +2013,27 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             )
             return
 
-        self._rewrite_extras(
-            command.client_order_id,
-            lambda extras: extras.__setitem__('corrective_delete_pending', False),
-        )
-        self.store_ctx.log_event(
-            'partial_close_corrective_delete',
-            client_order_id=command.client_order_id,
-            exchange_order_id=reverse_id,
-            intent_key=command.intent_key,
-            payload={'reason': 'repeated_while_listed', 'delete_landed': True},
-        )
+        try:
+            with self.store_ctx.transaction():
+                self._rewrite_extras(
+                    command.client_order_id,
+                    lambda extras: extras.__setitem__('corrective_delete_pending', False),
+                )
+                self.store_ctx.log_event(
+                    'partial_close_corrective_delete',
+                    client_order_id=command.client_order_id,
+                    exchange_order_id=reverse_id,
+                    intent_key=command.intent_key,
+                    payload={'reason': 'repeated_while_listed', 'delete_landed': True},
+                )
+        except sqlite3.Error as failed:
+            # The pending flag is read only while ``/positions`` still lists
+            # the leg: left set, it repeats a DELETE the venue answers
+            # not-found, and the command settles once the leg is gone.
+            logger.error(
+                "partial close %s: the corrective DELETE of %s landed, but it could "
+                "not be journaled (%s)", command.client_order_id, reverse_id, failed,
+            )
 
     def _parked_partial_close_record(self, command: 'OrderRow') -> dict | None:
         """The own-close record a partial-close command left on its target, if still there."""
@@ -1894,19 +2304,20 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 payload=payload,
             )
         elif report is not None:
-            store_ctx.log_event(
-                'position_netted_away_by_foreign_order',
-                client_order_id=row.client_order_id,
-                exchange_order_id=row.exchange_order_id,
-                payload={**payload, 'report_id': report['report_id'],
-                         'consumer': report['context']['consumer']},
-            )
-            store_ctx.log_event(
-                'manual_close_report_pending',
-                client_order_id=row.client_order_id,
-                exchange_order_id=row.exchange_order_id,
-                payload=report,
-            )
+            with store_ctx.transaction():
+                store_ctx.log_event(
+                    'position_netted_away_by_foreign_order',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                    payload={**payload, 'report_id': report['report_id'],
+                             'consumer': report['context']['consumer']},
+                )
+                store_ctx.log_event(
+                    'manual_close_report_pending',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                    payload=report,
+                )
         else:
             logger.error(
                 "bot position %s (%s, %s %s) left the venue and no close activity "
@@ -1921,8 +2332,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 exchange_order_id=row.exchange_order_id,
                 payload=payload,
             )
-        self._close_bracket_after_natural_close(row)
-        self._retire_netted_journal_exposure(row, row.filled_qty)
+        self._tear_down_natural_close(row)
         if report is not None:
             self._send_manual_close_report(report)
         return MissingConfirmation(MissingResolution.CLOSED)

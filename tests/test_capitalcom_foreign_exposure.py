@@ -24,6 +24,7 @@ nor the venue's mechanics caused is an external intervention:
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from datetime import UTC, datetime
 
@@ -54,9 +55,14 @@ from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.store_helpers import KIND_PARTIAL_CLOSE
 
-from pynecore_capitalcom import CapitalCom, CapitalComConfig, foreign, intervention
+from pynecore_capitalcom import CapitalCom, CapitalComConfig, foreign, helpers, intervention
 from pynecore_capitalcom.exceptions import OrderNotFoundError
-from pynecore_capitalcom.helpers import EXTRAS_KEY_OWN_LEVEL_WRITES
+from pynecore_capitalcom.helpers import (
+    _ACTIVITY_LAG_S,
+    EXTRAS_KEY_NETTED_RESIDUAL_PENDING,
+    EXTRAS_KEY_OWN_LEVEL_WRITES,
+    _parse_iso_timestamp,
+)
 from pynecore_capitalcom.models import _activity_fingerprint
 
 
@@ -1927,7 +1933,7 @@ def __test_unguarded_own_write_echo_read_in_flight_never_decides_a_held_verdict_
 
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'deal-L', side='sell', tp_price=1.20, sl_price=1.04,
-        trail_offset=None, coid='coid-leg-amend',
+        trail_offset=None, qty=1.0, coid='coid-leg-amend',
     ))
     assert ran, "the poll read the feed while the write was in flight"
     assert latched == []
@@ -1940,20 +1946,33 @@ def __test_unguarded_own_write_echo_read_in_flight_never_decides_a_held_verdict_
     store.close()
 
 
+@pytest.mark.parametrize('record', ['journaled', 'unjournaled'])
 @pytest.mark.parametrize('read_in_flight', [False, True])
 @pytest.mark.parametrize('source, reported', [
     ('SYSTEM', False), ('DEALER', False), ('USER', True),
 ])
 def __test_own_write_during_a_held_verdict_waits_for_an_edit_published_late__(
-        tmp_path, source, reported, read_in_flight):
+        tmp_path, source, reported, read_in_flight, record):
     """A position protection write the bot does not defer (the one-way
     emulator's leg amend) goes out while the verdict on a change of the
     position waits. The change stays judged by the edit that made it, read
     late: a venue or dealing-desk edit is the venue's and the bot's own
     levels stand, someone else's edit is reported. The write's own edit
     activity never decides the verdict, also when a poll reads it while the
-    write still waits for its confirm."""
+    write still waits for its confirm. With ``unjournaled`` the record of the
+    own write cannot be journaled after the venue took it, nor at the next
+    poll: the verdict waits for the record, which a later poll commits."""
     broker, store, ctx, latched = _published_lag_broker(tmp_path)
+    failures = [2 if record == 'unjournaled' else 0]
+    note_own_level_write = broker._note_own_level_write
+
+    def recorded(*args, **kwargs):
+        if failures[0]:
+            failures[0] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return note_own_level_write(*args, **kwargs)
+
+    broker._note_own_level_write = recorded
     _feed(broker, _edit_at('USER', 0.01), read_at=time.time() + 0.1)
     edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
     for _ in range(3):
@@ -1970,7 +1989,7 @@ def __test_own_write_during_a_held_verdict_waits_for_an_edit_published_late__(
     ran = _read_while_in_flight(broker, 'confirms/leg', late_feed) if read_in_flight else None
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'deal-L', side='sell', tp_price=1.20, sl_price=1.04,
-        trail_offset=None, coid='coid-leg-amend',
+        trail_offset=None, qty=1.0, coid='coid-leg-amend',
     ))
     if ran is not None:
         assert ran, "the poll read the feed while the write was in flight"
@@ -1979,6 +1998,10 @@ def __test_own_write_during_a_held_verdict_waits_for_an_edit_published_late__(
         _feed(broker, *late_feed(), read_at=time.time() + 0.6)
     assert len(_events(ctx, 'level_edit_verdict_kept_past_own_write')) == 1
     own = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.04, profitLevel=1.20))
+    if record == 'unjournaled':
+        _poll(broker, own, activity_read_at=time.time() + intervention._LEVEL_EDIT_SETTLE_S)
+        assert failures == [0]
+        assert _events(ctx, 'level_edit_verdict_decided') == []
     _poll(broker, own, activity_read_at=time.time() + intervention._LEVEL_EDIT_SETTLE_S)
 
     decided = _events(ctx, 'level_edit_verdict_decided')
@@ -2021,7 +2044,7 @@ def __test_foreign_edit_around_a_reduction_decided_after_an_own_write_is_reporte
     broker._responses[('confirms/leg', 'get')] = {'dealStatus': 'ACCEPTED'}
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'deal-L', side='sell', tp_price=1.20, sl_price=1.04,
-        trail_offset=None, coid='coid-leg-amend',
+        trail_offset=None, qty=1.0, coid='coid-leg-amend',
     ))
     assert len(_events(ctx, 'level_edit_verdict_kept_past_own_write')) == 1
     _feed(broker, _edit_at('USER', 0.2), _edit_at('USER', 0.5), read_at=time.time() + 0.6)
@@ -2716,6 +2739,643 @@ def __test_own_working_order_that_netted_a_foreign_deal_books_only_the_deal_it_o
     # A replay of the same batch books nothing again.
     assert asyncio.run(_drain(broker._process_activity(batch, positions))) == []
     assert len(latched) == 1
+    store.close()
+
+
+def _partly_net_with_unknown_opened_size(tmp_path, *, execution_first: bool,
+                                         executed_level: float | None = 1.11,
+                                         extra_activities=(),
+                                         opened_size: float | None = None,
+                                         opened_level: float | None = 1.11):
+    """Own BUY 2 working order ``wo-1`` nets the foreign SELL 1 ``deal-F`` and
+    opens ``deal-N`` with the rest, but the opening activity carries no size
+    (unless ``opened_size``) and no ``/positions`` read lists ``deal-N`` yet."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_working(ctx, side='buy', qty=2.0)
+    broker._remember_positions_snapshot(
+        _by_deal(_raw('deal-F', 'SELL', 1.0, created='2026-10-15T09:00:00.000')),
+        time.time() - 5.0)
+    now = _now_iso()
+    netted = {
+        'dateUTC': now, 'dealId': 'deal-F', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'USER', 'epic': 'EURUSD',
+        'details': {'workingOrderId': 'wo-1', 'direction': 'BUY', 'size': 1.0,
+                    'level': 1.11},
+    }
+    opened = {
+        'dateUTC': now, 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'USER', 'epic': 'EURUSD',
+        'details': {'workingOrderId': 'wo-1', 'direction': 'BUY',
+                    **({'level': opened_level} if opened_level is not None else {}),
+                    **({'size': opened_size} if opened_size is not None else {})},
+    }
+    executed = {
+        'dateUTC': now, 'dealId': 'wo-1', 'type': 'WORKING_ORDER',
+        'status': 'EXECUTED', 'source': 'USER', 'epic': 'EURUSD',
+        'details': {'direction': 'BUY', 'size': 2.0,
+                    **({'level': executed_level} if executed_level is not None else {})},
+    }
+    batch = [executed, netted, opened] if execution_first else [netted, opened, executed]
+    batch += list(extra_activities)
+    events = asyncio.run(_drain(broker._process_activity(batch, {})))
+    return broker, store, ctx, latched, batch, events, now
+
+
+def _age_listing(ctx, seconds: float) -> None:
+    """Date the held execution's first listing of its deal ``seconds`` earlier."""
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None
+    extras = dict(row.extras or {})
+    pending = dict(extras[EXTRAS_KEY_NETTED_RESIDUAL_PENDING])
+    pending['listed'] = {**pending['listed'], 'at': pending['listed']['at'] - seconds}
+    extras[EXTRAS_KEY_NETTED_RESIDUAL_PENDING] = pending
+    ctx.upsert_order(row.client_order_id, extras=extras)
+
+
+def _entry_fills(events) -> list[tuple]:
+    return [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled']
+
+
+@pytest.mark.parametrize('restart', [False, True])
+@pytest.mark.parametrize('execution_first', [True, False])
+def __test_partly_netted_execution_of_unknown_opened_size_waits_for_the_size__(
+        tmp_path, execution_first, restart):
+    """Nothing of the execution is booked while the opened deal's size is
+    unknown: the run never owns the exposure the foreign deal consumed. Once
+    ``/positions`` reads have listed the deal at one size for the grace, that
+    size is booked, once, also when the process restarts in between."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=execution_first)
+
+    assert _entry_fills(events) == [], "the opened size is unknown: nothing is booked"
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.client_order_id == 'coid-wo'
+    assert row.filled_qty == 0.0
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is not None
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.ENTRY_BLOCK
+
+    if restart:
+        broker, _ = _make_plugin(ctx)
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity(batch, {})))) == []
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 1.0, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == [], "a first listing is not yet the size"
+    _age_listing(ctx, 70.0)
+    settled = _poll(broker, listed)
+    assert _entry_fills(settled) == [(LegType.ENTRY, 1.0)]
+    assert [e.fill_price for e in settled if e.event_type == 'filled'] == [1.11]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is None
+
+    assert _entry_fills(_poll(broker, listed)) == []
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity(batch, listed)))) == []
+    store.close()
+
+
+def __test_sized_opening_activity_settles_a_held_partly_netted_execution__(tmp_path):
+    """A ``POSITION`` activity of the opened deal that states its size books
+    the held execution at that size."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    assert _entry_fills(events) == []
+
+    sized = {**batch[2], 'size': 1.0}
+    fills = asyncio.run(_drain(broker._process_activity([sized], {})))
+    assert _entry_fills(fills) == [(LegType.ENTRY, 1.0)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is None
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 1.0, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == []
+    store.close()
+
+
+def __test_close_of_a_held_partly_netted_deal_waits_for_its_entry__(tmp_path):
+    """A close of the opened deal before its size is known is deferred, not
+    booked against exposure the engine never had; once the entry is booked the
+    close follows."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    close = {
+        'dateUTC': _now_iso(1.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 1.0, 'level': 1.12},
+    }
+    assert asyncio.run(_drain(broker._process_activity([close], {}))) == []
+    assert len(_events(ctx, 'activity_held_netted_residual_pending')) == 1
+
+    sized = {**batch[2], 'size': 1.0}
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sized], {})))) == [
+        (LegType.ENTRY, 1.0)]
+    closed = asyncio.run(_drain(broker._process_activity([close], {})))
+    assert _entry_fills(closed) == [(LegType.CLOSE, 1.0)]
+    store.close()
+
+
+@pytest.mark.parametrize('same_batch', [True, False])
+def __test_held_partly_netted_deal_reduced_before_its_listing_books_the_opened_size__(
+        tmp_path, same_batch):
+    """The deal opened 1.0 and was reduced by 0.4 before any read listed it.
+    The close's 0.4 is never taken for the opened size, the listed 0.6 plus the
+    held close books the opened 1.0, and the close then leaves 0.6 — the
+    venue's size."""
+    close = {
+        'dateUTC': _now_iso(1.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True, extra_activities=[close] if same_batch else [])
+    assert _entry_fills(events) == []
+    if not same_batch:
+        assert asyncio.run(_drain(broker._process_activity([close], {}))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == 0.0
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is not None
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == []
+    _age_listing(ctx, 70.0)
+    assert _entry_fills(_poll(broker, listed)) == [(LegType.ENTRY, 1.0)]
+    closed = asyncio.run(_drain(broker._process_activity([close], listed)))
+    assert _entry_fills(closed) == [(LegType.CLOSE, 0.4)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    store.close()
+
+
+def __test_unpriced_opening_size_stays_held_until_a_priced_read__(tmp_path):
+    """An opening activity that states the size but no price does not book a
+    fill the engine would discard: the proven size is kept, and the first
+    priced ``/positions`` read books exactly one fill of that size."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True, executed_level=None, opened_level=None)
+    assert _entry_fills(events) == []
+    unpriced = {**batch[2], 'size': 1.0,
+                'details': {'workingOrderId': 'wo-1', 'direction': 'BUY'}}
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([unpriced], {})))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == 0.0
+    pending = (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+    assert pending is not None and pending.get('opened_qty') == pytest.approx(1.0)
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 1.0, created=now, workingOrderId='wo-1',
+                           level=1.13))
+    settled = _poll(broker, listed)
+    assert [(e.leg_type, e.fill_qty, e.fill_price) for e in settled
+            if e.event_type == 'filled'] == [(LegType.ENTRY, 1.0, 1.13)]
+    assert _entry_fills(_poll(broker, listed)) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    store.close()
+
+
+def __test_close_published_late_is_not_counted_twice_by_the_snapshot_settlement__(tmp_path):
+    """The deal opened 1.0 and was reduced by 0.4 before any read listed it,
+    but the close's activity is published only 20 s after the first listing.
+    The listed 0.6 is not taken for the opened size before the publication
+    lag passed; once the late close is held, the opened 1.0 is booked and the
+    close leaves 0.6 — the venue's size, never 0.2."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    assert _entry_fills(events) == []
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == []
+    _age_listing(ctx, 20.0)
+    assert _entry_fills(_poll(broker, listed)) == [], "the close may not be published yet"
+
+    close = {
+        'dateUTC': _now_iso(-25.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    assert asyncio.run(_drain(broker._process_activity([close], listed))) == []
+    _age_listing(ctx, 50.0)
+    assert _entry_fills(_poll(broker, listed)) == [(LegType.ENTRY, 1.0)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([close], listed)))) == [
+        (LegType.CLOSE, 0.4)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    store.close()
+
+
+@pytest.mark.parametrize('execution_first', [True, False])
+def __test_unpriced_execution_with_a_priced_sized_opening_books_the_opening_price__(
+        tmp_path, execution_first):
+    """The execution states no price, the deal's opening activity states both
+    its size and its price in the same batch: the opened size is booked once
+    at the opening price, never at 0.0."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=execution_first, executed_level=None,
+        opened_size=1.0, opened_level=1.12)
+    assert [(e.leg_type, e.fill_qty, e.fill_price) for e in events
+            if e.event_type == 'filled'] == [(LegType.ENTRY, 1.0, 1.12)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is None
+    store.close()
+
+
+@pytest.mark.parametrize('execution_first', [True, False])
+def __test_unpriced_sized_opening_in_the_first_batch_stays_held_until_a_priced_read__(
+        tmp_path, execution_first):
+    """Neither the execution nor the sized opening activity states a price,
+    and no read lists the deal: nothing is booked, the proven size is kept,
+    and the first priced ``/positions`` read books exactly that size once."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=execution_first, executed_level=None,
+        opened_size=1.0, opened_level=None)
+    assert _entry_fills(events) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == 0.0
+    pending = (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+    assert pending is not None and pending.get('opened_qty') == pytest.approx(1.0)
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity(batch, {})))) == []
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 1.0, created=now, workingOrderId='wo-1',
+                           level=1.13))
+    settled = _poll(broker, listed)
+    assert [(e.leg_type, e.fill_qty, e.fill_price) for e in settled
+            if e.event_type == 'filled'] == [(LegType.ENTRY, 1.0, 1.13)]
+    assert _entry_fills(_poll(broker, listed)) == []
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity(batch, listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    store.close()
+
+
+def __test_close_republished_with_its_size_settles_the_held_entry_once__(tmp_path):
+    """A close of the held deal is read first without its size, then again
+    with it. The sized copy replaces the sizeless record: the stable listing
+    books the opened 1.0, and the close is applied exactly once."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    close_at = _now_iso(1.0)
+    sizeless = {
+        'dateUTC': close_at, 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'level': 1.12},
+    }
+    sized = {**sizeless, 'details': {**sizeless['details'], 'size': 0.4}}
+    assert asyncio.run(_drain(broker._process_activity([sizeless], {}))) == []
+    assert asyncio.run(_drain(broker._process_activity([sizeless, sized], {}))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None
+    held = (row.extras or {})[EXTRAS_KEY_NETTED_RESIDUAL_PENDING]['held_closes']
+    assert [close['size'] for close in held.values()] == [0.4]
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == []
+    _age_listing(ctx, 70.0)
+    assert _entry_fills(_poll(broker, listed)) == [(LegType.ENTRY, 1.0)]
+    closed = asyncio.run(_drain(broker._process_activity([sizeless, sized], listed)))
+    assert _entry_fills(closed) == [(LegType.CLOSE, 0.4)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless, sized],
+                                                                    listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    store.close()
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def __test_activity_read_reaches_back_to_a_close_deferred_by_a_held_entry__(
+        tmp_path, restart):
+    """A close of the held deal is deferred until the entry is booked, which
+    the snapshot settlement does only a publication lag after the deal's first
+    listing. Every activity read meanwhile reaches back to the close, also
+    after a restart, so the venue still returns it once the entry is booked
+    and the close is applied; once nothing is deferred the read covers only
+    the time since the last read again."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    close = {
+        'dateUTC': _now_iso(-30.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    assert asyncio.run(_drain(broker._process_activity([close], {}))) == []
+    if restart:
+        broker, _ = _make_plugin(ctx)
+
+    later = time.time() + 100.0
+    if not restart:
+        broker._activity_polled_at = later - 5.0
+    assert broker._activity_lookback_s(later) >= 130 + _ACTIVITY_LAG_S
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == []
+    _age_listing(ctx, 70.0)
+    assert _entry_fills(_poll(broker, listed)) == [(LegType.ENTRY, 1.0)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([close], listed)))) == [
+        (LegType.CLOSE, 0.4)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    broker._activity_polled_at = later - 5.0
+    assert broker._activity_lookback_s(later) == 5 + _ACTIVITY_LAG_S
+    store.close()
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def __test_activity_read_keeps_reaching_back_to_a_deferred_close_after_the_entry_books__(
+        tmp_path, restart):
+    """The settlement poll's own activity read defers the close once more
+    before the snapshot books the entry, so the close can only book from a
+    later read. That read still reaches back to the close, also after a
+    restart between the entry's booking and the close's, until the close is
+    booked."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    close = {
+        'dateUTC': _now_iso(-30.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    assert asyncio.run(_drain(broker._process_activity([close], {}))) == []
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == []
+    _age_listing(ctx, 70.0)
+    assert asyncio.run(_drain(broker._process_activity([close], listed))) == []
+    assert _entry_fills(_poll(broker, listed)) == [(LegType.ENTRY, 1.0)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is None
+    if restart:
+        broker, _ = _make_plugin(ctx)
+
+    later = time.time() + 100.0
+    broker._activity_polled_at = later - 5.0
+    assert broker._activity_lookback_s(later) >= 130 + _ACTIVITY_LAG_S
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([close], listed)))) == [
+        (LegType.CLOSE, 0.4)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    assert broker._activity_lookback_s(later) == 5 + _ACTIVITY_LAG_S
+    store.close()
+
+
+@pytest.mark.parametrize('sized_copy', [True, False])
+def __test_opening_republished_with_its_price_settles_the_held_entry__(tmp_path, sized_copy):
+    """The sized opening proved the opened size but stated no price, and no
+    read lists the deal. The opening republished with ``details.level`` (with
+    or without the size again) shares the fingerprint, and still books the
+    proven size at that price, once."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True, executed_level=None,
+        opened_size=1.0, opened_level=None)
+    assert _entry_fills(events) == []
+    details = {**batch[2]['details'], 'level': 1.12}
+    if not sized_copy:
+        details.pop('size')
+    priced = {**batch[2], 'details': details}
+    assert _activity_fingerprint(priced) == _activity_fingerprint(batch[2])
+
+    booked = asyncio.run(_drain(broker._process_activity([priced], {})))
+    assert [(e.leg_type, e.fill_qty, e.fill_price) for e in booked
+            if e.event_type == 'filled'] == [(LegType.ENTRY, 1.0, 1.12)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is None
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([priced], {})))) == []
+    store.close()
+
+
+def __test_opening_republished_with_its_size_settles_the_held_entry__(tmp_path):
+    """The deal's opening activity is read first without its size, then again
+    with ``details.size``: the copies share the fingerprint, and the sized
+    copy still books the held execution, once."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    assert _entry_fills(events) == []
+    sized = {**batch[2], 'details': {**batch[2]['details'], 'size': 1.0}}
+    assert _activity_fingerprint(sized) == _activity_fingerprint(batch[2])
+
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sized], {})))) == [
+        (LegType.ENTRY, 1.0)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is None
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sized], {})))) == []
+    store.close()
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def __test_activity_read_reaches_back_to_the_opening_of_a_held_entry__(tmp_path, restart):
+    """A held entry with no deferred close still waits for its deal's opening,
+    republished with the price it lacks: every read reaches back to that
+    opening, also after a restart, and the priced copy books the proven size
+    once. The incomplete copy was never consumed, so it does not shadow the
+    priced one. Once the entry is booked the read covers only the time since
+    the last read again."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True, executed_level=None,
+        opened_size=1.0, opened_level=None)
+    assert _entry_fills(events) == []
+    if restart:
+        broker, _ = _make_plugin(ctx)
+
+    later = time.time() + 130.0
+    broker._activity_polled_at = later - 5.0
+    assert broker._activity_lookback_s(later) >= 130 + _ACTIVITY_LAG_S
+
+    priced = {**batch[2], 'details': {**batch[2]['details'], 'level': 1.12}}
+    booked = asyncio.run(_drain(broker._process_activity([priced], {})))
+    assert [(e.leg_type, e.fill_qty, e.fill_price) for e in booked
+            if e.event_type == 'filled'] == [(LegType.ENTRY, 1.0, 1.12)]
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert broker._activity_lookback_s(later) == 5 + _ACTIVITY_LAG_S
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([priced], {})))) == []
+    store.close()
+
+
+def __test_deferred_close_passes_a_watermark_that_moved_past_it__(tmp_path):
+    """The entry is booked with its close still deferred, and a newer own row
+    moves the watermark past the close while a read omits it. When the close
+    returns it still books, once: 0.6 is left, the venue's size."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    close = {
+        'dateUTC': _now_iso(-30.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    assert asyncio.run(_drain(broker._process_activity([close], {}))) == []
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    assert _entry_fills(_poll(broker, listed)) == []
+    _age_listing(ctx, 70.0)
+    assert _entry_fills(_poll(broker, listed)) == [(LegType.ENTRY, 1.0)]
+
+    broker._activity_cursor.last_date_utc = _now_iso(120.0)
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([close], listed)))) == [
+        (LegType.CLOSE, 0.4)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([close], listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    store.close()
+
+
+@pytest.mark.parametrize('watermark_moved', [False, True])
+def __test_sizeless_deferred_close_waits_for_its_size_after_the_entry_books__(
+        tmp_path, watermark_moved):
+    """A close of the held deal is read without its size, then the sized
+    opening books the entry. The sizeless copy still states no reduction: it
+    stays deferred, not booked at the order's quantity nor consumed. The sized
+    copy, also once a newer own row moved the watermark past it, books 0.4
+    exactly once, and a later sizeless copy books nothing."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    sizeless = {
+        'dateUTC': _now_iso(1.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'level': 1.12},
+    }
+    sized = {**sizeless, 'details': {**sizeless['details'], 'size': 0.4}}
+    assert asyncio.run(_drain(broker._process_activity([sizeless], {}))) == []
+    opening = {**batch[2], 'details': {**batch[2]['details'], 'size': 1.0}}
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([opening], {})))) == [
+        (LegType.ENTRY, 1.0)]
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    for _ in range(2):
+        assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless],
+                                                                        listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+
+    if watermark_moved:
+        broker._activity_cursor.last_date_utc = _now_iso(120.0)
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless, sized], listed)))) == [
+        (LegType.CLOSE, 0.4)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless, sized], listed)))) == []
+    sizeless_copy = {**sizeless, 'size': None}
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless_copy], listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    later = time.time() + 100.0
+    broker._activity_polled_at = later - 5.0
+    assert broker._activity_lookback_s(later) == 5 + _ACTIVITY_LAG_S
+    store.close()
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def __test_sized_deferred_close_is_not_booked_by_a_later_sizeless_copy__(tmp_path, restart):
+    """A close of the held deal is read with its size first, then the sized
+    opening books the entry. A later copy of the close that states no size,
+    also after a restart, books nothing and is not consumed: the sized copy
+    then books 0.4 exactly once, and 0.6 is left, the venue's size."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    sized = {
+        'dateUTC': _now_iso(1.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    sizeless = {**sized, 'details': {'direction': 'SELL', 'level': 1.12}}
+    assert asyncio.run(_drain(broker._process_activity([sized], {}))) == []
+    opening = {**batch[2], 'details': {**batch[2]['details'], 'size': 1.0}}
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([opening], {})))) == [
+        (LegType.ENTRY, 1.0)]
+    if restart:
+        broker, _ = _make_plugin(ctx)
+
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    for _ in range(2):
+        assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless],
+                                                                        listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless, sized],
+                                                                    listed)))) == [
+        (LegType.CLOSE, 0.4)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([sizeless, sized],
+                                                                    listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    later = time.time() + 100.0
+    broker._activity_polled_at = later - 5.0
+    assert broker._activity_lookback_s(later) == 5 + _ACTIVITY_LAG_S
+    store.close()
+
+
+def __test_startup_keeps_the_close_of_a_held_entry_for_the_poll__(tmp_path):
+    """A close of the held deal is deferred, then the process restarts while
+    the entry is still held, and its ``/positions`` read, well after the
+    close, lists the deal at 0.6. The startup close accounting does not
+    consume the close: the entry has booked no exposure the adopted size could
+    hold it in. The sized opening then books 1.0 and the close 0.4, once each,
+    and 0.6 is left, the venue's size."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    close = {
+        'dateUTC': _now_iso(1.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    assert asyncio.run(_drain(broker._process_activity([close], {}))) == []
+
+    broker, _ = _make_plugin(ctx)
+    listed = _by_deal(_raw('deal-N', 'BUY', 0.6, created=now, workingOrderId='wo-1'))
+    read_started_at = time.time() + 900.0
+    assert _parse_iso_timestamp(close['dateUTC']) < broker._venue_time_floor(read_started_at)
+    closed_deals, reports = broker._account_downtime_closes(
+        [*batch, close], listed, read_started_at)
+    assert closed_deals == set() and reports == []
+    assert _events(ctx, 'startup_close_accounted') == []
+    assert _activity_fingerprint(close) not in broker._activity_cursor.seen_fingerprints
+
+    opening = {**batch[2], 'details': {**batch[2]['details'], 'size': 1.0}}
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([opening], listed)))) == [
+        (LegType.ENTRY, 1.0)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([close], listed)))) == [
+        (LegType.CLOSE, 0.4)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity([close], listed)))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    store.close()
+
+
+@pytest.mark.parametrize('priced_first', [True, False])
+def __test_complementary_opening_copies_settle_the_held_entry__(tmp_path, priced_first):
+    """One copy of the deal's opening states only the price, another only the
+    size, and no read lists the deal: together they book 1.0 at 1.12, once,
+    in either order."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True, executed_level=None,
+        opened_size=None if priced_first else 1.0,
+        opened_level=1.12 if priced_first else None)
+    assert _entry_fills(events) == []
+    details = {key: value for key, value in batch[2]['details'].items()
+               if key not in ('size', 'level')}
+    other = {**batch[2], 'details': ({**details, 'size': 1.0} if priced_first
+                                     else {**details, 'level': 1.12})}
+    booked = asyncio.run(_drain(broker._process_activity([other], {})))
+    assert [(e.leg_type, e.fill_qty, e.fill_price) for e in booked
+            if e.event_type == 'filled'] == [(LegType.ENTRY, 1.0, 1.12)]
+    assert _entry_fills(asyncio.run(_drain(broker._process_activity(
+        [batch[2], other], {})))) == []
+    row = ctx.find_by_ref('deal_id', 'deal-N')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is None
+    store.close()
+
+
+def __test_activities_deferred_by_a_held_entry_are_audited_once__(tmp_path):
+    """The venue serves a deferred opening and a deferred close again on every
+    read while the entry is held: each is audited once, not once per read."""
+    broker, store, ctx, latched, batch, events, now = _partly_net_with_unknown_opened_size(
+        tmp_path, execution_first=True)
+    close = {
+        'dateUTC': _now_iso(1.0), 'dealId': 'deal-N', 'type': 'POSITION',
+        'status': 'EXECUTED', 'source': 'CLOSE_OUT', 'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 0.4, 'level': 1.12},
+    }
+    for _ in range(3):
+        assert asyncio.run(_drain(broker._process_activity([*batch, close], {}))) == []
+    assert len(_events(ctx, 'activity_held_netted_residual_pending')) == 1
+    assert len(_events(ctx, 'activity_held_netted_residual_opening_incomplete')) == 1
     store.close()
 
 
@@ -3944,3 +4604,451 @@ def __test_account_mode_is_logged_once_per_process__(tmp_path):
     assert detected[0]['mode'] == 'netting' and detected[0]['hedging'] is False
     store.close()
 
+
+
+# === One transaction per booking =============================================
+
+def _fail_exposure_writes(monkeypatch, ctx):
+    """Make every journal write of an exposure cursor fail, like a process killed there."""
+    upsert = ctx.upsert_order
+
+    def failing(coid, *args, **kwargs):
+        if 'filled_qty' in kwargs:
+            raise RuntimeError("killed before the exposure write")
+        return upsert(coid, *args, **kwargs)
+
+    monkeypatch.setattr(ctx, 'upsert_order', failing)
+
+
+def __test_poll_booking_that_dies_before_its_exposure_write_consumes_nothing__(
+        tmp_path, monkeypatch):
+    """Someone else's partial close is consumed (dedup commit) and its
+    exposure retired in one transaction: a process that dies at the exposure
+    write leaves the close unconsumed, so the next process still retires it."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    close = _close_activity(size=0.5, date_utc=_now_iso(-5.0))
+    _fail_exposure_writes(monkeypatch, ctx)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_drain(broker._process_activity(
+            [close], _by_deal(_raw('deal-L', 'BUY', 1.5)))))
+    monkeypatch.undo()
+
+    assert _events(ctx, 'activity_processed') == []
+    _start_process(ctx, positions=[_raw('deal-L', 'BUY', 1.5)], activities=[close])
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.filled_qty == pytest.approx(1.5)
+    store.close()
+
+
+def __test_startup_accounting_that_dies_before_its_exposure_write_consumes_nothing__(
+        tmp_path, monkeypatch):
+    """The startup pass's close accounting is one transaction too: a process
+    that dies at the exposure write leaves the close for the next start."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    close = _close_activity(size=0.5, date_utc=_now_iso(-30.0))
+    deal = _raw('deal-L', 'BUY', 1.5)
+    _fail_exposure_writes(monkeypatch, ctx)
+
+    with pytest.raises(RuntimeError):
+        _start_process(ctx, positions=[deal], activities=[close])
+    monkeypatch.undo()
+
+    assert _events(ctx, 'activity_processed') == []
+    _start_process(ctx, positions=[deal], activities=[close])
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.filled_qty == pytest.approx(1.5)
+    assert len(_events(ctx, 'startup_close_accounted')) == 1
+    store.close()
+
+
+def __test_natural_close_teardown_that_dies_before_its_exposure_write_stamps_nothing__(
+        tmp_path, monkeypatch):
+    """The ``natural_close_at`` stamp and the exposure retirement are one
+    write: a stamped row is skipped by the snapshot reconcile, so a stamp
+    without the retirement would keep the dead exposure counting for good."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    _fail_exposure_writes(monkeypatch, ctx)
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+
+    with pytest.raises(RuntimeError):
+        broker._tear_down_natural_close(row)
+    monkeypatch.undo()
+
+    row = ctx.get_order('coid-entry')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is None
+    assert row.filled_qty == pytest.approx(2.0)
+    broker._tear_down_natural_close(row)
+    row = ctx.get_order('coid-entry')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is not None
+    assert row.filled_qty == 0.0
+    store.close()
+
+
+def __test_netting_resolution_that_dies_before_its_exposure_write_stays_pending__(
+        tmp_path, monkeypatch):
+    """A close judged against a resting order is resolved, its exposure
+    retired and its report owed in one transaction: a process that dies at
+    the exposure write leaves the close waiting for the next process."""
+    broker, store, ctx, latched = _close_judged_against_a_resting_short(tmp_path)
+    broker._responses[('workingorders/wo-S', 'delete')] = {'dealReference': 'del-S'}
+    _cancel_resting_short(broker)
+    _fail_exposure_writes(monkeypatch, ctx)
+
+    with pytest.raises(RuntimeError):
+        _poll(broker, _by_deal(_raw('deal-L', 'BUY', 1.0)))
+    monkeypatch.undo()
+
+    assert _events(ctx, 'user_close_netting_resolved') == []
+    entry = ctx.get_order('coid-entry')
+    assert entry is not None and entry.filled_qty == pytest.approx(2.0)
+    store.close()
+
+
+def __test_poll_booking_whose_transaction_failed_is_retried_by_the_same_process__(
+        tmp_path, monkeypatch):
+    """The in-memory activity cursor follows only a committed booking: after a
+    failed transaction the reopened order stream of the same process books
+    the close once."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_position(ctx)
+    close = _close_activity(size=0.5, date_utc=_now_iso(-5.0))
+    snapshot = _by_deal(_raw('deal-L', 'BUY', 1.5))
+    _fail_exposure_writes(monkeypatch, ctx)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_drain(broker._process_activity([close], snapshot)))
+    monkeypatch.undo()
+
+    asyncio.run(_drain(broker._process_activity([close], snapshot)))
+    asyncio.run(_drain(broker._process_activity([close], snapshot)))
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.filled_qty == pytest.approx(1.5)
+    assert len(_events(ctx, 'partial_close_journal_retired')) == 1
+    store.close()
+
+
+def __test_netting_resolution_whose_transaction_failed_is_retried_by_the_same_process__(
+        tmp_path, monkeypatch):
+    """A pending netting close leaves the wait only once its verdict is
+    committed: the next order read of the same process resolves it."""
+    broker, store, ctx, latched = _close_judged_against_a_resting_short(tmp_path)
+    broker._responses[('workingorders/wo-S', 'delete')] = {'dealReference': 'del-S'}
+    _cancel_resting_short(broker)
+    _fail_exposure_writes(monkeypatch, ctx)
+
+    with pytest.raises(RuntimeError):
+        _poll(broker, _by_deal(_raw('deal-L', 'BUY', 1.0)))
+    monkeypatch.undo()
+
+    _poll(broker, _by_deal(_raw('deal-L', 'BUY', 1.0)))
+    assert [r['verdict'] for r in _events(ctx, 'user_close_netting_resolved')] == ['foreign']
+    entry = ctx.get_order('coid-entry')
+    assert entry is not None and entry.filled_qty == pytest.approx(1.0)
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    store.close()
+
+
+def _fail_log_once(ctx, failing_kind: str) -> None:
+    """Make the next ``failing_kind`` audit write of ``ctx`` raise, once."""
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == failing_kind:
+            del ctx.log_event
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+
+
+@pytest.mark.parametrize('path, target_size, matched, failing_kind', [
+    ('reconciled', 1.0, False, 'partial_close_journal_retired'),
+    ('reconciled', 1.0, False, 'partial_close_target_reconciled'),
+    ('own_activity', 0.5, True, 'partial_close_journal_retired'),
+    ('own_activity', 0.5, True, 'partial_close_own_activity_matched'),
+])
+def __test_parked_partial_close_settlement_is_one_transaction__(
+        tmp_path, path, target_size, matched, failing_kind):
+    """A write failing part-way through settling a parked partial close as
+    filled leaves nothing applied: the command stays parked, the target's
+    cursor untouched, and the next pass settles it exactly once."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _park_partial_close(ctx, sent_at=time.time() - 5.0,
+                        matched=[_now_iso(-4.0)] if matched else [])
+    ctx.record_park(coid='cmd-partial', key='Long', kind='new')
+    listed = {'orig': _raw('orig', 'BUY', target_size)}
+
+    _fail_log_once(ctx, failing_kind)
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(broker._resolve_partial_close_dispositions(listed))
+
+    command = ctx.get_order('cmd-partial')
+    assert command is not None and command.state == 'disposition_unknown'
+    assert command.closed_ts_ms is None
+    target = ctx.get_order('coid-entry')
+    assert target is not None and target.filled_qty == pytest.approx(2.0)
+    assert _events(ctx, 'partial_close_journal_retired') == []
+    assert 'cmd-partial' not in ctx.replay()[1] or (
+        ctx.replay()[1]['cmd-partial'].resolution is None)
+
+    asyncio.run(broker._resolve_partial_close_dispositions(listed))
+    asyncio.run(broker._resolve_partial_close_dispositions(listed))
+
+    command = ctx.get_order('cmd-partial')
+    assert command is not None and command.state == 'confirmed'
+    assert command.closed_ts_ms is not None
+    target = ctx.get_order('coid-entry')
+    assert target is not None and target.filled_qty == pytest.approx(1.0)
+    assert len(_events(ctx, 'partial_close_journal_retired')) == 1
+    settled = ('partial_close_target_reconciled' if path == 'reconciled'
+               else 'partial_close_own_activity_matched')
+    assert len(_events(ctx, settled)) == 1
+    assert ctx.replay()[1]['cmd-partial'].resolution == 'attached'
+    store.close()
+
+
+def __test_parked_partial_close_rejection_is_one_transaction__(tmp_path):
+    """The no-own-reduction settlement is all-or-nothing: a failed audit
+    write leaves the command parked and unresolved, the next pass rejects it
+    once and records the resolution the engine's park waits for."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _park_partial_close(ctx, sent_at=time.time() - 200.0, matched=[])
+    ctx.record_park(coid='cmd-partial', key='Long', kind='new')
+    listed = {'orig': _raw('orig', 'BUY', 2.0)}
+
+    _fail_log_once(ctx, 'partial_close_no_own_reduction')
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(broker._resolve_partial_close_dispositions(listed))
+
+    command = ctx.get_order('cmd-partial')
+    assert command is not None and command.state == 'disposition_unknown'
+    assert command.closed_ts_ms is None
+
+    asyncio.run(broker._resolve_partial_close_dispositions(listed))
+
+    command = ctx.get_order('cmd-partial')
+    assert command is not None and command.state == 'rejected'
+    assert command.closed_ts_ms is not None
+    assert len(_events(ctx, 'partial_close_no_own_reduction')) == 1
+    assert ctx.replay()[1]['cmd-partial'].resolution == 'rejected'
+    store.close()
+
+
+def __test_netted_away_report_and_its_pending_record_are_one_transaction__(tmp_path):
+    """The netted-away audit and the pending report the sender replays are
+    written together: a failure between them leaves neither, and the next
+    verdict reports the foreign close exactly once."""
+    broker, store, ctx, latched = _vanishing_broker(tmp_path)
+    assert asyncio.run(_drain(broker._process_activity([_consuming_order()]))) == []
+
+    _fail_log_once(ctx, 'manual_close_report_pending')
+    with pytest.raises(sqlite3.OperationalError):
+        _vanish_after_the_grace(broker, ctx)
+    assert _events(ctx, 'position_netted_away_by_foreign_order') == []
+    assert _events(ctx, 'manual_close_report_pending') == []
+    assert latched == []
+
+    verdict = _vanish_after_the_grace(broker, ctx)
+
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert len(_events(ctx, 'position_netted_away_by_foreign_order')) == 1
+    assert len(_events(ctx, 'manual_close_report_pending')) == 1
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    store.close()
+
+
+@pytest.mark.parametrize('failing_kind', [
+    'partial_close_corrective_delete_dispatched', 'partial_close_corrective_delete',
+])
+def __test_unconfirmed_reverse_leg_correction_records_are_one_transaction__(
+        tmp_path, failing_kind):
+    """The reverse-leg attribution and its audit, and the landed corrective
+    DELETE and its audit, are each written together: a failed audit write
+    leaves the earlier record unchanged, and the next poll finishes the
+    correction with one audit each."""
+    own_deal = _raw('deal-L', 'BUY', 2.0)
+    opposite = _raw('deal-R', 'SELL', 1.0, created=_now_iso())
+    broker, store, ctx, latched = _make_broker(tmp_path, responses={
+        ('positions', 'get'): [{'positions': [own_deal]}, {'positions': [own_deal]},
+                               {'positions': [opposite]}],
+        ('positions', 'post'): {'dealReference': 'dr-1'},
+        ('error', 'confirms/dr-1', 'get'): OrderNotFoundError(
+            'confirm TTL expired', ref_type='deal_reference'),
+    })
+    _seed_position(ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.execute_close(_partial_close(1700000000000)))
+    stop_out = dict(_close_activity(source='SL', size=2.0, date_utc=_now_iso()))
+    asyncio.run(_drain(broker._process_activity([stop_out], _by_deal(opposite))))
+    broker.fill_report_grace_s = 0.0
+    cmd_coid = _partial_close(1700000000000).client_order_id(KIND_CLOSE)
+
+    _fail_log_once(ctx, failing_kind)
+    if failing_kind == 'partial_close_corrective_delete_dispatched':
+        with pytest.raises(sqlite3.OperationalError):
+            _poll(broker, _by_deal(opposite))
+    else:
+        # The DELETE landed before the failed write: it is logged, never a raw
+        # abort of the poll.
+        _poll(broker, _by_deal(opposite))
+    extras = (ctx.get_order(cmd_coid) or ctx.get_order('coid-entry')).extras or {}
+    if failing_kind == 'partial_close_corrective_delete_dispatched':
+        assert extras.get('corrected_reverse_deal_id') is None
+    else:
+        assert extras.get('corrected_reverse_deal_id') == 'deal-R'
+        assert extras.get('corrective_delete_pending') is True
+
+    _poll(broker, _by_deal(opposite))
+
+    command = ctx.get_order(cmd_coid)
+    assert command is not None and command.state == 'disposition_unknown'
+    extras = command.extras or {}
+    assert extras.get('corrected_reverse_deal_id') == 'deal-R'
+    assert extras.get('corrective_delete_pending') is False
+    assert len(_events(ctx, 'partial_close_corrective_delete_dispatched')) == 1
+    assert len(_events(ctx, 'partial_close_corrective_delete')) == 1
+    _poll(broker, {})
+    command = ctx.get_order(cmd_coid)
+    assert command is not None and command.state == 'rejected'
+    assert latched == []
+    store.close()
+
+
+@pytest.mark.parametrize('failing_write', ['exposure', 'audit'])
+def __test_startup_rekey_migration_is_one_transaction__(tmp_path, failing_write):
+    """Moving an unbooked resting entry onto the deal it executed as, and
+    booking its exposure, are one transaction: a failed write leaves the row
+    on its old order id, unstamped, and the next startup migrates it with
+    the full exposure exactly once."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_working(ctx)
+    deal = _raw('deal-P', 'BUY', 1.0, created=_now_iso(-120.0), workingOrderId='wo-1')
+    name = 'upsert_order' if failing_write == 'exposure' else 'log_event'
+    write = getattr(ctx, name)
+
+    def failing(*args, **kwargs):
+        if (('filled_qty' in kwargs and args[0] == 'coid-wo') if name == 'upsert_order'
+                else args[0] == 'startup_rekeyed_row_migrated'):
+            delattr(ctx, name)
+            raise sqlite3.OperationalError("disk I/O error")
+        return write(*args, **kwargs)
+
+    setattr(ctx, name, failing)
+    with pytest.raises(sqlite3.OperationalError):
+        _restart_with_history(ctx, positions=[deal], activities=[])
+    row = ctx.get_order('coid-wo')
+    assert row is not None and row.exchange_order_id == 'wo-1'
+    assert (row.extras or {}).get('entry_filled_at') is None
+    assert row.filled_qty == 0.0
+
+    _restart_with_history(ctx, positions=[deal], activities=[])
+
+    row = ctx.get_order('coid-wo')
+    assert row is not None and row.closed_ts_ms is None
+    assert row.exchange_order_id == 'deal-P'
+    assert row.filled_qty == 1.0
+    assert len(_events(ctx, 'startup_rekeyed_row_migrated')) == 1
+    store.close()
+
+
+def __test_venue_end_of_a_resting_order_is_recorded_with_its_dedup_commit__(tmp_path):
+    """Who ended a resting bot order is written in the transaction that marks
+    its activity processed: when the record fails, the activity is read
+    again instead of staying consumed without it, and the venue's cancel is
+    never taken for someone else's."""
+    broker, store, ctx, latched = _make_broker(tmp_path)
+    _seed_working(ctx)
+    cancel = _working_order_cancel(source='SYSTEM', status='EXPIRED', date_utc=_now_iso(-1.0))
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == 'working_order_venue_cancel':
+            del ctx.log_event
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(_drain(broker._process_activity([cancel], {})))
+
+    assert asyncio.run(_drain(broker._process_activity([cancel], {}))) == []
+    assert len(_events(ctx, 'working_order_venue_cancel')) == 1
+    _missed_since(ctx, 'coid-wo', time.time() - 30.0)
+    events = _tracker_pass(broker)
+
+    assert [e.event_type for e in events] == ['cancelled']
+    assert events[0].cancel_reason in VENUE_DRIVEN_CANCEL_REASONS
+    assert latched == []
+    store.close()
+
+
+def __test_a_held_verdict_survives_a_failed_decision_write__(tmp_path):
+    """Deciding a held verdict drops its record and audits the decision in one
+    write, before the process forgets it: when that write fails, the verdict
+    stays held and the next read decides it, once."""
+    broker, store, ctx, latched = _published_lag_broker(tmp_path)
+    _feed(broker, _edit_at('USER', 0.01), read_at=time.time() + 0.1)
+    edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
+    for _ in range(3):
+        _poll(broker, edited)
+    assert latched == []
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == 'level_edit_verdict_decided':
+            del ctx.log_event
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    _feed(broker, _edit_at('USER', 0.5), read_at=time.time() + 0.6)
+    ctx.log_event = failing
+    with pytest.raises(sqlite3.OperationalError):
+        _poll(broker, edited)
+    assert latched == []
+    assert broker._held_edit_verdicts
+
+    _poll(broker, edited)
+
+    assert len(latched) == 1 and latched[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    decided = _events(ctx, 'level_edit_verdict_decided')
+    assert len(decided) == 1 and decided[0]['verdict'] == 'foreign'
+    store.close()
+
+
+def __test_keeping_a_held_verdict_past_an_own_write_is_one_journal_write__(tmp_path):
+    """Re-keeping a held verdict under its provisional identity writes the
+    journal first, in one transaction: a failed write leaves it held under its
+    old identity, here and on disk, and the next attempt keeps it once."""
+    broker, store, ctx, latched = _published_lag_broker(tmp_path)
+    _feed(broker, _edit_at('USER', 0.01), read_at=time.time() + 0.1)
+    edited = _by_deal(_raw('deal-L', 'BUY', 2.0, stopLevel=1.07, profitLevel=1.20))
+    for _ in range(3):
+        _poll(broker, edited)
+    held_before = set(broker._held_edit_verdicts)
+    assert held_before
+    key = intervention._protection_key('deal-L')
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == 'level_edit_verdict_kept_past_own_write':
+            del ctx.log_event
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+    with pytest.raises(sqlite3.OperationalError):
+        broker._keep_held_verdicts_past_own_write(key)
+    assert set(broker._held_edit_verdicts) == held_before
+    saved = {held_id for row in ctx.iter_live_orders()
+             for held_id in ((row.extras or {}).get(helpers.EXTRAS_KEY_HELD_EDIT_VERDICTS) or {})}
+    assert saved == held_before
+
+    broker._keep_held_verdicts_past_own_write(key)
+    assert len(_events(ctx, 'level_edit_verdict_kept_past_own_write')) == 1
+    assert all(v.provisional for v in broker._held_edit_verdicts.values())
+    store.close()

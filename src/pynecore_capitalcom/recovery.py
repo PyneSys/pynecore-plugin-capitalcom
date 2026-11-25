@@ -62,26 +62,32 @@ from pynecore.core.broker.store_helpers import (
     KIND_MODIFY_ENTRY,
     KIND_MODIFY_EXIT,
     KIND_PARTIAL_CLOSE,
+    STATE_DISPOSITION_UNKNOWN,
     find_pending_dispatch,
 )
 from pynecore.lib.log import broker_info, broker_warning
 from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
+from .activity import _record_booked_close
 from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import (
-    BOOKED_CLOSES_RETAINED,
     CLOSE_VERDICT_FOREIGN,
     CLOSE_VERDICT_VENUE,
     EXTERNAL_REDUCTION_VERDICTS,
     EXTRAS_KEY_BOOKED_CLOSES,
     EXTRAS_KEY_CANCEL_REQUESTED,
+    EXTRAS_KEY_NETTED_RESIDUAL_PENDING,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
     _extract_reject_reason,
     _parse_iso_timestamp,
+    _mirror_amended_level,
+    _modify_entry_snapshot_verdict,
+    _modify_exit_snapshot_verdict,
     _retire_parked_partial_close_exposure,
+    _settle_vanished_full_close_targets,
     _wire_float,
     _wire_id,
     _wire_int,
@@ -541,24 +547,29 @@ class _RecoveryMixin(_CapitalComBase, ABC):
             if deal_id is None:
                 continue
             unbooked = row.filled_qty <= 0.0
-            self._promote_working_row_to_position(row, deal_id, stamp_entry_filled=True)
-            if unbooked:
-                store_ctx.upsert_order(row.client_order_id, filled_qty=row.qty)
             venue_size = _wire_float(
                 (pos_by_deal_id[deal_id].get('position') or {}).get('size'), finite=True)
+            # One transaction: the move onto the new deal stamps the entry
+            # fill as accounted, so a move committed without its exposure
+            # would be skipped by the next startup (the deal is then listed
+            # under the row's own id) and its late activity suppressed.
+            with store_ctx.transaction():
+                self._promote_working_row_to_position(row, deal_id, stamp_entry_filled=True)
+                if unbooked:
+                    store_ctx.upsert_order(row.client_order_id, filled_qty=row.qty)
+                store_ctx.log_event(
+                    'startup_rekeyed_row_migrated',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=deal_id,
+                    payload={'previous_deal_id': did, 'kind': extras.get('kind'),
+                             'exposure': row.qty if unbooked else row.filled_qty,
+                             'fill_booked_before': not unbooked,
+                             'venue_size': venue_size},
+                )
             broker_info(
                 "startup: own %s entry %s (%s %s) executed as deal %s while the bot "
                 "was down; the row now tracks that deal",
                 extras.get('kind'), did, row.side, row.qty, deal_id,
-            )
-            store_ctx.log_event(
-                'startup_rekeyed_row_migrated',
-                client_order_id=row.client_order_id,
-                exchange_order_id=deal_id,
-                payload={'previous_deal_id': did, 'kind': extras.get('kind'),
-                         'exposure': row.qty if unbooked else row.filled_qty,
-                         'fill_booked_before': not unbooked,
-                         'venue_size': venue_size},
             )
 
     def _hold_unproven_take_over(self, row: 'OrderRow') -> None:
@@ -653,11 +664,16 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 # opened: its closes are never judged or reported as an
                 # intervention (``_retire_startup_orphans`` retires the row).
                 continue
+            present = deal_id in pos_by_deal_id
+            if present and (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is not None:
+                # A held partly netted entry has booked no exposure yet, so the
+                # size the engine adopts holds none of its closes: the poll
+                # defers them until the entry is booked, then books them.
+                continue
             event = self._activity_to_event(activity, row, pos_by_deal_id.get(deal_id))
             if (event is None or event.event_type != 'filled'
                     or event.leg_type not in _CLOSE_LEG_TYPES):
                 continue
-            present = deal_id in pos_by_deal_id
             activity_ts = _parse_iso_timestamp(str(activity.get('dateUTC') or ''))
             size = float(event.fill_qty or 0.0)
             own_retired = (present and event.leg_type == LegType.CLOSE
@@ -701,40 +717,44 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 continue
             if present and not own_retired:
                 snapshot_gaps[deal_id] = max(0.0, gap - size)
-            verdict = (self._attribute_close_activity(row, activity, pos_by_deal_id)
-                       if event.leg_type == LegType.CLOSE else CLOSE_VERDICT_VENUE)
+            # The verdict, the dedup commit, the booked-close record and the
+            # exposure retirement are one transaction, like the poll's
+            # booking: a process that dies in between must not find the close
+            # consumed while its effect on the journal is missing. The in-memory
+            # cursor follows only the committed transaction.
+            with store_ctx.transaction():
+                verdict = (self._attribute_close_activity(row, activity, pos_by_deal_id)
+                           if event.leg_type == LegType.CLOSE else CLOSE_VERDICT_VENUE)
+                store_ctx.log_event(
+                    'activity_processed',
+                    exchange_order_id=deal_id,
+                    client_order_id=row.client_order_id,
+                    payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
+                             'deal_id': deal_id, 'type': activity.get('type'),
+                             'status': activity.get('status'),
+                             'source': activity.get('source'),
+                             'startup_accounted': True},
+                )
+                fresh = store_ctx.get_order(row.client_order_id) or row
+                extras = dict(fresh.extras or {})
+                _record_booked_close(extras, activity, close_id)
+                remaining: float | None = None
+                if present and verdict in EXTERNAL_REDUCTION_VERDICTS:
+                    remaining = max(0.0, fresh.filled_qty - size)
+                    extras['partial_close_retired_at'] = epoch_time()
+                if remaining is None:
+                    store_ctx.upsert_order(row.client_order_id, extras=extras)
+                else:
+                    store_ctx.upsert_order(row.client_order_id, filled_qty=remaining, extras=extras)
+                store_ctx.log_event(
+                    'startup_close_accounted',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=deal_id,
+                    payload={'dateUTC': date_utc, 'source': activity.get('source'),
+                             'size': size, 'verdict': verdict, 'deal_present': present,
+                             'remaining_exposure': remaining},
+                )
             cursor.seen_fingerprints[fingerprint] = date_utc
-            store_ctx.log_event(
-                'activity_processed',
-                exchange_order_id=deal_id,
-                client_order_id=row.client_order_id,
-                payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
-                         'deal_id': deal_id, 'type': activity.get('type'),
-                         'status': activity.get('status'),
-                         'source': activity.get('source'),
-                         'startup_accounted': True},
-            )
-            fresh = store_ctx.get_order(row.client_order_id) or row
-            extras = dict(fresh.extras or {})
-            extras[EXTRAS_KEY_BOOKED_CLOSES] = [
-                *(extras.get(EXTRAS_KEY_BOOKED_CLOSES) or ())][
-                    -BOOKED_CLOSES_RETAINED + 1:] + [close_id]
-            remaining: float | None = None
-            if present and verdict in EXTERNAL_REDUCTION_VERDICTS:
-                remaining = max(0.0, fresh.filled_qty - size)
-                extras['partial_close_retired_at'] = epoch_time()
-            if remaining is None:
-                store_ctx.upsert_order(row.client_order_id, extras=extras)
-            else:
-                store_ctx.upsert_order(row.client_order_id, filled_qty=remaining, extras=extras)
-            store_ctx.log_event(
-                'startup_close_accounted',
-                client_order_id=row.client_order_id,
-                exchange_order_id=deal_id,
-                payload={'dateUTC': date_utc, 'source': activity.get('source'),
-                         'size': size, 'verdict': verdict, 'deal_present': present,
-                         'remaining_exposure': remaining},
-            )
             if verdict == CLOSE_VERDICT_FOREIGN:
                 reports.append((fresh, activity))
         return closed_deals, reports
@@ -865,8 +885,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 payload={**payload, 'symbol': row.symbol, 'side': row.side,
                          'at_startup': True},
             )
-        self._close_bracket_after_natural_close(row)
-        self._retire_netted_journal_exposure(row, row.filled_qty)
+        self._tear_down_natural_close(row)
         return report
 
     def _retire_startup_orphans(
@@ -953,158 +972,164 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         pending_reports: list[dict] = []
 
         for row in list(self.store_ctx.iter_live_orders()):
-            extras = row.extras or {}
-            if extras.get('leg_kind') in ('tp', 'sl'):
-                continue
-            if row.client_order_id in promoted:
-                continue
-            if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
-                # A row an earlier version seeded for a venue deal this run's
-                # journal never produced. The deal is not the run's: it is
-                # left on the venue untouched, and only the row is retired so
-                # no close or exit path can target it.
-                self.store_ctx.log_event(
-                    'startup_adopted_row_retired',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                    payload={'state': row.state, 'filled_qty': row.filled_qty},
+            # One row's retirement is one write: a failure part-way leaves
+            # the row as it was, and the next start judges it afresh
+            # instead of finding a report pending beside a live row.
+            with self.store_ctx.transaction():
+                extras = row.extras or {}
+                if extras.get('leg_kind') in ('tp', 'sl'):
+                    continue
+                if row.client_order_id in promoted:
+                    continue
+                if extras.get(ADOPTED_STARTUP_EXTRA_KEY):
+                    # A row an earlier version seeded for a venue deal this run's
+                    # journal never produced. The deal is not the run's: it is
+                    # left on the venue untouched, and only the row is retired so
+                    # no close or exit path can target it.
+                    self.store_ctx.log_event(
+                        'startup_adopted_row_retired',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=row.exchange_order_id,
+                        payload={'state': row.state, 'filled_qty': row.filled_qty},
+                    )
+                    self.store_ctx.close_order(row.client_order_id)
+                    retired_parent_coids.add(row.client_order_id)
+                    if row.intent_key:
+                        self.store_ctx.record_complete(row.intent_key)
+                        retired_intent_keys.add(row.intent_key)
+                    retired_count += 1
+                    continue
+                if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+                    # A held take-over: its order is gone because it executed,
+                    # and retiring the row would release the entry for a second
+                    # send. It stays live and held, like in the process that
+                    # stamped it.
+                    kept_parent_coids.add(row.client_order_id)
+                    continue
+                if reconnecting and row.state in ('confirmed', 'closing'):
+                    # The engine of this process still tracks the row and waits
+                    # for whatever made its deal disappear: our DELETE landing
+                    # right before the link dropped, a native TP/SL, a working
+                    # order filling into a new position, a manual close. The
+                    # activity poll's lookback covers the outage, and the
+                    # snapshot reconcile and disappearance tracker resolve the
+                    # rest. Retiring the row drops its deal_id reference, so its
+                    # fill reads as external and is never booked — the engine
+                    # then keeps the position open, rejects every reversal close
+                    # re-dispatch against the retired row and only clears the
+                    # book minutes later via its venue-flat detector (measured
+                    # 2026-09-30, cycle 225).
+                    kept_parent_coids.add(row.client_order_id)
+                    continue
+                did = row.exchange_order_id
+                if not did:
+                    # A rejected row with no exchange id exists on no venue by
+                    # definition — pure local residue of a failed dispatch.
+                    # Left live, it lingers across runs and its state shadows
+                    # the exit path's close-in-flight probe (measured live:
+                    # rejected rows from five days earlier still matched the
+                    # cycle-81 exit lookup). Retire it here; anything else
+                    # without an id stays untouched (an in-flight dispatch may
+                    # still be waiting for its confirm).
+                    if row.state != 'rejected':
+                        continue
+                    self.store_ctx.log_event(
+                        'startup_rejected_residue_retired',
+                        client_order_id=row.client_order_id,
+                        payload={'state': row.state,
+                                 'pine_entry_id': row.pine_entry_id},
+                    )
+                    self.store_ctx.close_order(row.client_order_id)
+                    retired_count += 1
+                    continue
+                if row.state not in ('confirmed', 'closing', 'rejected'):
+                    continue
+                if did in pos_by_deal_id or did in wo_by_deal_id:
+                    continue
+                filled_position = (
+                    extras.get('kind') == 'position'
+                    and row.state in ('confirmed', 'closing')
+                    and (row.filled_qty > 0.0
+                         or extras.get('entry_filled_at') is not None
+                         or extras.get('partial_close_retired_at') is not None)
                 )
+                if filled_position:
+                    report = self._retire_vanished_startup_position(
+                        row, closed_by_activity=did in closed, activities=activities or [])
+                    if report is not None:
+                        pending_reports.append(report)
+                elif row.state == 'confirmed' and extras.get('kind') == ENTRY_KIND_WORKING:
+                    report = self._judge_vanished_startup_working_order(row, activities or [])
+                    if report is not None:
+                        pending_reports.append(report)
+                else:
+                    self.store_ctx.log_event(
+                        'startup_orphan_retired',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=did,
+                        payload={'state': row.state, 'leg_kind': None},
+                    )
                 self.store_ctx.close_order(row.client_order_id)
                 retired_parent_coids.add(row.client_order_id)
+                # The envelope anchor in the ``envelopes`` table survives
+                # ``close_order``; without this delete the next dispatch of
+                # the same Pine intent reuses the stale ``bar_ts_ms`` and
+                # regenerates the SAME client_order_id, hitting the
+                # ``upsert_order`` UPDATE path on the just-closed row — and
+                # since UPDATE does not touch ``closed_ts_ms``, the freshly
+                # confirmed entry is invisible to ``iter_live_orders``,
+                # which makes the immediately-following ``execute_exit``
+                # raise ``no confirmed entry row``.
                 if row.intent_key:
                     self.store_ctx.record_complete(row.intent_key)
                     retired_intent_keys.add(row.intent_key)
                 retired_count += 1
-                continue
-            if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
-                # A held take-over: its order is gone because it executed,
-                # and retiring the row would release the entry for a second
-                # send. It stays live and held, like in the process that
-                # stamped it.
-                kept_parent_coids.add(row.client_order_id)
-                continue
-            if reconnecting and row.state in ('confirmed', 'closing'):
-                # The engine of this process still tracks the row and waits
-                # for whatever made its deal disappear: our DELETE landing
-                # right before the link dropped, a native TP/SL, a working
-                # order filling into a new position, a manual close. The
-                # activity poll's lookback covers the outage, and the
-                # snapshot reconcile and disappearance tracker resolve the
-                # rest. Retiring the row drops its deal_id reference, so its
-                # fill reads as external and is never booked — the engine
-                # then keeps the position open, rejects every reversal close
-                # re-dispatch against the retired row and only clears the
-                # book minutes later via its venue-flat detector (measured
-                # 2026-09-30, cycle 225).
-                kept_parent_coids.add(row.client_order_id)
-                continue
-            did = row.exchange_order_id
-            if not did:
-                # A rejected row with no exchange id exists on no venue by
-                # definition — pure local residue of a failed dispatch.
-                # Left live, it lingers across runs and its state shadows
-                # the exit path's close-in-flight probe (measured live:
-                # rejected rows from five days earlier still matched the
-                # cycle-81 exit lookup). Retire it here; anything else
-                # without an id stays untouched (an in-flight dispatch may
-                # still be waiting for its confirm).
-                if row.state != 'rejected':
-                    continue
-                self.store_ctx.log_event(
-                    'startup_rejected_residue_retired',
-                    client_order_id=row.client_order_id,
-                    payload={'state': row.state,
-                             'pine_entry_id': row.pine_entry_id},
-                )
-                self.store_ctx.close_order(row.client_order_id)
-                retired_count += 1
-                continue
-            if row.state not in ('confirmed', 'closing', 'rejected'):
-                continue
-            if did in pos_by_deal_id or did in wo_by_deal_id:
-                continue
-            filled_position = (
-                extras.get('kind') == 'position'
-                and row.state in ('confirmed', 'closing')
-                and (row.filled_qty > 0.0
-                     or extras.get('entry_filled_at') is not None
-                     or extras.get('partial_close_retired_at') is not None)
-            )
-            if filled_position:
-                report = self._retire_vanished_startup_position(
-                    row, closed_by_activity=did in closed, activities=activities or [])
-                if report is not None:
-                    pending_reports.append(report)
-            elif row.state == 'confirmed' and extras.get('kind') == ENTRY_KIND_WORKING:
-                report = self._judge_vanished_startup_working_order(row, activities or [])
-                if report is not None:
-                    pending_reports.append(report)
-            else:
-                self.store_ctx.log_event(
-                    'startup_orphan_retired',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=did,
-                    payload={'state': row.state, 'leg_kind': None},
-                )
-            self.store_ctx.close_order(row.client_order_id)
-            retired_parent_coids.add(row.client_order_id)
-            # The envelope anchor in the ``envelopes`` table survives
-            # ``close_order``; without this delete the next dispatch of
-            # the same Pine intent reuses the stale ``bar_ts_ms`` and
-            # regenerates the SAME client_order_id, hitting the
-            # ``upsert_order`` UPDATE path on the just-closed row — and
-            # since UPDATE does not touch ``closed_ts_ms``, the freshly
-            # confirmed entry is invisible to ``iter_live_orders``,
-            # which makes the immediately-following ``execute_exit``
-            # raise ``no confirmed entry row``.
-            if row.intent_key:
-                self.store_ctx.record_complete(row.intent_key)
-                retired_intent_keys.add(row.intent_key)
-            retired_count += 1
 
         orphaned_exit_keys: set[str] = set()
         for row in list(self.store_ctx.iter_live_orders()):
-            extras = row.extras or {}
-            leg_kind = extras.get('leg_kind')
-            if leg_kind not in ('tp', 'sl'):
-                continue
-            parent_coid = extras.get('parent_coid')
-            parent_deal_id = extras.get('parent_deal_id')
-            # If the parent was just promoted by recovery, its new
-            # ``deal_id`` (and therefore ``parent_deal_id`` stamped on
-            # this leg) may legitimately be absent from the stale
-            # pre-recovery ``pos_by_deal_id`` snapshot — don't retire.
-            if parent_coid is not None and str(parent_coid) in promoted:
-                continue
-            if parent_coid is not None and str(parent_coid) in kept_parent_coids:
-                # The kept parent's own resolution tears its legs down.
-                continue
-            orphan = False
-            if parent_coid is not None and str(parent_coid) in retired_parent_coids:
-                orphan = True
-            elif parent_deal_id and str(parent_deal_id) not in pos_by_deal_id:
-                orphan = True
-            if not orphan:
-                continue
-            self.store_ctx.log_event(
-                'startup_orphan_retired',
-                client_order_id=row.client_order_id,
-                exchange_order_id=row.exchange_order_id,
-                payload={
-                    'state': row.state,
-                    'leg_kind': leg_kind,
-                    'parent_coid': parent_coid,
-                    'parent_deal_id': parent_deal_id,
-                },
-            )
-            self.store_ctx.close_order(row.client_order_id)
-            # Leg rows persist ``intent_key`` as ``<exit_pine>\0<from_entry>\0TP/SL``;
-            # strip the leg suffix to get the exit envelope key that
-            # ``OrderSyncEngine._build_envelope`` looks up.
-            leg_intent_key = row.intent_key
-            if leg_intent_key and leg_intent_key.endswith(('\0TP', '\0SL')):
-                orphaned_exit_keys.add(leg_intent_key[:-3])
-            retired_count += 1
+            # One leg's retirement is one write, like its parent's.
+            with self.store_ctx.transaction():
+                extras = row.extras or {}
+                leg_kind = extras.get('leg_kind')
+                if leg_kind not in ('tp', 'sl'):
+                    continue
+                parent_coid = extras.get('parent_coid')
+                parent_deal_id = extras.get('parent_deal_id')
+                # If the parent was just promoted by recovery, its new
+                # ``deal_id`` (and therefore ``parent_deal_id`` stamped on
+                # this leg) may legitimately be absent from the stale
+                # pre-recovery ``pos_by_deal_id`` snapshot — don't retire.
+                if parent_coid is not None and str(parent_coid) in promoted:
+                    continue
+                if parent_coid is not None and str(parent_coid) in kept_parent_coids:
+                    # The kept parent's own resolution tears its legs down.
+                    continue
+                orphan = False
+                if parent_coid is not None and str(parent_coid) in retired_parent_coids:
+                    orphan = True
+                elif parent_deal_id and str(parent_deal_id) not in pos_by_deal_id:
+                    orphan = True
+                if not orphan:
+                    continue
+                self.store_ctx.log_event(
+                    'startup_orphan_retired',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                    payload={
+                        'state': row.state,
+                        'leg_kind': leg_kind,
+                        'parent_coid': parent_coid,
+                        'parent_deal_id': parent_deal_id,
+                    },
+                )
+                self.store_ctx.close_order(row.client_order_id)
+                # Leg rows persist ``intent_key`` as ``<exit_pine>\0<from_entry>\0TP/SL``;
+                # strip the leg suffix to get the exit envelope key that
+                # ``OrderSyncEngine._build_envelope`` looks up.
+                leg_intent_key = row.intent_key
+                if leg_intent_key and leg_intent_key.endswith(('\0TP', '\0SL')):
+                    orphaned_exit_keys.add(leg_intent_key[:-3])
+                retired_count += 1
 
         # TP and SL legs share one exit envelope, and an exit whose entry
         # pyramided holds legs on several deals. The envelope is retired only
@@ -1853,6 +1878,8 @@ class _CapitalComResumeHooks:
                     and echoed_level is not None
                     and abs(echoed_level - new_level) < 1e-9
                 ):
+                    if self.plugin.store_ctx is not None:
+                        _mirror_amended_level(self.plugin.store_ctx, target_coid, echoed_level)
                     return ResumeOutcome(
                         status='confirmed',
                         exchange_id=str(deal_id) if deal_id else None,
@@ -1864,51 +1891,36 @@ class _CapitalComResumeHooks:
                                           'echoed_level': echoed_level},
                     )
 
-        target_deal_id: str | None = None
-        if target_coid and self.plugin.store_ctx is not None:
-            target_row = self.plugin.store_ctx.get_order(str(target_coid))
-            if target_row is not None and target_row.exchange_order_id:
-                target_deal_id = str(target_row.exchange_order_id)
-
-        if target_deal_id is None:
+        store_ctx = self.plugin.store_ctx
+        if store_ctx is None:
             return ResumeOutcome(
                 status='still_unknown',
                 recovery_path='modify_entry_no_target',
             )
-
-        wo = self.wo_by_deal_id.get(target_deal_id)
-        if wo is None:
-            return ResumeOutcome(
-                status='still_unknown',
-                recovery_path='modify_entry_target_vanished',
-            )
-        wo_data = wo.get('workingOrderData') or {}
-        wo_level_raw = wo_data.get('orderLevel')
-        wo_level = _wire_float(wo_level_raw, finite=True)
-
-        if (
-            new_level is not None
-            and wo_level is not None
-            and abs(wo_level - new_level) < 1e-9
-        ):
+        path, target_deal_id, wo_level = _modify_entry_snapshot_verdict(
+            store_ctx, row, self.wo_by_deal_id,
+        )
+        if path == 'modify_entry_snapshot_match' and wo_level is not None:
+            _mirror_amended_level(store_ctx, target_coid, wo_level)
             return ResumeOutcome(
                 status='confirmed',
                 exchange_id=target_deal_id,
                 is_filled=False,
                 filled_qty=0.0,
                 fill_price=0.0,
-                recovery_path='modify_entry_snapshot_match',
+                recovery_path=path,
                 recovery_context={'echoed_level': wo_level},
             )
-
-        return ResumeOutcome(
-            status='still_unknown',
-            recovery_path='modify_entry_snapshot_level_mismatch',
-            recovery_context={
-                'wo_level': wo_level,
-                'expected_level': new_level,
-            },
-        )
+        if path == 'modify_entry_snapshot_level_mismatch':
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path=path,
+                recovery_context={
+                    'wo_level': wo_level,
+                    'expected_level': new_level,
+                },
+            )
+        return ResumeOutcome(status='still_unknown', recovery_path=path)
 
     async def _verdict_modify_exit(
             self, row: 'OrderRow', refs: Mapping[str, str],
@@ -1917,7 +1929,13 @@ class _CapitalComResumeHooks:
 
         The command row carries ``extras['target_coid']`` (the entry
         whose bracket was being amended). Recovery question: did the
-        ``PUT /positions/{dealId}`` land? Three resolution paths:
+        ``PUT /positions/{dealId}`` land? A command not refused by its
+        confirm whose legs no snapshot is settling was sent, but neither its
+        completion nor the park of its legs committed, so its legs may still
+        hold the old bracket: it is parked for the snapshot like the running
+        process parks it (``park_unsettled_modify_exit``) and stays
+        ``still_unknown`` until the poll settles the legs and the command from
+        the venue's levels. Otherwise three resolution paths:
 
         1. **Stored ``deal_reference`` + confirm GET**: ``REJECTED`` →
            ``rejected``. ``ACCEPTED`` → ``confirmed`` (the leg rows
@@ -1945,24 +1963,10 @@ class _CapitalComResumeHooks:
         ``rejected`` path via the snapshot reconciler.
         """
         extras = row.extras or {}
-        target_coid = extras.get('target_coid')
-
-        new_tp = _wire_float(extras.get('new_tp'), finite=True)
-        new_sl = _wire_float(extras.get('new_sl'), finite=True)
-        new_trail = _wire_float(extras.get('new_trail'), finite=True)
-        new_trail_price = _wire_float(
-            extras.get('new_trail_price'), finite=True,
-        )
-        # Pine pending trailing (``trail_price`` + ``trail_offset``) leaves
-        # broker ``trailingStop`` off — the local activation monitor PUTs the
-        # native stop only after price crosses ``new_trail_price``. Recovery
-        # therefore expects the broker snapshot to show ``trailingStop=False``
-        # and the existing fixed/native stop cleared.
-        pending_trail = new_trail is not None and new_trail_price is not None
-
         ref: str | None = (
             refs.get('deal_reference') or extras.get('deal_reference')
         )
+        accepted = False
         if ref:
             try:
                 confirm = await self.plugin.call_api(
@@ -1979,96 +1983,64 @@ class _CapitalComResumeHooks:
                         recovery_path='modify_exit_confirm_rejected',
                         recovery_context={'deal_reference': ref},
                     )
-                if deal_status == 'ACCEPTED':
-                    return ResumeOutcome(
-                        status='confirmed',
-                        is_filled=False,
-                        filled_qty=0.0,
-                        fill_price=0.0,
-                        recovery_path='modify_exit_confirm_get',
-                        recovery_context={'deal_reference': ref},
-                    )
+                accepted = deal_status == 'ACCEPTED'
 
-        target_deal_id: str | None = None
-        if target_coid and self.plugin.store_ctx is not None:
-            target_row = self.plugin.store_ctx.get_order(str(target_coid))
-            if target_row is not None and target_row.exchange_order_id:
-                target_deal_id = str(target_row.exchange_order_id)
+        if self.plugin.park_unsettled_modify_exit(row, ref):
+            # Neither the amend's completion nor the park of its legs
+            # committed: the legs may still hold the old bracket. Parked like
+            # the running process parks it, the poll settles the legs and the
+            # command from the venue's levels.
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='modify_exit_parked_for_snapshot',
+                recovery_context={'deal_reference': ref},
+            )
+        if row.state == STATE_DISPOSITION_UNKNOWN:
+            # Parked for the snapshot already: the poll's resolver judges it
+            # from the venue's levels, the verdict the running process reaches.
+            # An accepted confirm says the venue took the amend once, not that
+            # it holds the bracket now.
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path='modify_exit_parked_for_snapshot',
+                recovery_context={'deal_reference': ref},
+            )
+        if accepted:
+            return ResumeOutcome(
+                status='confirmed',
+                is_filled=False,
+                filled_qty=0.0,
+                fill_price=0.0,
+                recovery_path='modify_exit_confirm_get',
+                recovery_context={'deal_reference': ref},
+            )
 
-        if target_deal_id is None:
+        store_ctx = self.plugin.store_ctx
+        if store_ctx is None:
             return ResumeOutcome(
                 status='still_unknown',
                 recovery_path='modify_exit_no_target',
             )
-
-        pos = self.pos_by_deal_id.get(target_deal_id)
-        if pos is None:
-            return ResumeOutcome(
-                status='still_unknown',
-                recovery_path='modify_exit_target_vanished',
-            )
-        pos_data = pos.get('position') or {}
-        pos_profit_level: float | None = _wire_float(pos_data.get('profitLevel'))
-        pos_stop_level: float | None = _wire_float(pos_data.get('stopLevel'))
-        pos_stop_distance: float | None = _wire_float(pos_data.get('stopDistance'))
-        pos_trailing_stop = bool(pos_data.get('trailingStop'))
-
-        def _matches_tp() -> bool:
-            if new_tp is None:
-                return pos_profit_level is None
-            if pos_profit_level is None:
-                return False
-            return abs(pos_profit_level - new_tp) < 1e-9
-
-        def _matches_sl() -> bool:
-            if new_sl is None and new_trail is None:
-                return pos_stop_level is None and not pos_trailing_stop
-            if new_trail is not None:
-                # Pending trailing: the new bracket is purely local until the
-                # activation monitor PUTs it. The broker side has no SL leg —
-                # ``trailingStop`` must be off, ``stopLevel`` cleared.
-                if pending_trail:
-                    return pos_stop_level is None and not pos_trailing_stop
-                if not pos_trailing_stop:
-                    return False
-                if pos_stop_distance is None:
-                    return False
-                return abs(pos_stop_distance - new_trail) < 1e-9
-            if new_sl is None or pos_stop_level is None:
-                return False
-            return abs(pos_stop_level - new_sl) < 1e-9
-
-        if _matches_tp() and _matches_sl():
+        path, target_deal_id, levels = _modify_exit_snapshot_verdict(
+            store_ctx, row, self.pos_by_deal_id,
+        )
+        if path == 'modify_exit_snapshot_match':
             return ResumeOutcome(
                 status='confirmed',
                 exchange_id=target_deal_id,
                 is_filled=False,
                 filled_qty=0.0,
                 fill_price=0.0,
-                recovery_path='modify_exit_snapshot_match',
-                recovery_context={
-                    'profit_level': pos_profit_level,
-                    'stop_level': pos_stop_level,
-                    'stop_distance': pos_stop_distance,
-                    'trailing_stop': pos_trailing_stop,
-                },
+                recovery_path=path,
+                recovery_context=levels,
             )
-
-        return ResumeOutcome(
-            status='still_unknown',
-            recovery_path='modify_exit_snapshot_mismatch',
-            recovery_context={
-                'profit_level': pos_profit_level,
-                'stop_level': pos_stop_level,
-                'stop_distance': pos_stop_distance,
-                'trailing_stop': pos_trailing_stop,
-                'expected_tp': new_tp,
-                'expected_sl': new_sl,
-                'expected_trail': new_trail,
-                'expected_trail_price': new_trail_price,
-                'pending_trail': pending_trail,
-            },
-        )
+        if path == 'modify_exit_snapshot_mismatch':
+            return ResumeOutcome(
+                status='still_unknown',
+                recovery_path=path,
+                recovery_context=levels,
+            )
+        return ResumeOutcome(status='still_unknown', recovery_path=path)
 
     def _verdict_cancel(
             self, row: 'OrderRow', _refs: Mapping[str, str],
@@ -2188,10 +2160,12 @@ class _CapitalComResumeHooks:
         still alive → ``still_unknown``. ``extras['targets']`` empty
         → also ``confirmed`` because the dispatch had nothing to do.
 
-        The hook also mirrors each newly-confirmed target row to
-        ``closing`` so the activity stream's subsequent ``CLOSED`` event
-        matches a row in the same state the live dispatch would have
-        left behind.
+        The hook also mirrors the row of each swept target to ``closing``
+        (also while another target is still listed) so the activity stream's
+        subsequent ``CLOSED`` event matches a row in the same state the live
+        dispatch would have left behind. The judgement and the mirror are
+        :func:`~pynecore_capitalcom.helpers._settle_vanished_full_close_targets`,
+        which the poll's resolver of a parked close runs as well.
         """
         extras = row.extras or {}
         target_deal_ids = list(extras.get('targets') or ())
@@ -2208,14 +2182,10 @@ class _CapitalComResumeHooks:
                 recovery_context={'applied_targets': []},
             )
 
-        still_alive: list[str] = []
-        swept: list[str] = []
-        for did in target_deal_ids:
-            if str(did) in self.pos_by_deal_id:
-                still_alive.append(str(did))
-            else:
-                swept.append(str(did))
-
+        still_alive, swept, mirrored = _settle_vanished_full_close_targets(
+            self.plugin.store_ctx, row, self.pos_by_deal_id,
+            path='full_close_targets_vanished',
+        )
         if still_alive:
             return ResumeOutcome(
                 status='still_unknown',
@@ -2225,23 +2195,6 @@ class _CapitalComResumeHooks:
                     'swept_targets': swept,
                 },
             )
-
-        # All targets vanished — mirror each parent row to ``closing``
-        # so the activity stream's CLOSED event can promote it cleanly.
-        store_ctx = self.plugin.store_ctx
-        mirrored: list[str] = []
-        for r in list(store_ctx.iter_live_orders()):
-            if r.exchange_order_id and r.exchange_order_id in target_deal_ids:
-                if r.state not in ('closing', 'closed'):
-                    store_ctx.set_order_state(r.client_order_id, 'closing')
-                    store_ctx.log_event(
-                        'close_dispatched',
-                        client_order_id=r.client_order_id,
-                        exchange_order_id=r.exchange_order_id,
-                        intent_key=row.intent_key,
-                        payload={'recovery_path': 'full_close_targets_vanished'},
-                    )
-                    mirrored.append(r.client_order_id)
         return ResumeOutcome(
             status='confirmed',
             recovery_path='full_close_targets_vanished',

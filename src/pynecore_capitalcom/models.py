@@ -146,10 +146,17 @@ class _ActivityCursor:
     Each poll retains only fingerprints still present in the current
     activity batch (a row that left the rolling window can never be
     consulted again), so the set is bounded by the window size too.
+
+    ``held_logged_fingerprints`` does the same for an own activity deferred
+    while its partly netted entry is held: the venue serves it again on every
+    read until it is booked, and its audit event is written once per session.
+    It is kept apart from ``external_logged_fingerprints``, which a matched
+    row leaves on every read.
     """
     last_date_utc: str | None = None
     seen_fingerprints: dict[str, str] = field(default_factory=dict)
     external_logged_fingerprints: set[str] = field(default_factory=set)
+    held_logged_fingerprints: set[str] = field(default_factory=set)
 
 
 @dataclass

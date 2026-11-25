@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -25,10 +26,11 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.broker.models import (
     CapabilityLevel, DispatchEnvelope, EntryIntent, OrderType, QuarantineKind, Quote,
 )
-from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
+from pynecore.core.broker.native_failsafe_manager import FailsafeHealth, NativeBracketSnapshot
 from pynecore.core.broker.one_way_emulator import OneWayEmulator
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.idempotency import KIND_MODIFY_EXIT
 from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from pynecore_capitalcom import (
@@ -1832,6 +1834,43 @@ def __test_parked_working_order_deferred_cancel_already_gone_promotes_the_id__(t
     store.close()
 
 
+def __test_parked_working_order_deferred_cancel_journal_failure_stays_parked__(tmp_path):
+    """The deferred DELETE landed but its settlement cannot be journaled: the
+    poll does not abort, the row stays parked, and the next poll's not-found
+    DELETE persists the id for the ordinary settlement."""
+    from pynecore_capitalcom.exceptions import OrderNotFoundError
+
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-p', 'get'): {
+            'dealStatus': 'ACCEPTED',
+            'affectedDeals': [{'dealId': 'deal-P4'}],
+        },
+        ('workingorders/deal-P4', 'delete'): {},
+    })
+    _parked_working_row(ctx, cancel_requested=True)
+    record_resolution = ctx.record_resolution
+
+    def failing(*_args, **_kwargs):
+        del ctx.record_resolution
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ctx.record_resolution = failing
+    assert asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {}))) == []
+    assert ctx.record_resolution == record_resolution
+    row = ctx.get_order('coid-parked')
+    assert row is not None and row.state == 'disposition_unknown'
+    assert row.exchange_order_id is None and row.closed_ts_ms is None
+
+    del broker._responses[('workingorders/deal-P4', 'delete')]
+    broker._responses[('error', 'workingorders/deal-P4', 'delete')] = OrderNotFoundError(
+        'API error occured: error.not-found.dealId', ref_type='deal_id')
+    assert asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {}))) == []
+    row = ctx.get_order('coid-parked')
+    assert row is not None and row.exchange_order_id == 'deal-P4'
+    assert 'cancel_already_gone' in _event_kinds(ctx, 'coid-parked')
+    store.close()
+
+
 def __test_parked_working_order_deferred_cancel_retries_after_a_transport_error__(tmp_path):
     """A DELETE that cannot reach the venue leaves the row parked for the next poll."""
     from pynecore.core.broker.exceptions import ExchangeConnectionError
@@ -2441,6 +2480,174 @@ def __test_cancel_with_outcome_no_working_target_unknown__(tmp_path):
     store.close()
 
 
+@pytest.mark.parametrize('activities', [
+    [],
+    [{'epic': 'EURUSD', 'dateUTC': '2026-04-21T10:00:00.000', 'dealId': 'w1',
+      'type': 'WORKING_ORDER', 'status': 'DELETED'}],
+], ids=['history_without_it', 'history_with_it'])
+def __test_cancel_with_outcome_whose_booking_failed_is_confirmed_on_the_retry__(
+        tmp_path, activities):
+    """The venue accepted the DELETE, but closing the row could not be
+    journaled: the probe raises (the engine counts it as no answer), and the
+    engine's retry, whose DELETE now answers 404, confirms the cancel from the
+    accepted DELETE, whether or not the activity history still lists the
+    cancel. The row is closed and audited exactly once."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/w1', 'delete'): {},
+    })
+    _seed_working_order(ctx)
+    close_order = ctx.close_order
+
+    def failing(*args, **kwargs):
+        del ctx.close_order
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ctx.close_order = failing
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert ctx.close_order == close_order
+    row = ctx.get_order('coid-w')
+    assert row is not None and row.closed_ts_ms is None
+
+    broker._responses[('error', 'workingorders/w1', 'delete')] = OrderNotFoundError(
+        'gone', ref_type='deal_id')
+    broker._responses[('history/activity', 'get')] = {'activities': activities}
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.CANCEL_CONFIRMED
+    assert list(ctx.iter_live_orders()) == []
+    assert _event_kinds(ctx, 'coid-w').count('cancelled') == 1
+    store.close()
+
+
+@pytest.mark.parametrize('close_fails', [False, True], ids=['stamp', 'stamp_and_close'])
+def __test_cancel_with_outcome_whose_accepted_stamp_failed_still_settles__(
+        tmp_path, close_fails):
+    """The venue accepted the DELETE, but its accepted-cancel stamp cannot be
+    written. The booking of the cancel still runs: with ``stamp`` the cancel
+    is confirmed at once; with ``stamp_and_close`` the probe raises and the
+    retry, whose DELETE answers 404 with no history row, is confirmed from
+    the stamp still waiting to commit. The next poll retires the stamp's
+    pending write."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/w1', 'delete'): {},
+    })
+    _seed_working_order(ctx)
+    upsert_order = ctx.upsert_order
+    close_order = ctx.close_order
+
+    def failing_stamp(coid, **fields):
+        if 'own_cancel_accepted_sent_at' in (fields.get('extras') or {}):
+            del ctx.upsert_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, **fields)
+
+    def failing_close(*_args, **_kwargs):
+        del ctx.close_order
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ctx.upsert_order = failing_stamp
+    if close_fails:
+        ctx.close_order = failing_close
+        with pytest.raises(sqlite3.OperationalError):
+            asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+        broker._responses[('error', 'workingorders/w1', 'delete')] = OrderNotFoundError(
+            'gone', ref_type='deal_id')
+        broker._responses[('history/activity', 'get')] = {'activities': []}
+    assert ctx.close_order == close_order
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.CANCEL_CONFIRMED
+    assert list(ctx.iter_live_orders()) == []
+    assert _event_kinds(ctx, 'coid-w').count('cancelled') == 1
+
+    asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert broker._deferred_parks == {}
+    store.close()
+
+
+@pytest.mark.parametrize('history', ['cancel_listed', 'cancel_aged_out'])
+def __test_accepted_cancel_whose_stamp_never_committed_is_settled_after_a_restart__(
+        tmp_path, history):
+    """The venue accepted the DELETE of a resting entry order, but neither its
+    accepted-cancel stamp nor the row's close could be journaled, and the
+    process dies with the stamp still deferred. The restart sees the order
+    gone from ``/workingorders``; with ``cancel_listed`` the day's activity
+    still shows the cancel, with ``cancel_aged_out`` it shows nothing. The
+    restart must neither book a fill nor leave the row live, and the
+    engine's re-armed cancel probe gets a definite answer."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/w1', 'delete'): {},
+    })
+    _seed_working_order(ctx)
+    ctx.add_ref('coid-w', 'deal_id', 'w1')
+    upsert_order = ctx.upsert_order
+
+    def failing_stamp(coid, **fields):
+        if 'own_cancel_accepted_sent_at' in (fields.get('extras') or {}):
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, **fields)
+
+    def failing_close(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ctx.upsert_order = failing_stamp
+    ctx.close_order = failing_close
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert list(broker._deferred_parks) == ['own-cancel-accepted:coid-w']
+    del ctx.upsert_order
+    del ctx.close_order
+    ctx.close()
+
+    cancelled_at = datetime.fromtimestamp(time.time() - 5.0, tz=timezone.utc).strftime(
+        '%Y-%m-%dT%H:%M:%S.%f')[:-3]
+    activities = ([{
+        'epic': 'EURUSD', 'dealId': 'w1', 'type': 'WORKING_ORDER', 'status': 'DELETED',
+        'source': 'USER', 'dateUTC': cancelled_at,
+        'details': {'direction': 'BUY', 'size': 1.0},
+    }] if history == 'cancel_listed' else [])
+    restarted = _FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': activities},
+        ('error', 'workingorders/w1', 'delete'): OrderNotFoundError('gone', ref_type='deal_id'),
+    })
+    restarted._account_id = 'capitalcom-demo-test-account'
+    restarted.store_ctx = ctx = store.open_run(
+        RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                    account_id="test-account", label=None),
+        script_source="// test",
+    )
+    latched = _capture_quarantine(restarted)
+    asyncio.run(restarted._recover_in_flight_submissions())
+    events = asyncio.run(_drain_agen(restarted._reconcile_snapshot({}, {})))
+    assert [e for e in events if e.event_type == 'filled'] == []
+    outcome = asyncio.run(restarted.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome != CancelDispositionOutcome.UNKNOWN, outcome
+    assert outcome != CancelDispositionOutcome.ALREADY_FILLED
+    assert [r.client_order_id for r in ctx.iter_live_orders()] == []
+    assert latched == []
+    store.close()
+
+
+def __test_cancel_probe_with_a_live_entry_row_ignores_an_older_ended_order__(tmp_path):
+    """An earlier order of the same entry ended unfilled, but the entry has a
+    live row again (its new order is still being placed): the ended order
+    says nothing about the live one, so the probe stays unknown."""
+    broker, store, ctx = _make_broker(tmp_path)
+    _seed_working_order(ctx, coid='coid-old', exchange_order_id='w0')
+    ctx.close_order('coid-old')
+    ctx.upsert_order('coid-new', symbol='EURUSD', side='buy', qty=1.0,
+                     state='submitted', pine_entry_id='Long',
+                     extras={'kind': 'working'})
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.UNKNOWN
+    ctx.close_order('coid-new')
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+    assert outcome == CancelDispositionOutcome.CANCEL_CONFIRMED
+    store.close()
+
+
 def __test_modify_entry_size_change_falls_back_to_super__(tmp_path):
     # With size change the override delegates to super().modify_entry,
     # which is cancel+execute. We assert that by verifying a DELETE was
@@ -2884,6 +3091,236 @@ def __test_working_order_fill_migrates_the_row_to_the_position_deal__(tmp_path):
     store.close()
 
 
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+def __test_cancel_probe_of_an_order_that_filled_into_its_position_answers_filled__(
+        tmp_path, restart):
+    """The cancel's DELETE times out, so the engine probes the cancel again.
+    Meanwhile the order executed: the activity poll books its fill and moves
+    the row onto the position deal, in this process or, with ``restart``, in
+    the next one. The entry has no working order left to DELETE, and its
+    live row is the order that filled, so the probe answers that the order
+    filled before the cancel instead of an unknown the engine would halt on.
+    An unrelated position of the entry still decides nothing."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/wo-1', 'delete'): httpx.TimeoutException("read timeout"),
+    })
+    coid = _seed_working_order_row(ctx)
+    cancel = _cancel_outcome_env(pine_id='L', symbol='BTCUSD')
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.execute_cancel_with_outcome(cancel))
+    if restart:
+        ctx.close()
+        broker = _FakeBroker(config=_make_config(), responses={})
+        broker._account_id = 'capitalcom-demo-test-account'
+        broker.store_ctx = ctx = store.open_run(
+            RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                        account_id="test-account", label=None),
+            script_source="// test",
+        )
+
+    async def drain(acts):
+        return [ev async for ev in broker._process_activity(acts, None)]
+
+    fills = [e for e in asyncio.run(drain(list(_wo_fill_activities())))
+             if e.event_type == 'filled']
+    assert len(fills) == 1
+    _assert_promoted(ctx, coid, 'pos-1')
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(cancel))
+    assert outcome == CancelDispositionOutcome.ALREADY_FILLED
+    assert [c[:2] for c in broker._calls].count(('workingorders/wo-1', 'delete')) == (
+        0 if restart else 1)
+
+    ctx.upsert_order('coid-market', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', exchange_order_id='pos-2',
+                     extras={'kind': 'position'})
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(cancel))
+    assert outcome == CancelDispositionOutcome.UNKNOWN
+    store.close()
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+def __test_cancel_probe_of_an_order_whose_position_closed_never_answers_filled__(
+        tmp_path, restart):
+    """The order whose cancel timed out filled into its position, and the
+    position's bracket then closed it: the row stays live, stamped
+    ``natural_close_at``. The probe must not answer that the order filled
+    into an open position, where the engine would restore protection onto a
+    position that no longer exists."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/wo-1', 'delete'): httpx.TimeoutException("read timeout"),
+    })
+    coid = _seed_working_order_row(ctx)
+    cancel = _cancel_outcome_env(pine_id='L', symbol='BTCUSD')
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.execute_cancel_with_outcome(cancel))
+    fills = [e for e in asyncio.run(_drain_agen(broker._process_activity(
+        list(_wo_fill_activities()), None))) if e.event_type == 'filled']
+    assert len(fills) == 1
+    _assert_promoted(ctx, coid, 'pos-1')
+    entry = ctx.get_order(coid)
+    assert entry is not None
+    broker._close_bracket_after_natural_close(entry)
+    if restart:
+        ctx.close()
+        broker = _FakeBroker(config=_make_config(), responses={})
+        broker._account_id = 'capitalcom-demo-test-account'
+        broker.store_ctx = ctx = store.open_run(
+            RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                        account_id="test-account", label=None),
+            script_source="// test",
+        )
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(cancel))
+    assert outcome != CancelDispositionOutcome.ALREADY_FILLED
+    assert [c[:2] for c in broker._calls].count(('workingorders/wo-1', 'delete')) == (
+        0 if restart else 1)
+    store.close()
+
+
+def _swept_cancel_probe(tmp_path, venue: str, restart: bool) -> tuple:
+    """Probe a cancel again after its first attempt left it unsettled, with the venue at ``venue``.
+
+    ``working``: the DELETE never reached the venue and the order still
+    rests; ``cancelled``: the DELETE landed; ``rejected``: the venue ended the
+    order without a fill meanwhile; ``filled_open``: the order executed into
+    its position, which is still open; ``filled_closed``: it executed, and the
+    position's bracket then closed it; ``filled_closed_row``: the same, and the
+    position's row is closed as well; ``never_reached``: the order's own
+    submission never reached the venue (the cancel was stamped on the parked
+    row, and its confirm reports the order rejected). The running process or
+    a restart polls the venue once, then the engine probes the cancel again.
+
+    :return: The probe's answer, the live rows left and the quarantines latched.
+    """
+    tmp_path.mkdir()
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'): httpx.TimeoutException("read timeout"),
+    })
+    if venue == 'never_reached':
+        _parked_working_row(ctx, coid='coid-w', deal_ref='ref-w')
+        cancel = _cancel_outcome_env(pine_id='L')
+        assert asyncio.run(broker.execute_cancel(cancel)) is True
+    else:
+        _seed_working_order(ctx)
+        ctx.add_ref('coid-w', 'deal_id', 'w1')
+        cancel = _cancel_outcome_env()
+        with pytest.raises(OrderDispositionUnknownError):
+            asyncio.run(broker.execute_cancel_with_outcome(cancel))
+    ended_at = datetime.fromtimestamp(time.time() - 5.0, tz=timezone.utc).strftime(
+        '%Y-%m-%dT%H:%M:%S.%f')[:-3]
+    activities: list[dict] = []
+    positions: list[dict] = []
+    if venue in ('cancelled', 'rejected'):
+        activities = [{
+            'epic': 'EURUSD', 'dealId': 'w1', 'type': 'WORKING_ORDER',
+            'status': 'DELETED' if venue == 'cancelled' else 'REJECTED',
+            'source': 'USER', 'dateUTC': ended_at,
+            'details': {'direction': 'BUY', 'size': 1.0},
+        }]
+    elif venue in ('filled_open', 'filled_closed', 'filled_closed_row'):
+        activities = [{
+            'dateUTC': ended_at, 'dealId': 'pos-1', 'epic': 'EURUSD', 'type': 'POSITION',
+            'status': 'ACCEPTED', 'source': 'USER',
+            'details': {'workingOrderId': 'w1', 'size': 1.0, 'direction': 'BUY',
+                        'level': 1.17500},
+        }, {
+            'dateUTC': ended_at, 'dealId': 'w1', 'epic': 'EURUSD', 'type': 'WORKING_ORDER',
+            'status': 'EXECUTED', 'source': 'USER',
+            'details': {'size': 1.0, 'direction': 'BUY', 'level': 1.17500},
+        }]
+        positions = [{'position': {'dealId': 'pos-1', 'workingOrderId': 'w1', 'size': 1.0,
+                                   'direction': 'BUY', 'level': 1.17500},
+                      'market': {'epic': 'EURUSD', 'bid': 1.17500, 'offer': 1.17502}}]
+    working = ([{'workingOrderData': {'dealId': 'w1', 'epic': 'EURUSD'}}]
+               if venue == 'working' else [])
+    responses = {
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+        ('positions', 'get'): {'positions': positions},
+        ('workingorders', 'get'): {'workingOrders': working},
+        ('history/activity', 'get'): {'activities': activities},
+        ('confirms/ref-w', 'get'): {'dealStatus': 'REJECTED', 'reason': 'error.x'},
+        **({('workingorders/w1', 'delete'): {}} if venue == 'working' else
+           {('error', 'workingorders/w1', 'delete'): OrderNotFoundError(
+               'gone', ref_type='deal_id')}),
+    }
+    if venue in ('filled_closed', 'filled_closed_row'):
+        # The fill and the bracket's close both reach the process the cancel
+        # started in; only the probe comes after the restart.
+        broker._responses = responses
+        asyncio.run(_drain_agen(broker._poll_once()))
+        entry = ctx.get_order('coid-w')
+        assert entry is not None and entry.exchange_order_id == 'pos-1'
+        broker._close_bracket_after_natural_close(entry)
+        if venue == 'filled_closed_row':
+            ctx.close_order('coid-w')
+        responses = {**responses, ('positions', 'get'): {'positions': []},
+                     ('history/activity', 'get'): {'activities': []}}
+    if restart:
+        ctx.close()
+        broker = _FakeBroker(config=_make_config(), responses=responses)
+        broker._account_id = 'capitalcom-demo-test-account'
+        broker.store_ctx = ctx = store.open_run(
+            RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                        account_id="test-account", label=None),
+            script_source="// test",
+        )
+        asyncio.run(broker._recover_in_flight_submissions())
+    else:
+        broker._responses = responses
+    latched = _capture_quarantine(broker)
+    events = asyncio.run(_drain_agen(broker._poll_once()))
+    assert [e for e in events if e.event_type == 'filled'
+            and venue != 'filled_open'] == []
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(cancel))
+    live = [r.client_order_id for r in ctx.iter_live_orders()]
+    store.close()
+    return outcome, live, latched
+
+
+#: What the engine's probe of an unsettled cancel answers, by what the venue
+#: did with the order: the probe's answer and whether the order's row stays
+#: live (``None``: a filled order whose position closed stays live, stamped
+#: ``natural_close_at``, in the running process, and a restart that finds the
+#: position gone retires it). A filled order whose position closed answers
+#: ``UNKNOWN``: the Core's
+#: cancel outcomes have no terminal "filled, position since closed" answer
+#: (ALREADY_FILLED would restore protection onto a position that is gone), so
+#: the engine halts once its cancel-tentative grace expires. Update this entry
+#: when the Core gains that outcome.
+_CANCEL_PROBE_EXPECTED = {
+    'working': ({CancelDispositionOutcome.CANCEL_CONFIRMED}, False),
+    'cancelled': ({CancelDispositionOutcome.CANCEL_CONFIRMED,
+                   CancelDispositionOutcome.TOO_LATE_TO_CANCEL}, False),
+    'rejected': ({CancelDispositionOutcome.CANCEL_CONFIRMED,
+                  CancelDispositionOutcome.TOO_LATE_TO_CANCEL}, False),
+    'filled_open': ({CancelDispositionOutcome.ALREADY_FILLED}, True),
+    'filled_closed': ({CancelDispositionOutcome.FILLED_AND_CLOSED}, None),
+    'filled_closed_row': ({CancelDispositionOutcome.FILLED_AND_CLOSED}, False),
+    'never_reached': ({CancelDispositionOutcome.CANCEL_CONFIRMED,
+                       CancelDispositionOutcome.TOO_LATE_TO_CANCEL}, False),
+}
+
+
+@pytest.mark.parametrize('venue', list(_CANCEL_PROBE_EXPECTED))
+def __test_cancel_probe_reaches_the_same_answer_running_and_after_a_restart__(
+        tmp_path, venue):
+    """The cancel of an entry order did not settle at once. Whatever the venue
+    did with the order meanwhile, the running process and a restart give the
+    engine's next probe the same answer (:data:`_CANCEL_PROBE_EXPECTED`): an
+    order the venue no longer holds unfilled is cancelled (an order it ended
+    unfilled, or one that never reached it, counts the same way) and no row of
+    it stays live; an order that filled into its open position answers filled
+    and stays live as that position; an order that filled into a position
+    closed since answers filled and closed. No quarantine latches."""
+    answers, stays_live = _CANCEL_PROBE_EXPECTED[venue]
+    for restart in (False, True):
+        outcome, live, latched = _swept_cancel_probe(
+            tmp_path / ('restart' if restart else 'running'), venue, restart)
+        assert outcome in answers, (restart, outcome)
+        if stays_live is not None:
+            assert live == (['coid-w'] if stays_live else []), (restart, live)
+        assert latched == [], (restart, latched)
+
+
 def __test_working_order_fill_migrates_when_executed_arrives_first__(tmp_path):
     """Same pair, WORKING_ORDER EXECUTED sorted first: the promotion runs
     on the executed branch (batch lookup) and the POSITION activity's own
@@ -3131,6 +3568,83 @@ def __test_trailing_monitor_pending_crosses_activation__(tmp_path):
     assert row.extras.get('trail_state') == 'activating'
     assert any(c[0] == 'positions/deal-L' and c[1] == 'put'
                for c in broker._calls)
+    store.close()
+
+
+def __test_trailing_monitor_activation_journal_failure_retries_next_tick__(tmp_path):
+    """The activation PUT landed but ``activating`` cannot be journaled: the
+    monitor does not abort the poll, the row stays ``pending`` without a
+    half-written audit, and the next poll journals the activation the venue
+    took instead of sending it again."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'putref'},
+    })
+    ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', trailing_distance=0.005,
+                     extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L',
+                             'trail_state': 'pending',
+                             'trail_activation_price': 1.15})
+    positions = {'deal-L': {
+        'market': {'epic': 'EURUSD', 'bid': 1.1502, 'offer': 1.1504},
+        'position': {'trailingStop': False},
+    }}
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == 'trailing_activation_triggered':
+            ctx.log_event = log_event
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    row = ctx.get_order('sl-coid')
+    assert row is not None and row.extras.get('trail_state') == 'pending'
+
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    row = ctx.get_order('sl-coid')
+    assert row is not None and row.extras.get('trail_state') == 'pending'
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    row = ctx.get_order('sl-coid')
+    assert row is not None and row.extras.get('trail_state') == 'activating'
+    assert [kind for kind, *_ in ctx.iter_events_by_kind_for_run_id(
+        'trailing_activation_triggered')] != []
+    puts = [c for c in broker._calls if c[0] == 'positions/deal-L' and c[1] == 'put']
+    assert len(puts) == 1
+    store.close()
+
+
+def __test_trailing_monitor_own_write_record_failure_still_activates__(tmp_path):
+    """The record of the bot's own protection write cannot be journaled after
+    the venue took the PUT: the failure is logged, and the activation the
+    monitor journals after the request still goes through."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'putref'},
+    })
+    ctx.upsert_order('sl-coid', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     from_entry='Long', trailing_distance=0.005,
+                     extras={'leg_kind': 'sl', 'parent_deal_id': 'deal-L',
+                             'trail_state': 'pending',
+                             'trail_activation_price': 1.15})
+    positions = {'deal-L': {
+        'market': {'epic': 'EURUSD', 'bid': 1.1502, 'offer': 1.1504},
+        'position': {'trailingStop': False},
+    }}
+    recorded: list[str] = []
+
+    def failing(*_args, **_kwargs):
+        recorded.append('own_write')
+        raise sqlite3.OperationalError("disk I/O error")
+
+    broker._note_own_level_write = failing
+    broker._note_own_protection_write = failing
+    asyncio.run(broker._trailing_activation_monitor(positions))
+    assert recorded == ['own_write']
+    row = ctx.get_order('sl-coid')
+    assert row is not None and row.extras.get('trail_state') == 'activating'
     store.close()
 
 
@@ -4209,7 +4723,7 @@ def __test_amend_bracket_pre_check_marks_triggered_stop_level_crossed__(tmp_path
         with pytest.raises(InvalidStopDistanceError) as exc:
             asyncio.run(broker.amend_bracket(
                 'EURUSD', 'L1', side=exit_side,
-                tp_price=None, sl_price=1.10005, trail_offset=None, coid='c1',
+                tp_price=None, sl_price=1.10005, trail_offset=None, qty=1.0, coid='c1',
             ))
         assert exc.value.level_crossed is crossed
         assert not any(c[0] == 'positions/L1' for c in broker._calls)
@@ -8242,6 +8756,51 @@ def __test_reconcile_snapshot_unannounced_fill_needs_matching_deal__(tmp_path):
     broker._unannounced_fills_seen['coid-gone'] = 0.0
     assert _reconcile_events(broker, {}) == []
     assert 'coid-gone' not in broker._unannounced_fills_seen
+    store.close()
+
+
+def __test_reconcile_snapshot_unannounced_fill_survives_failed_audit_write__(tmp_path):
+    """A snapshot-booked entry fill whose audit write fails leaves the row
+    unstamped and the grace elapsed: the next reconcile of the same process
+    books the fill exactly once, and the late activity is then a replay."""
+    broker, store, ctx = _make_broker(tmp_path)
+    assert broker.store_ctx is not None
+    _seed_unannounced_entry(ctx)
+    assert _reconcile_events(broker, _UNANNOUNCED_POSITIONS) == []
+    broker._unannounced_fills_seen['coid-entry'] -= _UNANNOUNCED_FILL_GRACE_S
+
+    log_event = broker.store_ctx.log_event
+
+    def failing_log_event(kind, *args, **kwargs):
+        if kind == 'entry_fill_booked_from_snapshot':
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    broker.store_ctx.log_event = failing_log_event
+    with pytest.raises(sqlite3.OperationalError):
+        _reconcile_events(broker, _UNANNOUNCED_POSITIONS)
+    broker.store_ctx.log_event = log_event
+
+    row = ctx.get_order('coid-entry')
+    assert row is not None and (row.extras or {}).get('entry_filled_at') is None, (
+        "the stamp is committed only together with its audit event"
+    )
+    assert 'coid-entry' in broker._unannounced_fills_seen, (
+        "the elapsed grace is kept until the booking commits"
+    )
+
+    events = _reconcile_events(broker, _UNANNOUNCED_POSITIONS)
+    assert len(events) == 1
+    assert events[0].event_type == 'filled'
+    assert events[0].fill_qty == pytest.approx(1.0)
+    assert _reconcile_events(broker, _UNANNOUNCED_POSITIONS) == []
+
+    late_activity = _unannounced_position_activity()
+
+    async def drain_activity():
+        return [ev async for ev in broker._process_activity([late_activity])]
+
+    assert asyncio.run(drain_activity()) == [], "the late activity is a replay"
     store.close()
 
 
@@ -13791,6 +14350,7 @@ def __test_ws_volume_listener_buckets_quotes_by_timestamp__():
 
 from pynecore.core.broker.exceptions import OrderSkippedByPlugin  # noqa: E402
 from pynecore.core.broker.store_helpers import (  # noqa: E402
+    EXTRAS_KEY_CLOSE_LEG_ID,
     STATE_CLOSE_LEG,
     create_close_leg_row,
 )
@@ -13912,12 +14472,197 @@ def __test_close_leg_deletes_row_and_marks_closing__(tmp_path):
     store.close()
 
 
+def __test_close_leg_whose_closing_write_fails_parks_the_leg_close__(tmp_path):
+    """The DELETE landed, but the entry's ``closing`` audit cannot be written:
+    the leg close parks with a typed unknown disposition under its own coid
+    (the core's close-leg row settles it from venue data), never a raw
+    storage error, and no ``closing`` state is left without its audit."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/L1', 'delete'): {},
+    })
+    __test_helper_seed_leg_entry(ctx)
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == 'close_dispatched':
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    assert parked.value.client_order_id == 'coid-close:L1'
+    assert isinstance(parked.value.__cause__, sqlite3.OperationalError)
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.state == 'confirmed'
+    store.close()
+
+
 def __test_close_leg_not_found_is_benign__(tmp_path):
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('error', 'positions/L1', 'delete'): OrderNotFoundError(
             'error.not-found.dealId', ref_type='deal_id'),
     })
     asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    store.close()
+
+
+def __test_helper_seed_leg_entry(ctx):
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='L1', extras={'kind': 'position'})
+    ctx.add_ref('coid-entry', 'deal_id', 'L1')
+
+
+def __test_close_leg_stale_not_found_on_a_listed_leg_is_retried__(tmp_path):
+    """A not-found DELETE on a leg ``/positions`` still lists is stale routing
+    (measured, cycle 65): the close is sent once more, never reported as
+    landed while the leg stays open."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/L1', 'delete'): {},
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'L1', 'size': 1.0, 'direction': 'BUY',
+                          'level': 1.1}, 'market': {'epic': 'EURUSD'}},
+        ]},
+    })
+    __test_helper_seed_leg_entry(ctx)
+    original_call = broker._call
+    state = {'first_delete': True}
+
+    async def flaky_call(endpoint, *, data=None, method='post'):
+        if endpoint == 'positions/L1' and method == 'delete' and state['first_delete']:
+            state['first_delete'] = False
+            broker._calls.append((endpoint, method, data))
+            raise OrderNotFoundError('error.not-found.dealId', ref_type='deal_id')
+        return await original_call(endpoint, data=data, method=method)
+
+    broker._call = flaky_call
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    deletes = [c for c in broker._calls if c[0] == 'positions/L1' and c[1] == 'delete']
+    assert len(deletes) == 2
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.state == 'closing'
+    store.close()
+
+
+def __test_close_leg_not_found_on_a_still_listed_leg_does_not_land__(tmp_path):
+    """A leg the venue keeps listing while every DELETE answers not-found was
+    not closed: the close raises the unknown-disposition error, so the core's
+    close-leg row stays pending instead of being booked as landed."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): OrderNotFoundError(
+            'error.not-found.dealId', ref_type='deal_id'),
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'L1', 'size': 1.0, 'direction': 'BUY',
+                          'level': 1.1}, 'market': {'epic': 'EURUSD'}},
+        ]},
+    })
+    __test_helper_seed_leg_entry(ctx)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    deletes = [c for c in broker._calls if c[0] == 'positions/L1' and c[1] == 'delete']
+    assert len(deletes) == 2
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.state == 'confirmed'
+    store.close()
+
+
+def __test_close_leg_unresolved_on_a_rekeyed_deal_retargets_the_core_row__(tmp_path):
+    """A leg whose journal row moved onto another deal is closed on that deal,
+    and the core's close-leg row is retargeted to it first: when that DELETE
+    also answers not-found while the deal stays listed, the pending row names
+    the open deal, so the replay re-sends to it instead of settling on the old
+    id's absence."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): OrderNotFoundError(
+            'error.not-found.dealId', ref_type='deal_id'),
+        ('error', 'positions/L2', 'delete'): OrderNotFoundError(
+            'error.not-found.dealId', ref_type='deal_id'),
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'L2', 'size': 1.0, 'direction': 'BUY',
+                          'level': 1.1}, 'market': {'epic': 'EURUSD'}},
+        ]},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='L2', extras={'kind': 'position'})
+    ctx.add_ref('coid-entry', 'deal_id', 'L1')
+    create_close_leg_row(
+        ctx, coid='pcl:Long:L1', symbol='EURUSD', side='sell', qty=100.0,
+        intent_key='Long\x00', pine_entry_id='Long',
+        parent_close_coid='pcl:Long', leg_id='L1', leg_volume=100,
+        leg_pre_volume=100,
+    )
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    assert [c[0] for c in broker._calls if c[1] == 'delete'] == [
+        'positions/L1', 'positions/L2']
+    row = ctx.get_order('pcl:Long:L1')
+    assert row is not None and row.closed_ts_ms is None
+    assert (row.extras or {})[EXTRAS_KEY_CLOSE_LEG_ID] == 'L2'
+    store.close()
+
+
+def __test_close_leg_interrupted_after_the_rekey_keeps_the_new_target__(tmp_path, monkeypatch):
+    """The not-found DELETE's judgement moves the entry onto the deal a
+    back-link names. The core's close-leg row moves with it in the same
+    transaction, so a process interrupted before the close-leg path's own
+    retarget still leaves the pending row naming the open deal."""
+    from pynecore_capitalcom import execution
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): OrderNotFoundError(
+            'error.not-found.dealId', ref_type='deal_id'),
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'L2', 'size': 1.0, 'direction': 'BUY',
+                          'level': 1.1, 'workingOrderId': 'L1'},
+             'market': {'epic': 'EURUSD'}},
+        ]},
+        ('history/activity', 'get'): {'activities': [
+            {'dateUTC': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+             'dealId': 'L2', 'type': 'POSITION',
+             'status': 'EXECUTED', 'source': 'USER', 'epic': 'EURUSD',
+             'details': {'workingOrderId': 'L1', 'direction': 'BUY', 'size': 1.0,
+                         'level': 1.1}},
+        ]},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='L1', extras={'kind': 'working'})
+    ctx.add_ref('coid-entry', 'deal_id', 'L1')
+    create_close_leg_row(
+        ctx, coid='pcl:Long:L1', symbol='EURUSD', side='sell', qty=100.0,
+        intent_key='Long\x00', pine_entry_id='Long',
+        parent_close_coid='pcl:Long', leg_id='L1', leg_volume=100,
+        leg_pre_volume=100,
+    )
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(execution, 'update_close_leg_state', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    entry = ctx.get_order('coid-entry')
+    assert entry is not None and entry.exchange_order_id == 'L2'
+    row = ctx.get_order('pcl:Long:L1')
+    assert row is not None and row.closed_ts_ms is None
+    assert (row.extras or {})[EXTRAS_KEY_CLOSE_LEG_ID] == 'L2'
+    store.close()
+
+
+def __test_close_leg_not_found_on_a_gone_leg_is_benign__(tmp_path):
+    """A not-found DELETE on a leg the venue no longer lists is the landed
+    close (or a broker-side sweep): a benign no-op with no second DELETE."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): OrderNotFoundError(
+            'error.not-found.dealId', ref_type='deal_id'),
+        ('positions', 'get'): {'positions': []},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    __test_helper_seed_leg_entry(ctx)
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    deletes = [c for c in broker._calls if c[0] == 'positions/L1' and c[1] == 'delete']
+    assert len(deletes) == 1
     store.close()
 
 
@@ -13938,12 +14683,74 @@ def __test_amend_bracket_sends_full_replacement_levels__(tmp_path):
     })
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell',
-        tp_price=1.2, sl_price=1.05, trail_offset=None, coid='c1',
+        tp_price=1.2, sl_price=1.05, trail_offset=None, qty=1.0, coid='c1',
     ))
     call = [c for c in broker._calls if c[0] == 'positions/L1'][0]
     assert call[2] == {'profitLevel': 1.2, 'trailingStop': False,
                        'stopLevel': 1.05}
     store.close()
+
+
+def __test_amend_bracket_audit_failure_still_reads_the_confirm__(tmp_path):
+    """The amend's audit cannot be journaled after the PUT went out: the
+    amend still settles from its confirm (a REJECTED one is a typed reject)
+    instead of escaping as a raw storage error."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/L1', 'put'): {'dealReference': 'am'},
+        ('confirms/am', 'get'): {'dealStatus': 'REJECTED', 'reason': 'ATTACHED_ORDER_LEVEL_ERROR'},
+    })
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == 'one_way_bracket_amend':
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.amend_bracket(
+            'EURUSD', 'L1', side='sell',
+            tp_price=1.2, sl_price=1.05, trail_offset=None, qty=1.0, coid='c1',
+        ))
+    assert ('confirms/am', 'get') in {(c[0], c[1]) for c in broker._calls}
+    store.close()
+
+
+def __test_bracket_matches_reads_the_bracket_the_row_holds__(tmp_path):
+    """The fate of an amend without an answer is read from the position row itself."""
+    def matches(position: dict | None, **levels) -> bool | None:
+        rows = [] if position is None else [
+            {'position': {'dealId': 'L1', **position}, 'market': {'epic': 'EURUSD'}}]
+        broker, store, _ = _make_broker(
+            tmp_path, responses={('positions', 'get'): {'positions': rows}})
+        wanted = dict(tp_price=None, sl_price=None, trail_offset=None)
+        wanted.update(levels)
+        try:
+            return asyncio.run(broker.bracket_matches(
+                'EURUSD', 'L1', side='sell', qty=1.0, **wanted))
+        finally:
+            store.close()
+
+    fixed = {'stopLevel': 1.05, 'profitLevel': 1.2, 'trailingStop': False}
+    assert matches(fixed, tp_price=1.2, sl_price=1.05)
+    assert not matches(fixed, tp_price=1.2, sl_price=1.06)
+    assert not matches(fixed, sl_price=1.05)  # the row holds a profit level too
+    assert not matches(fixed)  # a clear did not take effect
+    assert matches({}) and not matches({}, sl_price=1.05)
+    # A trailing stop is its flag and distance; the stop level moves.
+    # (The fixture's price tick is 0.01: levels within half of it are equal.)
+    trailing = {'stopLevel': 1.09, 'trailingStop': True, 'stopDistance': 0.02}
+    assert matches(trailing, sl_price=1.05, trail_offset=0.02)
+    assert not matches(trailing, sl_price=1.05, trail_offset=0.05)
+    assert not matches(trailing, sl_price=1.09)
+    # A trailing row that does not report its distance proves no distance:
+    # the read cannot tell (None), while a level it does report still decides.
+    unreported = {'stopLevel': 1.09, 'trailingStop': True}
+    assert matches(unreported, trail_offset=0.02) is None
+    assert matches(unreported, trail_offset=0.05) is None
+    assert matches(unreported, tp_price=1.2, trail_offset=0.02) is False
+    # A row that is gone holds nothing and matches no write.
+    assert not matches(None)
 
 
 def __test_amend_bracket_all_none_clears_explicitly__(tmp_path):
@@ -13952,7 +14759,7 @@ def __test_amend_bracket_all_none_clears_explicitly__(tmp_path):
     })
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell',
-        tp_price=None, sl_price=None, trail_offset=None, coid='c1',
+        tp_price=None, sl_price=None, trail_offset=None, qty=1.0, coid='c1',
     ))
     call = [c for c in broker._calls if c[0] == 'positions/L1'][0]
     # Full replacement: explicit nulls/false — an empty body would no-op.
@@ -13967,7 +14774,7 @@ def __test_amend_bracket_trailing_takes_stop_slot__(tmp_path):
     })
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell',
-        tp_price=None, sl_price=1.05, trail_offset=0.002, coid='c1',
+        tp_price=None, sl_price=1.05, trail_offset=0.002, qty=1.0, coid='c1',
     ))
     call = [c for c in broker._calls if c[0] == 'positions/L1'][0]
     assert call[2]['trailingStop'] is True
@@ -13983,7 +14790,7 @@ def __test_amend_bracket_not_found_is_benign__(tmp_path):
     })
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell',
-        tp_price=1.2, sl_price=None, trail_offset=None, coid='c1',
+        tp_price=1.2, sl_price=None, trail_offset=None, qty=1.0, coid='c1',
     ))
     store.close()
 
@@ -13997,7 +14804,7 @@ def __test_amend_bracket_rejected_confirm_raises__(tmp_path):
     with pytest.raises(ExchangeOrderRejectedError):
         asyncio.run(broker.amend_bracket(
             'EURUSD', 'L1', side='sell',
-            tp_price=1.2, sl_price=None, trail_offset=None, coid='c1',
+            tp_price=1.2, sl_price=None, trail_offset=None, qty=1.0, coid='c1',
         ))
     store.close()
 
@@ -14010,7 +14817,7 @@ def __test_amend_bracket_transport_maps_to_disposition_unknown__(tmp_path):
     with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.amend_bracket(
             'EURUSD', 'L1', side='sell',
-            tp_price=1.2, sl_price=None, trail_offset=None, coid='c1',
+            tp_price=1.2, sl_price=None, trail_offset=None, qty=1.0, coid='c1',
         ))
     store.close()
 
@@ -14044,7 +14851,7 @@ def _guarded_leg_broker(tmp_path, *, sl, tp, mid=1.10000):
     ctx.add_ref('coid-entry', 'deal_id', 'L1')
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell', tp_price=tp, sl_price=sl,
-        trail_offset=None, coid='c-attach'))
+        trail_offset=None, qty=1.0, coid='c-attach'))
     broker._calls.clear()
     return broker, store
 
@@ -14063,7 +14870,7 @@ def __test_amend_bracket_does_not_check_a_stop_a_trail_supersedes__(tmp_path):
     })
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell',
-        tp_price=None, sl_price=1.09990, trail_offset=0.002, coid='c1',
+        tp_price=None, sl_price=1.09990, trail_offset=0.002, qty=1.0, coid='c1',
     ))
     [body] = _amend_puts(broker)
     assert body['trailingStop'] is True and 'stopLevel' not in body
@@ -14080,7 +14887,7 @@ def __test_amend_bracket_restating_a_held_stop_skips_the_distance_check__(tmp_pa
 
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.09,
-        trail_offset=None, coid='c-retire'))
+        trail_offset=None, qty=1.0, coid='c-retire'))
 
     assert _amend_puts(broker) == [
         {'profitLevel': None, 'trailingStop': False, 'stopLevel': 1.09}]
@@ -14096,7 +14903,7 @@ def __test_amend_bracket_restating_a_held_take_profit_skips_the_distance_check__
 
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell', tp_price=1.097, sl_price=None,
-        trail_offset=None, coid='c-retire'))
+        trail_offset=None, qty=1.0, coid='c-retire'))
 
     assert _amend_puts(broker) == [
         {'profitLevel': 1.097, 'trailingStop': False, 'stopLevel': None}]
@@ -14113,11 +14920,11 @@ def __test_amend_bracket_still_checks_a_changed_level__(tmp_path):
     with pytest.raises(InvalidStopDistanceError):
         asyncio.run(broker.amend_bracket(
             'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.0905,
-            trail_offset=None, coid='c-new'))
+            trail_offset=None, qty=1.0, coid='c-new'))
     with pytest.raises(InvalidStopDistanceError):
         asyncio.run(broker.amend_bracket(
             'EURUSD', 'L2', side='sell', tp_price=None, sl_price=1.09,
-            trail_offset=None, coid='c-unknown'))
+            trail_offset=None, qty=1.0, coid='c-unknown'))
 
     assert _amend_puts(broker) == []
     store.close()
@@ -14134,7 +14941,7 @@ def __test_amend_bracket_venue_reject_of_a_restated_level_still_raises__(tmp_pat
     with pytest.raises(ExchangeOrderRejectedError):
         asyncio.run(broker.amend_bracket(
             'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.09,
-            trail_offset=None, coid='c-retire'))
+            trail_offset=None, qty=1.0, coid='c-retire'))
     store.close()
 
 
@@ -14156,7 +14963,7 @@ def __test_amend_bracket_checks_the_distance_of_the_fresh_market_reply__(tmp_pat
 
     asyncio.run(broker.amend_bracket(
         'EURUSD', 'L1', side='sell', tp_price=None, sl_price=1.09700,
-        trail_offset=None, coid='c1'))
+        trail_offset=None, qty=1.0, coid='c1'))
 
     assert _amend_puts(broker) == [
         {'profitLevel': None, 'trailingStop': False, 'stopLevel': 1.09700}]
@@ -14393,6 +15200,22 @@ def __test_native_failsafe_fans_over_hedging_legs__(tmp_path):
     store.close()
 
 
+def __test_close_leg_executed_of_an_open_row_is_nothing__(tmp_path):
+    """A position row still open was closed by none of its DELETEs.
+
+    The DELETE removes the whole row or nothing, so the restart replay may
+    re-send the close of a row it still sees open: the answer is 0, read from
+    no venue call.
+    """
+    broker, store, _ctx = _make_broker(tmp_path)
+    calls_before = len(broker._calls)
+    executed = asyncio.run(broker.close_leg_executed(
+        'EURUSD', 'deal-L', ['pcl:Long:deal-L', 'pcl:Long:deal-L#r1'], 0))
+    assert executed == 0
+    assert len(broker._calls) == calls_before
+    store.close()
+
+
 def __test_reconcile_skips_core_close_leg_rows__(tmp_path):
     """G4 immunity: a live core close-leg ledger row (no exchange order id)
     must never be stamped ``missing_pending_since`` nor emit events when the
@@ -14402,6 +15225,7 @@ def __test_reconcile_skips_core_close_leg_rows__(tmp_path):
         ctx, coid='pcl:Long:L1', symbol='EURUSD', side='sell', qty=1.0,
         intent_key='Long\x00', pine_entry_id='Long',
         parent_close_coid='pcl:Long', leg_id='L1', leg_volume=100,
+        leg_pre_volume=100,
     )
     events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
     assert events == []
@@ -14822,6 +15646,48 @@ def __test_activity_poll_after_an_outage_reaches_back_to_the_last_read__(tmp_pat
         # Back to the steady-state window once the gap is covered.
         assert asyncio.run(_drain_agen(broker._poll_once())) == []
         assert broker._calls[-1][2]['lastPeriod'] <= 62
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_activity_poll_whose_batch_failed_keeps_reaching_back__(tmp_path):
+    """A read whose batch could not be processed does not shorten the next
+    read's window: the fill it returned comes back and is booked once."""
+    now = time.time()
+    fill_at = datetime.fromtimestamp(now - 80.0, timezone.utc)
+    broker = _WindowedActivityBroker(
+        config=_make_config(),
+        activities=[{
+            'dateUTC': fill_at.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+            'dealId': 'deal-S', 'type': 'POSITION', 'status': 'EXECUTED',
+            'source': 'USER', 'size': 1.0, 'level': 1.10,
+        }],
+    )
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    try:
+        ctx.upsert_order('coid-S', symbol='EURUSD', side='sell', qty=1.0,
+                         state='confirmed', pine_entry_id='S',
+                         extras={'kind': 'position', 'order_type': 'market'})
+        ctx.add_ref('coid-S', 'deal_id', 'deal-S')
+        ctx.set_exchange_id('coid-S', 'deal-S')
+        broker._activity_polled_at = now - 85.0
+        convert = broker._activity_to_event
+
+        def failing_convert(*args, **kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        broker._activity_to_event = failing_convert
+        with pytest.raises(sqlite3.OperationalError):
+            asyncio.run(_drain_agen(broker._poll_once()))
+        broker._activity_to_event = convert
+
+        events = asyncio.run(_drain_agen(broker._poll_once()))
+
+        assert broker._calls[-1][2]['lastPeriod'] >= 80
+        fills = [ev for ev in events if ev.event_type == 'filled']
+        assert [(ev.pine_id, ev.leg_type) for ev in fills] == [('S', LegType.ENTRY)]
+        assert asyncio.run(_drain_agen(broker._poll_once())) == []
     finally:
         ctx.close()
         store.close()
@@ -15404,3 +16270,1132 @@ def __test_order_poll_outage_is_logged_once_and_its_recovery_too__(monkeypatch, 
     ]
     debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
     assert len([m for m in debug if 'order poll failed' in m]) == 2
+
+
+def _fail_log_once(ctx, failing_kind: str) -> None:
+    """Make the next ``failing_kind`` audit write of ``ctx`` raise, once."""
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == failing_kind:
+            del ctx.log_event
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+
+
+def __test_reconcile_corrected_reverse_rejection_is_one_transaction__(tmp_path):
+    """Rejecting a corrected partial close whose target kept its size is
+    all-or-nothing: a failed audit write leaves it parked and unresolved,
+    and the next pass rejects it once with the park resolution."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order(
+        'partial-cmd', symbol='EURUSD', side='sell', qty=1.0,
+        state='disposition_unknown', pine_entry_id='Long',
+        extras={
+            'kind': 'partial_close_emulated',
+            'target_deal_id': 'deal-L',
+            'target_direction': 'BUY',
+            'pre_target_units': 200,
+            'intent_units': 100,
+            'corrected_reverse_deal_id': 'reverse',
+        },
+    )
+    ctx.record_park(coid='partial-cmd', key='Long', kind='new')
+    listed = {'deal-L': _live_position(size=2.0)}
+
+    _fail_log_once(ctx, 'partial_close_target_unchanged_after_correction')
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(broker._resolve_partial_close_dispositions(listed))
+    row = ctx.get_order('partial-cmd')
+    assert row is not None and row.state == 'disposition_unknown'
+    assert row.closed_ts_ms is None
+
+    asyncio.run(broker._resolve_partial_close_dispositions(listed))
+    row = ctx.get_order('partial-cmd')
+    assert row is not None and row.state == 'rejected' and row.closed_ts_ms is not None
+    assert ctx.replay()[1]['partial-cmd'].resolution == 'rejected'
+    assert _event_kinds(ctx, 'partial-cmd').count(
+        'partial_close_target_unchanged_after_correction') == 1
+    store.close()
+
+
+def __test_parked_submission_rejected_on_retry_is_one_transaction__(tmp_path):
+    """A REJECTED confirm on the retry closes the row and records the park
+    resolution together: a failed audit write leaves the row parked, and the
+    next pass settles it once."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/o-ref-5', 'get'): {
+            'dealStatus': 'REJECTED',
+            'rejectReason': 'RISK_CHECK',
+        },
+    })
+    ctx.upsert_order('coid-rej', symbol='EURUSD', side='sell', qty=1.0,
+                     state='disposition_unknown', pine_entry_id='S',
+                     extras={'kind': 'working', 'order_type': 'limit',
+                             'deal_reference': 'o-ref-5'})
+    ctx.record_park(coid='coid-rej', key='S', kind='new')
+
+    _fail_log_once(ctx, 'parked_submission_rejected_on_retry')
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    row = ctx.get_order('coid-rej')
+    assert row is not None and row.state == 'disposition_unknown'
+    assert row.closed_ts_ms is None
+
+    assert asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {}))) == []
+    row = ctx.get_order('coid-rej')
+    assert row is not None and row.state == 'rejected' and row.closed_ts_ms is not None
+    assert ctx.replay()[1]['coid-rej'].resolution == 'rejected'
+    assert _event_kinds(ctx, 'coid-rej').count('parked_submission_rejected_on_retry') == 1
+    store.close()
+
+
+def __test_bracket_leg_resolution_is_one_transaction__(tmp_path):
+    """A bracket leg leaves ``disposition_unknown`` only together with its
+    close and audit: a failed write keeps it parked, the next snapshot
+    resolves it, and the parent's park gets its resolution."""
+    broker, store, ctx = _make_broker(tmp_path)
+    e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx)
+    ctx.set_order_state(tp_coid, 'disposition_unknown')
+    ctx.set_order_state(sl_coid, 'disposition_unknown')
+    ctx.record_park(e_coid, 'Bracket\x00Long')
+
+    _fail_log_once(ctx, 'bracket_disposition_resolved')
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    for coid in (tp_coid, sl_coid):
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'disposition_unknown'
+        assert row.closed_ts_ms is None
+
+    asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    for coid in (tp_coid, sl_coid):
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'rejected' and row.closed_ts_ms is not None
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get(e_coid) == 'rejected'
+    store.close()
+
+
+def __test_bracket_attach_rollback_is_one_transaction__(tmp_path):
+    """Retiring the persist-first leg rows of a dead attach is all-or-nothing:
+    no leg is left ``rejected`` but live when a write fails part-way."""
+    broker, store, ctx = _make_broker(tmp_path)
+    e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx)
+    for coid in (tp_coid, sl_coid):
+        ctx.set_order_state(coid, 'submitted')
+    intent = ExitIntent(
+        pine_id='TP_SL', from_entry='Long', symbol='EURUSD',
+        side='sell', qty=1.0, tp_price=1.2, sl_price=1.05,
+    )
+
+    def rollback():
+        broker._rollback_bracket_legs(
+            intent=intent, parent_coid=e_coid, deal_id='deal-L',
+            tp_coid=tp_coid, sl_coid=sl_coid, reason='put_failed',
+        )
+
+    _fail_log_once(ctx, 'bracket_attach_rollback')
+    with pytest.raises(sqlite3.OperationalError):
+        rollback()
+    for coid in (tp_coid, sl_coid):
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'submitted' and row.closed_ts_ms is None
+
+    rollback()
+    for coid in (tp_coid, sl_coid):
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'rejected' and row.closed_ts_ms is not None
+    assert _event_kinds(ctx, e_coid).count('bracket_attach_rollback') == 1
+    store.close()
+
+
+@pytest.mark.parametrize('parent_present', [False, True])
+def __test_bracket_parent_resolution_failure_leaves_legs_parked__(tmp_path, parent_present):
+    """The legs' verdicts and their parent's aggregated park resolution are
+    one transaction: a failed parent write leaves both legs parked, and the
+    next snapshot resolves them together with the parent's park."""
+    broker, store, ctx = _make_broker(tmp_path)
+    e_coid, tp_coid, sl_coid = _seed_bracket_setup(ctx)
+    ctx.set_order_state(tp_coid, 'disposition_unknown')
+    ctx.set_order_state(sl_coid, 'disposition_unknown')
+    ctx.record_park(e_coid, 'Bracket\x00Long')
+    positions = {'deal-L': _live_position(size=1.0)} if parent_present else {}
+    record_resolution = ctx.record_resolution
+
+    def failing(coid, resolution):
+        if coid == e_coid:
+            del ctx.record_resolution
+            raise sqlite3.OperationalError("disk I/O error")
+        return record_resolution(coid, resolution)
+
+    ctx.record_resolution = failing
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+    for coid in (tp_coid, sl_coid):
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'disposition_unknown'
+        assert row.closed_ts_ms is None
+
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+    for coid in (tp_coid, sl_coid):
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'rejected' and row.closed_ts_ms is not None
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get(e_coid) == 'rejected'
+    store.close()
+
+
+def _seed_amendable_bracket(ctx):
+    """An entry on ``deal-L`` with a confirmed TP 1.179 / SL 1.174 bracket."""
+    ctx.upsert_order(
+        'coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+        state='confirmed', pine_entry_id='Long', exchange_order_id='deal-L',
+        sl_level=1.17400, tp_level=1.17900,
+        extras={'kind': 'position', 'confirm_level': 1.17500},
+    )
+    ctx.add_ref('coid-entry', 'deal_id', 'deal-L')
+    for coid, level in (('coid-tp-old', {'tp_level': 1.17900}),
+                        ('coid-sl-old', {'sl_level': 1.17400})):
+        ctx.upsert_order(
+            coid, symbol='EURUSD', side='sell', qty=1.0, state='confirmed',
+            pine_entry_id='Long', from_entry='Long', **level,
+            extras={'leg_kind': 'tp' if 'tp_level' in level else 'sl',
+                    'parent_deal_id': 'deal-L', 'parent_coid': 'coid-entry'},
+        )
+    old_env = DispatchEnvelope(
+        intent=ExitIntent(pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+                          side='sell', qty=1.0, tp_price=1.17900, sl_price=1.17400),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    new_env = DispatchEnvelope(
+        intent=ExitIntent(pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+                          side='sell', qty=1.0, tp_price=1.18000, sl_price=1.17300),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    return old_env, new_env
+
+
+def __test_modify_exit_mirror_failure_leaves_legs_for_the_snapshot__(tmp_path):
+    """An accepted amend whose leg mirror fails part-way leaves no leg at the
+    old level beside a leg at the new one: nothing re-runs the mirror, so the
+    legs go to the snapshot in ``disposition_unknown`` at the attempted target
+    and the amend is parked (a typed unknown disposition the engine parks on,
+    never a raw storage error that ends the live sync); the next poll resolves
+    both legs and the park against the venue's levels."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    old_env, new_env = _seed_amendable_bracket(ctx)
+    upsert_order = ctx.upsert_order
+
+    def failing(coid, **fields):
+        if coid == 'coid-sl-old' and fields.get('state') == 'confirmed':
+            del ctx.upsert_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, **fields)
+
+    ctx.upsert_order = failing
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    assert parked.value.client_order_id == 'coid-entry'
+    assert parked.value.predecessor_cancel_ids == ()
+    assert isinstance(parked.value.__cause__, sqlite3.OperationalError)
+
+    tp_row = ctx.get_order('coid-tp-old')
+    sl_row = ctx.get_order('coid-sl-old')
+    assert tp_row is not None and sl_row is not None
+    assert (tp_row.state, sl_row.state) == ('disposition_unknown', 'disposition_unknown')
+    assert tp_row.tp_level == pytest.approx(1.18000)
+    assert sl_row.sl_level == pytest.approx(1.17300)
+    command = ctx.get_order(new_env.client_order_id(KIND_MODIFY_EXIT))
+    assert command is not None and command.state == 'disposition_unknown'
+    ctx.record_park('coid-entry', new_env.intent.intent_key)
+
+    positions = {'deal-L': _live_position(size=1.0, stop_level=1.17300,
+                                          profit_level=1.18000)}
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+    for coid in ('coid-tp-old', 'coid-sl-old'):
+        row = ctx.get_order(coid)
+        assert row is not None and row.closed_ts_ms is None
+        assert row.state == 'confirmed'
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get('coid-entry') == 'attached'
+    store.close()
+
+
+from pynecore.core.broker.position import BrokerPosition  # noqa: E402
+from pynecore.core.broker.sync_engine import OrderSyncEngine  # noqa: E402
+
+
+def __test_engine_parks_an_accepted_amend_whose_mirror_write_failed__(tmp_path):
+    """The same failed mirror write, driven through the Core sync engine's
+    diff: the engine dispatches the amend, the plugin's typed unknown
+    disposition parks it (the diff returns, the live sync goes on), and the
+    park is released once the venue snapshot resolved it."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    old_env, new_env = _seed_amendable_bracket(ctx)
+    old_intent, new_intent = old_env.intent, new_env.intent
+    key = new_intent.intent_key
+    engine = OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    engine._active_intents[key] = old_intent
+    upsert_order = ctx.upsert_order
+
+    def failing(coid, **fields):
+        if coid == 'coid-sl-old' and fields.get('state') == 'confirmed':
+            del ctx.upsert_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, **fields)
+
+    ctx.upsert_order = failing
+    engine._diff_and_dispatch([new_intent])
+
+    assert [call[:2] for call in broker._calls].count(('positions/deal-L', 'put')) == 1
+    assert engine._active_intents[key] == new_intent
+    assert 'coid-entry' in engine._pending_verification
+    assert engine._modify_old_intents.get(key) == old_intent
+    _, parked = ctx.replay()
+    assert parked['coid-entry'].dispatch_kind == 'modify'
+    assert parked['coid-entry'].resolution is None
+
+    positions = {'deal-L': _live_position(size=1.0, stop_level=1.17300,
+                                          profit_level=1.18000)}
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+    engine._verify_pending_dispatches()
+    assert 'coid-entry' not in engine._pending_verification
+    assert 'coid-entry' in engine._consumed_attached_coids
+    assert key not in engine._modify_old_intents
+    assert engine._active_intents[key] == new_intent
+    store.close()
+
+
+@pytest.mark.parametrize('failures', [1, 2, 0], ids=['mirror', 'mirror_and_park', 'deal_reference'])
+def __test_accepted_amend_whose_journal_writes_failed_is_settled_by_the_running_process__(
+        tmp_path, failures):
+    """The venue took the bracket amend, but its mirror write fails, and with
+    ``mirror_and_park`` the park write after it as well; with
+    ``deal_reference`` the journal's write of the amend's reference, before
+    the mirror, fails instead. The engine parks the
+    amend under the position's entry either way, never under the command, and
+    one poll settles everything from the positions snapshot: an uncommitted
+    park is committed first, the legs take the venue's levels, the engine's
+    park is released, and the command row leaves the live set."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    old_env, new_env = _seed_amendable_bracket(ctx)
+    old_intent, new_intent = old_env.intent, new_env.intent
+    key = new_intent.intent_key
+    engine = OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    engine._active_intents[key] = old_intent
+    upsert_order = ctx.upsert_order
+    left = [failures]
+
+    def failing(coid, **fields):
+        if coid == 'coid-sl-old' and left[0] > 0:
+            left[0] -= 1
+            if left[0] == 0:
+                del ctx.upsert_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, **fields)
+
+    if failures:
+        ctx.upsert_order = failing
+    else:
+        add_ref = ctx.add_ref
+
+        def failing_ref(coid, ref_type, *args, **kwargs):
+            if ref_type == 'deal_reference':
+                del ctx.add_ref
+                raise sqlite3.OperationalError("disk I/O error")
+            return add_ref(coid, ref_type, *args, **kwargs)
+
+        ctx.add_ref = failing_ref
+    engine._diff_and_dispatch([new_intent])
+
+    assert [call[:2] for call in broker._calls].count(('positions/deal-L', 'put')) == 1
+    _, parked = ctx.replay()
+    assert list(parked) == ['coid-entry']
+    assert 'coid-entry' in engine._pending_verification
+
+    positions = {'deal-L': _live_position(size=1.0, stop_level=1.17300,
+                                          profit_level=1.18000)}
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+    engine._verify_pending_dispatches()
+    assert 'coid-entry' not in engine._pending_verification
+    assert key not in engine._modify_old_intents
+    assert broker._deferred_parks == {}
+    legs = {row.client_order_id: row for row in ctx.iter_live_orders()
+            if (row.extras or {}).get('leg_kind')}
+    assert legs['coid-tp-old'].state == 'confirmed' and legs['coid-tp-old'].tp_level == 1.18
+    assert legs['coid-sl-old'].state == 'confirmed' and legs['coid-sl-old'].sl_level == 1.173
+    assert [row.client_order_id for row in ctx.iter_live_orders()
+            if (row.extras or {}).get('kind') == 'modify_exit'] == []
+    store.close()
+
+
+@pytest.mark.parametrize('broken_at', ['deal_reference', 'deal_reference_marked', 'mirror',
+                                       'completion'])
+def __test_accepted_amend_whose_park_never_committed_is_settled_after_a_restart__(
+        tmp_path, broken_at):
+    """The venue took the bracket amend, then the storage breaks: at the
+    journal's write of the amend's reference, inside the leg mirror, or at the
+    command's completion after the mirror committed. The park of the amend
+    cannot commit either, and the process dies with it still deferred, the
+    engine's park on the position's entry persisted. With
+    ``deal_reference_marked`` the journal's own mark of the command as
+    ``disposition_unknown`` landed before the process died, while the legs'
+    park did not. The restart re-derives
+    the outcome from the venue and the journal: the legs take the levels the
+    positions snapshot holds, the entry's park is resolved, and the command
+    leaves the live set, each once."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    old_env, new_env = _seed_amendable_bracket(ctx)
+    command_coid = new_env.client_order_id(KIND_MODIFY_EXIT)
+    broken = [False]
+
+    def breaks(name, method):
+        def write(*args, **kwargs):
+            if not broken[0]:
+                if broken_at.startswith('deal_reference'):
+                    broken[0] = name == 'add_ref' and args[1] == 'deal_reference'
+                elif broken_at == 'mirror':
+                    broken[0] = name == 'set_risk'
+                else:
+                    broken[0] = (name == 'upsert_order' and args[0] == command_coid
+                                 and kwargs.get('state') == 'confirmed')
+            if broken[0]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return method(*args, **kwargs)
+        return write
+
+    for name in ('upsert_order', 'set_order_state', 'add_ref', 'log_event', 'set_risk'):
+        setattr(ctx, name, breaks(name, getattr(ctx, name)))
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    assert parked.value.client_order_id == 'coid-entry'
+    assert list(broker._deferred_parks) == [command_coid]
+    for name in ('upsert_order', 'set_order_state', 'add_ref', 'log_event', 'set_risk'):
+        delattr(ctx, name)
+    # The engine's park on the entry committed; the process dies here.
+    ctx.record_park('coid-entry', new_env.intent.intent_key, kind='modify')
+    if broken_at == 'deal_reference_marked':
+        with ctx.transaction():
+            ctx.add_ref(command_coid, 'deal_reference', 'modify-ok')
+            ctx.set_order_state(command_coid, 'disposition_unknown')
+    ctx.close()
+
+    positions_resp = {'positions': [_live_position(size=1.0, stop_level=1.17300,
+                                                   profit_level=1.18000)]}
+    restarted = _FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions', 'get'): positions_resp,
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    restarted._account_id = 'capitalcom-demo-test-account'
+    restarted.store_ctx = ctx = store.open_run(
+        RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                    account_id="test-account", label=None),
+        script_source="// test",
+    )
+    asyncio.run(restarted._recover_in_flight_submissions())
+    positions = {'deal-L': positions_resp['positions'][0]}
+    for _ in range(2):
+        asyncio.run(_drain_agen(restarted._reconcile_snapshot(positions, {})))
+
+    legs = {row.client_order_id: row for row in ctx.iter_live_orders()
+            if (row.extras or {}).get('leg_kind')}
+    assert sorted(legs) == ['coid-sl-old', 'coid-tp-old']
+    assert legs['coid-tp-old'].state == 'confirmed'
+    assert legs['coid-tp-old'].tp_level == pytest.approx(1.18000)
+    assert legs['coid-sl-old'].state == 'confirmed'
+    assert legs['coid-sl-old'].sl_level == pytest.approx(1.17300)
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get('coid-entry') == 'attached'
+    assert [row.client_order_id for row in ctx.iter_live_orders()
+            if (row.extras or {}).get('kind') == KIND_MODIFY_EXIT] == []
+    assert [c[:2] for c in restarted._calls].count(('positions/deal-L', 'put')) == 0
+    store.close()
+
+
+def __test_amend_to_a_pending_trail_whose_completion_failed_is_released_after_a_restart__(
+        tmp_path):
+    """The amend replaces the fixed bracket with a locally pending trailing
+    stop: the venue accepts the clear and the leg mirror commits, then the
+    command's completion and the park after it fail, and the process dies.
+    No leg of this amend goes to the leg resolver (the pending trail is
+    local), so once the snapshot shows the venue holding no stop and no
+    take-profit, the restart completes the command and resolves the engine's
+    park on the entry in the same pass."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    old_env, _ = _seed_amendable_bracket(ctx)
+    new_env = DispatchEnvelope(
+        intent=ExitIntent(pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+                          side='sell', qty=1.0, trail_price=1.17800, trail_offset=0.00200),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    command_coid = new_env.client_order_id(KIND_MODIFY_EXIT)
+    broken = [False]
+
+    def breaks(name, method):
+        def write(*args, **kwargs):
+            if not broken[0]:
+                broken[0] = (name == 'upsert_order' and args[0] == command_coid
+                             and kwargs.get('state') == 'confirmed')
+            if broken[0]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return method(*args, **kwargs)
+        return write
+
+    names = ('upsert_order', 'set_order_state', 'add_ref', 'log_event', 'set_risk')
+    for name in names:
+        setattr(ctx, name, breaks(name, getattr(ctx, name)))
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    for name in names:
+        delattr(ctx, name)
+    ctx.record_park('coid-entry', new_env.intent.intent_key, kind='modify')
+    ctx.close()
+
+    positions_resp = {'positions': [_live_position(size=1.0)]}
+    restarted = _FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions', 'get'): positions_resp,
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    restarted._account_id = 'capitalcom-demo-test-account'
+    restarted.store_ctx = ctx = store.open_run(
+        RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                    account_id="test-account", label=None),
+        script_source="// test",
+    )
+    asyncio.run(restarted._recover_in_flight_submissions())
+    positions = {'deal-L': positions_resp['positions'][0]}
+    for _ in range(2):
+        asyncio.run(_drain_agen(restarted._reconcile_snapshot(positions, {})))
+
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get('coid-entry') == 'attached'
+    assert [row.client_order_id for row in ctx.iter_live_orders()
+            if (row.extras or {}).get('kind') == KIND_MODIFY_EXIT] == []
+    trail = [row for row in ctx.iter_live_orders()
+             if (row.extras or {}).get('leg_kind') == 'sl']
+    assert len(trail) == 1 and (trail[0].extras or {}).get('trail_state') == 'pending'
+    assert [row for row in ctx.iter_live_orders()
+            if (row.extras or {}).get('leg_kind') == 'tp'] == []
+    store.close()
+
+
+def __test_restarted_pending_trail_amend_the_bot_activated_meanwhile_completes__(tmp_path):
+    """The restart of the pending-trailing amend whose completion failed
+    (see above) cannot write the command's completion on the first matching
+    snapshot either. The price then crosses the activation level and the
+    bot's own activation monitor sends the native trailing stop. The next
+    snapshot shows exactly that stop: the amend is complete and the engine's
+    park on the entry attached, never refused and retried."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    old_env, _ = _seed_amendable_bracket(ctx)
+    new_env = DispatchEnvelope(
+        intent=ExitIntent(pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+                          side='sell', qty=1.0, trail_price=1.17800, trail_offset=0.00200),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    command_coid = new_env.client_order_id(KIND_MODIFY_EXIT)
+    broken = [False]
+
+    def breaks(name, method):
+        def write(*args, **kwargs):
+            if not broken[0]:
+                broken[0] = (name == 'upsert_order' and args[0] == command_coid
+                             and kwargs.get('state') == 'confirmed')
+            if broken[0]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return method(*args, **kwargs)
+        return write
+
+    names = ('upsert_order', 'set_order_state', 'add_ref', 'log_event', 'set_risk')
+    for name in names:
+        setattr(ctx, name, breaks(name, getattr(ctx, name)))
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    for name in names:
+        delattr(ctx, name)
+    ctx.record_park('coid-entry', new_env.intent.intent_key, kind='modify')
+    ctx.close()
+
+    cleared = _live_position(size=1.0)
+    cleared['market'].update(bid=1.17850, offer=1.17852)
+    restarted = _FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17850, 1.17852),
+        ('positions', 'get'): {'positions': [_live_position(size=1.0)]},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+        ('positions/deal-L', 'put'): {'dealReference': 'activate-ok'},
+        ('confirms/activate-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    restarted._account_id = 'capitalcom-demo-test-account'
+    restarted.store_ctx = ctx = store.open_run(
+        RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                    account_id="test-account", label=None),
+        script_source="// test",
+    )
+    asyncio.run(restarted._recover_in_flight_submissions())
+    upsert_order = ctx.upsert_order
+
+    def completion_fails(coid, **fields):
+        if coid == command_coid and fields.get('state') == 'confirmed':
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, **fields)
+
+    ctx.upsert_order = completion_fails
+    asyncio.run(_drain_agen(restarted._reconcile_snapshot({'deal-L': cleared}, {})))
+    del ctx.upsert_order
+    command = ctx.get_order(command_coid)
+    assert command is not None and command.state == 'disposition_unknown'
+    asyncio.run(restarted._trailing_activation_monitor({'deal-L': cleared}))
+    assert [c[:2] for c in restarted._calls].count(('positions/deal-L', 'put')) == 1
+
+    trailing = _live_position(size=1.0, stop_level=1.17650, trailing=True,
+                              stop_distance=0.00200)
+    trailing['market'].update(bid=1.17850, offer=1.17852)
+    for _ in range(2):
+        asyncio.run(_drain_agen(restarted._reconcile_snapshot({'deal-L': trailing}, {})))
+
+    command = ctx.get_order(command_coid)
+    assert command is not None and command.state != 'rejected'
+    assert command.closed_ts_ms is not None
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get('coid-entry') == 'attached'
+    assert [c[:2] for c in restarted._calls].count(('positions/deal-L', 'put')) == 1
+    store.close()
+
+
+@pytest.mark.parametrize('history', ['fresh', 'earlier_activation'])
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+@pytest.mark.parametrize('held', ['stop', 'native_trail'])
+def __test_amend_to_a_pending_trail_the_venue_no_longer_holds_reaches_a_verdict__(
+        tmp_path, restart, held, history):
+    """The amend replaces the fixed bracket with a locally pending trailing
+    stop: the venue accepts the clear and the leg mirror commits, then the
+    command's completion fails. The venue then holds a stop the bot did not
+    send. The running process and the restart reach the same verdict: the
+    command is refused (the engine retries the amend), the engine's park on
+    the entry is resolved, and the protection guard judges the foreign stop
+    instead of waiting for a command that would never settle. With
+    ``earlier_activation`` the journal holds the bot's activation of an
+    earlier amend's pending trail under the same stop leg and at the same
+    price: that activation is no evidence for this amend."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    old_env, _ = _seed_amendable_bracket(ctx)
+    if history == 'earlier_activation':
+        ctx.log_event('trailing_activation_triggered', client_order_id='coid-sl-old',
+                      exchange_order_id=None,
+                      payload={'mid': 1.17850, 'activation_price': 1.17800,
+                               'trail_command_coid': 'an-earlier-amend'})
+    new_env = DispatchEnvelope(
+        intent=ExitIntent(pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+                          side='sell', qty=1.0, trail_price=1.17800, trail_offset=0.00200),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    command_coid = new_env.client_order_id(KIND_MODIFY_EXIT)
+    broken = [False]
+
+    def breaks(name, method):
+        def write(*args, **kwargs):
+            if not broken[0]:
+                broken[0] = (name == 'upsert_order' and args[0] == command_coid
+                             and kwargs.get('state') == 'confirmed')
+            if broken[0]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return method(*args, **kwargs)
+        return write
+
+    names = ('upsert_order', 'set_order_state', 'add_ref', 'log_event', 'set_risk')
+    for name in names:
+        setattr(ctx, name, breaks(name, getattr(ctx, name)))
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    for name in names:
+        delattr(ctx, name)
+    ctx.record_park('coid-entry', new_env.intent.intent_key, kind='modify')
+    position = (_live_position(size=1.0, stop_level=1.17300) if held == 'stop'
+                else _live_position(size=1.0, stop_level=1.17300, trailing=True,
+                                    stop_distance=0.00200))
+    if restart:
+        ctx.close()
+        broker = _FakeBroker(config=_make_config(), responses={
+            ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+            ('positions', 'get'): {'positions': [position]},
+            ('workingorders', 'get'): {'workingOrders': []},
+            ('history/activity', 'get'): {'activities': []},
+            ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+        })
+        broker._account_id = 'capitalcom-demo-test-account'
+        broker.store_ctx = ctx = store.open_run(
+            RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                        account_id="test-account", label=None),
+            script_source="// test",
+        )
+        asyncio.run(broker._recover_in_flight_submissions())
+    for _ in range(3):
+        asyncio.run(_drain_agen(broker._reconcile_snapshot({'deal-L': position}, {})))
+
+    command = ctx.get_order(command_coid)
+    assert command is not None and command.state == 'rejected'
+    assert command.closed_ts_ms is not None
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get('coid-entry') == 'rejected'
+    entry = ctx.get_order('coid-entry')
+    assert entry is not None and 'position:deal-L' in (entry.extras or {}).get(
+        'held_edit_verdicts', {})
+    assert [c[:2] for c in broker._calls].count(('positions/deal-L', 'put')) == (
+        0 if restart else 1)
+    store.close()
+
+
+@pytest.mark.parametrize('venue', ['old_bracket', 'position_closed'])
+def __test_parked_amend_the_venue_does_not_hold_leaves_the_live_set__(tmp_path, venue):
+    """The amend's PUT timed out, so the amend is parked. The venue kept the
+    old bracket, or the position closed. Once the snapshot settled the legs
+    (the engine retries a refused amend under a new command), the parked
+    command leaves the live set: left live, it would keep the protection
+    guard off the position for good, also across a restart."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('error', 'positions/deal-L', 'put'): httpx.TimeoutException("read timeout"),
+    })
+    old_env, new_env = _seed_amendable_bracket(ctx)
+    command_coid = new_env.client_order_id(KIND_MODIFY_EXIT)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    command = ctx.get_order(command_coid)
+    assert command is not None and command.state == 'disposition_unknown'
+    ctx.record_park('coid-entry', new_env.intent.intent_key, kind='modify')
+
+    positions = ({'deal-L': _live_position(size=1.0, stop_level=1.17400,
+                                           profit_level=1.17900)}
+                 if venue == 'old_bracket' else {})
+    for _ in range(2):
+        asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get('coid-entry') == 'rejected'
+    command = ctx.get_order(command_coid)
+    assert command is not None and command.closed_ts_ms is not None
+    assert [row.client_order_id for row in ctx.iter_live_orders()
+            if (row.extras or {}).get('kind') == KIND_MODIFY_EXIT] == []
+    store.close()
+
+
+#: The bracket amends of the modify-exit sweep, from the TP 1.179 / SL 1.174
+#: bracket of :func:`_seed_amendable_bracket`.
+_SWEEP_AMENDS = {
+    'fixed': {'tp_price': 1.18000, 'sl_price': 1.17300},
+    'native_trail': {'tp_price': 1.18000, 'trail_offset': 0.00200},
+    'pending_trail': {'trail_price': 1.17800, 'trail_offset': 0.00200},
+    'remove_tp': {'sl_price': 1.17300},
+    'tp_and_pending_trail': {'tp_price': 1.18000, 'trail_price': 1.17800,
+                             'trail_offset': 0.00200},
+}
+
+
+#: The sweep's venue states where the bot's activation monitor sent a pending
+#: trailing stop: journaled at once, or after its journal write failed twice.
+_SWEEP_ACTIVATED = ('activated', 'activated_unjournaled')
+
+
+def _sweep_venue_position(amend: dict, venue: str) -> dict | None:
+    """The position the venue shows after the amend, ``None`` when it is gone.
+
+    ``request`` holds the requested bracket (a pending trailing stop is local,
+    so the venue holds no stop for it), ``old`` the bracket before the amend,
+    ``foreign`` the requested take-profit beside a stop nobody of the bot sent,
+    ``activated`` the native trailing stop the bot's activation monitor sent
+    for a pending one, with the price past its activation level
+    (``activated_unjournaled`` as well).
+    """
+    if venue == 'gone':
+        return None
+    if venue == 'old':
+        return _live_position(size=1.0, stop_level=1.17400, profit_level=1.17900)
+    tp = amend.get('tp_price')
+    if venue == 'foreign':
+        return _live_position(size=1.0, stop_level=1.16000, profit_level=tp)
+    if venue in _SWEEP_ACTIVATED:
+        position = _live_position(size=1.0, stop_level=1.17650, profit_level=tp,
+                                  trailing=True, stop_distance=amend['trail_offset'])
+        position['market'].update(bid=1.17850, offer=1.17852)
+        return position
+    if amend.get('trail_offset') is not None and amend.get('trail_price') is None:
+        return _live_position(size=1.0, stop_level=1.17300, profit_level=tp, trailing=True,
+                              stop_distance=amend['trail_offset'])
+    return _live_position(size=1.0, stop_level=amend.get('sl_price'), profit_level=tp)
+
+
+def _sweep_amend_verdict(tmp_path, shape: str, venue: str, failure: str,
+                         restart: bool) -> tuple:
+    """Run one amend of the sweep to its terminal verdict.
+
+    The amend fails at ``failure``: ``put_timeout`` (the PUT's outcome is
+    unknown), ``mirror`` (the venue took it, the leg mirror fails, the park
+    commits), ``mirror_and_park`` (the park fails as well) or ``completion``
+    (the mirror commits, then the command's completion and the park fail).
+    The engine's park on the entry commits; then either the running process
+    or a restart polls the venue three times. With ``activated`` the bot's
+    activation monitor first sends the pending trailing stop, before any poll;
+    with ``activated_unjournaled`` the venue accepts it, but the journal write
+    of the activation fails, and fails again at the first poll.
+
+    :return: The command's state, whether it left the live set, the engine's
+        resolution of the entry's park and the number of PUTs the restart or
+        the polls sent after the amend.
+    """
+    tmp_path.mkdir()
+    bid = 1.17850 if venue in _SWEEP_ACTIVATED else 1.17500
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+        **({('error', 'positions/deal-L', 'put'): httpx.TimeoutException("read timeout")}
+           if failure == 'put_timeout' else {}),
+    })
+    old_env, _ = _seed_amendable_bracket(ctx)
+    new_env = DispatchEnvelope(
+        intent=ExitIntent(pine_id='Bracket', from_entry='Long', symbol='EURUSD',
+                          side='sell', qty=1.0, **_SWEEP_AMENDS[shape]),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    command_coid = new_env.client_order_id(KIND_MODIFY_EXIT)
+    names = ('upsert_order', 'set_order_state', 'add_ref', 'log_event', 'set_risk')
+    broken = [False]
+    left = [1]
+
+    def breaks(name, method):
+        def write(*args, **kwargs):
+            if failure == 'mirror':
+                if name == 'set_risk' and left[0]:
+                    left[0] -= 1
+                    raise sqlite3.OperationalError("disk I/O error")
+                return method(*args, **kwargs)
+            if not broken[0]:
+                if failure == 'mirror_and_park':
+                    broken[0] = name == 'set_risk'
+                else:
+                    broken[0] = (name == 'upsert_order' and args[0] == command_coid
+                                 and kwargs.get('state') == 'confirmed')
+            if broken[0]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return method(*args, **kwargs)
+        return write
+
+    if failure != 'put_timeout':
+        for name in names:
+            setattr(ctx, name, breaks(name, getattr(ctx, name)))
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    assert parked.value.client_order_id == 'coid-entry'
+    if failure != 'put_timeout':
+        for name in names:
+            delattr(ctx, name)
+    ctx.record_park('coid-entry', new_env.intent.intent_key, kind='modify')
+    position = _sweep_venue_position(_SWEEP_AMENDS[shape], venue)
+    positions = {'deal-L': position} if position is not None else {}
+    puts_before = [c[:2] for c in broker._calls].count(('positions/deal-L', 'put'))
+    if restart:
+        ctx.close()
+        broker = _FakeBroker(config=_make_config(), responses={
+            ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(bid, bid + 0.00002),
+            ('positions', 'get'): {'positions': list(positions.values())},
+            ('workingorders', 'get'): {'workingOrders': []},
+            ('history/activity', 'get'): {'activities': []},
+            ('confirms/modify-ok', 'get'): {'dealStatus': 'ACCEPTED'},
+            ('positions/deal-L', 'put'): {'dealReference': 'modify-ok'},
+        })
+        broker._account_id = 'capitalcom-demo-test-account'
+        broker.store_ctx = ctx = store.open_run(
+            RunIdentity(strategy_id="test", symbol="EURUSD", timeframe="60",
+                        account_id="test-account", label=None),
+            script_source="// test",
+        )
+        puts_before = 0
+        asyncio.run(broker._recover_in_flight_submissions())
+    else:
+        broker._responses[('markets/EURUSD', 'get')] = _rules_resp_with_snapshot(
+            bid, bid + 0.00002)
+    activation_failures = [2 if venue == 'activated_unjournaled' else 0]
+    log_event = ctx.log_event
+
+    def activation_journal(kind, *args, **kwargs):
+        if kind == 'trailing_activation_triggered' and activation_failures[0]:
+            activation_failures[0] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = activation_journal
+    if venue in _SWEEP_ACTIVATED:
+        crossed = _sweep_venue_position(_SWEEP_AMENDS[shape], 'request')
+        assert crossed is not None
+        crossed['market'].update(bid=1.17850, offer=1.17852)
+        asyncio.run(broker._trailing_activation_monitor({'deal-L': crossed}))
+    for _ in range(3):
+        asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+        if position is not None:
+            asyncio.run(broker._trailing_activation_monitor(positions))
+    assert activation_failures == [0]
+    del ctx.log_event
+    command = ctx.get_order(command_coid)
+    assert command is not None
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    verdict = (
+        command.state, command.closed_ts_ms is not None, resolutions.get('coid-entry'),
+        [c[:2] for c in broker._calls].count(('positions/deal-L', 'put')) - puts_before,
+    )
+    store.close()
+    return verdict
+
+
+_SWEEP_CASES = [
+    (shape, venue, failure)
+    for shape in _SWEEP_AMENDS
+    for venue in ('request', 'old', 'foreign', 'gone')
+    for failure in ('put_timeout', 'mirror', 'mirror_and_park', 'completion')
+] + [(shape, venue, 'completion') for shape in ('pending_trail', 'tp_and_pending_trail')
+      for venue in _SWEEP_ACTIVATED]
+
+
+@pytest.mark.parametrize(('shape', 'venue', 'failure'), _SWEEP_CASES,
+                         ids=['-'.join(case) for case in _SWEEP_CASES])
+def __test_unsettled_amend_reaches_the_same_verdict_running_and_after_a_restart__(
+        tmp_path, shape, venue, failure):
+    """Every bracket amend shape, every venue outcome and every point where
+    the amend's journal stops: the running process and a restart reach one
+    terminal verdict, and no command stays live. The venue holding the
+    requested bracket (or the trailing stop the bot activated from it)
+    completes the command and resolves the engine's park on the entry as
+    attached; any other venue state resolves the park as rejected, and the
+    engine retries the amend. A leg the amend removes, or a stop it replaces
+    with a local pending trail, is refused once parked at the snapshot, so
+    the engine sends the full-replacement amend once more; legs the
+    committed mirror already wrote are parked from the bracket they hold
+    and are not refused. Only the activation monitor writes to the venue."""
+    running = _sweep_amend_verdict(tmp_path / 'running', shape, venue, failure, False)
+    restarted = _sweep_amend_verdict(tmp_path / 'restart', shape, venue, failure, True)
+    assert running == restarted
+    state, closed, resolution, puts = running
+    assert closed
+    assert puts == (1 if venue in _SWEEP_ACTIVATED else 0)
+    if venue == 'request' or venue in _SWEEP_ACTIVATED:
+        assert state != 'rejected'
+        retried = (failure != 'completion'
+                   and shape in ('pending_trail', 'remove_tp', 'tp_and_pending_trail'))
+        assert resolution == ('rejected' if retried else 'attached')
+    else:
+        assert resolution == 'rejected'
+
+
+def __test_failsafe_sl_put_whose_audit_write_failed_is_put_again_by_the_engine__(tmp_path):
+    """The fail-safe stop PUT landed, but its audit write fails: the engine
+    counts the dispatch as a failed PUT (no raw error leaves the sync) and its
+    retry, on the next drive, puts the same stop again and succeeds. The PUT is
+    a full replacement, so the repeat changes nothing on the venue."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'r1'},
+        ('confirms/r1', 'get'): {'dealStatus': 'ACCEPTED', 'status': 'AMENDED'},
+    })
+    _seed_failsafe_entry(ctx)
+    engine = OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    engine.set_native_bracket_dispatcher(
+        lambda snapshot: engine._run_async(broker.publish_native_failsafe_sl(snapshot)))
+    manager = engine._native_failsafe_manager
+    manager.register_parent(parent_entry_dispatch_ref='coid-entry', symbol='EURUSD',
+                            parent_side='long', mintick=0.00001)
+    manager.recompute_worst_sl(parent_entry_dispatch_ref='coid-entry',
+                               active_sl_levels=[1.09], now_ms=1_000.0)
+    log_event = ctx.log_event
+
+    def failing(kind, *args, **kwargs):
+        if kind == 'native_failsafe_sl_put':
+            del ctx.log_event
+            raise sqlite3.OperationalError("disk I/O error")
+        return log_event(kind, *args, **kwargs)
+
+    ctx.log_event = failing
+    engine.drive_native_failsafe(now_ms=1_000.0)
+    state = manager.get_state('coid-entry')
+    assert state is not None
+    assert state.last_failure_reason == 'dispatcher-exception:OperationalError'
+    assert state.pending_retry
+
+    engine.drive_native_failsafe(now_ms=2_000.0)
+    puts = [c for c in broker._calls if c[:2] == ('positions/deal-L', 'put')]
+    assert [c[2]['stopLevel'] for c in puts] == [1.09, 1.09]
+    assert not state.pending_put
+    assert state.health is not FailsafeHealth.DEGRADED
+    assert manager.pending_dispatch() == []
+    store.close()
+
+
+def __test_modify_exit_ambiguous_leg_parking_is_one_transaction__(tmp_path):
+    """Parking the legs of an ambiguous amend is all-or-nothing: a write
+    failing part-way never leaves a leg at the attempted target but still
+    ``confirmed``, where the resolver would never look at it again."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('markets/EURUSD', 'get'): _rules_resp_with_snapshot(1.17500, 1.17502),
+        ('error', 'positions/deal-L', 'put'): httpx.TimeoutException("read timeout"),
+    })
+    old_env, new_env = _seed_amendable_bracket(ctx)
+    set_order_state = ctx.set_order_state
+
+    def failing(coid, state, *args, **kwargs):
+        if coid == 'coid-sl-old' and state == 'disposition_unknown':
+            del ctx.set_order_state
+            raise sqlite3.OperationalError("disk I/O error")
+        return set_order_state(coid, state, *args, **kwargs)
+
+    ctx.set_order_state = failing
+    states_after_failed_write: list[tuple] = []
+    park_after_venue_write = broker._park_after_venue_write
+
+    def observed(key, write):
+        # The record of the own write is journaled through the same retry; only
+        # the amend's park is observed.
+        if not key.startswith('own-write-evidence:'):
+            tp, sl = ctx.get_order('coid-tp-old'), ctx.get_order('coid-sl-old')
+            states_after_failed_write.append(
+                (tp.state, sl.state, tp.tp_level, sl.sl_level) if tp and sl else None)
+        park_after_venue_write(key, write)
+
+    broker._park_after_venue_write = observed
+    # The PUT may have landed, so the failed write parks the amend as unknown,
+    # under the position's entry, and the park is written again.
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.modify_exit(old_env, new_env))
+    assert parked.value.client_order_id == 'coid-entry'
+
+    # The failed write left nothing behind: both legs confirmed at their old levels.
+    assert len(states_after_failed_write) == 1
+    tp_state, sl_state, tp_level, sl_level = states_after_failed_write[0]
+    assert (tp_state, sl_state) == ('confirmed', 'confirmed')
+    assert tp_level == pytest.approx(1.17900)
+    assert sl_level == pytest.approx(1.17400)
+    # The park written again moves both legs together.
+    tp_row = ctx.get_order('coid-tp-old')
+    sl_row = ctx.get_order('coid-sl-old')
+    assert tp_row is not None and sl_row is not None
+    assert (tp_row.state, sl_row.state) == ('disposition_unknown', 'disposition_unknown')
+    store.close()
+
+
+def __test_accepted_bracket_with_failed_leg_bookkeeping_parks_for_the_snapshot__(tmp_path):
+    """The legs' post-PUT bookkeeping is one transaction: when it fails, no
+    leg is left ``submitted`` beside a confirmed one (settled by no pass in a
+    running process). The legs go to the snapshot in ``disposition_unknown``,
+    the exit parks, and the venue's levels resolve both legs and the park."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/deal-L', 'put'): {'dealReference': 'attach'},
+        ('confirms/attach', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-L', extras={'kind': 'position'})
+    ctx.add_ref('coid-entry', 'deal_id', 'deal-L')
+    env = DispatchEnvelope(
+        intent=ExitIntent(pine_id='TP_SL', from_entry='Long', symbol='EURUSD',
+                          side='sell', qty=1.0, tp_price=1.2, sl_price=1.05),
+        run_tag='test', bar_ts_ms=1700000000000,
+    )
+    set_order_state = ctx.set_order_state
+    failed: list[str] = []
+
+    def failing(coid, state, *args, **kwargs):
+        row = ctx.get_order(coid)
+        leg_kind = (row.extras or {}).get('leg_kind') if row is not None else None
+        if state == 'confirmed' and leg_kind == 'sl' and not failed:
+            failed.append(coid)
+            raise sqlite3.OperationalError("disk I/O error")
+        return set_order_state(coid, state, *args, **kwargs)
+
+    ctx.set_order_state = failing
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.execute_exit(env))
+    ctx.set_order_state = set_order_state
+
+    legs = [r for r in ctx.iter_live_orders() if (r.extras or {}).get('leg_kind')]
+    assert sorted((r.extras or {})['leg_kind'] for r in legs) == ['sl', 'tp']
+    assert {r.state for r in legs} == {'disposition_unknown'}
+    ctx.record_park('coid-entry', env.intent.intent_key)
+
+    positions = {'deal-L': _live_position(size=1.0, stop_level=1.05, profit_level=1.2)}
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(positions, {})))
+    for row in legs:
+        current = ctx.get_order(row.client_order_id)
+        assert current is not None and current.state == 'confirmed'
+        assert current.closed_ts_ms is None
+    resolutions = {p.coid: p.resolution for p in ctx.iter_pending_resolutions()}
+    assert resolutions.get('coid-entry') == 'attached'
+    store.close()
+
+
+def __test_startup_orphan_retirement_is_one_transaction_per_row__(tmp_path):
+    """Retiring a vanished own position at startup is one write: when the row
+    retirement fails, its audit is not left behind beside a live row, and the
+    next start retires it with one audit."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', intent_key='L-key',
+                     exchange_order_id='gone-1', filled_qty=1.0,
+                     extras={'kind': 'position'})
+    close_order = ctx.close_order
+
+    def failing(coid, *args, **kwargs):
+        if coid == 'coid-m':
+            del ctx.close_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return close_order(coid, *args, **kwargs)
+
+    ctx.close_order = failing
+    with pytest.raises(sqlite3.OperationalError):
+        broker._retire_startup_orphans({}, {})
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.closed_ts_ms is None and abs(row.filled_qty - 1.0) < 1e-9
+    assert _event_kinds(ctx, 'coid-m').count('position_vanished_unattributed') == 0
+
+    broker._retire_startup_orphans({}, {})
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.closed_ts_ms is not None
+    assert _event_kinds(ctx, 'coid-m').count('position_vanished_unattributed') == 1
+    store.close()

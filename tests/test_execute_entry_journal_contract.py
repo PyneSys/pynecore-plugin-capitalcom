@@ -2,7 +2,9 @@
 @pyne
 """
 import asyncio
+import sqlite3
 from dataclasses import asdict
+from datetime import datetime, timezone
 from time import time as epoch_time
 
 import httpx
@@ -13,13 +15,17 @@ from pynecore.core.broker.exceptions import (
     InsufficientMarginError,
     OrderDispositionUnknownError,
 )
+from pynecore.core.broker.idempotency import KIND_ENTRY
 from pynecore.core.broker.models import (
     DispatchEnvelope, EntryIntent, OrderStatus, OrderType,
 )
+from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.sync_engine import OrderSyncEngine
 
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
+from pynecore_capitalcom.exceptions import OrderNotFoundError
 from pynecore_capitalcom.models import _InstrumentRules
 
 
@@ -425,3 +431,290 @@ def __test_contract_market_confirm_accepted_status__(tmp_path):
     assert out['events'] == [
         'dispatch_submitted', 'deal_reference_seen', 'confirmed',
     ]
+
+
+# === Storage failure after the accepted POST =============================
+
+_ACCEPTED_MARKET = {
+    ('positions', 'post'): {'dealReference': 'ref-mkt'},
+    ('confirms/ref-mkt', 'get'): {
+        'dealStatus': 'ACCEPTED', 'status': 'OPEN', 'dealId': 'deal-mkt',
+        'level': 1.1234, 'size': 1.0, 'affectedDeals': [{'dealId': 'deal-mkt'}],
+    },
+}
+
+_LISTED_MARKET_DEAL = {'deal-mkt': {
+    'position': {'dealId': 'deal-mkt', 'direction': 'BUY', 'size': 1.0, 'level': 1.1234,
+                 'createdDateUTC': '2026-11-25T10:00:00.000'},
+    'market': {'epic': 'EURUSD'},
+}}
+
+
+def _fail_once(ctx, name, matches):
+    """Make the store method ``name`` raise a storage error on its first matching call."""
+    original = getattr(ctx, name)
+
+    def failing(*args, **kwargs):
+        if matches(*args, **kwargs):
+            setattr(ctx, name, original)
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(*args, **kwargs)
+
+    setattr(ctx, name, failing)
+
+
+async def _drain(agen):
+    return [event async for event in agen]
+
+
+_POST_WRITE_FAILURES = {
+    'deal_reference_ref': ('add_ref', lambda coid, ref_type, *_a, **_k: ref_type == 'deal_reference'),
+    'deal_reference_audit': ('log_event', lambda kind, *_a, **_k: kind == 'deal_reference_seen'),
+    'confirmed_state': ('upsert_order', lambda coid, **fields: fields.get('state') == 'confirmed'),
+    'confirmed_audit': ('log_event', lambda kind, *_a, **_k: kind == 'confirmed'),
+}
+
+
+@pytest.mark.parametrize('failure', sorted(_POST_WRITE_FAILURES))
+def __test_entry_whose_journal_write_after_the_post_failed_is_booked_by_the_poll__(
+        tmp_path, failure):
+    """The POST landed and the confirm reported the fill, but a journal write
+    after the POST failed. The entry parks ``disposition_unknown`` with its
+    ``dealReference`` instead of staying pending until a restart, and the next
+    poll books its fill exactly once from the confirm and the positions
+    snapshot."""
+    broker = _FakeBroker(config=_make_config(), responses=dict(_ACCEPTED_MARKET))
+    _seed_rules(broker)
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    envelope = _make_envelope(_make_intent(order_type=OrderType.MARKET), ctx.run_tag)
+    name, matches = _POST_WRITE_FAILURES[failure]
+    _fail_once(ctx, name, matches)
+    try:
+        with pytest.raises(OrderDispositionUnknownError) as parked:
+            asyncio.run(broker.execute_entry(envelope))
+        coid = parked.value.client_order_id
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'disposition_unknown'
+        assert (row.extras or {}).get('deal_reference') == 'ref-mkt'
+
+        events = asyncio.run(_drain(broker._reconcile_snapshot(_LISTED_MARKET_DEAL, {})))
+        fills = [e for e in events if e.event_type == 'filled']
+        assert [(e.order.client_order_id, e.fill_qty) for e in fills] == [(coid, 1.0)]
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'confirmed'
+        assert row.exchange_order_id == 'deal-mkt' and row.filled_qty == 1.0
+        again = asyncio.run(_drain(broker._reconcile_snapshot(_LISTED_MARKET_DEAL, {})))
+        assert [e for e in again if e.event_type == 'filled'] == []
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_entry_park_whose_write_fails_too_is_committed_by_the_next_poll__(tmp_path):
+    """The journal write after the POST fails, and so does the park write:
+    the dispatch still reports a typed unknown disposition, and the next poll
+    commits the park first and books the fill in the same pass."""
+    broker = _FakeBroker(config=_make_config(), responses=dict(_ACCEPTED_MARKET))
+    _seed_rules(broker)
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    envelope = _make_envelope(_make_intent(order_type=OrderType.MARKET), ctx.run_tag)
+    _fail_once(ctx, 'upsert_order', lambda coid, **fields: fields.get('state') == 'confirmed')
+    for _ in range(2):
+        # The Core journal's mark of the row and the plugin's park both fail.
+        _fail_once(ctx, 'set_order_state',
+                   lambda coid, state, *_a, **_k: state == 'disposition_unknown')
+    try:
+        with pytest.raises(OrderDispositionUnknownError) as parked:
+            asyncio.run(broker.execute_entry(envelope))
+        coid = parked.value.client_order_id
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'server_ref_seen'
+
+        events = asyncio.run(_drain(broker._reconcile_snapshot(_LISTED_MARKET_DEAL, {})))
+        fills = [e for e in events if e.event_type == 'filled']
+        assert [(e.order.client_order_id, e.fill_qty) for e in fills] == [(coid, 1.0)]
+        again = asyncio.run(_drain(broker._reconcile_snapshot(_LISTED_MARKET_DEAL, {})))
+        assert [e for e in again if e.event_type == 'filled'] == []
+        assert broker._deferred_parks == {}
+    finally:
+        ctx.close()
+        store.close()
+
+
+@pytest.mark.parametrize('failure', ['deal_reference_ref', 'confirmed_state'])
+def __test_entry_park_never_committed_is_recovered_once_by_the_restart__(tmp_path, failure):
+    """The journal write after the POST fails, the park write fails too, and
+    the process dies with the park still deferred: the row stays
+    ``submitted`` (no ``dealReference`` journaled) or ``server_ref_seen``. The
+    restart re-derives the entry from the venue (the stored reference, or the
+    deal's open activity) and takes the deal over once: the row is confirmed
+    filled on its deal, no POST goes out again, and no later poll books the
+    fill a second time (the engine adopts the venue position at startup)."""
+    broker = _FakeBroker(config=_make_config(), responses=dict(_ACCEPTED_MARKET))
+    _seed_rules(broker)
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    envelope = _make_envelope(_make_intent(order_type=OrderType.MARKET), ctx.run_tag)
+    name, matches = _POST_WRITE_FAILURES[failure]
+    _fail_once(ctx, name, matches)
+    for _ in range(2):
+        # The journal's own park of the row and the plugin's park both fail.
+        if failure == 'deal_reference_ref':
+            _fail_once(ctx, 'add_ref',
+                       lambda coid, ref_type, *_a, **_k: ref_type == 'deal_reference')
+        _fail_once(ctx, 'set_order_state',
+                   lambda coid, state, *_a, **_k: state == 'disposition_unknown')
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.execute_entry(envelope))
+    coid = parked.value.client_order_id
+    assert list(broker._deferred_parks) == [coid]
+    row = ctx.get_order(coid)
+    assert row is not None
+    assert row.state == ('submitted' if failure == 'deal_reference_ref' else 'server_ref_seen')
+    created = row.created_ts_ms / 1000.0
+    ctx.close()
+
+    position = {'position': {**_LISTED_MARKET_DEAL['deal-mkt']['position'],
+                             'dealReference': 'ref-mkt'},
+                'market': {'epic': 'EURUSD'}}
+    opened = datetime.fromtimestamp(created, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+    restarted = _FakeBroker(config=_make_config(), responses={
+        **_ACCEPTED_MARKET,
+        ('positions', 'get'): {'positions': [position]},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': [{
+            'epic': 'EURUSD', 'dealId': 'deal-mkt', 'type': 'POSITION', 'status': 'ACCEPTED',
+            'source': 'USER', 'dateUTC': opened,
+            'details': {'direction': 'BUY', 'size': 1.0, 'level': 1.1234},
+        }]},
+    })
+    _seed_rules(restarted)
+    restarted.store_ctx = ctx = store.open_run(
+        RunIdentity(strategy_id="contract", symbol="EURUSD", timeframe="60",
+                    account_id="contract-account"),
+        script_source="// contract",
+    )
+    try:
+        asyncio.run(restarted._recover_in_flight_submissions())
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'confirmed'
+        assert row.exchange_order_id == 'deal-mkt' and row.filled_qty == 1.0
+        assert ctx.find_by_ref('deal_id', 'deal-mkt').client_order_id == coid
+        listed = {'deal-mkt': position}
+        for _ in range(2):
+            events = asyncio.run(_drain(restarted._reconcile_snapshot(listed, {})))
+            assert [e for e in events if e.event_type == 'filled'] == []
+        assert [c[:2] for c in restarted._calls].count(('positions', 'post')) == 0
+    finally:
+        ctx.close()
+        store.close()
+
+
+def __test_working_entry_whose_journal_write_after_the_post_failed_gets_its_order_id__(
+        tmp_path):
+    """A LIMIT entry the venue placed, whose confirmed state could not be
+    journaled, learns its order id on the next poll, so the open-order view
+    maps the venue's working order back to it."""
+    broker = _FakeBroker(config=_make_config(), responses={
+        ('workingorders', 'post'): {'dealReference': 'ref-lim'},
+        ('confirms/ref-lim', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'ACCEPTED', 'dealId': 'deal-lim',
+            'level': 1.20, 'size': 1.0, 'affectedDeals': [{'dealId': 'deal-lim'}],
+        },
+    })
+    _seed_rules(broker)
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    envelope = _make_envelope(
+        _make_intent(order_type=OrderType.LIMIT, limit=1.20), ctx.run_tag)
+    _fail_once(ctx, 'upsert_order', lambda coid, **fields: fields.get('state') == 'confirmed')
+    try:
+        with pytest.raises(OrderDispositionUnknownError) as parked:
+            asyncio.run(broker.execute_entry(envelope))
+        coid = parked.value.client_order_id
+        asyncio.run(_drain(broker._reconcile_snapshot({}, {})))
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'confirmed'
+        assert row.exchange_order_id == 'deal-lim'
+        assert ctx.find_by_ref('deal_id', 'deal-lim').client_order_id == coid
+    finally:
+        ctx.close()
+        store.close()
+
+
+_REJECTED_MARKET = {
+    ('positions', 'post'): {'dealReference': 'ref-rej'},
+    ('confirms/ref-rej', 'get'): {'dealStatus': 'REJECTED', 'reason': 'RISK_CHECK'},
+}
+
+
+@pytest.mark.parametrize('after', ['running', 'restart', 'restart_confirm_expired'])
+def __test_rejected_entry_whose_reject_write_failed_is_never_sent_again__(tmp_path, after):
+    """The venue refused the entry, and the journal's booking of the refusal
+    fails, and so does its owed retry: the dispatch still surfaces the reject,
+    and the row is left ``server_ref_seen`` with its ``dealReference``. With ``running`` the
+    engine's next sync lands the owed reject; with ``restart`` the process
+    dies first and the restart's confirm read rejects the row; with
+    ``restart_confirm_expired`` the venue no longer serves the confirm and
+    lists nothing for the reference, and the inherited-submission resolver
+    rejects the row once the venue's answer held. Either way the row ends
+    rejected and closed, no POST goes out again for it, and nothing is
+    booked."""
+    broker = _FakeBroker(config=_make_config(), responses=dict(_REJECTED_MARKET))
+    _seed_rules(broker)
+    store, ctx = _open_store_ctx(tmp_path, broker)
+    engine = OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    envelope = _make_envelope(_make_intent(order_type=OrderType.MARKET), ctx.run_tag)
+    coid = envelope.client_order_id(KIND_ENTRY)
+    for _ in range(2):
+        # The journal's booking of the refusal fails, and so does its owed retry.
+        _fail_once(ctx, 'set_order_state', lambda c, state, *_a, **_k: state == 'rejected')
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_entry(envelope))
+    row = ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None and row.state == 'server_ref_seen'
+    events = asyncio.run(_drain(broker._reconcile_snapshot({}, {})))
+    assert [e for e in events if e.event_type == 'filled'] == []
+    assert ctx.get_order(coid).exchange_order_id is None
+
+    if after == 'running':
+        engine._flush_owed_store_writes()
+        row = ctx.get_order(coid)
+        assert row is not None and row.state == 'rejected' and row.closed_ts_ms is not None
+        assert [c[:2] for c in broker._calls].count(('positions', 'post')) == 1
+        ctx.close()
+        store.close()
+        return
+
+    ctx.close()
+    responses = {
+        **_REJECTED_MARKET,
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+    }
+    if after == 'restart_confirm_expired':
+        responses[('error', 'confirms/ref-rej', 'get')] = OrderNotFoundError(
+            'gone', ref_type='deal_reference')
+    restarted = _FakeBroker(config=_make_config(), responses=responses)
+    _seed_rules(restarted)
+    restarted.store_ctx = ctx = store.open_run(
+        RunIdentity(strategy_id="contract", symbol="EURUSD", timeframe="60",
+                    account_id="contract-account"),
+        script_source="// contract",
+    )
+    # The inherited-submission resolver looks at the row once it is past the
+    # venue's indexing grace, a lookup interval apart.
+    passes = iter(range(1, 100))
+    restarted._inherited_resolver._clock = lambda: epoch_time() + 3600.0 * next(passes)
+    try:
+        asyncio.run(restarted._recover_in_flight_submissions())
+        for _ in range(4):
+            events = asyncio.run(_drain(restarted._reconcile_snapshot({}, {})))
+            assert [e for e in events if e.event_type == 'filled'] == []
+        row = ctx.get_order_for_run_id(coid)
+        assert row is not None and row.exchange_order_id is None
+        assert row.state == 'rejected' and row.closed_ts_ms is not None
+        assert [c[:2] for c in restarted._calls].count(('positions', 'post')) == 0
+    finally:
+        ctx.close()
+        store.close()

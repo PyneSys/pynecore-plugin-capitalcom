@@ -30,7 +30,7 @@ import asyncio
 import collections
 import threading
 from abc import ABC
-from collections.abc import Container, Iterable
+from collections.abc import Container, Iterable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -139,6 +139,12 @@ class CapitalComHookCollaborator(Protocol):
     async def resolve_own_deal(
             self, row: 'OrderRow', deal_id: str,
     ) -> tuple[_DealVerdict, str]: ...
+
+    def park_after_venue_write(self, key: str, write: Callable[[], None]) -> None: ...
+
+    def park_unsettled_modify_exit(
+            self, command: 'OrderRow', deal_reference: str | None,
+    ) -> bool: ...
 
 
 class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
@@ -286,6 +292,16 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
         """Judge an own entry's deal after a not-found on ``deal_id``, for a hook."""
         return await self._resolve_own_deal(row, deal_id)
 
+    def park_after_venue_write(self, key: str, write: Callable[[], None]) -> None:
+        """Commit the park of a write the venue accepted, or retry it each poll, for a hook."""
+        self._park_after_venue_write(key, write)
+
+    def park_unsettled_modify_exit(
+            self, command: 'OrderRow', deal_reference: str | None,
+    ) -> bool:
+        """Hand a restart's unsettled bracket amend to the positions snapshot, for a hook."""
+        return self._park_unsettled_modify_exit(command, deal_reference)
+
     if TYPE_CHECKING:
         def __call__(
                 self,
@@ -384,8 +400,9 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     _activity_cursor: _ActivityCursor
     _instrument_rules_cache: dict[str, _InstrumentRules]
     _current_poll_id: int
-    # Epoch time the last successful activity read was issued; the next
-    # poll's ``lastPeriod`` reaches back past it (``_activity_lookback_s``).
+    # Epoch time the last successful activity read was issued, set once its
+    # whole batch is processed; the next poll's ``lastPeriod`` reaches back
+    # past it (``_activity_lookback_s``).
     _activity_polled_at: float
     # Lazily-built core disappearance tracker (reconcile.py owns it).
     _disappearance: 'DisappearanceTracker | None'
@@ -466,6 +483,11 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # fill is still unbooked, by client order id: first seen at (see
     # ``reconcile.py``, ``_unannounced_entry_fill``).
     _unannounced_fills_seen: dict[str, float]
+    # Park writes of venue writes the venue accepted whose journal write
+    # failed, retried at the start of every poll until they commit, by the
+    # parked row's client order id (see ``reconcile.py``,
+    # ``_park_after_venue_write``).
+    _deferred_parks: dict[str, Callable[[], None]]
     # Resolver of the entry submissions an earlier process left pending, and
     # the ones of them already reported as older than the activity history or
     # as indistinguishable from another pending submission (see
@@ -561,6 +583,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _extra_fields(self) -> dict[str, float] | None: ...
 
     # --- Execution (execution.py) ---
+    def _park_unsettled_modify_exit(
+            self, command: 'OrderRow', deal_reference: str | None,
+    ) -> bool: ...
+
     # PositionPort transport surface — real bodies on the execution mix-in;
     # declared here so the assembled plugin structurally satisfies the
     # protocol and ``_detect_account_mode`` can assign
@@ -575,6 +601,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             self, symbol: str, leg_id: str, volume: int, coid: str,
     ) -> None: ...
 
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids: 'Sequence[str]', since_ms: int,
+    ) -> int | None: ...
+
     async def reject_out_of_range(
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> None: ...
@@ -586,8 +616,14 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     async def amend_bracket(
             self, symbol: str, leg_id: str, *,
             side: str, tp_price: float | None, sl_price: float | None,
-            trail_offset: float | None, coid: str,
+            trail_offset: float | None, qty: float, coid: str,
     ) -> None: ...
+
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str, tp_price: float | None, sl_price: float | None,
+            trail_offset: float | None, qty: float,
+    ) -> bool | None: ...
 
     async def _execute_close_partial(self, *args: Any, **kwargs: Any) -> ExchangeOrder: ...
 
@@ -621,6 +657,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             self, closed_row: 'OrderRow', retired_exposure: float,
     ) -> None: ...
 
+    def _tear_down_natural_close(self, row: 'OrderRow') -> None: ...
+
     def _find_promoted_deal_id(
             self, *args: Any, **kwargs: Any,
     ) -> str | None: ...
@@ -628,6 +666,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _promote_working_row_to_position(
             self, *args: Any, **kwargs: Any,
     ) -> None: ...
+
+    def _settle_netted_residual_from_snapshot(
+            self, row: 'OrderRow', pos: dict, *, now_ts: float, read_started_at: float,
+    ) -> OrderEvent | None: ...
 
     def _note_residual_after_netting_retirement(
             self, wo_id: str, deal_id: str, activity_ts: float,
@@ -673,6 +715,12 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _held_protection(self, deal_id: str) -> 'ProtectionLevels | None': ...
 
+    @staticmethod
+    def _levels_from_put_body(body: dict) -> 'ProtectionLevels': ...
+
+    @staticmethod
+    def _levels_from_position(pos: dict) -> 'ProtectionLevels': ...
+
     def _claim_failsafe_protection(self, deal_ids: Iterable[str]) -> None: ...
 
     async def _observe_protection(
@@ -687,6 +735,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _rewrite_extras(self, coid: str, mutate: Callable[[dict], Any]) -> None: ...
 
     def _stamp_own_cancel_accepted(self, coid: str, sent_at: float) -> None: ...
+
+    def _own_cancel_accepted(self, coid: str) -> bool: ...
 
     def _own_cancel(self, coid: str) -> AbstractContextManager[float]: ...
 
@@ -840,6 +890,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     ) -> None: ...
 
     # --- Reconcile (reconcile.py) ---
+    def _park_after_venue_write(self, key: str, write: Callable[[], None]) -> None: ...
+
+    def _modify_exit_legs_refused(self, command: 'OrderRow') -> bool: ...
+
     def _reconcile_snapshot(
             self,
             *args: Any,

@@ -13,7 +13,9 @@ state transition is PERSIST-FIRST so a process crash mid-dispatch
 leaves an auditable row that ``_recover_in_flight_submissions`` can
 replay on restart).
 """
+import sqlite3
 from abc import ABC
+from collections.abc import Sequence
 from dataclasses import replace
 from time import time as epoch_time
 from typing import TYPE_CHECKING, Callable, cast
@@ -44,9 +46,16 @@ from pynecore.core.broker.idempotency import (
 )
 from pynecore.core.broker.emulator import aggregate_positions
 from pynecore.core.broker.journal import DispatchJournal
+from pynecore.core.broker.one_way_emulator import close_leg_row_client_order_id
 from pynecore.core.broker.store_helpers import (
+    CLOSE_LEG_STATE_PENDING,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    EXTRAS_KEY_CLOSE_LEG_ID,
+    PENDING_DISPATCH_STATES,
+    STATE_DISPOSITION_UNKNOWN,
+    mark_disposition_unknown,
+    update_close_leg_state,
 )
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
@@ -63,7 +72,7 @@ from pynecore.core.broker.models import (
     PositionLeg,
 )
 from pynecore.core.plugin import override
-from pynecore.lib.log import broker_warning
+from pynecore.lib.log import broker_error, broker_warning
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .exceptions import (
@@ -82,7 +91,7 @@ from .helpers import (
     _is_crossed_working_order_reject,
     _is_funds_reject,
     _is_market_closed_reject,
-    _mark_own_close_cursor_retired,
+    _modify_exit_dispatch,
     _parse_iso_timestamp,
     _position_legs_from_payload,
     _size_from_units,
@@ -97,6 +106,8 @@ if TYPE_CHECKING:
         SubmitOutcome,
     )
     from pynecore.core.broker.storage import OrderRow
+
+    from .dispatch_hooks import _CapitalComModifyExitHooks
 
 
 class _PositionDealPending(Exception):
@@ -352,6 +363,80 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             margin_mode=margin_mode,
         )
 
+    @staticmethod
+    def _bracket_put_body(
+            tp_price: float | None, sl_price: float | None, trail_offset: float | None,
+    ) -> dict:
+        """The ``PUT /positions/{dealId}`` body of one whole-bracket amend.
+
+        Every bracket field is set explicitly (full replacement). A
+        ``trail_offset`` takes the stop slot as the ``trailingStop`` +
+        ``stopDistance`` pair; otherwise the stop is the fixed ``stopLevel``.
+        """
+        body: dict = {
+            'profitLevel': float(tp_price) if tp_price is not None else None,
+        }
+        if trail_offset is not None:
+            body['trailingStop'] = True
+            body['stopDistance'] = float(trail_offset)
+        else:
+            body['trailingStop'] = False
+            body['stopLevel'] = (
+                float(sl_price) if sl_price is not None else None
+            )
+        return body
+
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            qty: float,
+    ) -> bool | None:
+        """Whether position row ``leg_id`` holds exactly the bracket this amend writes.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` transport
+        primitive. Reads ``GET /positions`` and compares the row's bracket
+        with the one :meth:`amend_bracket` would leave for the same levels
+        (:meth:`_bracket_put_body`): the trailing flag, the profit level, and
+        the stop level of a fixed stop. A trailing stop is identified by its
+        flag and its distance, never by its stop level, which the venue moves
+        itself. A trailing row whose payload leaves the distance out does not
+        show which distance it trails at: when its flag and profit level agree
+        with a trailing write, the answer is ``None``, "cannot tell" (the core
+        then re-asserts the write once after its settle window), where a
+        guessed match could leave an older distance in force. A row that is no
+        longer open matches no write.
+        """
+        del side, qty
+        rules = await self._get_instrument_rules(symbol)
+        res = await self._call('positions', method='get')
+        row = next(
+            (pos for pos in res.get('positions') or []
+             if str((pos.get('position') or {}).get('dealId') or '') == leg_id),
+            None,
+        )
+        if row is None:
+            return False
+        held = self._levels_from_position(row)
+        wanted = self._levels_from_put_body(
+            self._bracket_put_body(tp_price, sl_price, trail_offset))
+        tolerance = rules.price_tick / 2.0
+
+        def same(have: float | None, want: float | None) -> bool:
+            if have is None or want is None:
+                return have is want
+            return abs(have - want) <= tolerance
+
+        if held.trailing != wanted.trailing or not same(held.limit, wanted.limit):
+            return False
+        if wanted.trailing:
+            if held.trail_distance is None:
+                return None
+            return same(held.trail_distance, wanted.trail_distance)
+        return same(held.stop, wanted.stop)
+
     async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
         """Return the run's own open position rows ("legs") for ``symbol``, oldest first.
 
@@ -433,9 +518,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
 
     #: ``DELETE /positions/{dealId}`` is full-row only — it silently ignores
     #: any ``size`` parameter, body or query (measured on demo, 2026-07-10) —
-    #: so the core emulator must never plan a partial leg slice. A fractional
-    #: ``strategy.close(qty=...)`` on a hedging account becomes a loud
-    #: non-halting skip; partial closes need a one-way (netting) account.
+    #: so the core emulator never sends a partial leg slice. A fractional
+    #: ``strategy.close(qty=...)`` on a hedging account closes the whole leg
+    #: it would slice, with a warning; exact partial closes need a one-way
+    #: (netting) account.
     supports_partial_leg_close = False
 
     async def close_leg(
@@ -454,9 +540,23 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         An ambiguous transport fault maps to
         :class:`OrderDispositionUnknownError`: the emulator's close-leg
         ledger + restart replay reconcile the leg against the live book
-        and re-dispatch only the residual. A vanished leg is a benign
-        no-op (the close already landed or the row was swept broker-side;
-        the replay finalises the row).
+        and re-dispatch only the residual.
+
+        A not-found DELETE is a benign no-op only when the leg is gone (the
+        close already landed or the row was swept broker-side), judged by
+        :meth:`~pynecore_capitalcom.identity._DealIdentityMixin._resolve_own_deal`
+        as on the netting full close: the venue has answered not-found on a
+        deal ``/positions`` still listed (measured, cycle 65), and reporting
+        that as landed would drop a close the venue never made. A leg the
+        venue lists is DELETEd once more, a journal row that moved onto
+        another deal is closed there (the core's close-leg row is retargeted
+        to that deal first, so its replay follows the open position), and a
+        leg still materialising, or still
+        not addressable on the second try, raises
+        :class:`OrderDispositionUnknownError`: nothing closed, the core's
+        close-leg row stays pending for the replay. Without a journal row for
+        the leg there is nothing to judge it by, and the not-found stays
+        benign.
         """
         # ``volume`` is audit-only here: full-leg by contract, and a size is
         # not expressible on the DELETE wire anyway.
@@ -465,42 +565,136 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             store_ctx.find_by_ref('deal_id', leg_id)
             if store_ctx is not None else None
         )
-        try:
-            with self._own_close([leg_id], full=True, size=None):
-                await self._call(f'positions/{leg_id}', method='delete')
-        except OrderNotFoundError:
-            if store_ctx is not None:
-                store_ctx.log_event(
-                    'close_already_gone',
-                    client_order_id=(
-                        entry_row.client_order_id if entry_row else coid
-                    ),
-                    exchange_order_id=leg_id,
-                )
-            return
-        except ExchangeConnectionError as net:
-            # ``_call`` maps httpx transport faults to
-            # ``ExchangeConnectionError`` centrally; at THIS dispatch site a
-            # DELETE was in flight, so the leg's fate is genuinely unknown.
-            raise OrderDispositionUnknownError(
-                f"Capital DELETE positions/{leg_id} ({symbol}) ambiguous "
-                f"during one-way leg close: {net}",
-                client_order_id=coid,
-                cause=net,
-            ) from net
+        deal_id = leg_id
+        for attempt in range(2):
+            try:
+                with self._own_close([deal_id], full=True, size=None):
+                    await self._call(f'positions/{deal_id}', method='delete')
+                break
+            except OrderNotFoundError as missing:
+                if entry_row is None or store_ctx is None:
+                    if store_ctx is not None:
+                        store_ctx.log_event(
+                            'close_already_gone',
+                            client_order_id=coid,
+                            exchange_order_id=deal_id,
+                        )
+                    return
+                try:
+                    verdict, current = await self._resolve_own_deal(entry_row, deal_id)
+                except ExchangeConnectionError as net:
+                    raise OrderDispositionUnknownError(
+                        f"Capital DELETE positions/{deal_id} ({symbol}) not found "
+                        f"and the deal could not be judged: {net}",
+                        client_order_id=coid,
+                        cause=net,
+                    ) from net
+                if verdict is _DealVerdict.GONE:
+                    store_ctx.log_event(
+                        'close_already_gone',
+                        client_order_id=entry_row.client_order_id,
+                        exchange_order_id=deal_id,
+                    )
+                    return
+                if verdict is _DealVerdict.MATERIALISING or attempt == 1:
+                    # The deal is the run's and is not gone, but the venue
+                    # cannot route a close to it yet: nothing closed. The
+                    # close-leg row stays pending for the replay.
+                    store_ctx.log_event(
+                        'close_target_not_addressable',
+                        client_order_id=entry_row.client_order_id,
+                        exchange_order_id=deal_id,
+                        payload={'verdict': verdict.value, 'deal_id': current},
+                    )
+                    raise OrderDispositionUnknownError(
+                        f"Capital DELETE positions/{deal_id} ({symbol}) not found "
+                        f"while the deal is {verdict.value} (the entry holds "
+                        f"{current}): the leg close did not land",
+                        client_order_id=coid,
+                        cause=missing,
+                    ) from missing
+                if current != deal_id:
+                    # The position lives on under another dealId. The core's
+                    # close-leg row is retargeted BEFORE that DELETE goes out,
+                    # so a replay of an unresolved close asks about, and
+                    # re-sends to, the deal that is still open instead of
+                    # settling on the old id's absence.
+                    row_coid = close_leg_row_client_order_id(coid)
+                    if store_ctx.get_order(row_coid) is not None:
+                        update_close_leg_state(
+                            store_ctx, coid=row_coid,
+                            new_state=CLOSE_LEG_STATE_PENDING,
+                            extras_patch={EXTRAS_KEY_CLOSE_LEG_ID: current},
+                        )
+                deal_id = current
+            except ExchangeConnectionError as net:
+                # ``_call`` maps httpx transport faults to
+                # ``ExchangeConnectionError`` centrally; at THIS dispatch site a
+                # DELETE was in flight, so the leg's fate is genuinely unknown.
+                raise OrderDispositionUnknownError(
+                    f"Capital DELETE positions/{deal_id} ({symbol}) ambiguous "
+                    f"during one-way leg close: {net}",
+                    client_order_id=coid,
+                    cause=net,
+                ) from net
         # Bookkeeping AFTER the wire call, mirroring the netting full-close
         # hook: the core close-leg ledger row (written persist-first by the
         # emulator before this call) owns the crash window, so the entry
         # row's ``closing`` mirror only needs to reflect a dispatch that
         # actually went out.
+        # The state and its audit are one write; a failed write after the
+        # DELETE landed parks the leg close (the core's close-leg row keeps its
+        # reservation and is settled from the venue's evidence) instead of
+        # escaping as a raw storage error.
         if store_ctx is not None and entry_row is not None:
-            store_ctx.set_order_state(entry_row.client_order_id, 'closing')
-            store_ctx.log_event(
-                'close_dispatched',
-                client_order_id=entry_row.client_order_id,
-                exchange_order_id=leg_id,
-                payload={'leg_volume': volume, 'leg_coid': coid},
-            )
+            try:
+                with store_ctx.transaction():
+                    store_ctx.set_order_state(entry_row.client_order_id, 'closing')
+                    store_ctx.log_event(
+                        'close_dispatched',
+                        client_order_id=entry_row.client_order_id,
+                        exchange_order_id=deal_id,
+                        payload={'leg_volume': volume, 'leg_coid': coid},
+                    )
+            except sqlite3.Error as failed:
+                broker_error(
+                    "close of leg %s (%s) landed, but its closing state could not be "
+                    "journaled (%s); the leg close is settled from venue data",
+                    deal_id, symbol, failed,
+                )
+                raise OrderDispositionUnknownError(
+                    f"Capital DELETE positions/{deal_id} ({symbol}) landed, but the "
+                    f"entry's closing state could not be journaled: {failed}",
+                    client_order_id=coid,
+                    cause=failed,
+                ) from failed
+
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids: 'Sequence[str]', since_ms: int,
+    ) -> int | None:
+        """What the closes sent for a still-open position row executed: nothing.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` primitive. A close
+        here is ``DELETE /positions/{dealId}``, which removes the whole row or
+        nothing (:attr:`supports_partial_leg_close` is ``False``), so a row the
+        core still sees open was not closed by any of them. A DELETE that is
+        still in flight cannot close more either: it targets the same dealId a
+        re-send does, and the row can be deleted only once (the later DELETE
+        answers not-found, a benign no-op in :meth:`close_leg`).
+
+        The answer cannot authorize a duplicate close. The core asks only
+        while ``leg_id`` is listed open (a leg missing from
+        :meth:`fetch_raw_positions` settles the close without a re-send), and
+        the only re-send it can make is :meth:`close_leg` on that same
+        ``leg_id``. When an earlier DELETE executed but the ``/positions`` read
+        still lists the row (a lagging read), the re-send's DELETE meets a
+        removed row and answers not-found; it never reaches another position,
+        because the DELETE names the row by its own dealId and a position a
+        later entry opens has a dealId of its own. That Capital.com never hands a closed position's dealId to a new
+        position is not measured; no reuse has been observed.
+        """
+        del symbol, leg_id, coids, since_ms
+        return 0
 
     async def amend_bracket(
             self, symbol: str, leg_id: str, *,
@@ -508,6 +702,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             tp_price: float | None,
             sl_price: float | None,
             trail_offset: float | None,
+            qty: float,
             coid: str,
     ) -> None:
         """Replicate (or clear) a protective bracket on ONE position row.
@@ -553,7 +748,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         moved inside the minimum distance since it was set is no reason to
         refuse the amend. Whether the venue accepts such a restated level is
         its own call; its reject propagates like any other.
+
+        ``qty`` is unused: a row's bracket covers the whole row, which is all
+        the core ever asks of this port (``sized_leg_bracket`` is declared
+        ``SOFTWARE``).
         """
+        del qty
         # Same live-mid pre-check as the netting bracket paths: turns an
         # obviously-rejectable level into the typed distance error before
         # the round-trip. Distance violations subclass
@@ -579,17 +779,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 rules, mid_price, float(tp_price), position_side,
             )
 
-        body: dict = {
-            'profitLevel': float(tp_price) if tp_price is not None else None,
-        }
-        if trail_offset is not None:
-            body['trailingStop'] = True
-            body['stopDistance'] = float(trail_offset)
-        else:
-            body['trailingStop'] = False
-            body['stopLevel'] = (
-                float(sl_price) if sl_price is not None else None
-            )
+        body = self._bracket_put_body(tp_price, sl_price, trail_offset)
 
         # Full replacement: the body is the whole protection the row
         # carries afterwards.
@@ -620,17 +810,25 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 ) from exc
 
             if self.store_ctx is not None:
-                self.store_ctx.log_event(
-                    'one_way_bracket_amend',
-                    client_order_id=coid,
-                    exchange_order_id=leg_id,
-                    payload={
-                        'side': side,
-                        'tp_price': tp_price,
-                        'sl_price': sl_price,
-                        'trail_offset': trail_offset,
-                    },
-                )
+                try:
+                    self.store_ctx.log_event(
+                        'one_way_bracket_amend',
+                        client_order_id=coid,
+                        exchange_order_id=leg_id,
+                        payload={
+                            'side': side,
+                            'tp_price': tp_price,
+                            'sl_price': sl_price,
+                            'trail_offset': trail_offset,
+                        },
+                    )
+                except sqlite3.Error as failed:
+                    # Only an audit: the amend's outcome is still settled from
+                    # its confirm below, which a raw storage error would skip.
+                    broker_error(
+                        "bracket amend of leg %s (%s) went out, but its audit could "
+                        "not be journaled (%s)", leg_id, symbol, failed,
+                    )
             deal_ref = resp.get('dealReference') if isinstance(resp, dict) else None
             if not deal_ref:
                 # No dealReference to confirm — treat the round-trip as success;
@@ -906,6 +1104,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 symbol=intent.symbol, foreign=refused.foreign_deals,
                 write=write, latch=False,
             ) from refused
+        except OrderDispositionUnknownError as unknown:
+            if isinstance(unknown.__cause__, sqlite3.Error):
+                self._park_entry_after_journal_failure(coid, hooks.server_ref, unknown.__cause__)
+            raise
         except PositionSnapshotUnavailableError as unavailable:
             # Nothing left the client: the signal is retried on the next sync.
             # A skip, not an exchange reject, so a read outage never counts
@@ -922,6 +1124,48 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # on, listed by ``/positions`` or not (see ``identity.py``).
             self._note_entry_fill_unlisted(coid)
         return orders
+
+    def _park_entry_after_journal_failure(
+            self, coid: str, server_ref: str | None, failed: sqlite3.Error,
+    ) -> None:
+        """Park an entry whose journal write failed after the venue call.
+
+        The journal raised the storage failure as an unknown disposition, but
+        the row is left in its pending state, which only a restart's recovery
+        reads. Parked ``disposition_unknown`` with the POST's
+        ``dealReference``, the row is the poll's to settle from venue data
+        (:meth:`~pynecore_capitalcom.reconcile._ReconcileMixin._resolve_parked_submission_dispositions`):
+        the confirm decides whether the entry landed, and a landed one is
+        taken over and its fill booked. The park is one transaction, retried
+        on every poll until it commits.
+
+        :param coid: The entry's client order id.
+        :param server_ref: The ``dealReference`` the POST returned, when it did.
+        :param failed: The storage failure.
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+
+        def park() -> None:
+            with store_ctx.transaction():
+                row = store_ctx.get_order(coid)
+                if (row is None or row.closed_ts_ms is not None or row.exchange_order_id
+                        or row.state not in PENDING_DISPATCH_STATES):
+                    return
+                extras = row.extras or {}
+                if server_ref is not None and extras.get('deal_reference') is None:
+                    store_ctx.add_ref(coid, 'deal_reference', server_ref)
+                    store_ctx.upsert_order(coid, extras={**extras, 'deal_reference': server_ref})
+                mark_disposition_unknown(store_ctx, coid=coid)
+                store_ctx.log_event(
+                    'disposition_unknown',
+                    client_order_id=coid,
+                    intent_key=row.intent_key,
+                    payload={'phase': 'journal', 'deal_reference': server_ref,
+                             'reason': str(failed)},
+                )
+
+        self._park_after_venue_write(coid, park)
 
     async def _put_bracket_with_notfound_retry(
             self, target_row: 'OrderRow', deal_id: str, body: dict,
@@ -1741,40 +1985,67 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 protection.accepted()
 
         # --- Mark legs confirmed + persist risk on entry row ---
+        # One transaction: a leg left ``submitted`` beside a confirmed one is
+        # settled by no pass while the process runs. When it fails, the legs
+        # the PUT carried go to the snapshot as after an unreadable confirm,
+        # and the exit parks until the venue's levels resolve them.
         if self.store_ctx is not None:
-            if intent.tp_price is not None:
-                self.store_ctx.set_order_state(tp_coid, 'confirmed')
-            if has_sl_leg:
-                # ``confirmed`` even when trailing is pending — the row
-                # exists; the activation monitor promotes it to active.
-                self.store_ctx.set_order_state(sl_coid, 'confirmed')
-            self.store_ctx.set_risk(
-                target_row.client_order_id,
-                sl=intent.sl_price, tp=intent.tp_price,
-                trailing_distance=intent.trail_offset,
-                trailing_stop=(intent.trail_offset is not None and not trail_pending),
-            )
-            self.store_ctx.log_event(
-                'bracket_attached',
-                client_order_id=target_row.client_order_id,
-                exchange_order_id=deal_id,
-                intent_key=intent.intent_key,
-                payload={
-                    'tp': intent.tp_price, 'sl': intent.sl_price,
-                    'trail_offset': intent.trail_offset,
-                    'trail_activation': intent.trail_price,
-                    'trail_pending': trail_pending,
-                },
-            )
-            for row in superseded:
-                self.store_ctx.close_order(row.client_order_id)
-                self.store_ctx.log_event(
-                    'bracket_leg_superseded',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=deal_id,
-                    intent_key=intent.intent_key,
-                    payload={'leg_kind': (row.extras or {}).get('leg_kind')},
-                )
+            try:
+                with self.store_ctx.transaction():
+                    if intent.tp_price is not None:
+                        self.store_ctx.set_order_state(tp_coid, 'confirmed')
+                    if has_sl_leg:
+                        # ``confirmed`` even when trailing is pending — the row
+                        # exists; the activation monitor promotes it to active.
+                        self.store_ctx.set_order_state(sl_coid, 'confirmed')
+                    self.store_ctx.set_risk(
+                        target_row.client_order_id,
+                        sl=intent.sl_price, tp=intent.tp_price,
+                        trailing_distance=intent.trail_offset,
+                        trailing_stop=(intent.trail_offset is not None and not trail_pending),
+                    )
+                    self.store_ctx.log_event(
+                        'bracket_attached',
+                        client_order_id=target_row.client_order_id,
+                        exchange_order_id=deal_id,
+                        intent_key=intent.intent_key,
+                        payload={
+                            'tp': intent.tp_price, 'sl': intent.sl_price,
+                            'trail_offset': intent.trail_offset,
+                            'trail_activation': intent.trail_price,
+                            'trail_pending': trail_pending,
+                        },
+                    )
+                    for row in superseded:
+                        self.store_ctx.close_order(row.client_order_id)
+                        self.store_ctx.log_event(
+                            'bracket_leg_superseded',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=deal_id,
+                            intent_key=intent.intent_key,
+                            payload={'leg_kind': (row.extras or {}).get('leg_kind')},
+                        )
+            except sqlite3.Error as failed:
+                if not body or (intent.tp_price is None and not sl_in_body):
+                    # Nothing went to the venue, or no leg the snapshot could
+                    # resolve: the rolled-back journal is the whole state.
+                    raise
+                with self.store_ctx.transaction():
+                    self._mark_bracket_legs_disposition_unknown(
+                        intent=intent, parent_coid=target_row.client_order_id,
+                        deal_id=deal_id,
+                        tp_coid=tp_coid if intent.tp_price is not None else None,
+                        sl_coid=sl_coid if sl_in_body else None,
+                        reason=f"attach bookkeeping failed: {failed}", stage='journal',
+                    )
+                    if has_sl_leg and not sl_in_body:
+                        self.store_ctx.set_order_state(sl_coid, 'confirmed')
+                raise OrderDispositionUnknownError(
+                    f"Capital bracket on {deal_id} was accepted, but its legs could "
+                    f"not be journaled: {failed}",
+                    client_order_id=target_row.client_order_id,
+                    cause=failed,
+                ) from failed
 
         # --- Build canonical ExchangeOrder legs ---
         legs: list[ExchangeOrder] = []
@@ -1994,49 +2265,53 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     # Same invariants the reconcile loop's working-to-position
                     # promotion path enforces (see :meth:`reconcile.run` →
                     # ``working_to_position`` branch).
-                    self.store_ctx.upsert_order(
-                        synthetic_coid,
-                        symbol=intent.symbol,
-                        side='buy' if direction == 'BUY' else 'sell',
-                        qty=size,
-                        filled_qty=size,
-                        state='confirmed',
-                        exchange_order_id=deal_id,
-                        pine_entry_id=parent_from_entry,
-                        from_entry=parent_from_entry,
-                        extras={
-                            'kind': 'position',
-                            'entry_filled_at': epoch_time(),
-                            'orphan_close_synthetic': True,
-                        },
-                    )
-                    # Mirror the normal entry path's ``deal_id`` ref so the
-                    # activity loop's ``find_by_ref('deal_id', deal_id)`` lookup
-                    # in :meth:`CapitalcomActivityLoop._process_activity_batch`
-                    # resolves the close-leg activity back to this synthetic
-                    # row. Without the ref, the close activity is classified as
-                    # external; the row never advances to ``closed``, picks up
-                    # ``missing_pending_since`` after the next ``/positions``
-                    # poll drops the deal, and the grace window can fire a
-                    # false ``UnexpectedCancelError`` even though the defensive
-                    # DELETE succeeded.
-                    self.store_ctx.add_ref(
-                        synthetic_coid, 'deal_id', deal_id,
-                    )
-                    rebuilt = self.store_ctx.get_order(synthetic_coid)
-                    if rebuilt is not None:
-                        targets.append(rebuilt)
-                    self.store_ctx.log_event(
-                        'orphan_close_target_synthesised',
-                        client_order_id=synthetic_coid,
-                        exchange_order_id=deal_id,
-                        intent_key=intent.intent_key,
-                        payload={
-                            'symbol': intent.symbol,
-                            'broker_direction': direction,
-                            'size': size,
-                        },
-                    )
+                    # The row, its ``deal_id`` ref and the audit commit
+                    # together: a row without the ref would be a live
+                    # position row the close activity cannot find.
+                    with self.store_ctx.transaction():
+                        self.store_ctx.upsert_order(
+                            synthetic_coid,
+                            symbol=intent.symbol,
+                            side='buy' if direction == 'BUY' else 'sell',
+                            qty=size,
+                            filled_qty=size,
+                            state='confirmed',
+                            exchange_order_id=deal_id,
+                            pine_entry_id=parent_from_entry,
+                            from_entry=parent_from_entry,
+                            extras={
+                                'kind': 'position',
+                                'entry_filled_at': epoch_time(),
+                                'orphan_close_synthetic': True,
+                            },
+                        )
+                        # Mirror the normal entry path's ``deal_id`` ref so the
+                        # activity loop's ``find_by_ref('deal_id', deal_id)`` lookup
+                        # in :meth:`CapitalcomActivityLoop._process_activity_batch`
+                        # resolves the close-leg activity back to this synthetic
+                        # row. Without the ref, the close activity is classified as
+                        # external; the row never advances to ``closed``, picks up
+                        # ``missing_pending_since`` after the next ``/positions``
+                        # poll drops the deal, and the grace window can fire a
+                        # false ``UnexpectedCancelError`` even though the defensive
+                        # DELETE succeeded.
+                        self.store_ctx.add_ref(
+                            synthetic_coid, 'deal_id', deal_id,
+                        )
+                        rebuilt = self.store_ctx.get_order(synthetic_coid)
+                        if rebuilt is not None:
+                            targets.append(rebuilt)
+                        self.store_ctx.log_event(
+                            'orphan_close_target_synthesised',
+                            client_order_id=synthetic_coid,
+                            exchange_order_id=deal_id,
+                            intent_key=intent.intent_key,
+                            payload={
+                                'symbol': intent.symbol,
+                                'broker_direction': direction,
+                                'size': size,
+                            },
+                        )
 
         if not targets:
             # A DELETE mirrors its target row to ``closing`` until the venue's
@@ -2237,6 +2512,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             plugin=self,
             rules=rules,
             target_deal_ids=close_target_ids,
+            target_coid=(targets[0].client_order_id
+                         if kind == KIND_PARTIAL_CLOSE and targets else None),
         )
         journal = DispatchJournal(self.store_ctx)
         try:
@@ -2271,44 +2548,6 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 reason='close_preflight_unavailable',
                 context={'symbol': intent.symbol, 'write': close_write},
             ) from unavailable
-        if kind == KIND_PARTIAL_CLOSE and targets:
-            # The journal's ``filled_qty`` doubles as the run-owned exposure
-            # cursor (K3 cycle-end book, adoption clamp, and the fold-netting
-            # ``retired_exposure`` all read it). The emulated partial close
-            # reduced the venue deal, so the target row's cursor must drop by
-            # the closed amount or every later consumer sees the pre-partial
-            # exposure — measured live on cycle 32: the inflated cursor made
-            # the next reversal fold over-net, close the fold row at
-            # retained=0, orphan its own entry activity (ignored as external,
-            # fill lost) and end the cycle at venue 0.01 vs journal 0.
-            # ``row.qty`` stays the original traded volume (the full-vs-
-            # partial router above resolves live size at the venue seam).
-            target = targets[0]
-            refreshed = self.store_ctx.get_order(target.client_order_id)
-            if refreshed is not None:
-                closed_qty = float(exch_order.filled_qty)
-                reduced = max(0.0, refreshed.filled_qty - closed_qty)
-                extras = dict(refreshed.extras or {})
-                extras['partial_close_retired_at'] = epoch_time()
-                command = self.store_ctx.get_order(coid)
-                _mark_own_close_cursor_retired(
-                    extras, (command.extras or {}).get('own_close_sent_at')
-                    if command is not None else None,
-                )
-                self.store_ctx.upsert_order(
-                    target.client_order_id,
-                    filled_qty=reduced,
-                    extras=extras,
-                )
-                self.store_ctx.log_event(
-                    'partial_close_journal_retired',
-                    client_order_id=target.client_order_id,
-                    exchange_order_id=target.exchange_order_id,
-                    payload={
-                        'retired_exposure': closed_qty,
-                        'remaining_exposure': reduced,
-                    },
-                )
         return exch_order
 
     async def execute_cancel(
@@ -2436,7 +2675,12 @@ class _ExecutionMixin(_CapitalComBase, ABC):
           (idempotent), an expiry / rejection without fill →
           :attr:`CancelDispositionOutcome.TOO_LATE_TO_CANCEL` (terminal
           non-fill). No terminal row →
-          :attr:`CancelDispositionOutcome.UNKNOWN` so the loop retries.
+          :attr:`CancelDispositionOutcome.UNKNOWN` so the loop retries. A row
+          an earlier DELETE of which the venue accepted
+          (:meth:`~pynecore_capitalcom.intervention._InterventionMixin._own_cancel_accepted`)
+          is :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED` without the
+          history: that DELETE cancelled the resting order, also when its
+          booking could not be journaled.
         * Transient network failure → :class:`OrderDispositionUnknownError`
           (the cancel-tentative stays armed, but the probe does not count as
           an answer from the venue).
@@ -2445,7 +2689,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         so bracket-leg and filled-position rows are not classified here; an
         empty working-order target set returns
         :attr:`CancelDispositionOutcome.UNKNOWN` rather than fabricating a
-        resolution.
+        resolution, unless the entry has no live row other than the ones its
+        working order's fill moved onto the position and its last order's
+        journaled ending answers the probe
+        (:meth:`_ended_working_order_outcome`).
 
         A take-over held because its fill could not be proven
         (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
@@ -2472,6 +2719,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
 
         outcomes: list[CancelDispositionOutcome] = []
         targets: list[tuple[str, str]] = []
+        entry_live = False
+        promoted: list['OrderRow'] = []
         for row in self.store_ctx.iter_live_orders(
                 from_entry=intent.from_entry,
         ):
@@ -2484,6 +2733,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             extras = row.extras or {}
             if extras.get('leg_kind') in ('tp', 'sl'):
                 continue
+            if extras.get('promoted_from_working_order_id') is not None:
+                promoted.append(row)
+                continue
+            entry_live = True
             if extras.get('kind', ENTRY_KIND_POSITION) != ENTRY_KIND_WORKING:
                 continue
             if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
@@ -2494,6 +2747,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 targets.append((row.client_order_id, row.exchange_order_id))
 
         if not targets:
+            if not entry_live and not outcomes:
+                ended = self._ended_working_order_outcome(intent, promoted)
+                if ended is not None:
+                    return ended
             return CancelDispositionOutcome.UNKNOWN
 
         for coid, deal_id in targets:
@@ -2511,7 +2768,14 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     client_order_id=coid, cause=exc,
                 ) from exc
             except OrderNotFoundError:
-                resolved = await self._classify_cancel_via_activity(deal_id)
+                # An earlier DELETE of this order the venue accepted while it
+                # was still resting cancelled it: the 404 now is that cancel,
+                # whether or not its booking was journaled and whether or not
+                # the activity history still lists it.
+                if self._own_cancel_accepted(coid):
+                    resolved = CancelDispositionOutcome.CANCEL_CONFIRMED
+                else:
+                    resolved = await self._classify_cancel_via_activity(deal_id)
                 outcomes.append(self._finalize_cancel_outcome_row(
                     coid, deal_id, resolved, intent=intent,
                     already_gone=True,
@@ -2537,6 +2801,65 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             return CancelDispositionOutcome.UNKNOWN
         if CancelDispositionOutcome.TOO_LATE_TO_CANCEL in outcomes:
             return CancelDispositionOutcome.TOO_LATE_TO_CANCEL
+        return CancelDispositionOutcome.CANCEL_CONFIRMED
+
+    def _ended_working_order_outcome(
+            self, intent: CancelIntent, promoted: 'list[OrderRow]',
+    ) -> CancelDispositionOutcome | None:
+        """The cancel outcome the journal holds for an entry order that already ended.
+
+        The probe of a cancel can find no working order of its entry left:
+        the order ended meanwhile, by a booking of this process that the
+        probe's caller never saw (its result raised), or by a restart that
+        judged the order gone from the venue (``_retire_startup_orphans``) or
+        booked its fill, where the engine re-arms the cancel from its
+        journal. The entry's most recently placed working order is the one
+        the cancel aims at: a closed working-order row, or a row the order's
+        fill moved onto its position (``promoted_from_working_order_id``),
+        live or closed. Closed without a fill, the order is gone without one,
+        which the probe reports as a confirmed cancel; still live on its
+        open position, the order filled, which the probe reports as filled.
+        A row whose fill is booked (``filled_qty`` or ``entry_filled_at``) and
+        whose position closed (a closed row, or a live one its bracket's fill
+        stamped ``natural_close_at``) is reported as filled and closed: the
+        order filled, but its position is no longer open to restore
+        protection onto. A live row stamped ``natural_close_at`` whose fill
+        the journal does not show decides nothing.
+
+        :param intent: The cancel's intent.
+        :param promoted: The entry's live rows its working order's fill moved
+            onto the position.
+        :return: :attr:`CancelDispositionOutcome.CANCEL_CONFIRMED`,
+            :attr:`CancelDispositionOutcome.ALREADY_FILLED`,
+            :attr:`CancelDispositionOutcome.FILLED_AND_CLOSED`, or ``None``
+            when no ending of the entry's last order decides the cancel.
+        """
+        assert self.store_ctx is not None
+        ended: 'OrderRow | None' = None
+        for row in self.store_ctx.iter_orders_closed_since_for_run_id(0):
+            extras = row.extras or {}
+            if (extras.get('leg_kind') is not None
+                    or (extras.get('kind') != ENTRY_KIND_WORKING
+                        and extras.get('promoted_from_working_order_id') is None)
+                    or not (row.pine_entry_id == intent.pine_id
+                            or (intent.from_entry is not None
+                                and row.from_entry == intent.from_entry))):
+                continue
+            if ended is None or row.created_ts_ms >= ended.created_ts_ms:
+                ended = row
+        for row in promoted:
+            if ended is None or row.created_ts_ms >= ended.created_ts_ms:
+                ended = row
+        if ended is None:
+            return None
+        extras = ended.extras or {}
+        fill_booked = ended.filled_qty > 0.0 or extras.get('entry_filled_at') is not None
+        if ended.closed_ts_ms is None:
+            if extras.get('natural_close_at') is None:
+                return CancelDispositionOutcome.ALREADY_FILLED
+            return CancelDispositionOutcome.FILLED_AND_CLOSED if fill_booked else None
+        if fill_booked:
+            return CancelDispositionOutcome.FILLED_AND_CLOSED
         return CancelDispositionOutcome.CANCEL_CONFIRMED
 
     def _hold_take_over_dispatch(self, row: 'OrderRow', action: str) -> None:
@@ -2910,7 +3233,6 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         state machine.
         """
         from pynecore.core.broker.journal import DispatchJournal, ModifyExitOutcome
-        from .dispatch_hooks import _CapitalComModifyExitHooks
 
         old_i = old.intent
         new_i = new.intent
@@ -2966,6 +3288,110 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 from_entry=new_i.from_entry,
                 level_crossed=exc.level_crossed,
             ) from exc
+
+        tp_coid = new.client_order_id(KIND_EXIT_TP)
+        sl_coid = new.client_order_id(KIND_EXIT_SL)
+        planned = self._plan_modify_exit(
+            target_row, old_i, new_i, tp_coid=tp_coid, sl_coid=sl_coid,
+        )
+        if planned is None:
+            return []
+        body, hooks = planned
+        effective_tp_coid, effective_sl_coid = hooks.effective_leg_coids
+        coid = new.client_order_id(KIND_MODIFY_EXIT)
+
+        if body:
+            # Wire round-trip required — run through the Core journal so
+            # the entry-side command row is persisted and state-machined.
+            # The hook owns the PUT + confirm + ambiguous-path seeding.
+            if self.store_ctx is None:
+                raise RuntimeError(
+                    "modify_exit requires a live BrokerStore context"
+                )
+            journal = DispatchJournal(self.store_ctx)
+            try:
+                return await journal.run_modify_exit(
+                    coid=coid,
+                    target_coid=target_row.client_order_id,
+                    target_row=target_row,
+                    old_intent=old_i,
+                    new_intent=new_i,
+                    qty=target_row.qty,
+                    hooks=hooks,
+                    audit_payload={'pine_id': new_i.pine_id,
+                                   'from_entry': new_i.from_entry,
+                                   'tp_coid': effective_tp_coid,
+                                   'sl_coid': effective_sl_coid,
+                                   'envelope_tp_coid': tp_coid,
+                                   'envelope_sl_coid': sl_coid},
+                )
+            except OrderDispositionUnknownError as unknown:
+                # A journal write the Core makes after the PUT failed (the
+                # ``dealReference``, or the park of an ambiguous PUT): the
+                # Core parks the amend under the command's id with the legs
+                # untouched, where nothing the poll resolves would release it.
+                # Parked like a failed mirror, the snapshot settles it.
+                failed = unknown.__cause__
+                if unknown.client_order_id != coid or not isinstance(failed, sqlite3.Error):
+                    raise
+                park_hooks = hooks
+                if hooks.mirror_committed:
+                    # The legs carry the amend already: parked from the bracket
+                    # they hold, as a restart parks it
+                    # (:meth:`_park_unsettled_modify_exit`), never from the
+                    # bracket before the amend, whose transition (a stop
+                    # replaced by a local pending trail) would refuse the legs
+                    # the venue holds.
+                    replanned = self._plan_modify_exit(
+                        target_row, self._bracket_held_by_legs(target_row, new_i), new_i,
+                        tp_coid=tp_coid, sl_coid=sl_coid,
+                    )
+                    if replanned is not None:
+                        park_hooks = replanned[1]
+                raise park_hooks.park_after_journal_failure(
+                    new_i, failed, stage='journal', deal_reference=hooks.accepted_ref or None,
+                    command_coid=coid,
+                ) from failed
+
+        # Pure local seed amend (e.g. pending-trail bookkeeping with an
+        # empty PUT body): no broker round-trip means there is nothing
+        # for the journal to state-machine. Apply the post-success mirror
+        # directly so the leg rows and entry-row risk snapshot are
+        # consistent with the new intent. All of it or none: the venue holds
+        # nothing of this amend, so a failed write leaves the old bracket.
+        if self.store_ctx is not None:
+            with self.store_ctx.transaction():
+                hooks.apply_mirror(target_row=target_row, new_intent=new_i)
+        else:
+            hooks.apply_mirror(target_row=target_row, new_intent=new_i)
+        return hooks.exchange_order_from_state(
+            row=target_row, new_intent=new_i,
+            outcome=ModifyExitOutcome(
+                server_ref='', deal_status='ACCEPTED',
+                rejected_reason=None, post_put_state={}, raw=None,
+            ),
+        )
+
+    def _plan_modify_exit(
+            self, target_row: 'OrderRow', old_i: ExitIntent, new_i: ExitIntent, *,
+            tp_coid: str, sl_coid: str,
+    ) -> 'tuple[dict, _CapitalComModifyExitHooks] | None':
+        """Build the ``PUT /positions/{dealId}`` body of a bracket amend and its hooks.
+
+        One derivation for the amend (:meth:`modify_exit`) and for the restart
+        that parks an amend whose park never committed
+        (:meth:`_park_unsettled_modify_exit`): the body, the legs the amend
+        touches and how an unknown outcome leaves them for the snapshot.
+
+        :param target_row: The position's entry row.
+        :param old_i: The bracket before the amend.
+        :param new_i: The bracket the amend sets.
+        :param tp_coid: The COID a take-profit leg the amend adds is written under.
+        :param sl_coid: The COID a stop leg the amend adds is written under.
+        :return: The PUT body and the amend's hooks, or ``None`` when the amend
+            changes nothing.
+        """
+        from .dispatch_hooks import _CapitalComModifyExitHooks
 
         # Pine ``trail_price`` + ``trail_offset`` defers native trailing
         # until the activation monitor sees the threshold crossed. The
@@ -3086,10 +3512,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             and new_i.trail_offset is None
         )
         if not body and not needs_persist and not needs_pending_trail_retire:
-            return []
+            return None
 
-        tp_coid = new.client_order_id(KIND_EXIT_TP)
-        sl_coid = new.client_order_id(KIND_EXIT_SL)
         # Existing leg rows for the parent — marked ``disposition_unknown``
         # below if the PUT or confirm GET goes ambiguous, so the snapshot
         # reconcile path (:meth:`_resolve_bracket_leg_disposition`) can
@@ -3196,8 +3620,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             else None
         )
 
-        coid = new.client_order_id(KIND_MODIFY_EXIT)
-        hooks = _CapitalComModifyExitHooks(
+        return body, _CapitalComModifyExitHooks(
             plugin=self,
             target_row=target_row,
             body=body,
@@ -3214,43 +3637,98 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             sl_clears_broker_active=sl_clears_broker_active,
         )
 
-        if body:
-            # Wire round-trip required — run through the Core journal so
-            # the entry-side command row is persisted and state-machined.
-            # The hook owns the PUT + confirm + ambiguous-path seeding.
-            if self.store_ctx is None:
-                raise RuntimeError(
-                    "modify_exit requires a live BrokerStore context"
-                )
-            journal = DispatchJournal(self.store_ctx)
-            return await journal.run_modify_exit(
-                coid=coid,
-                target_coid=target_row.client_order_id,
-                target_row=target_row,
-                old_intent=old_i,
-                new_intent=new_i,
-                qty=target_row.qty,
-                hooks=hooks,
-                audit_payload={'pine_id': new_i.pine_id,
-                               'from_entry': new_i.from_entry,
-                               'tp_coid': effective_tp_coid,
-                               'sl_coid': effective_sl_coid,
-                               'envelope_tp_coid': tp_coid,
-                               'envelope_sl_coid': sl_coid},
-            )
+    def _park_unsettled_modify_exit(
+            self, command: 'OrderRow', deal_reference: str | None,
+    ) -> bool:
+        """Hand a restart's unsettled bracket amend to the positions snapshot.
 
-        # Pure local seed amend (e.g. pending-trail bookkeeping with an
-        # empty PUT body): no broker round-trip means there is nothing
-        # for the journal to state-machine. Apply the post-success mirror
-        # directly so the leg rows and entry-row risk snapshot are
-        # consistent with the new intent.
-        hooks.apply_mirror(target_row=target_row, new_intent=new_i)
-        return hooks.exchange_order_from_state(
-            row=target_row, new_intent=new_i,
-            outcome=ModifyExitOutcome(
-                server_ref='', deal_status='ACCEPTED',
-                rejected_reason=None, post_put_state={}, raw=None,
-            ),
+        A pending ``modify_exit`` command a restart finds while no leg of its
+        position waits for the snapshot, and no leg of it was refused by one
+        (:meth:`~pynecore_capitalcom.reconcile._ReconcileMixin._modify_exit_legs_refused`),
+        was sent, but neither its completion nor the park of its legs
+        committed (the process ended first): its legs may still hold the
+        bracket from before the amend while the venue holds the new one, and
+        the engine's park on the position's entry, which only a settled leg
+        releases, would stay. The amend is parked as the running process
+        parks it (:meth:`_plan_modify_exit`, ``park_for_snapshot``), with the
+        bracket before the amend read from the legs, so the poll settles the
+        legs against the venue's levels and completes the command from the
+        same verdict the runtime uses
+        (:func:`~pynecore_capitalcom.helpers._modify_exit_snapshot_verdict`).
+
+        :param command: The ``modify_exit`` command row.
+        :param deal_reference: The amend's ``dealReference`` when it is journaled.
+        :return: Whether the amend was handed over; ``False`` leaves the
+            command to the restart's own verdict (its legs are with the
+            snapshot already, its target is gone, or its dispatch is not
+            journaled).
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        extras = command.extras or {}
+        target_coid = extras.get('target_coid')
+        target_row = store_ctx.get_order(str(target_coid)) if target_coid else None
+        if (target_row is None or target_row.closed_ts_ms is not None
+                or not target_row.exchange_order_id
+                or command.pine_entry_id is None or command.from_entry is None):
+            return False
+        if (any((row.extras or {}).get('leg_kind') in ('tp', 'sl')
+                and (row.extras or {}).get('parent_coid') == target_row.client_order_id
+                and row.state == STATE_DISPOSITION_UNKNOWN
+                for row in store_ctx.iter_live_orders())
+                or self._modify_exit_legs_refused(command)):
+            return False
+        submitted = _modify_exit_dispatch(store_ctx, command.client_order_id)
+        tp_coid = submitted.get('envelope_tp_coid') if submitted is not None else None
+        sl_coid = submitted.get('envelope_sl_coid') if submitted is not None else None
+        if not isinstance(tp_coid, str) or not isinstance(sl_coid, str):
+            return False
+        new_i = ExitIntent(
+            pine_id=command.pine_entry_id, from_entry=command.from_entry,
+            symbol=command.symbol, side=command.side, qty=command.qty,
+            tp_price=_wire_float(extras.get('new_tp'), finite=True),
+            sl_price=_wire_float(extras.get('new_sl'), finite=True),
+            trail_offset=_wire_float(extras.get('new_trail'), finite=True),
+            trail_price=_wire_float(extras.get('new_trail_price'), finite=True),
+        )
+        if new_i.intent_key != command.intent_key:
+            return False
+        planned = self._plan_modify_exit(
+            target_row, self._bracket_held_by_legs(target_row, new_i), new_i,
+            tp_coid=tp_coid, sl_coid=sl_coid,
+        )
+        if planned is None:
+            return False
+        _, hooks = planned
+        hooks.park_for_snapshot(
+            new_i, command_coid=command.client_order_id, stage='restart',
+            reason='the amend was sent, but neither its completion nor its park was journaled',
+            deal_reference=deal_reference,
+        )
+        return True
+
+    def _bracket_held_by_legs(self, target_row: 'OrderRow', new_i: ExitIntent) -> ExitIntent:
+        """The bracket the live legs of a position hold, as an exit intent.
+
+        The bracket an unsettled amend is parked from once its legs may already
+        carry it (:meth:`_park_unsettled_modify_exit`, and :meth:`modify_exit`
+        after a committed mirror): a pending trailing stop keeps its
+        activation price, so the amend's own pending trail is no transition.
+
+        :param target_row: The position's entry row.
+        :param new_i: The amend's target intent, whose identity the result keeps.
+        :return: ``new_i`` with the levels of the position's live legs.
+        """
+        existing_tp = self._find_bracket_leg_row(target_row, 'tp')
+        existing_sl = self._find_bracket_leg_row(target_row, 'sl')
+        sl_extras = (existing_sl.extras or {}) if existing_sl is not None else {}
+        return replace(
+            new_i,
+            tp_price=existing_tp.tp_level if existing_tp is not None else None,
+            sl_price=existing_sl.sl_level if existing_sl is not None else None,
+            trail_offset=existing_sl.trailing_distance if existing_sl is not None else None,
+            trail_price=(_wire_float(sl_extras.get('trail_activation_price'), finite=True)
+                         if sl_extras.get('trail_state') == 'pending' else None),
         )
 
     @staticmethod
@@ -3309,6 +3787,8 @@ class _CapitalComEntryHooks:
         self._endpoint = endpoint
         self._body = body
         self._quantized_qty = quantized_qty
+        #: The ``dealReference`` the venue answered the POST with, once it did.
+        self.server_ref: str | None = None
 
     def _record_order_level(self, coid: str, level: float | None = None) -> None:
         """Keep the level a working order is placed at on its row.
@@ -3426,7 +3906,8 @@ class _CapitalComEntryHooks:
                 f"Capital POST {self._endpoint}: no dealReference in response",
                 client_order_id=coid,
             )
-        return SubmitOutcome(server_ref=str(deal_ref), raw=resp)
+        self.server_ref = str(deal_ref)
+        return SubmitOutcome(server_ref=self.server_ref, raw=resp)
 
     async def confirm_submission(
             self, *, coid: str, intent: EntryIntent, server_ref: str,

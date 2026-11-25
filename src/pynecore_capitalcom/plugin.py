@@ -21,7 +21,7 @@ import collections
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from pynecore.core.broker.parked_dispatch import ParkedDispatchResolver
 from pynecore.core.broker.protection_guard import ProtectionLevels
@@ -296,6 +296,7 @@ class CapitalCom(
         self._netting_retired_orders: dict[str, dict] | None = None
         self._residual_deals_reported: set[str] = set()
         self._unannounced_fills_seen: dict[str, float] = {}
+        self._deferred_parks: dict[str, Callable[[], None]] = {}
         # Resolves the entry submissions an earlier process left pending; the
         # engine holds their intents' entries meanwhile (see ``reconcile.py``,
         # ``_resolve_inherited_submissions``). A conclusive absence rejects a

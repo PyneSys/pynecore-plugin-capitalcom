@@ -17,7 +17,7 @@ import json
 import math
 import os
 from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
-from collections.abc import Mapping
+from collections.abc import Container, Mapping
 from datetime import UTC, datetime, time
 from decimal import Decimal
 from time import time as epoch_time
@@ -244,6 +244,42 @@ EXTRAS_KEY_PROTECTION_HANDOVER = 'protection_failsafe_handover_at'
 #: fill is then not the run's exposure.
 EXTRAS_KEY_NETTED_FOREIGN_DEAL = 'netted_foreign_deal'
 
+#: ``orders.extras`` key on a position row: the held execution of an own
+#: working order that netted a foreign deal and opened this deal with the rest,
+#: while its opened size or a price is unknown. Nothing of the execution is
+#: booked meanwhile, and the row's ``filled_qty`` stays ``0``.
+#: ``{'executed_qty', 'fill_price', 'fill_id', 'netted_deal_id', 'since'}``
+#: plus, as the evidence arrives, ``'opened_qty'`` (size proven by the deal's
+#: opening activity), ``'listed'`` (``{'size', 'at'}``, first ``/positions``
+#: listing of the current size) and ``'held_closes'`` (close identity ->
+#: ``{'size', 'seen_at', 'sizeless_id', 'date_utc'}``).
+#:
+#: ===================  ==========================================  =====================
+#: State                Event                                       Next
+#: ===================  ==========================================  =====================
+#: not held             execution, opened size unknown              size unknown
+#: not held             execution, size proven, no price            size proven
+#: size unknown         sized opening activity, no price            size proven
+#: size unknown         sized opening activity, priced              booked (key dropped)
+#: size unknown         listing unchanged for ``_ACTIVITY_LAG_S``,  booked (listed + held
+#:                      every held close sized and seen before            closes)
+#:                      the read
+#: size proven          priced opening activity or listing          booked (key dropped)
+#: either held state    close of the deal                           same, close recorded
+#: ===================  ==========================================  =====================
+#:
+#: A held close is deferred without consuming its fingerprint, and every
+#: activity read reaches back to it, so it is booked from its activity once
+#: the entry is. Booking drops the key in the transaction that raises
+#: ``filled_qty``.
+EXTRAS_KEY_NETTED_RESIDUAL_PENDING = 'netted_residual_pending'
+
+#: ``orders.extras`` key on a position row: the closes a held partly netted
+#: entry deferred, still unbooked after the entry was, ``{close_id: dateUTC}``.
+#: The activity read keeps reaching back to them until each close's identity
+#: is booked (:data:`EXTRAS_KEY_BOOKED_CLOSES`); booking the close drops it.
+EXTRAS_KEY_DEFERRED_CLOSES = 'deferred_close_dates'
+
 #: ``orders.extras`` key on a position row: the partial-close commands whose
 #: reduction the run-owned exposure cursor (``filled_qty``) already reflects.
 EXTRAS_KEY_RETIRED_CLOSE_COMMANDS = 'partial_close_retired_commands'
@@ -314,6 +350,23 @@ EXTRAS_KEY_HELD_EDIT_VERDICTS = 'held_edit_verdicts'
 #: key, the venue time of the venue or dealing-desk edit a verdict accepted.
 #: That edit, and every older one, explains no later change.
 EXTRAS_KEY_LEVEL_EDITS_CONSUMED = 'level_edits_consumed_until'
+
+#: ``orders.extras`` key on a pending trailing stop leg a bracket amend wrote:
+#: the amend command's COID. The activation monitor journals it with the
+#: activation, so the amend's verdict counts only an activation of its own
+#: pending trail, never one of an earlier amend under the same leg row.
+EXTRAS_KEY_TRAIL_COMMAND = 'trail_command_coid'
+
+
+def _trail_activation_key(leg_coid: str, command_coid: str | None) -> str:
+    """The deferred-park key of an accepted trailing activation whose journal write failed.
+
+    :param leg_coid: The pending trailing stop leg's COID.
+    :param command_coid: The amend that wrote the pending trail
+        (:data:`EXTRAS_KEY_TRAIL_COMMAND`), ``None`` for one no amend wrote.
+    :return: The key under which the activation's journal transaction waits.
+    """
+    return f'trail-activation:{leg_coid}:{command_coid or ""}'
 
 #: Close verdicts (``_InterventionMixin._attribute_close_activity``): who
 #: closed (part of) a bot position.
@@ -793,13 +846,13 @@ def _retire_parked_partial_close_exposure(
         store_ctx: 'RunContext', command: 'OrderRow', units: int, lot_step: float,
         *, path: str,
 ) -> None:
-    """Lower the target's exposure cursor for a parked partial close that settled filled.
+    """Lower the target's exposure cursor for a partial close proven filled.
 
     The journal's ``filled_qty`` of a position row doubles as the run-owned
-    exposure cursor. A partial close that returns from its dispatch lowers it
-    right there; one that was parked (``disposition_unknown``) and settles
-    later lowers it here, once per command, whichever path settles it (the
-    poll's resolver or startup recovery).
+    exposure cursor. It is lowered here once per command, whichever path
+    proves the reduction: the dispatch (before the journal makes the command
+    terminal), the poll's resolver of a parked (``disposition_unknown``)
+    close, or startup recovery.
 
     :param store_ctx: The run's journal.
     :param command: The partial-close command row.
@@ -844,3 +897,244 @@ def _retire_parked_partial_close_exposure(
                 'path': path,
             },
         )
+
+
+def _settle_vanished_full_close_targets(
+        store_ctx: 'RunContext', command: 'OrderRow', positions_by_deal: Mapping[str, object],
+        *, path: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """Judge a full-close command's targets against a positions snapshot.
+
+    A target the snapshot no longer lists was swept: the command's DELETE
+    landed even if what came after it was never journaled. Each live row of
+    a swept target that is not ``closing`` yet is moved there with its
+    ``close_dispatched`` audit, in one transaction, whether or not the other
+    targets are gone too: the snapshot's vanished-close pass then books each
+    close fill, as it does after a fully journaled dispatch, and a target
+    still listed does not hold back the accounting of one that is gone. One
+    judgement for startup recovery and for the poll's resolver of a parked
+    close.
+
+    :param store_ctx: The run's journal.
+    :param command: The full-close command row (``extras['targets']``).
+    :param positions_by_deal: The authoritative ``/positions`` snapshot by deal id.
+    :param path: The settling path, for the audit events.
+    :return: The targets still listed, the targets swept, and the client order
+        ids of the target rows moved to ``closing``.
+    """
+    targets = [str(deal) for deal in (command.extras or {}).get('targets') or ()]
+    still_alive = [deal for deal in targets if deal in positions_by_deal]
+    swept = [deal for deal in targets if deal not in positions_by_deal]
+    mirrored: list[str] = []
+    if not swept:
+        return still_alive, swept, mirrored
+    with store_ctx.transaction():
+        for row in list(store_ctx.iter_live_orders()):
+            if (row.exchange_order_id in swept
+                    and row.client_order_id != command.client_order_id
+                    and row.state not in ('closing', 'closed')):
+                store_ctx.set_order_state(row.client_order_id, 'closing')
+                store_ctx.log_event(
+                    'close_dispatched',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=row.exchange_order_id,
+                    intent_key=command.intent_key,
+                    payload={'recovery_path': path},
+                )
+                mirrored.append(row.client_order_id)
+    return still_alive, swept, mirrored
+
+
+def _mirror_amended_level(store_ctx: 'RunContext', target_coid: object, level: float) -> None:
+    """Mirror an own amend's level onto its working order's row (``amended_level``).
+
+    The dispatch writes it after the venue took the amend; a settlement that
+    proves the amend from venue data writes it when the dispatch could not.
+    Without it, the working-order guard seeding its baseline from the row
+    would take the order's own new level for someone else's edit.
+
+    :param store_ctx: The run's journal.
+    :param target_coid: The amended working order's client order id.
+    :param level: The level the venue holds the order at.
+    """
+    if not target_coid:
+        return
+    with store_ctx.transaction():
+        target = store_ctx.get_order(str(target_coid))
+        if target is None or target.closed_ts_ms is not None:
+            return
+        extras = dict(target.extras or {})
+        extras['amended_level'] = level
+        store_ctx.upsert_order(target.client_order_id, extras=extras)
+
+
+def _modify_entry_snapshot_verdict(
+        store_ctx: 'RunContext', command: 'OrderRow', working_by_deal: Mapping[str, dict],
+) -> tuple[str, str | None, float | None]:
+    """Judge a modify-entry command from the ``/workingorders`` snapshot.
+
+    The amend landed when the target's working order holds the requested
+    ``new_level``. One judgement for startup recovery and for the poll's
+    resolver of a parked amend.
+
+    :param store_ctx: The run's journal.
+    :param command: The modify-entry command row.
+    :param working_by_deal: The authoritative ``/workingorders`` snapshot by deal id.
+    :return: The verdict path (``modify_entry_no_target``,
+        ``modify_entry_target_vanished``, ``modify_entry_snapshot_match`` or
+        ``modify_entry_snapshot_level_mismatch``), the target's deal id and the
+        level the venue holds the order at.
+    """
+    extras = command.extras or {}
+    new_level = _wire_float(extras.get('new_level'), finite=True)
+    target_coid = extras.get('target_coid')
+    target = store_ctx.get_order(str(target_coid)) if target_coid else None
+    target_deal_id = str(target.exchange_order_id) if target and target.exchange_order_id else None
+    if target_deal_id is None:
+        return 'modify_entry_no_target', None, None
+    working = working_by_deal.get(target_deal_id)
+    if working is None:
+        return 'modify_entry_target_vanished', target_deal_id, None
+    level = _wire_float((working.get('workingOrderData') or {}).get('orderLevel'), finite=True)
+    if new_level is not None and level is not None and abs(level - new_level) < 1e-9:
+        return 'modify_entry_snapshot_match', target_deal_id, level
+    return 'modify_entry_snapshot_level_mismatch', target_deal_id, level
+
+
+def _modify_exit_dispatch(store_ctx: 'RunContext', coid: str) -> dict | None:
+    """The ``dispatch_submitted`` audit payload of the modify-exit command ``coid``.
+
+    Written with the command row, before its PUT: it names the leg rows the
+    amend writes (``tp_coid`` / ``sl_coid``) and the COIDs a leg the amend
+    adds is created under (``envelope_tp_coid`` / ``envelope_sl_coid``).
+
+    :param store_ctx: The run's journal.
+    :param coid: The command's client order id.
+    :return: The payload, or ``None`` when none is journaled.
+    """
+    return next((
+        payload for _, event_coid, _, payload
+        in store_ctx.iter_events_by_kind_for_run_id('dispatch_submitted')
+        if event_coid == coid
+    ), None)
+
+
+def _own_trail_activation_sent(
+        store_ctx: 'RunContext', parent_coid: str, activation_price: float,
+        command_coid: str, unjournaled: Container[str],
+) -> bool:
+    """Whether the bot's activation monitor sent the pending trailing stop an amend wrote.
+
+    The monitor journals ``trailing_activation_triggered`` for the stop leg
+    once the venue accepted its ``trailingStop`` PUT, with the leg's
+    activation price and the amend that wrote the pending trail
+    (:data:`EXTRAS_KEY_TRAIL_COMMAND`). An amend reuses the leg row of the
+    one before it, so only the amend's own COID tells its activation from
+    an earlier one at the same price. An accepted activation whose journal
+    write is still waiting to commit counts the same way, while the running
+    process holds it (``unjournaled``).
+
+    :param store_ctx: The run's journal.
+    :param parent_coid: The position's entry COID.
+    :param activation_price: The pending trailing stop's activation price.
+    :param command_coid: The amend command's COID.
+    :param unjournaled: The deferred-park keys (:func:`_trail_activation_key`)
+        of accepted activations whose journal write has not committed yet.
+    :return: ``True`` when a live stop leg of the position has such an
+        activation of the amend's pending trail journaled at ``activation_price``,
+        or waiting to be journaled.
+    """
+    legs = {
+        row.client_order_id for row in store_ctx.iter_live_orders()
+        if (row.extras or {}).get('leg_kind') == 'sl'
+        and (row.extras or {}).get('parent_coid') == parent_coid
+    }
+    if not legs:
+        return False
+    if any(_trail_activation_key(leg, command_coid) in unjournaled for leg in legs):
+        return True
+    for _, coid, _, payload in store_ctx.iter_events_by_kind_for_run_id(
+            'trailing_activation_triggered'):
+        price = _wire_float(payload.get('activation_price'), finite=True)
+        if (coid in legs and payload.get(EXTRAS_KEY_TRAIL_COMMAND) == command_coid
+                and price is not None and abs(price - activation_price) < 1e-9):
+            return True
+    return False
+
+
+def _modify_exit_snapshot_verdict(
+        store_ctx: 'RunContext', command: 'OrderRow', positions_by_deal: Mapping[str, dict],
+        *, unjournaled_activations: Container[str] = (),
+) -> tuple[str, str | None, dict]:
+    """Judge a modify-exit command from the ``/positions`` snapshot.
+
+    The amend landed when the target position carries the requested bracket:
+    ``new_tp`` as its ``profitLevel``, and ``new_sl`` as its ``stopLevel`` or
+    ``new_trail`` as its native trailing distance. A pending trailing stop
+    (``new_trail_price`` with ``new_trail``) is local until the activation
+    monitor sends it, so the venue must show no stop at all, or the native
+    trailing distance ``new_trail`` once the journal holds the monitor's
+    accepted activation of the pending trail this amend wrote, at
+    ``new_trail_price`` (:func:`_own_trail_activation_sent`). One judgement
+    for startup recovery and for the poll's resolver of a parked amend.
+
+    :param store_ctx: The run's journal.
+    :param command: The modify-exit command row.
+    :param positions_by_deal: The authoritative ``/positions`` snapshot by deal id.
+    :param unjournaled_activations: The running process's accepted trailing
+        activations whose journal write has not committed yet
+        (:func:`_trail_activation_key`); a restart has none.
+    :return: The verdict path (``modify_exit_no_target``,
+        ``modify_exit_target_vanished``, ``modify_exit_snapshot_match`` or
+        ``modify_exit_snapshot_mismatch``), the target's deal id and the
+        levels the venue holds, with the expected ones on a mismatch.
+    """
+    extras = command.extras or {}
+    new_tp = _wire_float(extras.get('new_tp'), finite=True)
+    new_sl = _wire_float(extras.get('new_sl'), finite=True)
+    new_trail = _wire_float(extras.get('new_trail'), finite=True)
+    new_trail_price = _wire_float(extras.get('new_trail_price'), finite=True)
+    pending_trail = new_trail is not None and new_trail_price is not None
+    target_coid = extras.get('target_coid')
+    target = store_ctx.get_order(str(target_coid)) if target_coid else None
+    target_deal_id = str(target.exchange_order_id) if target and target.exchange_order_id else None
+    if target_deal_id is None:
+        return 'modify_exit_no_target', None, {}
+    pos = positions_by_deal.get(target_deal_id)
+    if pos is None:
+        return 'modify_exit_target_vanished', target_deal_id, {}
+    pos_data = pos.get('position') or {}
+    profit_level = _wire_float(pos_data.get('profitLevel'))
+    stop_level = _wire_float(pos_data.get('stopLevel'))
+    stop_distance = _wire_float(pos_data.get('stopDistance'))
+    trailing_stop = bool(pos_data.get('trailingStop'))
+    held = {'profit_level': profit_level, 'stop_level': stop_level,
+            'stop_distance': stop_distance, 'trailing_stop': trailing_stop}
+
+    if new_tp is None:
+        tp_matches = profit_level is None
+    else:
+        tp_matches = profit_level is not None and abs(profit_level - new_tp) < 1e-9
+    if new_sl is None and new_trail is None:
+        sl_matches = stop_level is None and not trailing_stop
+    elif new_trail is not None:
+        if pending_trail:
+            sl_matches = (stop_level is None and not trailing_stop) or (
+                trailing_stop and stop_distance is not None
+                and abs(stop_distance - new_trail) < 1e-9
+                and new_trail_price is not None
+                and _own_trail_activation_sent(
+                    store_ctx, str(target_coid), new_trail_price, command.client_order_id,
+                    unjournaled_activations))
+        else:
+            sl_matches = (trailing_stop and stop_distance is not None
+                          and abs(stop_distance - new_trail) < 1e-9)
+    else:
+        sl_matches = (new_sl is not None and stop_level is not None
+                      and abs(stop_level - new_sl) < 1e-9)
+    if tp_matches and sl_matches:
+        return 'modify_exit_snapshot_match', target_deal_id, held
+    return 'modify_exit_snapshot_mismatch', target_deal_id, {
+        **held, 'expected_tp': new_tp, 'expected_sl': new_sl, 'expected_trail': new_trail,
+        'expected_trail_price': new_trail_price, 'pending_trail': pending_trail,
+    }

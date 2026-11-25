@@ -509,6 +509,10 @@ class _ProviderMixin(_CapitalComBase, ABC):
             amend_order=CapabilityLevel.PARTIAL_NATIVE,
             cancel_all=CapabilityLevel.SOFTWARE,
             reduce_only=CapabilityLevel.SOFTWARE,
+            # A position row's stop / profit level covers the whole row. A leg
+            # that needs less protected (an opposing leg partly offsets it)
+            # is left to the core, which keeps the row's bracket off it.
+            sized_leg_bracket=CapabilityLevel.SOFTWARE,
             watch_orders=CapabilityLevel.SOFTWARE,
             fetch_position=CapabilityLevel.NATIVE,
             idempotency=CapabilityLevel.SOFTWARE,

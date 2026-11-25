@@ -13,6 +13,9 @@ so the dispatch surface stays small and the ~2700-line execution mix-in
 shrinks as each path migrates.
 """
 import logging
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from time import time as epoch_time
 from typing import TYPE_CHECKING
@@ -38,6 +41,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     PENDING_DISPATCH_STATES,
+    mark_disposition_unknown,
 )
 from pynecore.core.broker.models import (
     CancelDispositionOutcome,
@@ -56,10 +60,12 @@ from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     EXTRAS_KEY_TAKEN_OVER_AT,
+    EXTRAS_KEY_TRAIL_COMMAND,
     _extract_reject_reason,
     _is_funds_reject,
     _is_market_closed_reject,
     _is_position_gone_reject,
+    _retire_parked_partial_close_exposure,
     _venue_rendered_level,
     _wire_float,
     _wire_id,
@@ -234,16 +240,19 @@ class _CapitalComModifyEntryHooks:
         # Mirror the new level onto the target row so the engine sees it
         # immediately. The target row lives outside the journal's
         # command-row scope, so the hook owns this write.
+        # Unjournaled, the amend parks; the poll's resolver (or a restart's
+        # recovery) mirrors the level the venue holds (``_mirror_amended_level``).
         if self._plugin.store_ctx is not None:
-            existing = self._plugin.store_ctx.get_order(
-                self._target_row.client_order_id,
-            )
-            merged_extras = dict((existing.extras or {}) if existing else {})
-            merged_extras['amended_level'] = echoed_level
-            self._plugin.store_ctx.upsert_order(
-                self._target_row.client_order_id,
-                extras=merged_extras,
-            )
+            with _parked_on_journal_failure(coid, "the amended entry level"):
+                existing = self._plugin.store_ctx.get_order(
+                    self._target_row.client_order_id,
+                )
+                merged_extras = dict((existing.extras or {}) if existing else {})
+                merged_extras['amended_level'] = echoed_level
+                self._plugin.store_ctx.upsert_order(
+                    self._target_row.client_order_id,
+                    extras=merged_extras,
+                )
 
         return ModifyEntryOutcome(
             server_ref=str(deal_ref),
@@ -297,6 +306,28 @@ class _CapitalComModifyEntryHooks:
             reduce_only=False,
             client_order_id=target.client_order_id,
         )]
+
+
+@contextmanager
+def _parked_on_journal_failure(coid: str, what: str) -> Iterator[None]:
+    """Raise a storage failure after an accepted venue write as a typed park.
+
+    The command is marked ``disposition_unknown``, which the poll's resolvers
+    settle from venue data; a raw storage error would leave it pending for a
+    restart's recovery only.
+
+    :param coid: The command's client order id.
+    :param what: The state the failed write journals, for the message.
+    """
+    try:
+        yield
+    except sqlite3.Error as failed:
+        logger.error("%s of %s could not be journaled (%s); parked", what, coid, failed)
+        raise OrderDispositionUnknownError(
+            f"{what} of {coid} landed on the venue, but could not be journaled: {failed}",
+            client_order_id=coid,
+            cause=failed,
+        ) from failed
 
 
 def _unbooked_take_over(row: 'OrderRow') -> bool:
@@ -870,10 +901,12 @@ class _CapitalComCloseHooks:
             plugin: CapitalComHookCollaborator,
             rules: '_InstrumentRules',
             target_deal_ids: frozenset[str],
+            target_coid: str | None = None,
     ) -> None:
         self._plugin = plugin
         self._rules = rules
         self._target_deal_ids = target_deal_ids
+        self._target_coid = target_coid
 
     async def submit_full_close(
             self, *, coid: str, intent: CloseIntent,
@@ -912,120 +945,188 @@ class _CapitalComCloseHooks:
         """
         store_ctx = self._plugin.store_ctx
         applied_targets: list[str] = []
+        # The first landed DELETE whose ``closing`` state could not be
+        # journaled: the remaining targets are still closed, then the command
+        # parks, and the poll's resolver books each target the snapshot no
+        # longer lists (``_resolve_full_close_dispositions``).
+        unjournaled: str | None = None
+        unjournaled_cause: sqlite3.Error | None = None
+        # Targets whose DELETE did not land after such a target: the rest are
+        # still sent, as every target is a close of its own; the snapshot
+        # keeps listing these, so the parked command waits on them.
+        not_landed: list[str] = []
+        not_landed_cause: BrokerError | None = None
         for row in targets:
-            close_ref: str | None = None
-            deal_id = row.exchange_order_id or ''
-            # A not-found is judged by the deal's identity before the target
-            # counts as swept: the row may hold another deal by now (the
-            # confirm named the executed working order, the position opened
-            # under a fresh ``dealId``), or a deal the venue does not list
-            # yet. One more DELETE goes to the deal the row holds.
-            for attempt in range(2):
-                try:
-                    with self._plugin.own_close([deal_id], full=True, size=None):
-                        resp = await self._plugin.call_api(
-                            f'positions/{deal_id}', method='delete',
-                        )
-                    if isinstance(resp, dict):
-                        close_ref = _wire_id(resp.get('dealReference'))
-                    break
-                except (httpx.TimeoutException, httpx.RequestError,
-                        ConnectionError, ExchangeConnectionError) as net:
-                    raise OrderDispositionUnknownError(
-                        f"Capital DELETE positions/{deal_id} "
-                        f"ambiguous during full close: {net}",
-                        client_order_id=coid,
-                        cause=net if isinstance(net, Exception) else None,
-                    ) from net
-                except CapitalComApiError as exc:
-                    # The venue evaluated the DELETE and refused it: nothing
-                    # landed, the target is untouched. A session-pause refusal
-                    # (measured live: the 21:00 UTC maintenance break) is
-                    # non-terminal — the engine retries once trading resumes;
-                    # any other verdict is a definitive reject. Letting the raw
-                    # provider error escape killed the run through the engine's
-                    # generic dispatch net.
-                    if _is_market_closed_reject(str(exc)):
-                        raise MarketClosedError(
-                            f"Capital DELETE positions/{deal_id} "
-                            f"declined, market closed: {exc}",
-                        ) from exc
-                    raise ExchangeOrderRejectedError(
-                        f"Capital DELETE positions/{deal_id} "
-                        f"rejected: {exc}",
-                    ) from exc
-                except OrderNotFoundError as missing:
+            unjournaled_target = False
+            try:
+                close_ref: str | None = None
+                already_gone = False
+                deal_id = row.exchange_order_id or ''
+                # A not-found is judged by the deal's identity before the target
+                # counts as swept: the row may hold another deal by now (the
+                # confirm named the executed working order, the position opened
+                # under a fresh ``dealId``), or a deal the venue does not list
+                # yet. One more DELETE goes to the deal the row holds.
+                for attempt in range(2):
                     try:
-                        verdict, current = await self._plugin.resolve_own_deal(row, deal_id)
+                        with self._plugin.own_close([deal_id], full=True, size=None):
+                            resp = await self._plugin.call_api(
+                                f'positions/{deal_id}', method='delete',
+                            )
+                        if isinstance(resp, dict):
+                            close_ref = _wire_id(resp.get('dealReference'))
+                        break
                     except (httpx.TimeoutException, httpx.RequestError,
                             ConnectionError, ExchangeConnectionError) as net:
                         raise OrderDispositionUnknownError(
-                            f"Capital DELETE positions/{deal_id} not found and "
-                            f"the deal could not be judged: {net}",
+                            f"Capital DELETE positions/{deal_id} "
+                            f"ambiguous during full close: {net}",
                             client_order_id=coid,
                             cause=net if isinstance(net, Exception) else None,
                         ) from net
-                    if verdict is _DealVerdict.GONE:
-                        # The target vanished between the local snapshot and
-                        # the DELETE (broker-side natural close, manual
-                        # intervention, or another stale dispatch already
-                        # swept it). The user's close intent is satisfied
-                        # either way — count the target as swept so the
-                        # journal's ``mark_closing`` path records it. Letting
-                        # ``OrderNotFoundError`` (a subclass of
-                        # :class:`ExchangeOrderRejectedError`) escape would
-                        # mark the entire close dispatch ``rejected`` —
-                        # terminal, no recovery, stale position row left
-                        # behind. Mirrors the cancel hook's ``already_gone``
-                        # semantics.
-                        if store_ctx is not None:
-                            store_ctx.log_event(
-                                'close_already_gone',
-                                client_order_id=row.client_order_id,
-                                exchange_order_id=deal_id,
-                                intent_key=intent.intent_key,
+                    except CapitalComApiError as exc:
+                        # The venue evaluated the DELETE and refused it: nothing
+                        # landed, the target is untouched. A session-pause refusal
+                        # (measured live: the 21:00 UTC maintenance break) is
+                        # non-terminal — the engine retries once trading resumes;
+                        # any other verdict is a definitive reject. Letting the raw
+                        # provider error escape killed the run through the engine's
+                        # generic dispatch net.
+                        if _is_market_closed_reject(str(exc)):
+                            raise MarketClosedError(
+                                f"Capital DELETE positions/{deal_id} "
+                                f"declined, market closed: {exc}",
+                            ) from exc
+                        raise ExchangeOrderRejectedError(
+                            f"Capital DELETE positions/{deal_id} "
+                            f"rejected: {exc}",
+                        ) from exc
+                    except OrderNotFoundError as missing:
+                        try:
+                            verdict, current = await self._plugin.resolve_own_deal(row, deal_id)
+                        except (httpx.TimeoutException, httpx.RequestError,
+                                ConnectionError, ExchangeConnectionError) as net:
+                            raise OrderDispositionUnknownError(
+                                f"Capital DELETE positions/{deal_id} not found and "
+                                f"the deal could not be judged: {net}",
+                                client_order_id=coid,
+                                cause=net if isinstance(net, Exception) else None,
+                            ) from net
+                        if verdict is _DealVerdict.GONE:
+                            # The target vanished between the local snapshot and
+                            # the DELETE (broker-side natural close, manual
+                            # intervention, or another stale dispatch already
+                            # swept it). The user's close intent is satisfied
+                            # either way — count the target as swept so the
+                            # journal's ``mark_closing`` path records it. Letting
+                            # ``OrderNotFoundError`` (a subclass of
+                            # :class:`ExchangeOrderRejectedError`) escape would
+                            # mark the entire close dispatch ``rejected`` —
+                            # terminal, no recovery, stale position row left
+                            # behind. Mirrors the cancel hook's ``already_gone``
+                            # semantics. The ``close_already_gone`` audit is
+                            # written with the target's ``closing`` state below.
+                            already_gone = True
+                            break
+                        if verdict is _DealVerdict.MATERIALISING or attempt == 1:
+                            # The deal is the run's and is not gone, but the
+                            # venue cannot route a close to it yet. Nothing
+                            # closed: the command parks, and the position keeps
+                            # counting the deal until the venue shows it.
+                            if store_ctx is not None:
+                                try:
+                                    store_ctx.log_event(
+                                        'close_target_not_addressable',
+                                        client_order_id=row.client_order_id,
+                                        exchange_order_id=deal_id,
+                                        intent_key=intent.intent_key,
+                                        payload={'verdict': verdict.value, 'deal_id': current},
+                                    )
+                                except sqlite3.Error as failed:
+                                    # The audit only explains the park below; a
+                                    # failed write must not turn it into a raw
+                                    # storage error.
+                                    logger.error(
+                                        "close of %s parked on %s; its audit could not "
+                                        "be journaled (%s)", row.client_order_id, deal_id, failed,
+                                    )
+                            raise OrderDispositionUnknownError(
+                                f"Capital DELETE positions/{deal_id} not found while "
+                                f"the deal is {verdict.value} (the entry holds "
+                                f"{current}): the close did not land",
+                                client_order_id=coid,
+                                cause=missing,
+                            ) from missing
+                        deal_id = current
+                if store_ctx is not None:
+                    try:
+                        self._record_target_closing(
+                            store_ctx, row=row, deal_id=deal_id, close_ref=close_ref,
+                            intent=intent, already_gone=already_gone,
+                        )
+                    except sqlite3.Error as failed:
+                        # The DELETE landed (or the deal was already gone): the
+                        # target's ``closing`` state is the obligation the
+                        # positions snapshot finishes, booking the close fill
+                        # when the deal is gone, which the venue does not always
+                        # announce with an activity (measured 2026-09-05, cycle
+                        # 122). Left ``confirmed``, the deal's disappearance would
+                        # read as no close at all, so the transition is written
+                        # once more; a second failure parks the close, which the
+                        # poll's resolver settles from the positions snapshot once
+                        # the deal is gone (``_resolve_full_close_dispositions``).
+                        logger.error(
+                            "full close of %s landed on %s but its closing state "
+                            "could not be journaled (%s); writing it again",
+                            row.client_order_id, deal_id, failed,
+                        )
+                        try:
+                            self._record_target_closing(
+                                store_ctx, row=row, deal_id=deal_id, close_ref=close_ref,
+                                intent=intent, already_gone=already_gone,
                             )
-                        break
-                    if verdict is _DealVerdict.MATERIALISING or attempt == 1:
-                        # The deal is the run's and is not gone, but the
-                        # venue cannot route a close to it yet. Nothing
-                        # closed: the command parks, and the position keeps
-                        # counting the deal until the venue shows it.
-                        if store_ctx is not None:
-                            store_ctx.log_event(
-                                'close_target_not_addressable',
-                                client_order_id=row.client_order_id,
-                                exchange_order_id=deal_id,
-                                intent_key=intent.intent_key,
-                                payload={'verdict': verdict.value, 'deal_id': current},
+                        except sqlite3.Error as again:
+                            logger.error(
+                                "full close of %s landed on %s; its closing state "
+                                "could not be journaled again (%s): the close parks",
+                                row.client_order_id, deal_id, again,
                             )
-                        raise OrderDispositionUnknownError(
-                            f"Capital DELETE positions/{deal_id} not found while "
-                            f"the deal is {verdict.value} (the entry holds "
-                            f"{current}): the close did not land",
-                            client_order_id=coid,
-                            cause=missing,
-                        ) from missing
-                    deal_id = current
-            if store_ctx is not None:
-                store_ctx.set_order_state(row.client_order_id, 'closing')
-                if close_ref is not None:
-                    refreshed = store_ctx.get_order(row.client_order_id)
-                    extras = dict((refreshed or row).extras or {})
-                    extras['close_deal_reference'] = close_ref
-                    store_ctx.upsert_order(row.client_order_id, extras=extras)
-                store_ctx.log_event(
-                    'close_dispatched',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=deal_id,
-                    intent_key=intent.intent_key,
-                    payload=(
-                        {'close_deal_reference': close_ref}
-                        if close_ref is not None else None
-                    ),
+                            unjournaled_target = True
+                            if unjournaled is None:
+                                unjournaled = (
+                                    f"Capital DELETE positions/{deal_id} landed, but the "
+                                    f"target's closing state could not be journaled: {again}"
+                                )
+                                unjournaled_cause = again
+            except (ExchangeOrderRejectedError, OrderDispositionUnknownError) as failed_target:
+                # A DELETE refused, or left ambiguous, after an earlier target's
+                # landed DELETE could not be journaled: the command must stay
+                # parked, or that target's close would be dropped with the
+                # reject, and the targets after this one are still closed,
+                # since nothing else would ever send their DELETE.
+                if unjournaled is None:
+                    raise
+                logger.error(
+                    "full close %s: the DELETE of %s did not land (%s); the remaining "
+                    "targets are still closed and the close parks",
+                    coid, row.client_order_id, failed_target,
                 )
+                not_landed.append(f"{row.client_order_id}: {failed_target}")
+                if not_landed_cause is None:
+                    not_landed_cause = failed_target
+                continue
+            if unjournaled_target:
+                continue
             applied_targets.append(deal_id)
 
+        if unjournaled is not None:
+            message = unjournaled
+            if not_landed:
+                message += "; DELETEs that did not land: " + "; ".join(not_landed)
+            cause: Exception | None = not_landed_cause or unjournaled_cause
+            raise OrderDispositionUnknownError(
+                message, client_order_id=coid, cause=cause,
+            ) from cause
         return CloseOutcome(
             mode='full',
             applied_targets=applied_targets,
@@ -1033,6 +1134,44 @@ class _CapitalComCloseHooks:
             exchange_id=applied_targets[0] if applied_targets else '',
             filled_qty=intent.qty,
         )
+
+    @staticmethod
+    def _record_target_closing(
+            store_ctx: 'RunContext', *, row: 'OrderRow', deal_id: str,
+            close_ref: str | None, intent: CloseIntent, already_gone: bool,
+    ) -> None:
+        """Move one full-close target to ``closing``, in one write.
+
+        The state, the DELETE's ``close_deal_reference`` (what the snapshot
+        prices the close fill from) and the ``close_dispatched`` audit commit
+        together, so a failed write never leaves a ``closing`` row without
+        its reference or audit. A target whose DELETE found the deal already
+        gone gets its ``close_already_gone`` audit in the same write.
+        """
+        with store_ctx.transaction():
+            if already_gone:
+                store_ctx.log_event(
+                    'close_already_gone',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=deal_id,
+                    intent_key=intent.intent_key,
+                )
+            store_ctx.set_order_state(row.client_order_id, 'closing')
+            if close_ref is not None:
+                refreshed = store_ctx.get_order(row.client_order_id)
+                extras = dict((refreshed or row).extras or {})
+                extras['close_deal_reference'] = close_ref
+                store_ctx.upsert_order(row.client_order_id, extras=extras)
+            store_ctx.log_event(
+                'close_dispatched',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id,
+                intent_key=intent.intent_key,
+                payload=(
+                    {'close_deal_reference': close_ref}
+                    if close_ref is not None else None
+                ),
+            )
 
     async def submit_partial_close(
             self, *, coid: str, intent: CloseIntent,
@@ -1097,6 +1236,8 @@ class _CapitalComCloseHooks:
                     merged_extras['own_close_sent_at'] = own_close.sent_at
                     if target_row is not None:
                         merged_extras['target_coid'] = target_row.client_order_id
+                    elif self._target_coid is not None:
+                        merged_extras['target_coid'] = self._target_coid
                     store_ctx.upsert_order(coid, extras=merged_extras)
                 post_resp, pre_rows = await self._plugin.submit_exclusive_partial_close(
                     coid=coid,
@@ -1222,10 +1363,14 @@ class _CapitalComCloseHooks:
             # Without a confirm naming the deals this POST touched, the poll
             # attributes its reverse leg by its fit once the activity feed
             # shows the POST reduced nothing (``_unconfirmed_reverse_leg``).
-            existing = store_ctx.get_order(coid)
-            merged_extras = dict((existing.extras or {}) if existing else {})
-            merged_extras['confirm_deal_ids'] = sorted(confirm_deal_ids)
-            store_ctx.upsert_order(coid, extras=merged_extras)
+            # The deals the confirm says it opened let the poll find the
+            # reverse leg should its id below never be journaled.
+            with _parked_on_journal_failure(coid, "the partial close's confirmed deals"):
+                existing = store_ctx.get_order(coid)
+                merged_extras = dict((existing.extras or {}) if existing else {})
+                merged_extras['confirm_deal_ids'] = sorted(confirm_deal_ids)
+                merged_extras['confirm_opened_ids'] = sorted(confirm_opened_ids)
+                store_ctx.upsert_order(coid, extras=merged_extras)
 
         target_deal_id = next(iter(self._target_deal_ids))
         expected_post_units = pre_target_units - intent_units
@@ -1269,17 +1414,21 @@ class _CapitalComCloseHooks:
         if reverse_id is not None:
             corrected_reverse_id = reverse_id
             if store_ctx is not None:
-                existing = store_ctx.get_order(coid)
-                merged_extras = dict((existing.extras or {}) if existing else {})
-                merged_extras['corrected_reverse_deal_id'] = reverse_id
-                merged_extras['corrective_delete_pending'] = True
-                store_ctx.upsert_order(coid, extras=merged_extras)
-                store_ctx.log_event(
-                    'partial_close_corrective_delete_dispatched',
-                    client_order_id=coid,
-                    exchange_order_id=reverse_id,
-                    intent_key=intent.intent_key,
-                )
+                # Unjournaled, the poll finds the leg from the deals the
+                # confirm says the POST opened (``confirm_opened_ids``).
+                with (_parked_on_journal_failure(coid, "the partial close's reverse leg"),
+                      store_ctx.transaction()):
+                    existing = store_ctx.get_order(coid)
+                    merged_extras = dict((existing.extras or {}) if existing else {})
+                    merged_extras['corrected_reverse_deal_id'] = reverse_id
+                    merged_extras['corrective_delete_pending'] = True
+                    store_ctx.upsert_order(coid, extras=merged_extras)
+                    store_ctx.log_event(
+                        'partial_close_corrective_delete_dispatched',
+                        client_order_id=coid,
+                        exchange_order_id=reverse_id,
+                        intent_key=intent.intent_key,
+                    )
             delete_landed = True
             try:
                 await self._plugin.call_api(
@@ -1300,18 +1449,22 @@ class _CapitalComCloseHooks:
                     cause=net if isinstance(net, Exception) else None,
                 ) from net
             if store_ctx is not None:
-                existing = store_ctx.get_order(coid)
-                merged_extras = dict((existing.extras or {}) if existing else {})
-                merged_extras['corrective_delete_pending'] = not delete_landed
-                store_ctx.upsert_order(coid, extras=merged_extras)
-                store_ctx.log_event(
-                    'partial_close_corrective_delete',
-                    client_order_id=coid,
-                    exchange_order_id=reverse_id,
-                    intent_key=intent.intent_key,
-                    payload={'reason': 'race_reverse_leg_corrected',
-                             'delete_landed': delete_landed},
-                )
+                # Unjournaled, the pending flag stays set: the poll repeats
+                # the DELETE only while ``/positions`` lists the leg.
+                with (_parked_on_journal_failure(coid, "the corrective DELETE"),
+                      store_ctx.transaction()):
+                    existing = store_ctx.get_order(coid)
+                    merged_extras = dict((existing.extras or {}) if existing else {})
+                    merged_extras['corrective_delete_pending'] = not delete_landed
+                    store_ctx.upsert_order(coid, extras=merged_extras)
+                    store_ctx.log_event(
+                        'partial_close_corrective_delete',
+                        client_order_id=coid,
+                        exchange_order_id=reverse_id,
+                        intent_key=intent.intent_key,
+                        payload={'reason': 'race_reverse_leg_corrected',
+                                 'delete_landed': delete_landed},
+                    )
             post_rows = await position_snapshot()
             opposite_rows = [
                 raw.get('position') or {} for raw in post_rows
@@ -1440,6 +1593,36 @@ class _CapitalComCloseHooks:
                 client_order_id=coid,
             )
 
+        if store_ctx is not None:
+            # The journal's ``filled_qty`` doubles as the run-owned exposure
+            # cursor (K3 cycle-end book, adoption clamp, and the fold-netting
+            # ``retired_exposure`` all read it), so the target's cursor drops
+            # by the proven reduction — measured live on cycle 32: an
+            # inflated cursor made the next reversal fold over-net, close the
+            # fold row at retained=0, orphan its own entry activity and end
+            # the cycle at venue 0.01 vs journal 0. It is lowered here, while
+            # the command is still pending, never after the journal made it
+            # terminal: a command already ``confirmed`` is settled by no later
+            # path, so a failed write would leave the cursor high for good.
+            # The retirement is recorded per command, so a parked settlement
+            # or startup recovery of this command never lowers it twice; a
+            # failed write parks the close for the snapshot to settle.
+            command = store_ctx.get_order(coid)
+            if command is not None:
+                try:
+                    _retire_parked_partial_close_exposure(
+                        store_ctx, command,
+                        round(quantized_qty / rules.lot_step) if rules.lot_step > 0 else 0,
+                        rules.lot_step, path='partial_close_dispatch',
+                    )
+                except sqlite3.Error as failed:
+                    raise OrderDispositionUnknownError(
+                        f"Capital partial close {coid} reached the expected residual, "
+                        f"but its exposure retirement could not be journaled: {failed}",
+                        client_order_id=coid,
+                        cause=failed,
+                    ) from failed
+
         return CloseOutcome(
             mode='partial',
             applied_targets=[deal_ref] if deal_ref else [],
@@ -1545,6 +1728,18 @@ class _CapitalComModifyExitHooks:
         self._ambiguous_sl_coid = ambiguous_sl_coid
         self._sl_in_body = sl_in_body
         self._sl_clears_broker_active = sl_clears_broker_active
+        #: The amend command row's COID, known once the journal submits it.
+        self._command_coid: str | None = None
+        #: The accepted amend's ``dealReference`` (empty when the PUT returned
+        #: none), once the venue accepted it.
+        self.accepted_ref: str | None = None
+        #: Whether the leg mirror of the accepted amend committed.
+        self.mirror_committed = False
+
+    @property
+    def effective_leg_coids(self) -> tuple[str, str]:
+        """The COIDs the amend writes its take-profit and stop legs under."""
+        return self._effective_tp_coid, self._effective_sl_coid
 
     async def submit_amend(
             self, *, coid: str, target_coid: str,
@@ -1589,6 +1784,7 @@ class _CapitalComModifyExitHooks:
                 f"Modify-exit symbol changed from {old_intent.symbol!r} to "
                 f"{new_intent.symbol!r}"
             )
+        self._command_coid = coid
 
         deal_id = self._target_row.exchange_order_id
         if deal_id is None:
@@ -1610,17 +1806,7 @@ class _CapitalComModifyExitHooks:
                 # the amend while local state still reflects the pre-amend
                 # bracket. Seed/refresh the leg rows so the next reconcile
                 # snapshot resolves them against authoritative broker state.
-                self._seed_added_legs_disposition_unknown(new_intent)
-                self._mark_existing_sl_force_rejected_on_pending_trail()
-                self._persist_existing_legs_attempted_target(new_intent)
-                self._plugin.mark_bracket_legs_disposition_unknown(
-                    intent=new_intent,
-                    parent_coid=self._target_row.client_order_id,
-                    deal_id=deal_id,
-                    tp_coid=self._ambiguous_tp_coid,
-                    sl_coid=self._ambiguous_sl_coid,
-                    reason=str(net), stage='put',
-                )
+                self._park_legs_for_snapshot(new_intent, reason=str(net), stage='put')
                 raise OrderDispositionUnknownError(
                     f"Capital modify_exit PUT positions/{deal_id} "
                     f"ambiguous: {net}",
@@ -1653,16 +1839,8 @@ class _CapitalComModifyExitHooks:
                         self._plugin.store_ctx.add_ref(
                             coid, 'deal_reference', new_ref,
                         )
-                    self._seed_added_legs_disposition_unknown(new_intent)
-                    self._mark_existing_sl_force_rejected_on_pending_trail()
-                    self._persist_existing_legs_attempted_target(new_intent)
-                    self._plugin.mark_bracket_legs_disposition_unknown(
-                        intent=new_intent,
-                        parent_coid=self._target_row.client_order_id,
-                        deal_id=deal_id,
-                        tp_coid=self._ambiguous_tp_coid,
-                        sl_coid=self._ambiguous_sl_coid,
-                        reason=str(net), stage='confirm',
+                    self._park_legs_for_snapshot(
+                        new_intent, reason=str(net), stage='confirm',
                         deal_reference=new_ref,
                     )
                     raise OrderDispositionUnknownError(
@@ -1707,6 +1885,7 @@ class _CapitalComModifyExitHooks:
                 raw_confirm = None
             protection.accepted()
 
+        self.accepted_ref = str(new_ref) if new_ref else ''
         return ModifyExitOutcome(
             server_ref=str(new_ref) if new_ref else '',
             deal_status='ACCEPTED',
@@ -1721,8 +1900,8 @@ class _CapitalComModifyExitHooks:
     ) -> None:
         """Mirror the new TP / SL onto the parent entry row + leg rows.
 
-        Invoked by the journal only on the happy path (after the
-        command row has been ``confirmed`` + ``close_order``). Writes:
+        Invoked by the journal only on the happy path, before it makes the
+        command row terminal. Writes, in one transaction:
 
         * The parent entry row's risk snapshot
           (``set_risk`` + risk-clear ``upsert_order``).
@@ -1737,7 +1916,155 @@ class _CapitalComModifyExitHooks:
                 f"Cannot mirror bracket legs from outcome "
                 f"{outcome.deal_status!r}"
             )
-        self.apply_mirror(target_row=target_row, new_intent=new_intent)
+        store_ctx = self._plugin.store_ctx
+        if store_ctx is None:
+            self.apply_mirror(target_row=target_row, new_intent=new_intent)
+            return
+        # The mirror is all-or-nothing, and nothing re-runs it once it failed:
+        # recovery settles the command from ``confirms/{ref}`` alone. So a
+        # failed mirror hands the amend over the way an ambiguous one is: the
+        # legs in ``disposition_unknown`` at the attempted target and the
+        # command row parked, in one write, and the engine parks the amend on
+        # the raised :class:`OrderDispositionUnknownError` until the next
+        # snapshot resolves the legs against the venue's levels. A raw
+        # storage error would end the live sync with the new bracket on the
+        # venue. When that write fails too, it is retried at the start of
+        # every poll until it commits (``park_after_venue_write``): the
+        # engine's park under the entry is released only by the resolved
+        # legs, so an uncommitted park would hold the amend until a restart.
+        try:
+            with store_ctx.transaction():
+                self.apply_mirror(target_row=target_row, new_intent=new_intent)
+        except sqlite3.Error as failed:
+            raise self.park_after_journal_failure(
+                new_intent, failed, stage='mirror',
+                deal_reference=outcome.server_ref or None,
+            ) from failed
+        self.mirror_committed = True
+
+    def park_after_journal_failure(
+            self, new_intent: ExitIntent, failed: sqlite3.Error, *, stage: str,
+            deal_reference: str | None, command_coid: str | None = None,
+    ) -> OrderDispositionUnknownError:
+        """Park an amend whose journal write failed after its PUT reached the venue.
+
+        The amend is handed to the positions snapshot (:meth:`park_for_snapshot`).
+
+        :param new_intent: The amend's target intent.
+        :param failed: The storage failure.
+        :param stage: The step whose write failed, for the audit event.
+        :param deal_reference: The amend's ``dealReference`` when one came back.
+        :param command_coid: The amend command row's COID, when these hooks did
+            not submit it themselves.
+        :return: The unknown disposition to raise, under the position's entry,
+            where the engine parks it.
+        """
+        target_row = self._target_row
+        self.park_for_snapshot(
+            new_intent, command_coid=command_coid or self._command_coid, stage=stage,
+            reason=f"{stage} failed: {failed}", deal_reference=deal_reference,
+        )
+        logger.error(
+            "modify_exit of %s: the %s write failed (%s); the amend is parked until "
+            "the next positions snapshot resolves its legs",
+            target_row.client_order_id, stage, failed,
+        )
+        return OrderDispositionUnknownError(
+            f"Capital modify_exit on {target_row.exchange_order_id} reached the venue, "
+            f"but could not be journaled: {failed}",
+            client_order_id=target_row.client_order_id,
+            cause=failed,
+            predecessor_cancel_ids=(),
+        )
+
+    def park_for_snapshot(
+            self, new_intent: ExitIntent, *, command_coid: str | None, stage: str,
+            reason: str, deal_reference: str | None,
+    ) -> None:
+        """Hand an amend the venue may hold to the positions snapshot, in one write.
+
+        The legs go ``disposition_unknown`` at the attempted target
+        (:meth:`_park_legs_for_snapshot`) and the command row
+        ``disposition_unknown`` with its ``dealReference``. The write is
+        retried at the start of every poll until it commits
+        (``park_after_venue_write``). The snapshot then settles the legs
+        against the venue's levels, which releases the engine's park on the
+        position's entry, and the command completes once the venue holds the
+        requested bracket.
+
+        :param new_intent: The amend's target intent.
+        :param command_coid: The amend command row's COID, once it exists.
+        :param stage: The step that left the outcome unknown, for the audit event.
+        :param reason: Why the outcome is not known locally, for the audit event.
+        :param deal_reference: The amend's ``dealReference`` when one came back.
+        """
+        store_ctx = self._plugin.store_ctx
+        if store_ctx is None:
+            return
+        if self._command_coid is None:
+            # A restart's park: a pending trailing stop it seeds belongs to
+            # this command (:data:`EXTRAS_KEY_TRAIL_COMMAND`).
+            self._command_coid = command_coid
+
+        def park() -> None:
+            with store_ctx.transaction():
+                self._park_legs_for_snapshot(
+                    new_intent, reason=reason, stage=stage,
+                    deal_reference=deal_reference,
+                )
+                if command_coid is None:
+                    return
+                if (deal_reference is not None
+                        and store_ctx.find_by_ref('deal_reference', deal_reference) is None):
+                    store_ctx.add_ref(command_coid, 'deal_reference', deal_reference)
+                mark_disposition_unknown(store_ctx, coid=command_coid)
+                store_ctx.log_event(
+                    'disposition_unknown',
+                    client_order_id=command_coid,
+                    intent_key=new_intent.intent_key,
+                    payload={'phase': f'modify_exit_{stage}', 'reason': reason},
+                )
+
+        self._plugin.park_after_venue_write(
+            command_coid or self._target_row.client_order_id, park,
+        )
+
+    def _park_legs_for_snapshot(
+            self, new_intent: ExitIntent, *, reason: str, stage: str,
+            deal_reference: str | None = None,
+    ) -> None:
+        """Leave the leg rows for the snapshot to resolve against the venue, in one write.
+
+        Seeds rows for added legs, stamps the pending-trail transition, writes
+        the attempted target onto the existing legs and flips them to
+        ``disposition_unknown`` (:meth:`_seed_added_legs_disposition_unknown`,
+        :meth:`_mark_existing_sl_force_rejected_on_pending_trail`,
+        :meth:`_persist_existing_legs_attempted_target`). The steps commit
+        together: a flip without the attempted target would let the resolver
+        compare the old level with the old level and call an amend that never
+        landed ``attached``.
+
+        :param new_intent: The amend's target intent.
+        :param reason: Why the outcome is not known locally, for the audit event.
+        :param stage: Where it became unknown (``put``, ``confirm``, ``mirror``).
+        :param deal_reference: The amend's ``dealReference`` when one came back.
+        """
+        store_ctx = self._plugin.store_ctx
+        if store_ctx is None:
+            return
+        with store_ctx.transaction():
+            self._seed_added_legs_disposition_unknown(new_intent)
+            self._mark_existing_sl_force_rejected_on_pending_trail()
+            self._persist_existing_legs_attempted_target(new_intent)
+            self._plugin.mark_bracket_legs_disposition_unknown(
+                intent=new_intent,
+                parent_coid=self._target_row.client_order_id,
+                deal_id=self._target_row.exchange_order_id or '',
+                tp_coid=self._ambiguous_tp_coid,
+                sl_coid=self._ambiguous_sl_coid,
+                reason=reason, stage=stage,
+                deal_reference=deal_reference,
+            )
 
     def apply_mirror(
             self, *, target_row: 'OrderRow', new_intent: ExitIntent,
@@ -1893,6 +2220,7 @@ class _CapitalComModifyExitHooks:
                     sl_extras['trail_activation_price'] = new_i.trail_price
                     sl_extras['trail_offset'] = new_i.trail_offset
                     sl_extras['trail_state'] = 'pending'
+                    sl_extras[EXTRAS_KEY_TRAIL_COMMAND] = self._command_coid
                 store_ctx.upsert_order(
                     effective_sl_coid,
                     symbol=new_i.symbol,
@@ -1931,6 +2259,7 @@ class _CapitalComModifyExitHooks:
                     new_sl_extras['trail_activation_price'] = new_i.trail_price
                     new_sl_extras['trail_offset'] = new_i.trail_offset
                     new_sl_extras['trail_state'] = 'pending'
+                    new_sl_extras[EXTRAS_KEY_TRAIL_COMMAND] = self._command_coid
                 else:
                     # Leaving pending trailing: drop ALL three trail
                     # extras — ``trail_offset`` MUST go too, otherwise
@@ -1942,6 +2271,7 @@ class _CapitalComModifyExitHooks:
                     new_sl_extras.pop('trail_state', None)
                     new_sl_extras.pop('trail_activation_price', None)
                     new_sl_extras.pop('trail_offset', None)
+                    new_sl_extras.pop(EXTRAS_KEY_TRAIL_COMMAND, None)
                 store_ctx.upsert_order(
                     effective_sl_coid,
                     state='confirmed',
@@ -2180,6 +2510,7 @@ class _CapitalComModifyExitHooks:
                 'trail_activation_price': new_i.trail_price,
                 'trail_offset': new_i.trail_offset,
                 'trail_state': 'pending',
+                EXTRAS_KEY_TRAIL_COMMAND: self._command_coid,
             }
             pending_existing = store_ctx.get_order(sl_coid)
             if (pending_existing is not None
@@ -2284,6 +2615,7 @@ class _CapitalComModifyExitHooks:
                         'trail_state',
                         'trail_activation_price',
                         'trail_offset',
+                        EXTRAS_KEY_TRAIL_COMMAND,
                 ):
                     cur_extras.pop(key, None)
             store_ctx.upsert_order(

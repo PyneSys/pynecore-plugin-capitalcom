@@ -23,9 +23,10 @@ import asyncio
 import logging
 import math
 from abc import ABC
+from contextlib import nullcontext
 from dataclasses import replace
 from time import time as epoch_time
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator, Callable
 
 import httpx
 
@@ -41,7 +42,14 @@ from pynecore.core.broker.models import (
     OrderStatus,
     QuarantineKind,
 )
-from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
+from pynecore.core.broker.store_helpers import (
+    CLOSE_LEG_STATE_PENDING,
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
+    EXTRAS_KEY_CLOSE_LEG_ID,
+    iter_active_close_legs,
+    update_close_leg_state,
+)
 from pynecore.core.plugin import override
 
 from ._base import _CapitalComBase
@@ -55,7 +63,9 @@ from .helpers import (
     CLOSE_VERDICT_UNJUDGED,
     EXTERNAL_REDUCTION_VERDICTS,
     EXTRAS_KEY_BOOKED_CLOSES,
+    EXTRAS_KEY_DEFERRED_CLOSES,
     EXTRAS_KEY_NETTED_FOREIGN_DEAL,
+    EXTRAS_KEY_NETTED_RESIDUAL_PENDING,
     EXTRAS_KEY_PROTECTION_ADOPT_AFTER,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _ACTIVITY_LAG_S,
@@ -78,6 +88,79 @@ logger = logging.getLogger(__name__)
 #: Failed polls between two reminders of an order-poll outage (~5 minutes at
 #: the poll cadence).
 _FAILED_POLL_REMINDER_EVERY = 200
+
+#: Activity sources that only ever close a deal.
+_CLOSING_SOURCES = frozenset({'TP', 'SL', 'CLOSE_OUT', 'CLOSE', 'MARGIN', 'STOP_OUT'})
+
+
+def _activity_size(activity: dict) -> float | None:
+    """The size an activity row states itself, ``None`` when it states none.
+
+    :param activity: A ``/history/activity`` row.
+    :return: The positive size at the top level or in ``details``.
+    """
+    details = activity.get('details') or {}
+    size = _wire_float(activity.get('size') or details.get('size'), finite=True)
+    return size if size is not None and size > 0.0 else None
+
+
+def _is_opening_activity(activity: dict, side: str, deal_id: str) -> bool:
+    """Whether ``activity`` is the opening of the own deal ``deal_id`` of ``side``.
+
+    A ``POSITION`` activity of the deal in the deal's own trade direction
+    (``details.direction`` is the trade direction, measured 2026-07-10) and
+    from no closing source.
+
+    :param activity: A ``/history/activity`` row.
+    :param side: The deal's side (``'buy'`` / ``'sell'``).
+    :param deal_id: The deal.
+    """
+    details = activity.get('details') or {}
+    return (str(activity.get('type') or '') == 'POSITION'
+            and str(activity.get('dealId') or '') == deal_id
+            and str(details.get('direction') or '').upper() == ('BUY' if side == 'buy' else 'SELL')
+            and str(activity.get('source') or '').upper() not in _CLOSING_SOURCES)
+
+
+def _sizeless_close_identity(activity: dict) -> str:
+    """The identity a copy of the close ``activity`` that states no size carries."""
+    details = activity.get('details') or {}
+    return _close_identity({**activity, 'size': None, 'details': {**details, 'size': None}})
+
+
+def _owed_deferred_closes(extras: dict) -> dict[str, str]:
+    """The closes a booked entry still owes from its deferral, by identity.
+
+    :param extras: A position row's ``extras``.
+    :return: The ``dateUTC`` of each close in
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_DEFERRED_CLOSES` not yet
+        in :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_BOOKED_CLOSES`.
+    """
+    booked = set(extras.get(EXTRAS_KEY_BOOKED_CLOSES) or ())
+    return {close_id: str(date_utc or '')
+            for close_id, date_utc in (extras.get(EXTRAS_KEY_DEFERRED_CLOSES) or {}).items()
+            if close_id not in booked}
+
+
+def _record_booked_close(extras: dict, activity: dict, close_id: str) -> None:
+    """Record the booked close ``close_id`` on a position row's ``extras``.
+
+    The close joins :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_BOOKED_CLOSES`
+    and leaves :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_DEFERRED_CLOSES`,
+    together with its sizeless copy's identity: either copy books the close,
+    and a sizeless copy read after the sized one booked it is dropped.
+    """
+    identities = list(dict.fromkeys((close_id, _sizeless_close_identity(activity))))
+    booked = [key for key in (extras.get(EXTRAS_KEY_BOOKED_CLOSES) or ()) if key not in identities]
+    extras[EXTRAS_KEY_BOOKED_CLOSES] = (booked + identities)[-BOOKED_CLOSES_RETAINED:]
+    deferred = extras.get(EXTRAS_KEY_DEFERRED_CLOSES)
+    if deferred:
+        deferred = {key: value for key, value in deferred.items()
+                    if key not in identities}
+        if deferred:
+            extras[EXTRAS_KEY_DEFERRED_CLOSES] = deferred
+        else:
+            extras.pop(EXTRAS_KEY_DEFERRED_CLOSES, None)
 
 
 def _note_failed_poll(failed_polls: int, error: Exception) -> int:
@@ -193,7 +276,6 @@ class _ActivityMixin(_CapitalComBase, ABC):
             method='get',
         )
         activity_read_at = epoch_time()
-        self._activity_polled_at = polled_at
 
         positions_by_deal: dict[str, dict] = {}
         for row in positions_resp.get('positions') or []:
@@ -215,6 +297,10 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 activity_resp.get('activities') or [],
                 positions_by_deal, read_at=activity_read_at):
             yield ev
+        # The read counts as successful only once its whole batch is
+        # processed: a batch whose booking rolled back must come back in the
+        # next read, so the lookback keeps reaching back past this read.
+        self._activity_polled_at = polled_at
         async for ev in self._reconcile_snapshot(
                 positions_by_deal, working_by_deal,
                 read_started_at=positions_read_started_at):
@@ -235,13 +321,88 @@ class _ActivityMixin(_CapitalComBase, ABC):
         recovers those rows; fingerprint dedup and the date watermark drop the
         ones already processed.
 
+        The read also reaches back to the oldest activity some durable
+        pending state still waits for (:meth:`_oldest_pending_activity_ts`):
+        such an activity is booked only after a later read, and a window
+        anchored at the last read would no longer return it by then.
+
         :param now: Epoch time of the read about to be issued.
         :return: Lookback in whole seconds, capped at the venue maximum.
         """
         since_last = 0.0
         if self._activity_polled_at > 0.0:
             since_last = max(0.0, now - self._activity_polled_at)
+        oldest_pending = self._oldest_pending_activity_ts()
+        if oldest_pending is not None:
+            since_last = max(since_last, now - oldest_pending)
         return min(_ACTIVITY_MAX_PERIOD_S, math.ceil(since_last) + _ACTIVITY_LAG_S)
+
+    def _oldest_pending_activity_ts(self) -> float | None:
+        """Venue time of the oldest activity a durable pending state still waits for.
+
+        The one place every pending state that waits for an activity read
+        anchors the lookback, so no transition between those states can
+        shrink the window while an activity is still needed:
+
+        * a held partly netted entry
+          (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_NETTED_RESIDUAL_PENDING`)
+          waits for its deal's opening activity, republished with the size or
+          price it still lacks; its record keeps the ``dateUTC`` of the
+          activity that revealed the execution;
+        * a close deferred while that entry is held (its ``held_closes``);
+        * after the entry is booked, the same closes until each is booked
+          itself (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_DEFERRED_CLOSES`):
+          the settlement poll's own activity read defers them once more
+          before the snapshot books the entry, so only a later read books them.
+
+        An activity older than the venue's maximum lookback can no longer be
+        read and does not count.
+
+        :return: Epoch seconds, ``None`` when nothing waits for an activity.
+        """
+        if self.store_ctx is None:
+            return None
+        readable_since = epoch_time() - _ACTIVITY_MAX_PERIOD_S
+        oldest: float | None = None
+        for row in self.store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            dates: list[str] = []
+            pending = extras.get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+            if isinstance(pending, dict):
+                dates.append(str(pending.get('date_utc') or ''))
+                dates.extend(str(close.get('date_utc') or '')
+                             for close in (pending.get('held_closes') or {}).values())
+            dates.extend(_owed_deferred_closes(extras).values())
+            for date_utc in dates:
+                ts = _parse_iso_timestamp(date_utc)
+                if ts > readable_since and (oldest is None or ts < oldest):
+                    oldest = ts
+        return oldest
+
+    def _pending_activity_keys(self) -> tuple[set[str], set[str]]:
+        """What the durable pending states of :meth:`_oldest_pending_activity_ts` wait for.
+
+        :return: The deals of held partly netted entries (their opening
+            activity), and the identities
+            (:func:`~pynecore_capitalcom.models._close_identity`) of the closes
+            still deferred, held or after their entry was booked. A close
+            deferred without its size is keyed by its sizeless identity, which
+            the sized copy matches through
+            :func:`~pynecore_capitalcom.activity._sizeless_close_identity`.
+        """
+        held_deals: set[str] = set()
+        close_ids: set[str] = set()
+        if self.store_ctx is None:
+            return held_deals, close_ids
+        for row in self.store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            pending = extras.get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+            if isinstance(pending, dict):
+                if row.exchange_order_id:
+                    held_deals.add(row.exchange_order_id)
+                close_ids.update(pending.get('held_closes') or {})
+            close_ids.update(_owed_deferred_closes(extras))
+        return held_deals, close_ids
 
     async def _process_activity(
             self, activities: list[dict],
@@ -290,6 +451,15 @@ class _ActivityMixin(_CapitalComBase, ABC):
             _activity_watermark_floor(cursor.last_date_utc)
             if cursor.last_date_utc else ''
         )
+        # An activity a durable pending state still waits for passes the
+        # watermark: a read that omitted it may have let a newer row move the
+        # watermark past it, and the lookback reaches back to it for exactly
+        # this read (:meth:`_oldest_pending_activity_ts`). A close deferred
+        # without its size is matched by the sized copy's sizeless identity.
+        # Fingerprint dedup and the booked-close identities still drop a copy
+        # already booked.
+        pending_deals, pending_closes = (
+            self._pending_activity_keys() if watermark_floor else (set(), set()))
         # Every fingerprint in this batch, collected BEFORE the watermark
         # guard: the end-of-poll retention below must keep any fingerprint
         # that a future poll could still consult, and consultable rows are
@@ -307,12 +477,18 @@ class _ActivityMixin(_CapitalComBase, ABC):
             # watermark: a read after an outage serves it again, and the
             # edit stays the evidence of a verdict still to be decided.
             self._note_level_edit(a)
-            if watermark_floor and date_utc < watermark_floor:
+            if (watermark_floor and date_utc < watermark_floor
+                    and deal_id not in pending_deals
+                    and _close_identity(a) not in pending_closes
+                    and _sizeless_close_identity(a) not in pending_closes):
                 continue
             if fingerprint in cursor.seen_fingerprints:
                 continue
 
             row: 'OrderRow | None' = None
+            # The opened size of a partly netted own working order this
+            # activity's deal belongs to, when the bridge below promoted it.
+            bridge_fill_qty: float | None = None
             # A taken-over entry whose fill the snapshot could not prove
             # (:data:`EXTRAS_KEY_TAKE_OVER_UNPROVEN`) that this activity belongs
             # to, directly or through the order's back-link.
@@ -382,8 +558,9 @@ class _ActivityMixin(_CapitalComBase, ABC):
                         # defensive DELETE both went to the order's id).
                         if (wo_row.extras or {}).get('kind') in (
                                 ENTRY_KIND_WORKING, ENTRY_KIND_POSITION):
-                            self._promote_working_row_to_position(
-                                wo_row, deal_id, stamp_entry_filled=False,
+                            bridge_fill_qty = self._bridge_working_order_deal(
+                                wo_row, deal_id, a, activities_sorted, positions_by_deal,
+                                fingerprint,
                             )
                         row = (self.store_ctx.find_by_ref('deal_id', deal_id)
                                or wo_row)
@@ -451,6 +628,101 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 if positions_by_deal and deal_id else None
             )
             event = self._activity_to_event(a, row, position_snapshot)
+            if (bridge_fill_qty is not None and event is not None
+                    and event.event_type == 'filled' and event.leg_type == LegType.ENTRY):
+                event = self._residual_fill(event, bridge_fill_qty)
+
+            # An own execution held until the size of the deal it opened is
+            # known (``EXTRAS_KEY_NETTED_RESIDUAL_PENDING``): the deal's opening
+            # activity, when it states the size, books that size; any other
+            # entry-side row is the replay of the held execution. A close of
+            # the deal waits for the held entry to be booked first — reducing
+            # exposure never booked would walk the engine's book across — and,
+            # like an unmatched row, is deferred, not consumed, and audited
+            # once. The held record remembers it: the deal's ``/positions``
+            # size is net of it.
+            pending_settle_size: float | None = None
+            if ((row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING) is not None
+                    and event is not None and event.event_type == 'filled'):
+                if event.leg_type != LegType.ENTRY:
+                    deferred_in_batch = True
+                    self._hold_close_of_netted_residual(row, a, _activity_size(a))
+                    if (self.store_ctx is not None
+                            and fingerprint not in cursor.held_logged_fingerprints):
+                        cursor.held_logged_fingerprints.add(fingerprint)
+                        self.store_ctx.log_event(
+                            'activity_held_netted_residual_pending',
+                            client_order_id=row.client_order_id,
+                            exchange_order_id=deal_id or None,
+                            intent_key=row.intent_key,
+                            payload={'activity': a, 'fingerprint': fingerprint},
+                        )
+                    continue
+                if _is_opening_activity(a, row.side, row.exchange_order_id or ''):
+                    # A copy stating no size still prices a size an earlier
+                    # copy proved.
+                    held = (row.extras or {})[EXTRAS_KEY_NETTED_RESIDUAL_PENDING]
+                    proven = (_wire_float(held.get('opened_qty'), finite=True)
+                              if isinstance(held, dict) else None)
+                    pending_settle_size = _activity_size(a) or proven
+                    price_held = ((_wire_float(held.get('fill_price'), finite=True)
+                                   if isinstance(held, dict) else None) or 0.0) > 0.0
+                    priced = price_held or (
+                        _wire_float(event.fill_price, finite=True) or 0.0) > 0.0
+                    if pending_settle_size is None or not priced:
+                        # An opening that leaves the held entry without its
+                        # size or price is deferred, not consumed: the venue
+                        # republishes it with the missing ``details`` field
+                        # under the same fingerprint (which reads neither the
+                        # ``details`` size nor level), and that copy books the
+                        # entry. A size or a price it proves is kept on the
+                        # held record, so complementary copies settle it.
+                        deferred_in_batch = True
+                        details = a.get('details') or {}
+                        level = _wire_float(a.get('level') or details.get('level'),
+                                            finite=True)
+                        proof: dict = {}
+                        if pending_settle_size is not None and proven is None:
+                            proof['opened_qty'] = pending_settle_size
+                        if level is not None and level > 0.0 and not price_held:
+                            proof['fill_price'] = level
+                        if proof:
+                            self._update_netted_residual(
+                                row, lambda record: record.update(proof))
+                        if (self.store_ctx is not None
+                                and fingerprint not in cursor.held_logged_fingerprints):
+                            cursor.held_logged_fingerprints.add(fingerprint)
+                            self.store_ctx.log_event(
+                                'activity_held_netted_residual_opening_incomplete',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=deal_id or None,
+                                intent_key=row.intent_key,
+                                payload={'activity': a, 'fingerprint': fingerprint},
+                            )
+                        continue
+
+            # A close deferred without its size while its entry was held is
+            # still owed after the entry is booked
+            # (:data:`EXTRAS_KEY_DEFERRED_CLOSES`), and a copy that states no
+            # size still cannot tell the reduction: it stays deferred, not
+            # consumed, and audited once. The sized copy shares the fingerprint
+            # (which does not read the ``details`` size) and books the close.
+            if (event is not None and event.event_type == 'filled'
+                    and event.leg_type != LegType.ENTRY
+                    and _activity_size(a) is None
+                    and _close_identity(a) in _owed_deferred_closes(row.extras or {})):
+                deferred_in_batch = True
+                if (self.store_ctx is not None
+                        and fingerprint not in cursor.held_logged_fingerprints):
+                    cursor.held_logged_fingerprints.add(fingerprint)
+                    self.store_ctx.log_event(
+                        'activity_deferred_close_size_unknown',
+                        client_order_id=row.client_order_id,
+                        exchange_order_id=deal_id or None,
+                        intent_key=row.intent_key,
+                        payload={'activity': a, 'fingerprint': fingerprint},
+                    )
+                continue
 
             # DEFER guard: a closing-leg fill with no resolvable price
             # (Capital.com sometimes leaves ``level`` empty on closes
@@ -532,6 +804,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
                         event_type=event.event_type,
                         fill_price=proxy_price,
                         fill_qty=event.fill_qty,
+                        journal_fill_qty=event.journal_fill_qty,
                         timestamp=event.timestamp,
                         pine_id=event.pine_id,
                         from_entry=event.from_entry,
@@ -581,11 +854,16 @@ class _ActivityMixin(_CapitalComBase, ABC):
                         self._report_manual_close(row, a)
                     continue
 
-            cursor.seen_fingerprints[fingerprint] = date_utc
-            if (not deferred_in_batch
-                    and (not cursor.last_date_utc
-                         or date_utc > cursor.last_date_utc)):
-                cursor.last_date_utc = date_utc
+            # A sizeless copy of a close whose sized copy superseded it
+            # (:meth:`_hold_close_of_netted_residual`) is dropped without
+            # consuming its fingerprint: the fingerprint does not read the
+            # ``details`` size, so the sized copy shares it and still books.
+            if (event is not None and event.event_type == 'filled'
+                    and event.leg_type != LegType.ENTRY
+                    and _activity_size(a) is None
+                    and _close_identity(a)
+                    in ((row.extras or {}).get(EXTRAS_KEY_BOOKED_CLOSES) or ())):
+                continue
 
             # Idempotent entry-fill replay guard. An ENTRY fill whose
             # matched row already carries ``entry_filled_at`` was
@@ -613,6 +891,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 and event.event_type == 'filled'
                 and event.leg_type == LegType.ENTRY
                 and (row.extras or {}).get('entry_filled_at') is not None
+                and pending_settle_size is None
             )
             # Closing-leg twin of the guard above. A row stamped
             # ``natural_close_at`` with its exposure cursor retired
@@ -652,8 +931,17 @@ class _ActivityMixin(_CapitalComBase, ABC):
             # dies after the commit must still find the report on restart,
             # where the deduplicated activity no longer replays.
             close_verdict = CLOSE_VERDICT_UNJUDGED
-            if self.store_ctx is not None:
-                with self.store_ctx.transaction():
+            # The dedup commit and every journal write the booking makes
+            # before its event is yielded (the entry stamp, the exposure
+            # cursor, the close teardown or partial-close retirement) are one
+            # transaction: a process that dies in between must not find the
+            # activity consumed while its effect on the journal is missing. The
+            # in-memory cursor follows only the committed transaction: a failed
+            # one leaves the activity for the next poll of this process.
+            suppress_fill = False
+            with (self.store_ctx.transaction() if self.store_ctx is not None
+                  else nullcontext()):
+                if self.store_ctx is not None:
                     self.store_ctx.log_event(
                         'activity_processed',
                         exchange_order_id=deal_id,
@@ -674,273 +962,260 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     if is_close_fill and not close_fill_already_recorded:
                         self._rewrite_extras(
                             row.client_order_id,
-                            lambda extras: extras.__setitem__(
-                                EXTRAS_KEY_BOOKED_CLOSES,
-                                [*(extras.get(EXTRAS_KEY_BOOKED_CLOSES) or ())][
-                                    -BOOKED_CLOSES_RETAINED + 1:] + [close_id],
-                            ),
+                            lambda extras: _record_booked_close(extras, a, close_id),
                         )
-            report_close = close_verdict == CLOSE_VERDICT_FOREIGN
-
-            if event is not None:
-                # Working-order fill (WORKING_ORDER EXECUTED): promote the
-                # row to its position identity BEFORE yielding the fill.
-                # The new dealId comes from the same-instant POSITION
-                # activity in this batch, or from the same-poll
-                # ``/positions`` snapshot (the position payload carries
-                # ``workingOrderId``). ``stamp_entry_filled=True`` marks
-                # the fill as accounted so the POSITION activity's own
-                # ENTRY-fill replay is suppressed by the guard above on a
-                # later poll. When neither source shows the new deal yet,
-                # still clear the missing-pending premise and stamp the
-                # fill — the bridge branch or the next poll's snapshot
-                # completes the ref migration within the grace window.
-                if (event.event_type == 'filled'
-                        and event.leg_type == LegType.ENTRY
-                        and not entry_fill_already_recorded
-                        and (row.extras or {}).get('kind') == 'working'
-                        and self.store_ctx is not None):
-                    promoted_deal_id = self._find_promoted_deal_id(
-                        row, activities_sorted, positions_by_deal,
-                    )
-                    netted = self._netted_foreign_deal(
-                        row, activities_sorted, positions_by_deal,
-                    )
-                    if netted is not None and not promoted_deal_id:
-                        event = self._retire_order_netted_into_foreign_deal(
-                            row, event, netted, positions_by_deal,
+                    # Working-order fill (WORKING_ORDER EXECUTED): promote the
+                    # row to its position identity BEFORE yielding the fill,
+                    # in the dedup commit's transaction: a process that dies
+                    # after the commit must find the promotion (and an
+                    # execution held for its size) on restart, where the
+                    # deduplicated activity no longer replays. The new dealId
+                    # comes from the same-instant POSITION activity in this
+                    # batch, or from the same-poll ``/positions`` snapshot
+                    # (the position payload carries ``workingOrderId``).
+                    # ``stamp_entry_filled=True`` marks the fill as accounted
+                    # so the POSITION activity's own ENTRY-fill replay is
+                    # suppressed by the guard above on a later poll. When
+                    # neither source shows the new deal yet, still clear the
+                    # missing-pending premise and stamp the fill — the bridge
+                    # branch or the next poll's snapshot completes the ref
+                    # migration within the grace window.
+                    if (event is not None
+                            and event.event_type == 'filled'
+                            and event.leg_type == LegType.ENTRY
+                            and not entry_fill_already_recorded
+                            and (row.extras or {}).get('kind') == 'working'):
+                        event = self._promote_executed_working_order(
+                            row, event, activities_sorted, positions_by_deal,
+                            date_utc=date_utc,
                         )
-                    elif promoted_deal_id:
-                        if netted is not None:
-                            event = self._book_residual_of_partly_netted_order(
-                                row, event, netted, promoted_deal_id,
-                                activities_sorted, positions_by_deal,
-                            )
-                        self._promote_working_row_to_position(
-                            row, promoted_deal_id, stamp_entry_filled=True,
+                    if event is not None and pending_settle_size is not None:
+                        event = self._settle_netted_residual(
+                            row, pending_settle_size, fill_price=event.fill_price,
+                            fill_id=event.fill_id,
                         )
-                    else:
-                        refreshed = self.store_ctx.get_order(
-                            row.client_order_id,
-                        )
+                if event is not None:
+                    # Stamp the entry row before yielding its first
+                    # filled-as-ENTRY activity so :meth:`_activity_to_event`
+                    # can recognise subsequent ``USER`` / ``DEALER`` activities
+                    # for the same dealId as manual closes (Capital.com nets
+                    # per dealId — without the stamp the close routes as an
+                    # entry add). Persisting BEFORE the yield, in the
+                    # transaction of the ``activity_processed`` log, is
+                    # critical: a crash or cancellation before the consumer
+                    # resumes would otherwise dedupe the entry on restart but
+                    # leave ``entry_filled_at`` missing, misclassifying any
+                    # later manual close as ``LegType.ENTRY``.
+                    if (event.event_type == 'filled'
+                            and event.leg_type == LegType.ENTRY
+                            and (row.extras or {}).get('kind') == 'position'
+                            and not (row.extras or {}).get('entry_filled_at')
+                            and self.store_ctx is not None):
+                        refreshed = self.store_ctx.get_order(row.client_order_id)
                         base_extras = dict((refreshed or row).extras or {})
                         base_extras['entry_filled_at'] = epoch_time()
-                        base_extras.pop('missing_pending_since', None)
                         self.store_ctx.upsert_order(
                             row.client_order_id, extras=base_extras,
                         )
-                # Stamp the entry row before yielding its first
-                # filled-as-ENTRY activity so :meth:`_activity_to_event`
-                # can recognise subsequent ``USER`` / ``DEALER`` activities
-                # for the same dealId as manual closes (Capital.com nets
-                # per dealId — without the stamp the close routes as an
-                # entry add). Persisting BEFORE the yield is critical:
-                # the ``activity_processed`` log + cursor advance above
-                # are already durable, so a crash or cancellation between
-                # this point and the consumer's resumption would dedupe
-                # the entry on restart but leave ``entry_filled_at``
-                # missing, misclassifying any later manual close as
-                # ``LegType.ENTRY``.
-                if (event.event_type == 'filled'
-                        and event.leg_type == LegType.ENTRY
-                        and (row.extras or {}).get('kind') == 'position'
-                        and not (row.extras or {}).get('entry_filled_at')
-                        and self.store_ctx is not None):
-                    refreshed = self.store_ctx.get_order(row.client_order_id)
-                    base_extras = dict((refreshed or row).extras or {})
-                    base_extras['entry_filled_at'] = epoch_time()
-                    self.store_ctx.upsert_order(
-                        row.client_order_id, extras=base_extras,
-                    )
-                # The journal ``filled_qty`` doubles as the run-owned
-                # exposure cursor (K3 cycle-end book + startup adoption
-                # clamp read the signed sum of live rows' cursors), and the
-                # activity stream is the ONLY fill source for a working
-                # entry whose promote raced ahead of the snapshot pass:
-                # once the row is ``kind='position'`` the snapshot's
-                # working→position stamp can never run, and a FULL fill is
-                # excluded from the partial-fill detector by design — so
-                # without this write the cursor would stay at zero forever
-                # (measured 2026-08-21, cycle 51: engine and venue both
-                # -0.01, journal owned 0 → K3 MISMATCH).
-                if (event.event_type == 'filled'
-                        and event.leg_type == LegType.ENTRY
-                        and not entry_fill_already_recorded
-                        and self.store_ctx is not None):
-                    refreshed = self.store_ctx.get_order(row.client_order_id)
-                    if refreshed is not None:
-                        cursor_fill = min(
-                            refreshed.qty,
-                            max(refreshed.filled_qty,
-                                float(event.fill_qty or 0.0)),
-                        )
-                        if cursor_fill > refreshed.filled_qty:
-                            self.store_ctx.upsert_order(
-                                row.client_order_id, filled_qty=cursor_fill,
-                            )
-                # Stamp the close-event breadcrumb / natural-close teardown
-                # BEFORE yielding, for the same reason as the entry stamp
-                # above: the ``activity_processed`` log + cursor advance
-                # are already durable at this point, so a crash or
-                # cancellation between the yield and the legacy post-yield
-                # branch would dedupe the activity on restart but leave
-                # the breadcrumb missing. Next poll's vanished deal would
-                # then fall into ``missing_pending_since`` /
-                # :class:`UnexpectedCancelError` instead of the intended
-                # natural-close teardown (or, for the still-present-deal
-                # race, the snapshot would lack the breadcrumb that
-                # ``_reconcile_snapshot`` relies on to upgrade to a
-                # teardown without waiting for the grace window).
-                suppress_fill = False
-                if entry_fill_already_recorded:
-                    suppress_fill = True
-                    if self.store_ctx is not None:
-                        self.store_ctx.log_event(
-                            'entry_fill_replay_suppressed',
-                            client_order_id=row.client_order_id,
-                            exchange_order_id=deal_id,
-                            payload={
-                                'reason': 'entry_already_accounted',
-                                'fingerprint': fingerprint,
-                                'dateUTC': date_utc,
-                                'deal_id': deal_id,
-                                'symbol': row.symbol,
-                                'side': row.side,
-                            },
-                        )
-                elif close_fill_already_recorded:
-                    suppress_fill = True
-                    if self.store_ctx is not None:
-                        self.store_ctx.log_event(
-                            'close_fill_replay_suppressed',
-                            client_order_id=row.client_order_id,
-                            exchange_order_id=deal_id,
-                            payload={
-                                'reason': 'close_already_accounted',
-                                'fingerprint': fingerprint,
-                                'dateUTC': date_utc,
-                                'deal_id': deal_id,
-                                'symbol': row.symbol,
-                                'side': row.side,
-                            },
-                        )
-                if (not suppress_fill
-                        and event.event_type == 'filled'
-                        and event.leg_type in (
-                            LegType.TAKE_PROFIT,
-                            LegType.STOP_LOSS,
-                            LegType.TRAILING_STOP,
-                            LegType.CLOSE,
-                        )):
-                    # Bracket / manual close handling: the same-poll
-                    # ``positions_by_deal`` snapshot decides whether
-                    # this fill actually retired the position.
-                    #   * Deal absent / size <= 0 → full close. Tear
-                    #     down the entry + bracket rows so
-                    #     :meth:`_reconcile_snapshot` does not stamp
-                    #     ``missing_pending_since`` on the now-gone
-                    #     dealId next poll.
-                    #   * Deal still present at size > 0 → either a
-                    #     PARTIAL close (``USER`` / ``DEALER`` reduced
-                    #     the deal — the OCA bracket stays attached
-                    #     to the remaining exposure) or a race where
-                    #     ``/history/activity`` is ahead of
-                    #     ``/positions`` in this same poll. Stamping
-                    #     ``natural_close_at`` here would orphan the
-                    #     live exposure: ``execute_exit`` / ``modify_exit``
-                    #     and reconcile would skip the still-open
-                    #     remainder. Leave a ``close_event_yielded_at``
-                    #     breadcrumb instead — :meth:`_reconcile_snapshot`
-                    #     reads it on a subsequent poll: if the deal has
-                    #     since vanished, that's the race resolving and
-                    #     the row is upgraded to a teardown without
-                    #     waiting for the missing-pending grace window
-                    #     (which would otherwise raise a false
-                    #     :class:`UnexpectedCancelError`).
-                    #   * Deal absent, but a later close of the same deal
-                    #     follows in this batch (an own partial close and
-                    #     someone else's close of the rest) → not this
-                    #     close's teardown: it is booked like a partial, and
-                    #     the last close tears down. Tearing down at the
-                    #     first would turn the later, different close into
-                    #     a suppressed replay — never booked, never judged.
-                    deal_remaining: float | None = None
-                    if (deal_id and positions_by_deal
-                            and deal_id in positions_by_deal):
-                        pos_snap = (
-                            positions_by_deal[deal_id].get('position') or {}
-                        )
-                        deal_remaining = float(pos_snap.get('size') or 0.0)
-                    if ((deal_remaining is None or deal_remaining <= 0.0)
-                            and not self._later_close_in_batch(
-                                activities_sorted, index, deal_id, row)):
-                        retired_exposure = row.filled_qty
-                        self._close_bracket_after_natural_close(row)
-                        self._retire_netted_journal_exposure(
-                            row, retired_exposure,
-                        )
-                    elif self.store_ctx is not None:
+                    # The journal ``filled_qty`` doubles as the run-owned
+                    # exposure cursor (K3 cycle-end book + startup adoption
+                    # clamp read the signed sum of live rows' cursors), and the
+                    # activity stream is the ONLY fill source for a working
+                    # entry whose promote raced ahead of the snapshot pass:
+                    # once the row is ``kind='position'`` the snapshot's
+                    # working→position stamp can never run, and a FULL fill is
+                    # excluded from the partial-fill detector by design — so
+                    # without this write the cursor would stay at zero forever
+                    # (measured 2026-08-21, cycle 51: engine and venue both
+                    # -0.01, journal owned 0 → K3 MISMATCH).
+                    if (event.event_type == 'filled'
+                            and event.leg_type == LegType.ENTRY
+                            and not entry_fill_already_recorded
+                            and self.store_ctx is not None):
                         refreshed = self.store_ctx.get_order(row.client_order_id)
                         if refreshed is not None:
-                            mark_extras = dict(refreshed.extras or {})
-                            mark_extras['close_event_yielded_at'] = epoch_time()
-                            # Tie the breadcrumb to the current poll cycle so
-                            # :meth:`_reconcile_snapshot` does not clear it
-                            # against the same stale snapshot that triggered
-                            # the defer here. See ``_current_poll_id`` in
-                            # ``__init__`` for the rationale.
-                            mark_extras['close_event_yielded_at_poll_id'] = (
-                                self._current_poll_id
+                            cursor_fill = min(
+                                refreshed.qty,
+                                max(refreshed.filled_qty,
+                                    float(event.fill_qty or 0.0)),
                             )
-                            # A reduction may change the bracket the venue
-                            # keeps on the residual: the next snapshot read
-                            # after it becomes the accepted protection.
-                            mark_extras[EXTRAS_KEY_PROTECTION_ADOPT_AFTER] = (
-                                epoch_time()
+                            if cursor_fill > refreshed.filled_qty:
+                                self.store_ctx.upsert_order(
+                                    row.client_order_id, filled_qty=cursor_fill,
+                                )
+                    # Stamp the close-event breadcrumb / natural-close teardown
+                    # BEFORE yielding, for the same reason as the entry stamp
+                    # above, in the transaction of the ``activity_processed``
+                    # log: a crash or cancellation after the yield would
+                    # otherwise dedupe the activity on restart but leave the
+                    # breadcrumb missing. Next poll's vanished deal would
+                    # then fall into ``missing_pending_since`` /
+                    # :class:`UnexpectedCancelError` instead of the intended
+                    # natural-close teardown (or, for the still-present-deal
+                    # race, the snapshot would lack the breadcrumb that
+                    # ``_reconcile_snapshot`` relies on to upgrade to a
+                    # teardown without waiting for the grace window).
+                    suppress_fill = False
+                    if entry_fill_already_recorded:
+                        suppress_fill = True
+                        if self.store_ctx is not None:
+                            self.store_ctx.log_event(
+                                'entry_fill_replay_suppressed',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=deal_id,
+                                payload={
+                                    'reason': 'entry_already_accounted',
+                                    'fingerprint': fingerprint,
+                                    'dateUTC': date_utc,
+                                    'deal_id': deal_id,
+                                    'symbol': row.symbol,
+                                    'side': row.side,
+                                },
                             )
-                            # The run's share of the deal shrinks by what
-                            # someone else (or the venue) took: the
-                            # ``filled_qty`` exposure cursor follows it, as it
-                            # does after an own partial close. An own close
-                            # already lowered it at dispatch; an own netting
-                            # entry offsets it with its own cursor.
-                            remaining: float | None = None
-                            if (event.leg_type == LegType.CLOSE
-                                    and close_verdict in EXTERNAL_REDUCTION_VERDICTS):
-                                remaining = max(
-                                    0.0, refreshed.filled_qty - float(event.fill_qty or 0.0),
+                    elif close_fill_already_recorded:
+                        suppress_fill = True
+                        if self.store_ctx is not None:
+                            self.store_ctx.log_event(
+                                'close_fill_replay_suppressed',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=deal_id,
+                                payload={
+                                    'reason': 'close_already_accounted',
+                                    'fingerprint': fingerprint,
+                                    'dateUTC': date_utc,
+                                    'deal_id': deal_id,
+                                    'symbol': row.symbol,
+                                    'side': row.side,
+                                },
+                            )
+                    if (not suppress_fill
+                            and event.event_type == 'filled'
+                            and event.leg_type in (
+                                LegType.TAKE_PROFIT,
+                                LegType.STOP_LOSS,
+                                LegType.TRAILING_STOP,
+                                LegType.CLOSE,
+                            )):
+                        # Bracket / manual close handling: the same-poll
+                        # ``positions_by_deal`` snapshot decides whether
+                        # this fill actually retired the position.
+                        #   * Deal absent / size <= 0 → full close. Tear
+                        #     down the entry + bracket rows so
+                        #     :meth:`_reconcile_snapshot` does not stamp
+                        #     ``missing_pending_since`` on the now-gone
+                        #     dealId next poll.
+                        #   * Deal still present at size > 0 → either a
+                        #     PARTIAL close (``USER`` / ``DEALER`` reduced
+                        #     the deal — the OCA bracket stays attached
+                        #     to the remaining exposure) or a race where
+                        #     ``/history/activity`` is ahead of
+                        #     ``/positions`` in this same poll. Stamping
+                        #     ``natural_close_at`` here would orphan the
+                        #     live exposure: ``execute_exit`` / ``modify_exit``
+                        #     and reconcile would skip the still-open
+                        #     remainder. Leave a ``close_event_yielded_at``
+                        #     breadcrumb instead — :meth:`_reconcile_snapshot`
+                        #     reads it on a subsequent poll: if the deal has
+                        #     since vanished, that's the race resolving and
+                        #     the row is upgraded to a teardown without
+                        #     waiting for the missing-pending grace window
+                        #     (which would otherwise raise a false
+                        #     :class:`UnexpectedCancelError`).
+                        #   * Deal absent, but a later close of the same deal
+                        #     follows in this batch (an own partial close and
+                        #     someone else's close of the rest) → not this
+                        #     close's teardown: it is booked like a partial, and
+                        #     the last close tears down. Tearing down at the
+                        #     first would turn the later, different close into
+                        #     a suppressed replay — never booked, never judged.
+                        deal_remaining: float | None = None
+                        if (deal_id and positions_by_deal
+                                and deal_id in positions_by_deal):
+                            pos_snap = (
+                                positions_by_deal[deal_id].get('position') or {}
+                            )
+                            deal_remaining = float(pos_snap.get('size') or 0.0)
+                        if ((deal_remaining is None or deal_remaining <= 0.0)
+                                and not self._later_close_in_batch(
+                                    activities_sorted, index, deal_id, row)):
+                            self._tear_down_natural_close(row)
+                        elif self.store_ctx is not None:
+                            refreshed = self.store_ctx.get_order(row.client_order_id)
+                            if refreshed is not None:
+                                mark_extras = dict(refreshed.extras or {})
+                                mark_extras['close_event_yielded_at'] = epoch_time()
+                                # Tie the breadcrumb to the current poll cycle so
+                                # :meth:`_reconcile_snapshot` does not clear it
+                                # against the same stale snapshot that triggered
+                                # the defer here. See ``_current_poll_id`` in
+                                # ``__init__`` for the rationale.
+                                mark_extras['close_event_yielded_at_poll_id'] = (
+                                    self._current_poll_id
                                 )
-                                mark_extras['partial_close_retired_at'] = epoch_time()
-                            if remaining is None:
-                                self.store_ctx.upsert_order(
-                                    row.client_order_id, extras=mark_extras,
+                                # A reduction may change the bracket the venue
+                                # keeps on the residual: the next snapshot read
+                                # after it becomes the accepted protection.
+                                mark_extras[EXTRAS_KEY_PROTECTION_ADOPT_AFTER] = (
+                                    epoch_time()
                                 )
-                            else:
-                                self.store_ctx.upsert_order(
-                                    row.client_order_id, filled_qty=remaining,
-                                    extras=mark_extras,
-                                )
-                                self.store_ctx.log_event(
-                                    'partial_close_journal_retired',
-                                    client_order_id=row.client_order_id,
-                                    exchange_order_id=deal_id,
-                                    payload={
-                                        'retired_exposure': float(event.fill_qty or 0.0),
-                                        'remaining_exposure': remaining,
-                                        'source': a.get('source'),
-                                        'verdict': close_verdict,
-                                    },
-                                )
+                                # The run's share of the deal shrinks by what
+                                # someone else (or the venue) took: the
+                                # ``filled_qty`` exposure cursor follows it, as it
+                                # does after an own partial close. An own close
+                                # already lowered it at dispatch; an own netting
+                                # entry offsets it with its own cursor.
+                                remaining: float | None = None
+                                if (event.leg_type == LegType.CLOSE
+                                        and close_verdict in EXTERNAL_REDUCTION_VERDICTS):
+                                    remaining = max(
+                                        0.0, refreshed.filled_qty - float(event.fill_qty or 0.0),
+                                    )
+                                    mark_extras['partial_close_retired_at'] = epoch_time()
+                                if remaining is None:
+                                    self.store_ctx.upsert_order(
+                                        row.client_order_id, extras=mark_extras,
+                                    )
+                                else:
+                                    self.store_ctx.upsert_order(
+                                        row.client_order_id, filled_qty=remaining,
+                                        extras=mark_extras,
+                                    )
+                                    self.store_ctx.log_event(
+                                        'partial_close_journal_retired',
+                                        client_order_id=row.client_order_id,
+                                        exchange_order_id=deal_id,
+                                        payload={
+                                            'retired_exposure': float(event.fill_qty or 0.0),
+                                            'remaining_exposure': remaining,
+                                            'source': a.get('source'),
+                                            'verdict': close_verdict,
+                                        },
+                                    )
+                # Who ended a resting bot order is recorded in the dedup
+                # commit's transaction too: the deduplicated activity never
+                # replays, and without the record the disappearance verdict
+                # would take the venue's cancel for someone else's.
+                venue_ended = (
+                    event is not None
+                    and event.event_type in ('cancelled', 'rejected')
+                    and (row.extras or {}).get('kind') == 'working'
+                    and self._note_working_order_end(row, a)
+                )
+            cursor.seen_fingerprints[fingerprint] = date_utc
+            if (not deferred_in_batch
+                    and (not cursor.last_date_utc
+                         or date_utc > cursor.last_date_utc)):
+                cursor.last_date_utc = date_utc
+            report_close = close_verdict == CLOSE_VERDICT_FOREIGN
+
+            if event is not None:
                 if suppress_fill:
                     # The activity is already durable (``activity_processed``
                     # logged, cursor advanced) and the entry/bracket rows were
                     # torn down above — only the double-counting fill is
                     # dropped.
                     continue
-                if (event.event_type in ('cancelled', 'rejected')
-                        and (row.extras or {}).get('kind') == 'working'
-                        and self._note_working_order_end(row, a)
-                        and event.event_type == 'cancelled'):
+                if venue_ended and event.event_type == 'cancelled':
                     # The venue itself ended the resting order: the engine
                     # would take the cancel for someone else's. The
                     # disappearance verdict retires the row as the venue's.
@@ -970,6 +1245,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
             for fp in stale:
                 del cursor.seen_fingerprints[fp]
         cursor.external_logged_fingerprints &= batch_fingerprints
+        cursor.held_logged_fingerprints &= batch_fingerprints
 
     def _activity_to_event(
             self, activity: dict, row: 'OrderRow',
@@ -1293,6 +1569,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
             event_type=event_type,
             fill_price=level if event_type == 'filled' else None,
             fill_qty=size if event_type == 'filled' else None,
+            journal_fill_qty=size if event_type == 'filled' else None,
             timestamp=now_ts,
             pine_id=row.pine_entry_id,
             from_entry=row.from_entry,
@@ -1308,6 +1585,103 @@ class _ActivityMixin(_CapitalComBase, ABC):
             fill_id=_activity_fingerprint(activity),
         )
 
+    def _bridge_working_order_deal(
+            self, wo_row: 'OrderRow', deal_id: str, activity: dict,
+            activities: list[dict], positions_by_deal: dict[str, dict] | None,
+            fingerprint: str,
+    ) -> float | None:
+        """Promote an own order onto the deal a ``POSITION`` activity says it opened.
+
+        The bridge leaves the entry fill to this activity (no
+        ``entry_filled_at`` stamp). When the order also netted a foreign deal,
+        only the opened deal's size is the run's: the size the opening
+        activity states. Without one, the execution is held until the size is
+        known (:meth:`_hold_netted_residual`).
+
+        :param wo_row: The order's row, still on the order's ``dealId``.
+        :param deal_id: The deal the activity names.
+        :param activity: The ``POSITION`` activity back-linking the order.
+        :param activities: The activity batch.
+        :param positions_by_deal: The poll's ``/positions`` rows by ``dealId``.
+        :param fingerprint: The activity's fingerprint, the held fill's id.
+        :return: The opened size to book for a partly netted order, else ``None``.
+        """
+        netted = self._netted_foreign_deal(wo_row, activities, positions_by_deal)
+        if netted is None:
+            self._promote_working_row_to_position(wo_row, deal_id, stamp_entry_filled=False)
+            return None
+        netted_deal_id, conflict = netted
+        self._report_own_order_netted_foreign_deal(
+            wo_row, wo_row.exchange_order_id or '', netted_deal_id, conflict, positions_by_deal,
+        )
+        opened = self._netted_residual_size(wo_row.side, deal_id, [activity])
+        date_utc = str(activity.get('dateUTC') or '')
+        if opened is None:
+            details = activity.get('details') or {}
+            self._hold_netted_residual(
+                wo_row, deal_id, netted_deal_id, executed=wo_row.qty,
+                fill_price=_wire_float(activity.get('level') or details.get('level'),
+                                       finite=True),
+                fill_id=fingerprint, date_utc=date_utc,
+            )
+            return None
+        if self._opened_deal_price(wo_row.side, deal_id, [activity], positions_by_deal) <= 0.0:
+            # The size is proven but no price is: held with the size, booked
+            # by the first read that prices it (:meth:`_settle_netted_residual`).
+            self._hold_netted_residual(
+                wo_row, deal_id, netted_deal_id, executed=wo_row.qty,
+                fill_price=None, fill_id=fingerprint, opened_qty=opened, date_utc=date_utc,
+            )
+            return None
+        self._promote_working_row_to_position(wo_row, deal_id, stamp_entry_filled=False)
+        return opened
+
+    def _promote_executed_working_order(
+            self, row: 'OrderRow', event: OrderEvent, activities: list[dict],
+            positions_by_deal: dict[str, dict] | None, *, date_utc: str,
+    ) -> OrderEvent | None:
+        """Move an executed own working order onto the deal it opened, before its fill is booked.
+
+        :param row: The working-order row.
+        :param event: The ``filled`` ENTRY event of its ``WORKING_ORDER EXECUTED`` activity.
+        :param activities: The activity batch.
+        :param positions_by_deal: The poll's ``/positions`` rows by ``dealId``.
+        :param date_utc: The execution activity's ``dateUTC``.
+        :return: The event to book: ``event``, the residual of a partly netted
+            execution, the ``rejected`` entry of one that only netted a foreign
+            deal, or ``None`` while a partly netted execution's opened size is
+            unknown.
+        """
+        assert self.store_ctx is not None
+        promoted_deal_id = self._find_promoted_deal_id(row, activities, positions_by_deal)
+        netted = self._netted_foreign_deal(row, activities, positions_by_deal)
+        if netted is not None and not promoted_deal_id:
+            return self._retire_order_netted_into_foreign_deal(
+                row, event, netted, positions_by_deal,
+            )
+        if promoted_deal_id:
+            if netted is None:
+                self._promote_working_row_to_position(
+                    row, promoted_deal_id, stamp_entry_filled=True,
+                )
+                return event
+            # A held execution promotes the row itself.
+            residual = self._book_residual_of_partly_netted_order(
+                row, event, netted, promoted_deal_id, activities, positions_by_deal,
+                date_utc=date_utc,
+            )
+            if residual is not None:
+                self._promote_working_row_to_position(
+                    row, promoted_deal_id, stamp_entry_filled=True,
+                )
+            return residual
+        refreshed = self.store_ctx.get_order(row.client_order_id)
+        base_extras = dict((refreshed or row).extras or {})
+        base_extras['entry_filled_at'] = epoch_time()
+        base_extras.pop('missing_pending_since', None)
+        self.store_ctx.upsert_order(row.client_order_id, extras=base_extras)
+        return event
+
     def _later_close_in_batch(
             self, activities: list[dict], index: int, deal_id: str, row: 'OrderRow',
     ) -> bool:
@@ -1319,9 +1693,11 @@ class _ActivityMixin(_CapitalComBase, ABC):
         :param row: The bot position row the deal belongs to.
         """
         seen = self._activity_cursor.seen_fingerprints
+        current = _activity_fingerprint(activities[index])
         for later in activities[index + 1:]:
+            fingerprint = _activity_fingerprint(later)
             if (str(later.get('dealId') or '') != deal_id
-                    or _activity_fingerprint(later) in seen):
+                    or fingerprint == current or fingerprint in seen):
                 continue
             event = self._activity_to_event(later, row)
             if (event is not None and event.event_type == 'filled'
@@ -1514,7 +1890,9 @@ class _ActivityMixin(_CapitalComBase, ABC):
             promoted_deal_id: str,
             activities: list[dict],
             positions_by_deal: dict[str, dict] | None,
-    ) -> OrderEvent:
+            *,
+            date_utc: str,
+    ) -> OrderEvent | None:
         """The fill of an own working order that netted a foreign deal and opened one.
 
         On a netting account an order larger than the foreign deal it nets
@@ -1524,14 +1902,20 @@ class _ActivityMixin(_CapitalComBase, ABC):
         venue does not show the run. The netting itself is reported once
         (ERROR, audit event, ``ENTRY_BLOCK``).
 
+        While neither the batch nor the snapshot tells the opened size, nothing
+        is booked: the execution is kept on the row
+        (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_NETTED_RESIDUAL_PENDING`)
+        until the deal's size is known (:meth:`_settle_netted_residual`).
+
         :param row: The own working-order row.
         :param event: The ``filled`` ENTRY event of the order's whole execution.
         :param netted: ``(dealId, conflict)`` of the netted foreign deal.
         :param promoted_deal_id: The deal the order opened.
         :param activities: The activity batch.
         :param positions_by_deal: The poll's ``/positions`` rows by ``dealId``.
-        :return: The event to book: the residual fill, or ``event`` unchanged
-            when the opened size is unknown.
+        :param date_utc: The execution activity's ``dateUTC``.
+        :return: The event to book (the residual fill), or ``None`` while the
+            opened size is unknown.
         """
         assert self.store_ctx is not None
         wo_id = row.exchange_order_id or ''
@@ -1539,18 +1923,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
         self._report_own_order_netted_foreign_deal(
             row, wo_id, deal_id, conflict, positions_by_deal,
         )
-        opened: float | None = None
-        for activity in activities:
-            if (str(activity.get('type') or '') == 'POSITION'
-                    and str(activity.get('dealId') or '') == promoted_deal_id):
-                details = activity.get('details') or {}
-                opened = _wire_float(activity.get('size') or details.get('size'), finite=True)
-                if opened is not None:
-                    break
-        if opened is None:
-            raw = (positions_by_deal or {}).get(promoted_deal_id)
-            if raw is not None:
-                opened = _wire_float((raw.get('position') or {}).get('size'), finite=True)
+        opened = self._netted_residual_size(row.side, promoted_deal_id, activities)
         executed = float(event.fill_qty or 0.0)
         self.store_ctx.log_event(
             'own_working_order_partly_netted_foreign_deal',
@@ -1560,21 +1933,368 @@ class _ActivityMixin(_CapitalComBase, ABC):
                      'conflict': conflict, 'executed_qty': executed,
                      'opened_qty': opened},
         )
-        if opened is None or opened <= 0.0 or opened >= executed:
-            if opened is None:
-                logger.error(
-                    "own working order %s (%s) netted foreign deal %s and opened "
-                    "deal %s of unknown size: its whole execution of %s is booked",
-                    wo_id, row.symbol, deal_id, promoted_deal_id, executed,
-                )
-            return event
+        if opened is None:
+            self._hold_netted_residual(
+                row, promoted_deal_id, deal_id, executed=executed,
+                fill_price=event.fill_price, fill_id=event.fill_id, date_utc=date_utc,
+            )
+            return None
+        price = (_wire_float(event.fill_price, finite=True)
+                 or self._opened_deal_price(row.side, promoted_deal_id, activities,
+                                            positions_by_deal))
+        if price <= 0.0:
+            self._hold_netted_residual(
+                row, promoted_deal_id, deal_id, executed=executed,
+                fill_price=None, fill_id=event.fill_id, opened_qty=opened, date_utc=date_utc,
+            )
+            return None
+        return self._residual_fill(event, opened, fill_price=price)
+
+    @staticmethod
+    def _opened_deal_price(
+            side: str, deal_id: str, activities: list[dict],
+            positions_by_deal: dict[str, dict] | None,
+    ) -> float:
+        """The open price of the deal a partly netted own order opened, ``0.0`` when unknown.
+
+        The deal's opening activity's level, else its ``/positions`` row's
+        open level.
+
+        :param side: The order's side (``'buy'`` / ``'sell'``).
+        :param deal_id: The opened deal.
+        :param activities: The activity batch.
+        :param positions_by_deal: The poll's ``/positions`` rows by ``dealId``.
+        """
+        for activity in activities:
+            if _is_opening_activity(activity, side, deal_id):
+                details = activity.get('details') or {}
+                level = _wire_float(activity.get('level') or details.get('level'), finite=True)
+                if level is not None and level > 0.0:
+                    return level
+        position = ((positions_by_deal or {}).get(deal_id) or {}).get('position') or {}
+        level = _wire_float(position.get('level'), finite=True)
+        return level if level is not None and level > 0.0 else 0.0
+
+    @staticmethod
+    def _residual_fill(event: OrderEvent, opened: float, *,
+                       fill_price: float | None = None) -> OrderEvent:
+        """``event`` cut to the ``opened`` size of the deal a partly netted order opened.
+
+        :param event: The ``filled`` ENTRY event of the order's execution.
+        :param opened: The opened deal's size; at or above the executed size
+            (nothing was netted after all) the size stays unchanged.
+        :param fill_price: The price to book in place of the event's own,
+            ``None`` to keep it.
+        """
         order = event.order
+        if fill_price is not None and fill_price != event.fill_price:
+            order = replace(order, average_fill_price=fill_price)
+            event = replace(event, order=order, fill_price=fill_price)
+        if opened <= 0.0 or opened >= float(event.fill_qty or 0.0):
+            return event
         return replace(
             event,
             order=replace(order, filled_qty=opened,
                           remaining_qty=max(0.0, order.qty - opened)),
             fill_qty=opened,
+            journal_fill_qty=opened,
         )
+
+    @staticmethod
+    def _netted_residual_size(side: str, deal_id: str, activities: list[dict]) -> float | None:
+        """The size of the deal a partly netted own working order opened, if an activity states it.
+
+        Only the deal's opening activity counts: a ``POSITION`` activity of the
+        deal in the order's own trade direction and from no closing source. A
+        close of the deal states the size it took, not what the order opened.
+        A ``/positions`` row is no such evidence: it states the size left after
+        every reduction it already reflects, which
+        :meth:`_settle_netted_residual_from_snapshot` accounts for.
+
+        :param side: The order's side (``'buy'`` / ``'sell'``).
+        :param deal_id: The opened deal.
+        :param activities: The activity batch.
+        :return: The size, or ``None`` when no opening activity states a positive one.
+        """
+        for activity in activities:
+            if _is_opening_activity(activity, side, deal_id):
+                opened = _activity_size(activity)
+                if opened is not None:
+                    return opened
+        return None
+
+    def _hold_netted_residual(
+            self, row: 'OrderRow', deal_id: str, netted_deal_id: str, *,
+            executed: float, fill_price: float | None, fill_id: str | None,
+            date_utc: str, opened_qty: float | None = None,
+    ) -> None:
+        """Keep the execution of a partly netted own order unbooked until its size and price are known.
+
+        The order netted a foreign deal and opened ``deal_id`` with the rest,
+        but how much it opened is not known yet: booking the whole execution
+        would give the run the exposure the foreign deal consumed. A size
+        already proven without a price (``opened_qty``) is held the same way:
+        a fill without a valid price would be discarded by the engine. The row
+        stays on the opened deal with the execution recorded under
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_NETTED_RESIDUAL_PENDING`;
+        the deal's sized opening activity or the ``/positions`` reads that list
+        it book exactly the opened size (:meth:`_settle_netted_residual`,
+        :meth:`_settle_netted_residual_from_snapshot`). The record is durable,
+        so a restart in between still books it once; the run-owned exposure
+        cursor stays at zero meanwhile, so a startup adoption does not count
+        the deal either.
+
+        :param row: The own working-order row, before its promotion.
+        :param deal_id: The deal the order opened.
+        :param netted_deal_id: The foreign deal it netted.
+        :param executed: The size of the whole execution.
+        :param fill_price: The execution's price, ``None`` when unknown.
+        :param fill_id: The execution's fill id.
+        :param date_utc: The ``dateUTC`` of the activity that revealed the
+            execution; the activity read reaches back to it while the
+            execution is held (:meth:`_oldest_pending_activity_ts`).
+        :param opened_qty: The opened deal's size when an opening activity
+            proved it, ``None`` when unknown.
+        """
+        assert self.store_ctx is not None
+        pending = {'executed_qty': executed, 'fill_price': fill_price, 'fill_id': fill_id,
+                   'netted_deal_id': netted_deal_id, 'since': epoch_time(),
+                   'date_utc': date_utc}
+        if opened_qty is not None:
+            pending['opened_qty'] = opened_qty
+        with self.store_ctx.transaction():
+            self._rewrite_extras(
+                row.client_order_id,
+                lambda extras: extras.__setitem__(EXTRAS_KEY_NETTED_RESIDUAL_PENDING, pending),
+            )
+            self.store_ctx.log_event(
+                'netted_residual_size_pending',
+                client_order_id=row.client_order_id,
+                exchange_order_id=deal_id,
+                payload={'working_order': row.exchange_order_id, **pending},
+            )
+            self._promote_working_row_to_position(row, deal_id, stamp_entry_filled=True)
+        if opened_qty is None:
+            logger.warning(
+                "own working order %s (%s) netted foreign deal %s and opened deal %s of "
+                "unknown size: nothing of its execution of %s is booked until the deal's "
+                "size is known",
+                row.exchange_order_id, row.symbol, netted_deal_id, deal_id, executed,
+            )
+        else:
+            logger.warning(
+                "own working order %s (%s) netted foreign deal %s and opened deal %s of "
+                "%s at an unknown price: nothing is booked until a read prices the deal",
+                row.exchange_order_id, row.symbol, netted_deal_id, deal_id, opened_qty,
+            )
+
+    def _update_netted_residual(self, row: 'OrderRow', mutate: Callable[[dict], None]) -> None:
+        """Apply ``mutate`` to the held execution record of ``row``, if it still has one."""
+
+        def apply(extras: dict) -> None:
+            pending = extras.get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+            if isinstance(pending, dict):
+                pending = dict(pending)
+                mutate(pending)
+                extras[EXTRAS_KEY_NETTED_RESIDUAL_PENDING] = pending
+
+        self._rewrite_extras(row.client_order_id, apply)
+
+    def _hold_close_of_netted_residual(
+            self, row: 'OrderRow', activity: dict, size: float | None,
+    ) -> None:
+        """Remember a close of a held partly netted deal, deferred until the entry is booked.
+
+        The ``/positions`` size of the deal is net of such a close, so the
+        snapshot settlement adds it back (:meth:`_settle_netted_residual_from_snapshot`);
+        the close itself is then booked from its activity like any other.
+
+        A close read without its size and again with it is one close: the
+        sized copy (same deal, ``dateUTC``, type, status and source) replaces
+        the sizeless record and keeps its first sighting, and the sizeless
+        copy's identity joins
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_BOOKED_CLOSES`, so only
+        the sized copy is booked once the entry is.
+
+        :param row: The held position row.
+        :param activity: The deferred close activity.
+        :param size: The size it closed, ``None`` when the activity states none
+            (the snapshot then cannot tell the opened size).
+        """
+        close_id = _close_identity(activity)
+        sizeless_id = _sizeless_close_identity(activity)
+        date_utc = str(activity.get('dateUTC') or '')
+        now = epoch_time()
+
+        def remember(extras: dict) -> None:
+            pending = extras.get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+            if not isinstance(pending, dict):
+                return
+            pending = dict(pending)
+            held = dict(pending.get('held_closes') or {})
+            superseded = False
+            if size is None:
+                if any(close.get('sizeless_id') == close_id and close_id != key
+                       for key, close in held.items()):
+                    superseded = True
+                elif close_id not in held:
+                    held[close_id] = {'size': None, 'seen_at': now, 'sizeless_id': close_id,
+                                      'date_utc': date_utc}
+            elif close_id not in held:
+                provisional = held.pop(sizeless_id, None)
+                seen_at = now
+                if provisional is not None:
+                    superseded = True
+                    seen_at = min(now, float(provisional.get('seen_at') or now))
+                held[close_id] = {'size': size, 'seen_at': seen_at, 'sizeless_id': sizeless_id,
+                                  'date_utc': date_utc}
+            pending['held_closes'] = held
+            extras[EXTRAS_KEY_NETTED_RESIDUAL_PENDING] = pending
+            booked = list(extras.get(EXTRAS_KEY_BOOKED_CLOSES) or ())
+            if superseded and sizeless_id not in booked:
+                extras[EXTRAS_KEY_BOOKED_CLOSES] = (
+                    booked[-BOOKED_CLOSES_RETAINED + 1:] + [sizeless_id])
+
+        self._rewrite_extras(row.client_order_id, remember)
+
+    def _settle_netted_residual(
+            self, row: 'OrderRow', opened: float, *, fill_price: float | None,
+            fill_id: str | None,
+    ) -> OrderEvent | None:
+        """Book the held execution of a partly netted own order once its size and price are known.
+
+        Without a valid price the fill would be discarded by the engine while
+        the journal already counted it: the proven size is kept on the held
+        record instead (``opened_qty``), and a later priced activity or
+        ``/positions`` read books it.
+
+        :param row: The position row carrying
+            :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_NETTED_RESIDUAL_PENDING`.
+        :param opened: The opened deal's size.
+        :param fill_price: The price to book when the held execution has none.
+        :param fill_id: The fill id to book when the held execution has none.
+        :return: The ENTRY fill of the opened size, ``None`` when nothing is
+            held or the price is still unknown.
+        """
+        assert self.store_ctx is not None
+        coid = row.client_order_id
+        current = self.store_ctx.get_order(coid) or row
+        pending = (current.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+        if not isinstance(pending, dict) or opened <= 0.0:
+            return None
+        price = (_wire_float(pending.get('fill_price'), finite=True)
+                 or _wire_float(fill_price, finite=True) or 0.0)
+        if price <= 0.0:
+            if _wire_float(pending.get('opened_qty'), finite=True) is None:
+                self._update_netted_residual(
+                    current, lambda held: held.__setitem__('opened_qty', opened))
+            return None
+        executed = float(pending.get('executed_qty') or current.qty)
+        booked = min(opened, executed, current.qty)
+        now_ts = epoch_time()
+        with self.store_ctx.transaction():
+            extras = dict(current.extras or {})
+            extras.pop(EXTRAS_KEY_NETTED_RESIDUAL_PENDING, None)
+            held_closes = pending.get('held_closes') or {}
+            if held_closes:
+                # The held closes are booked from their activities after the
+                # entry: the read keeps reaching back to them until they are.
+                # Each close is owed under its sizeless identity too, so a
+                # copy stating no size stays deferred in whichever order the
+                # copies arrive; booking the close settles both identities.
+                deferred = dict(extras.get(EXTRAS_KEY_DEFERRED_CLOSES) or {})
+                for close_id, close in held_closes.items():
+                    date_utc = str(close.get('date_utc') or '')
+                    deferred[close_id] = date_utc
+                    deferred[str(close.get('sizeless_id') or close_id)] = date_utc
+                extras[EXTRAS_KEY_DEFERRED_CLOSES] = deferred
+            self.store_ctx.upsert_order(
+                coid, filled_qty=max(current.filled_qty, booked), extras=extras)
+            self.store_ctx.log_event(
+                'netted_residual_booked',
+                client_order_id=coid,
+                exchange_order_id=current.exchange_order_id,
+                payload={'opened_qty': opened, 'booked_qty': booked,
+                         'executed_qty': executed, 'fill_price': price,
+                         'netted_deal_id': pending.get('netted_deal_id')},
+            )
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=current.exchange_order_id or '', symbol=current.symbol,
+                side=current.side, order_type=_order_type_from_row(current, 'WORKING_ORDER'),
+                qty=current.qty, filled_qty=booked,
+                remaining_qty=max(0.0, current.qty - booked),
+                price=None, stop_price=None, average_fill_price=price,
+                status=OrderStatus.FILLED, timestamp=now_ts, fee=0.0, fee_currency='',
+                reduce_only=False, client_order_id=coid,
+            ),
+            event_type='filled',
+            fill_price=price,
+            fill_qty=booked,
+            journal_fill_qty=booked,
+            timestamp=now_ts,
+            pine_id=current.pine_entry_id,
+            from_entry=current.from_entry,
+            leg_type=LegType.ENTRY,
+            fill_id=pending.get('fill_id') or fill_id,
+        )
+
+    def _settle_netted_residual_from_snapshot(
+            self, row: 'OrderRow', pos: dict, *, now_ts: float, read_started_at: float,
+    ) -> OrderEvent | None:
+        """Book a held partly netted execution from the opened deal's ``/positions`` rows.
+
+        A size an opening activity already proved (``opened_qty``) is booked
+        at the listed open level. Otherwise the listed size is the opened size
+        less every reduction the read reflects, and a reduction's activity can
+        be published after the read. A deal's size only ever shrinks, so a size
+        unchanged since the first listing means every reduction this read
+        reflects happened before the first listing. The size is taken only once
+        this poll's reads started at least
+        :data:`~pynecore_capitalcom.helpers._ACTIVITY_LAG_S` after that first
+        listing: the venue publishes an activity row within that lag, and this
+        poll's activity read, processed before the snapshot, has held every
+        such close. A close first read in this poll may postdate the snapshot
+        read and keeps the execution held one more poll. The opened size is
+        then the listed size plus the held closes; those closes are booked
+        from their activities afterwards like any other. A held close that
+        states no size leaves the opened size unknown, and the execution stays
+        held.
+
+        :param row: A row carrying
+            :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_NETTED_RESIDUAL_PENDING`.
+        :param pos: The row's deal in this poll's ``/positions`` read.
+        :param now_ts: Wall-clock time of this reconcile pass, after its reads.
+        :param read_started_at: Local time the poll's snapshot reads started;
+            the poll's activity read follows them.
+        :return: The ENTRY fill, or ``None`` while the execution stays held.
+        """
+        pending = (row.extras or {}).get(EXTRAS_KEY_NETTED_RESIDUAL_PENDING)
+        position = pos.get('position') or {}
+        if (not isinstance(pending, dict)
+                or str(position.get('direction') or '').upper()
+                != ('BUY' if row.side == 'buy' else 'SELL')):
+            return None
+        level = _wire_float(position.get('level'), finite=True)
+        proven = _wire_float(pending.get('opened_qty'), finite=True)
+        if proven is not None:
+            return self._settle_netted_residual(row, proven, fill_price=level, fill_id=None)
+        listed = _wire_float(position.get('size'), finite=True)
+        if listed is None or listed <= 0.0:
+            return None
+        first = pending.get('listed') or {}
+        if _wire_float(first.get('size'), finite=True) != listed:
+            self._update_netted_residual(
+                row, lambda held: held.__setitem__('listed', {'size': listed, 'at': now_ts}))
+            return None
+        held_closes = list((pending.get('held_closes') or {}).values())
+        if (read_started_at - float(first.get('at') or now_ts) < _ACTIVITY_LAG_S
+                or any(float(close.get('seen_at') or 0.0) >= read_started_at
+                       or _wire_float(close.get('size'), finite=True) is None
+                       for close in held_closes)):
+            return None
+        opened = listed + sum(float(close['size']) for close in held_closes)
+        return self._settle_netted_residual(row, opened, fill_price=level, fill_id=None)
 
     def _netting_retirements(self) -> dict[str, dict]:
         """Own working orders retired because their execution only netted a foreign deal.
@@ -1691,31 +2411,46 @@ class _ActivityMixin(_CapitalComBase, ABC):
         the bridge path leaves it unset so the POSITION activity's own
         ENTRY fill still emits when the WORKING_ORDER EXECUTED activity
         was never seen.
+
+        A pending core close-leg row naming the old deal is retargeted to the
+        new one in the same transaction: its restart replay would otherwise
+        find the old id absent from ``/positions`` and settle the close
+        without sending it to the position that is still open.
         """
-        assert self.store_ctx is not None
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
         old_deal_id = wo_row.exchange_order_id
         # The resting order's level guard ends with the order; its persisted
         # levels share the row with the position's protection to come.
         self._forget_working_order_guard(old_deal_id)
-        refreshed = self.store_ctx.get_order(wo_row.client_order_id)
+        refreshed = store_ctx.get_order(wo_row.client_order_id)
         base_extras = dict((refreshed or wo_row).extras or {})
         base_extras['kind'] = 'position'
         base_extras['promoted_from_working_order_id'] = old_deal_id
         base_extras.pop('missing_pending_since', None)
         if stamp_entry_filled and not base_extras.get('entry_filled_at'):
             base_extras['entry_filled_at'] = epoch_time()
-        self.store_ctx.add_ref(
-            wo_row.client_order_id, 'deal_id', new_deal_id,
-        )
-        self.store_ctx.upsert_order(
-            wo_row.client_order_id,
-            exchange_order_id=new_deal_id,
-            extras=base_extras,
-        )
+        with store_ctx.transaction():
+            store_ctx.add_ref(
+                wo_row.client_order_id, 'deal_id', new_deal_id,
+            )
+            store_ctx.upsert_order(
+                wo_row.client_order_id,
+                exchange_order_id=new_deal_id,
+                extras=base_extras,
+            )
+            if old_deal_id and old_deal_id != new_deal_id:
+                for leg_row in list(iter_active_close_legs(store_ctx)):
+                    if (leg_row.extras or {}).get(EXTRAS_KEY_CLOSE_LEG_ID) == old_deal_id:
+                        update_close_leg_state(
+                            store_ctx, coid=leg_row.client_order_id,
+                            new_state=CLOSE_LEG_STATE_PENDING,
+                            extras_patch={EXTRAS_KEY_CLOSE_LEG_ID: new_deal_id},
+                        )
         # The promoted deal is the run's from here on; a read may not list it
         # yet (see ``identity.py``).
         self._note_entry_fill_unlisted(wo_row.client_order_id)
-        self.store_ctx.log_event(
+        store_ctx.log_event(
             'working_order_promoted_to_position',
             client_order_id=wo_row.client_order_id,
             exchange_order_id=new_deal_id,
@@ -1725,6 +2460,25 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 'stamp_entry_filled': stamp_entry_filled,
             },
         )
+
+    def _tear_down_natural_close(self, row: 'OrderRow') -> None:
+        """Tear down a position row whose deal a close retired, in one transaction.
+
+        Stamps the row and its bracket legs ``natural_close_at``
+        (:meth:`~_BracketMixin._close_bracket_after_natural_close`) and drops
+        its exposure cursor (:meth:`_retire_netted_journal_exposure`)
+        together: the snapshot reconcile skips a stamped row, so a process
+        that died between the two writes would keep the dead exposure
+        counting as run-owned for good.
+
+        :param row: The position row whose deal is gone.
+        """
+        if self.store_ctx is None:
+            return
+        retired_exposure = row.filled_qty
+        with self.store_ctx.transaction():
+            self._close_bracket_after_natural_close(row)
+            self._retire_netted_journal_exposure(row, retired_exposure)
 
     def _retire_netted_journal_exposure(
             self, closed_row: 'OrderRow', retired_exposure: float,

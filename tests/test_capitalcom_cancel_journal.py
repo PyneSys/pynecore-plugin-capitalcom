@@ -26,6 +26,7 @@ These tests pin the externally-observable contract of that migration:
   ``still_unknown`` so the engine reconciler re-issues the cancel.
 """
 import asyncio
+import sqlite3
 
 import httpx
 import pytest
@@ -38,6 +39,7 @@ from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import KIND_CANCEL
 
 from pynecore_capitalcom import CapitalCom, CapitalComConfig
+from pynecore_capitalcom.exceptions import OrderNotFoundError
 
 
 def main():
@@ -317,4 +319,63 @@ def __test_execute_cancel_recovery_mid_loop_partial_sweep__(tmp_path):
     # Both targets are listed in applied_target_coids.
     applied = extras.get('applied_target_coids') or []
     assert set(applied) == {'coid-a', 'coid-b'}
+    store.close()
+
+
+def _seed_sweep_target(ctx, target: str) -> DispatchEnvelope:
+    """Seed one cancel target: a resting working order, or a TP leg on a position."""
+    if target == 'working':
+        ctx.upsert_order('coid-target', symbol='EURUSD', side='buy', qty=1.0,
+                         state='confirmed', pine_entry_id='Long',
+                         exchange_order_id='w1', extras={'kind': 'working'})
+        intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+    else:
+        ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0, filled_qty=1.0,
+                         state='confirmed', pine_entry_id='Long', exchange_order_id='deal-P',
+                         extras={'kind': 'position', 'entry_filled_at': 1.0})
+        ctx.upsert_order('coid-target', symbol='EURUSD', side='sell', qty=1.0,
+                         state='confirmed', pine_entry_id='Long', from_entry='Long',
+                         tp_level=1.3, extras={'leg_kind': 'tp', 'parent_deal_id': 'deal-P'})
+        intent = CancelIntent(pine_id='Exit', symbol='EURUSD', from_entry='Long')
+    return DispatchEnvelope(intent=intent, run_tag='test', bar_ts_ms=1700000000000)
+
+
+@pytest.mark.parametrize('target', ['working', 'leg'])
+def __test_cancel_sweep_whose_booking_failed_lands_once_on_the_engine_retry__(
+        tmp_path, target):
+    """The venue accepted the sweep's DELETE (or bracket-clearing PUT), but
+    closing the target row could not be journaled. The cancel parks with a
+    typed unknown disposition, not a raw storage error, and the engine's
+    retry of the same cancel settles it: a DELETE now answering 404 closes
+    the working order, a repeated PUT-null clears nothing more, and each
+    target and command row is closed and audited exactly once."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/w1', 'delete'): {},
+        ('positions/deal-P', 'put'): {'dealReference': 'p-ref'},
+        ('confirms/p-ref', 'get'): {'dealStatus': 'ACCEPTED'},
+    })
+    env = _seed_sweep_target(ctx, target)
+    close_order = ctx.close_order
+
+    def failing(coid, *args, **kwargs):
+        if coid == 'coid-target':
+            del ctx.close_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return close_order(coid, *args, **kwargs)
+
+    ctx.close_order = failing
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.execute_cancel(env))
+    cmd_coid = env.client_order_id(COID_KIND_CANCEL)
+    assert parked.value.client_order_id == cmd_coid
+    assert isinstance(parked.value.__cause__, sqlite3.OperationalError)
+    target_row = ctx.get_order('coid-target')
+    assert target_row is not None and target_row.closed_ts_ms is None
+
+    broker._responses[('error', 'workingorders/w1', 'delete')] = OrderNotFoundError(
+        'gone', ref_type='deal_id')
+    assert asyncio.run(broker.execute_cancel(env)) is True
+    live = {row.client_order_id for row in ctx.iter_live_orders()}
+    assert 'coid-target' not in live and cmd_coid not in live
+    assert [kind for kind, _ in _events_for(ctx, 'coid-target')].count('cancelled') == 1
     store.close()

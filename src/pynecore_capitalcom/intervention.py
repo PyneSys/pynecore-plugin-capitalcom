@@ -87,7 +87,7 @@ import logging
 import math
 from abc import ABC
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from time import monotonic, time as epoch_time
 from typing import TYPE_CHECKING, Any
@@ -221,6 +221,26 @@ _UNSETTLED_WRITE_S = 120.0
 #: Own-close records older than this are dropped (the activity feed's
 #: longest lookback).
 _OWN_CLOSE_RETAIN_S = 86400.0
+
+
+#: Deferred-park key prefix of an own write's evidence whose journal write
+#: failed (:meth:`_InterventionMixin._journal_own_write_evidence`).
+_OWN_WRITE_EVIDENCE_PREFIX = 'own-write-evidence:'
+
+
+def _own_write_evidence_key(key: str, sent_at: float | None) -> str:
+    """The evidence key of an own write of the protection ``key`` sent at ``sent_at``.
+
+    :param key: The position or resting-order protection key written.
+    :param sent_at: When the write left; ``None`` for the prefix every write of
+        ``key`` shares.
+    """
+    return f'{key}@' if sent_at is None else f'{key}@{sent_at!r}'
+
+
+def _own_cancel_accepted_key(coid: str) -> str:
+    """The deferred-park key of the accepted-cancel stamp of the working order ``coid``."""
+    return f'own-cancel-accepted:{coid}'
 
 #: How long a level-edit activity is remembered for the guard's judgement,
 #: counted from when this process first saw it (a restart's activity read
@@ -539,21 +559,24 @@ class _InterventionMixin(_CapitalComBase, ABC):
         if existing is not None and keep_held:
             self._resolve_held_edit_verdicts()
             return
-        if existing is not None:
-            self._drop_held_verdict_record(held_id, existing)
+        # The journal first, in one write; the process's view follows the
+        # commit, so a failed write leaves both on the verdict held before.
+        with self._verdict_write():
+            if existing is not None:
+                self._drop_held_verdict_record(held_id, existing)
+            self._persist_held_verdict(held_id, verdict)
+            if self.store_ctx is not None:
+                self.store_ctx.log_event(
+                    'level_edit_verdict_held',
+                    exchange_order_id=verdict.deal_id,
+                    payload={'held_id': held_id, 'observed_at': verdict.observed_at,
+                             'settle_s': self._level_edit_settle_s},
+                )
         self._held_edit_verdicts[held_id] = verdict
-        self._persist_held_verdict(held_id, verdict)
         logger.info(
             "bot %s changed on the venue; who changed it is decided from the "
             "activity feed", held_id,
         )
-        if self.store_ctx is not None:
-            self.store_ctx.log_event(
-                'level_edit_verdict_held',
-                exchange_order_id=verdict.deal_id,
-                payload={'held_id': held_id, 'observed_at': verdict.observed_at,
-                         'settle_s': self._level_edit_settle_s},
-            )
         self._resolve_held_edit_verdicts()
 
     def _resolve_held_edit_verdicts(self) -> None:
@@ -567,14 +590,17 @@ class _InterventionMixin(_CapitalComBase, ABC):
         A verdict whose key the bot is writing right now waits until the
         write settles (:meth:`_own_write_in_flight`): a read may already hold
         the write's own edit activity, which counts as the bot's own only
-        once the write is recorded (:meth:`_own_write_claims`).
+        once the write is recorded (:meth:`_own_write_claims`); one whose
+        record waits to commit after a storage failure waits until it commits
+        (:meth:`_own_write_evidence_owed`).
         """
         if not self._held_edit_verdicts:
             return
         read_at = self._activity_polled_at
         for held_id, verdict in list(self._held_edit_verdicts.items()):
             if (self._held_edit_verdicts.get(held_id) is not verdict
-                    or self._own_writes_in_flight.get(verdict.guard_key, 0) > 0):
+                    or self._own_writes_in_flight.get(verdict.guard_key, 0) > 0
+                    or self._own_write_evidence_owed(verdict.guard_key)):
                 continue
             outcome, edit = self._judge_level_edits(verdict)
             settled = read_at >= verdict.observed_at + self._level_edit_settle_s
@@ -582,12 +608,17 @@ class _InterventionMixin(_CapitalComBase, ABC):
                 continue
             if outcome == _EDIT_VENUE and self._held_view_outdated(verdict, read_at):
                 continue
+            # The record leaves the journal with the decision's audit, before
+            # the process forgets the verdict: a failed write keeps it held
+            # here and on disk, and the next read decides it again.
+            with self._verdict_write():
+                self._drop_held_verdict_record(held_id, verdict)
+                self._audit_edit_verdict(held_id, verdict, outcome, edit, settled=settled)
             del self._held_edit_verdicts[held_id]
-            self._drop_held_verdict_record(held_id, verdict)
             if held_id == verdict.guard_key:
                 self._held_level_views.pop(held_id, None)
                 self._held_level_changes.pop(held_id, None)
-            self._decide_edit_verdict(held_id, verdict, outcome, edit, settled=settled)
+            self._apply_edit_verdict(verdict, outcome, edit)
 
     def _note_held_levels_view(
             self, key: str, venue: ProtectionLevels, *, tick: float,
@@ -683,11 +714,15 @@ class _InterventionMixin(_CapitalComBase, ABC):
         latest_view = max(verdict.observed_at, self._held_level_views.get(key, float('-inf')))
         return latest_view <= newest_seen
 
-    def _decide_edit_verdict(
+    def _verdict_write(self) -> AbstractContextManager[object]:
+        """One journal transaction for a held verdict's records, when there is a journal."""
+        return self.store_ctx.transaction() if self.store_ctx is not None else nullcontext()
+
+    def _audit_edit_verdict(
             self, held_id: str, verdict: _HeldEditVerdict, outcome: str,
             edit: tuple[float, str] | None, *, settled: bool,
     ) -> None:
-        """Apply one verdict :meth:`_judge_level_edits` reached, audited."""
+        """Audit the verdict :meth:`_judge_level_edits` reached on a held change."""
         if self.store_ctx is not None:
             self.store_ctx.log_event(
                 'level_edit_verdict_decided',
@@ -697,6 +732,12 @@ class _InterventionMixin(_CapitalComBase, ABC):
                          'activity_ts': edit[0] if edit is not None else None,
                          'feed_settled': settled, 'provisional': verdict.provisional},
             )
+
+    @staticmethod
+    def _apply_edit_verdict(
+            verdict: _HeldEditVerdict, outcome: str, edit: tuple[float, str] | None,
+    ) -> None:
+        """Apply the verdict :meth:`_judge_level_edits` reached on a held change."""
         if outcome == _EDIT_VENUE and edit is not None:
             verdict.venue(edit, verdict.provisional)
         elif outcome == _EDIT_UNEXPLAINED and verdict.unexplained is not None:
@@ -867,25 +908,28 @@ class _InterventionMixin(_CapitalComBase, ABC):
         for held_id, verdict in list(self._held_edit_verdicts.items()):
             if verdict.guard_key != key or verdict.provisional:
                 continue
-            del self._held_edit_verdicts[held_id]
-            self._drop_held_verdict_record(held_id, verdict)
             kept_id = f"{held_id}@{now!r}"
             kept = replace(verdict, provisional=True)
+            # The journal first, in one write: a failed write keeps the
+            # verdict held under its old identity, here and on disk.
+            with self._verdict_write():
+                self._drop_held_verdict_record(held_id, verdict)
+                self._persist_held_verdict(kept_id, kept)
+                if self.store_ctx is not None:
+                    self.store_ctx.log_event(
+                        'level_edit_verdict_kept_past_own_write',
+                        exchange_order_id=verdict.deal_id,
+                        payload={'held_id': held_id, 'kept_as': kept_id,
+                                 'observed_at': verdict.observed_at, 'own_write_at': now},
+                    )
+            del self._held_edit_verdicts[held_id]
             self._held_edit_verdicts[kept_id] = kept
-            self._persist_held_verdict(kept_id, kept)
             if verdict.own_write is not None:
                 verdict.own_write()
             logger.info(
                 "bot %s is written again while the verdict on its change waits; "
                 "the change is still judged from the activity feed", held_id,
             )
-            if self.store_ctx is not None:
-                self.store_ctx.log_event(
-                    'level_edit_verdict_kept_past_own_write',
-                    exchange_order_id=verdict.deal_id,
-                    payload={'held_id': held_id, 'kept_as': kept_id,
-                             'observed_at': verdict.observed_at, 'own_write_at': now},
-                )
 
     def _protection_write_deferred(self, deal_id: str) -> bool:
         """Whether a verdict on a change of ``deal_id``'s protection is still held."""
@@ -1359,16 +1403,46 @@ class _InterventionMixin(_CapitalComBase, ABC):
                     yield write
                 finally:
                     if not write.rejected:
-                        self._note_own_protection_write(deal_id, sent_at, epoch_time())
+                        done_at = epoch_time()
+                        self._journal_own_write_evidence(
+                            _own_write_evidence_key(_protection_key(deal_id), sent_at),
+                            lambda: self._note_own_protection_write(deal_id, sent_at, done_at),
+                        )
             return
         released = self._release_failsafe_for_own_write(row)
         with self._guarded_write(_protection_key(deal_id), write, row.client_order_id):
             yield write
         if released and write.ok:
-            self._rewrite_extras(
-                row.client_order_id,
-                lambda extras: extras.pop(EXTRAS_KEY_PROTECTION_HANDOVER, None),
+            self._journal_own_write_evidence(
+                f'protection-handover:{deal_id}',
+                lambda: self._rewrite_extras(
+                    row.client_order_id,
+                    lambda extras: extras.pop(EXTRAS_KEY_PROTECTION_HANDOVER, None),
+                ),
             )
+
+    def _journal_own_write_evidence(self, key: str, write: Callable[[], None]) -> None:
+        """Journal the evidence of an own venue write that has already gone out.
+
+        The record (an own level write, an own close's settlement) lets a later
+        read attribute the write's activity to the bot. A failed write never
+        raises, which would replace the caller's outcome and skip the state
+        transition the caller journals after the request, including its own
+        park: it is kept under ``key`` and retried at the start of every poll
+        until it commits (:meth:`~_CapitalComBase._park_after_venue_write`).
+        While the record of an own level write waits, the verdicts held on its
+        key are not judged (:meth:`_own_write_evidence_owed`).
+
+        :param key: The evidence's identity (:func:`_own_write_evidence_key`
+            for an own level write).
+        :param write: The journal write.
+        """
+        self._park_after_venue_write(f'{_OWN_WRITE_EVIDENCE_PREFIX}{key}', write)
+
+    def _own_write_evidence_owed(self, key: str) -> bool:
+        """Whether the record of an own write of the protection ``key`` still waits to commit."""
+        prefix = f'{_OWN_WRITE_EVIDENCE_PREFIX}{_own_write_evidence_key(key, None)}'
+        return any(pending.startswith(prefix) for pending in self._deferred_parks)
 
     def _release_failsafe_for_own_write(self, row: 'OrderRow') -> bool:
         """Take a position back from the native fail-safe manager for the bot's own write.
@@ -1426,7 +1500,11 @@ class _InterventionMixin(_CapitalComBase, ABC):
                     yield
                 finally:
                     if not write.rejected:
-                        self._note_own_level_write(row_coid, key, sent_at, epoch_time())
+                        done_at = epoch_time()
+                        self._journal_own_write_evidence(
+                            _own_write_evidence_key(key, sent_at),
+                            lambda: self._note_own_level_write(row_coid, key, sent_at, done_at),
+                        )
         finally:
             remaining = self._protection_in_flight.get(key, 1) - 1
             if remaining > 0:
@@ -2272,7 +2350,10 @@ class _InterventionMixin(_CapitalComBase, ABC):
                         extras[EXTRAS_KEY_PROTECTION_ADOPT_AFTER] = done_at
 
                 for coid in coids:
-                    self._rewrite_extras(coid, finish)
+                    self._journal_own_write_evidence(
+                        f'close:{coid}@{sent_at!r}',
+                        lambda target=coid: self._rewrite_extras(target, finish),
+                    )
 
     @staticmethod
     def _own_close_in_flight(extras: dict, now: float) -> bool:
@@ -3017,7 +3098,6 @@ class _InterventionMixin(_CapitalComBase, ABC):
                 verdict = CLOSE_VERDICT_FOREIGN
             else:
                 verdict = CLOSE_VERDICT_AMBIGUOUS
-            del self._netting_pending[close_id]
             self._settle_netting_pending(pending, verdict, proven=proven)
 
     def _own_cancel_after_close(self, coid: str, activity_ts: float, judged_at: float) -> bool:
@@ -3056,13 +3136,30 @@ class _InterventionMixin(_CapitalComBase, ABC):
         """Record that the venue accepted the bot's DELETE of the working order ``coid``.
 
         The order was still resting when the venue took the request: evidence
-        :meth:`_own_cancel_after_close` reads.
+        :meth:`_own_cancel_after_close` and the cancel's retry
+        (:meth:`_own_cancel_accepted`) read. A write that fails is retried on
+        every poll until it commits, and never raises: the caller's booking of
+        the cancel still runs.
         """
         if self.store_ctx is None:
             return
-        self._rewrite_extras(
-            coid, lambda extras: extras.__setitem__(EXTRAS_KEY_OWN_CANCEL_SENT_AT, sent_at),
+        self._park_after_venue_write(
+            _own_cancel_accepted_key(coid),
+            lambda: self._rewrite_extras(
+                coid, lambda extras: extras.__setitem__(EXTRAS_KEY_OWN_CANCEL_SENT_AT, sent_at),
+            ),
         )
+
+    def _own_cancel_accepted(self, coid: str) -> bool:
+        """Whether the venue accepted an own DELETE of the working order ``coid``.
+
+        Read from the row's stamp, or from the stamp's write still waiting to
+        commit (:meth:`_stamp_own_cancel_accepted`).
+        """
+        if _own_cancel_accepted_key(coid) in self._deferred_parks:
+            return True
+        row = self.store_ctx.get_order(coid) if self.store_ctx is not None else None
+        return row is not None and (row.extras or {}).get(EXTRAS_KEY_OWN_CANCEL_SENT_AT) is not None
 
     def _own_order_still_resting(self, coid: str, working_by_deal: dict[str, dict]) -> bool:
         """Whether the own working order ``coid`` rests unexecuted at its full size."""
@@ -3093,66 +3190,75 @@ class _InterventionMixin(_CapitalComBase, ABC):
         coid = str(pending.get('client_order_id') or '')
         deal_id = pending.get('deal_id')
         payload = dict(pending.get('payload') or {})
-        store_ctx.log_event(
-            'user_close_netting_resolved',
-            client_order_id=coid or None,
-            exchange_order_id=deal_id,
-            payload={'close_id': close_id, 'verdict': verdict, 'proven': proven},
-        )
-
-        def keep(extras: dict) -> None:
-            verdicts = dict(extras.get(EXTRAS_KEY_CLOSE_VERDICTS) or {})
-            verdicts[close_id] = verdict
-            extras[EXTRAS_KEY_CLOSE_VERDICTS] = dict(
-                list(verdicts.items())[-_CLOSE_VERDICTS_RETAINED:])
-
-        self._rewrite_extras(coid, keep)
-        if verdict != CLOSE_VERDICT_FOREIGN:
-            logger.error(
-                "close of bot position %s at %s matches no own close and no own "
-                "fill; resting own working order(s) %s may have netted it (%s) — "
-                "possibly a manual close, not reported, check the venue history",
-                deal_id, payload.get('dateUTC'), pending.get('candidates'),
-                'an order left or shrank' if proven else 'no later order read decided',
-            )
+        # The resolution, the verdict, the exposure retirement and the owed
+        # report are one transaction: the resolution event ends the wait on
+        # restart, so a process that dies after it must find the rest too.
+        report: dict | None = None
+        with store_ctx.transaction():
             store_ctx.log_event(
-                'user_close_ambiguous_netting',
+                'user_close_netting_resolved',
                 client_order_id=coid or None,
                 exchange_order_id=deal_id,
-                payload={**payload, 'candidates': pending.get('candidates'),
-                         'proven': proven},
+                payload={'close_id': close_id, 'verdict': verdict, 'proven': proven},
             )
-            return
-        # The resting order(s) never executed: someone else closed (part of)
-        # the bot position. Its exposure cursor drops by the closed size, as
-        # it does when such a close is judged at once.
-        size = _wire_float(pending.get('size'), finite=True)
-        row = store_ctx.get_order(coid) if coid else None
-        if (row is not None and row.closed_ts_ms is None and size is not None
-                and (row.extras or {}).get('natural_close_at') is None
-                and close_id in ((row.extras or {}).get(EXTRAS_KEY_BOOKED_CLOSES) or ())):
-            remaining = max(0.0, row.filled_qty - size)
 
-            def retire(extras: dict) -> None:
-                extras['partial_close_retired_at'] = epoch_time()
+            def keep(extras: dict) -> None:
+                verdicts = dict(extras.get(EXTRAS_KEY_CLOSE_VERDICTS) or {})
+                verdicts[close_id] = verdict
+                extras[EXTRAS_KEY_CLOSE_VERDICTS] = dict(
+                    list(verdicts.items())[-_CLOSE_VERDICTS_RETAINED:])
 
-            self._rewrite_extras(coid, retire)
-            store_ctx.upsert_order(coid, filled_qty=remaining)
-            store_ctx.log_event(
-                'partial_close_journal_retired',
-                client_order_id=coid,
-                exchange_order_id=deal_id,
-                payload={'retired_exposure': size, 'remaining_exposure': remaining,
-                         'source': payload.get('source'), 'verdict': verdict},
-            )
-        report = dict(pending.get('report') or {})
-        store_ctx.log_event(
-            'manual_close_report_pending',
-            client_order_id=coid or None,
-            exchange_order_id=deal_id,
-            payload=report,
-        )
-        self._send_manual_close_report(report)
+            self._rewrite_extras(coid, keep)
+            if verdict != CLOSE_VERDICT_FOREIGN:
+                logger.error(
+                    "close of bot position %s at %s matches no own close and no own "
+                    "fill; resting own working order(s) %s may have netted it (%s) — "
+                    "possibly a manual close, not reported, check the venue history",
+                    deal_id, payload.get('dateUTC'), pending.get('candidates'),
+                    'an order left or shrank' if proven else 'no later order read decided',
+                )
+                store_ctx.log_event(
+                    'user_close_ambiguous_netting',
+                    client_order_id=coid or None,
+                    exchange_order_id=deal_id,
+                    payload={**payload, 'candidates': pending.get('candidates'),
+                             'proven': proven},
+                )
+            else:
+                # The resting order(s) never executed: someone else closed (part of)
+                # the bot position. Its exposure cursor drops by the closed size, as
+                # it does when such a close is judged at once.
+                size = _wire_float(pending.get('size'), finite=True)
+                row = store_ctx.get_order(coid) if coid else None
+                if (row is not None and row.closed_ts_ms is None and size is not None
+                        and (row.extras or {}).get('natural_close_at') is None
+                        and close_id in ((row.extras or {}).get(EXTRAS_KEY_BOOKED_CLOSES) or ())):
+                    remaining = max(0.0, row.filled_qty - size)
+
+                    def retire(extras: dict) -> None:
+                        extras['partial_close_retired_at'] = epoch_time()
+
+                    self._rewrite_extras(coid, retire)
+                    store_ctx.upsert_order(coid, filled_qty=remaining)
+                    store_ctx.log_event(
+                        'partial_close_journal_retired',
+                        client_order_id=coid,
+                        exchange_order_id=deal_id,
+                        payload={'retired_exposure': size, 'remaining_exposure': remaining,
+                                 'source': payload.get('source'), 'verdict': verdict},
+                    )
+                report = dict(pending.get('report') or {})
+                store_ctx.log_event(
+                    'manual_close_report_pending',
+                    client_order_id=coid or None,
+                    exchange_order_id=deal_id,
+                    payload=report,
+                )
+        # Only a committed verdict ends the wait: a failed transaction leaves
+        # the close pending for the next order read of this process.
+        self._netting_pending.pop(close_id, None)
+        if report is not None:
+            self._send_manual_close_report(report)
 
     def _reload_netting_pending(self) -> None:
         """Pick up the closes an earlier process left waiting for a working-order read."""

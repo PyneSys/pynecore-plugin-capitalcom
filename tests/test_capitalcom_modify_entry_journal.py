@@ -22,6 +22,7 @@ These tests pin the externally-observable contract of that migration:
   recovery; the target row's level is NOT mutated.
 """
 import asyncio
+import sqlite3
 
 import httpx
 import pytest
@@ -112,6 +113,10 @@ def _seed_target(ctx, *, coid: str, exchange_id: str = 'wo-1', level: float = 1.
         extras={'kind': 'working', 'order_type': 'limit',
                 'requested_level': level},
     )
+
+
+async def _drain(agen):
+    return [ev async for ev in agen]
 
 
 def _events_for(ctx, coid: str) -> list[tuple[str, dict]]:
@@ -287,6 +292,101 @@ def __test_modify_entry_recovery_via_snapshot_match__(tmp_path):
     # Recovery closes the command row (kind-aware _apply_resume_outcome).
     live_coids = [r.client_order_id for r in ctx.iter_live_orders()]
     assert cmd_coid not in live_coids
+    store.close()
+
+
+def __test_modify_entry_level_mirror_failure_parks_and_recovery_mirrors_it__(tmp_path):
+    """The venue took the amend, but its level cannot be mirrored onto the
+    working order's row: the amend parks typed (``disposition_unknown``, not a
+    raw storage error), and its recovery mirrors the level the venue holds, so
+    the working-order guard's baseline is the bot's own new level."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/wo-1', 'put'): {'dealReference': 'amend-ref'},
+        ('confirms/amend-ref', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'OPEN',
+            'dealId': 'wo-1', 'level': 1.25,
+        },
+        ('positions', 'get'): {'positions': []},
+        ('workingorders', 'get'): {'workingOrders': [
+            {'workingOrderData': {'dealId': 'wo-1', 'orderLevel': 1.25}},
+        ]},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    old = _envelope(qty=1.0, limit=1.20)
+    new = _envelope(qty=1.0, limit=1.25)
+    target_coid = old.client_order_id(KIND_ENTRY)
+    _seed_target(ctx, coid=target_coid, exchange_id='wo-1', level=1.20)
+    upsert_order = ctx.upsert_order
+
+    def failing(coid, *args, **kwargs):
+        if 'amended_level' in (kwargs.get('extras') or {}):
+            ctx.upsert_order = upsert_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, *args, **kwargs)
+
+    ctx.upsert_order = failing
+    with pytest.raises(OrderDispositionUnknownError) as parked:
+        asyncio.run(broker.modify_entry(old, new))
+    cmd_coid = new.client_order_id(COID_KIND_MODIFY_ENTRY)
+    assert parked.value.client_order_id == cmd_coid
+    cmd_row = ctx.get_order(cmd_coid)
+    assert cmd_row is not None and cmd_row.state == 'disposition_unknown'
+    target_row = ctx.get_order(target_coid)
+    assert target_row is not None and 'amended_level' not in (target_row.extras or {})
+
+    asyncio.run(broker._recover_in_flight_submissions())
+    cmd_row = ctx.get_order(cmd_coid)
+    assert cmd_row is not None and cmd_row.state == 'confirmed'
+    target_row = ctx.get_order(target_coid)
+    assert target_row is not None and (target_row.extras or {}).get('amended_level') == 1.25
+    store.close()
+
+
+def __test_parked_entry_amend_is_settled_by_the_poll_once_the_venue_holds_its_level__(
+        tmp_path):
+    """An amend parked because its level could not be mirrored is settled by
+    the running process: once ``/workingorders`` shows the requested level,
+    the level is mirrored, the command completes and its park resolves
+    ``attached`` (the engine cannot promote it: the venue lists the order
+    under the working order's id)."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('workingorders/wo-1', 'put'): {'dealReference': 'amend-ref'},
+        ('confirms/amend-ref', 'get'): {
+            'dealStatus': 'ACCEPTED', 'status': 'OPEN',
+            'dealId': 'wo-1', 'level': 1.25,
+        },
+    })
+    old = _envelope(qty=1.0, limit=1.20)
+    new = _envelope(qty=1.0, limit=1.25)
+    target_coid = old.client_order_id(KIND_ENTRY)
+    _seed_target(ctx, coid=target_coid, exchange_id='wo-1', level=1.20)
+    upsert_order = ctx.upsert_order
+
+    def failing(coid, *args, **kwargs):
+        if 'amended_level' in (kwargs.get('extras') or {}):
+            ctx.upsert_order = upsert_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return upsert_order(coid, *args, **kwargs)
+
+    ctx.upsert_order = failing
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.modify_entry(old, new))
+    cmd_coid = new.client_order_id(COID_KIND_MODIFY_ENTRY)
+    ctx.record_park(coid=cmd_coid, key='Long', kind='modify')
+
+    working = {'wo-1': {'workingOrderData': {'dealId': 'wo-1', 'orderLevel': 1.20}}}
+    asyncio.run(_drain(broker._reconcile_snapshot({}, working)))
+    cmd_row = ctx.get_order(cmd_coid)
+    assert cmd_row is not None and cmd_row.state == 'disposition_unknown'
+
+    working = {'wo-1': {'workingOrderData': {'dealId': 'wo-1', 'orderLevel': 1.25}}}
+    asyncio.run(_drain(broker._reconcile_snapshot({}, working)))
+    cmd_row = ctx.get_order(cmd_coid)
+    assert cmd_row is not None and cmd_row.state == 'confirmed'
+    assert cmd_coid not in [r.client_order_id for r in ctx.iter_live_orders()]
+    target_row = ctx.get_order(target_coid)
+    assert target_row is not None and (target_row.extras or {}).get('amended_level') == 1.25
+    assert ctx.replay()[1][cmd_coid].resolution == 'attached'
     store.close()
 
 
