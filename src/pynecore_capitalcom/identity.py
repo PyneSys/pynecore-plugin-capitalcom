@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, EXTRAS_KEY_LEG_KIND
 
 from ._base import _CapitalComBase
+from .delivery import entry_pending_since
 from .helpers import _wire_float, _wire_id
 from .models import _DealVerdict
 
@@ -166,7 +167,13 @@ class _DealIdentityMixin(_CapitalComBase, ABC):
                 current, list(history.get('activities') or []), positions_by_deal,
             )
             if promoted:
-                self._promote_working_row_to_position(current, promoted, stamp_entry_filled=True)
+                # An entry deferred for its price is not booked: its priced
+                # activity or the snapshot fallback books it, before the
+                # fills held behind it.
+                self._promote_working_row_to_position(
+                    current, promoted,
+                    stamp_entry_filled=entry_pending_since(current.extras or {}) is None,
+                )
                 return _DealVerdict.REKEYED, promoted
         if self._materialising(current, positions_by_deal):
             return _DealVerdict.MATERIALISING, deal_id

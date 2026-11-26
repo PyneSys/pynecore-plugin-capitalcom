@@ -85,6 +85,7 @@ legs), takes the venue's protection as its guarded baseline again.
 """
 import logging
 import math
+import sqlite3
 from abc import ABC
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -99,6 +100,7 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
     UnexpectedCancelError,
 )
+from pynecore.core.broker.one_way_emulator import close_leg_row_client_order_id
 from pynecore.core.broker.protection_guard import (
     PROTECTION_LEVELS_EXTRA,
     ProtectionLevelGuard,
@@ -118,6 +120,7 @@ from pynecore.core.broker.store_helpers import (
 )
 
 from ._base import _CapitalComBase
+from .delivery import entry_executed, entry_execution_date, identity_delivered
 from .exceptions import CapitalComError
 from .helpers import (
     ACTOR_CLIENT,
@@ -130,7 +133,6 @@ from .helpers import (
     CLOSE_VERDICT_OWN_NETTING,
     CLOSE_VERDICT_UNJUDGED,
     CLOSE_VERDICT_VENUE,
-    EXTRAS_KEY_BOOKED_CLOSES,
     EXTRAS_KEY_CANCEL_REQUESTED,
     EXTRAS_KEY_CLOSE_VERDICTS,
     EXTRAS_KEY_FAILSAFE_OWNED,
@@ -146,6 +148,7 @@ from .helpers import (
     EXTRAS_KEY_WORKING_ORDER_END,
     EXTRAS_KEY_WORKING_ACCEPTED_ATTRIBUTES,
     OWN_CLOSE_CURSOR_RETIRED,
+    OWN_CLOSE_LEG_OUTLIVED,
     _ACTIVITY_LAG_S,
     _activity_actor,
     _level_on_tick_grid,
@@ -1613,7 +1616,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
             if (not deal_id or extras.get('kind') != ENTRY_KIND_WORKING
                     or extras.get(EXTRAS_KEY_LEG_KIND) is not None
                     or row.state != 'confirmed'
-                    or extras.get('entry_filled_at') is not None
+                    or entry_executed(extras)
                     or extras.get(EXTRAS_KEY_CANCEL_REQUESTED) is not None
                     or row.client_order_id in busy_coids):
                 continue
@@ -1982,7 +1985,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
             if (not guard.known(key)
                     and extras.get(EXTRAS_KEY_PROTECTION_ADOPT_AFTER) is None):
                 if (self._protection_in_flight.get(key, 0) > 0
-                        or (row.filled_qty <= 0.0 and not extras.get('entry_filled_at'))
+                        or (row.filled_qty <= 0.0 and not entry_executed(extras))
                         or (read_started_at is not None
                             and read_started_at < self._protection_written_at.get(key, 0.0))):
                     continue
@@ -2281,6 +2284,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
     @contextmanager
     def _own_close(
             self, deal_ids: Iterable[str], *, full: bool, size: float | None,
+            coid: str | None = None, leg_size: float | None = None,
     ) -> Iterator[_OwnCloseHandle]:
         """Record an own close of ``deal_ids`` around the request that sends it.
 
@@ -2294,6 +2298,12 @@ class _InterventionMixin(_CapitalComBase, ABC):
         :param deal_ids: The positions the request closes or reduces.
         :param full: The whole position is closed (any activity size matches).
         :param size: The reduced size of a partial close.
+        :param coid: The client order id the core gave a leg close
+            (:meth:`~pynecore_capitalcom.execution._ExecutionMixin.close_leg`),
+            kept on the record for the close's fill
+            (:meth:`_own_close_leg_coid`); ``None`` for every other close.
+        :param leg_size: The venue size of the whole leg a leg close closes,
+            kept with ``coid``; ``None`` when it is not known.
         :return: A handle whose :meth:`~._OwnCloseHandle.failed` withdraws the
             record when the refusal only shows after the request returned.
         """
@@ -2306,8 +2316,11 @@ class _InterventionMixin(_CapitalComBase, ABC):
                     coids.append(row.client_order_id)
         sent_at = epoch_time()
         self._note_own_close_send(sent_at)
-        record = {'full': full, 'size': size, 'sent_at': sent_at,
-                  'done_at': None, 'matched': []}
+        record: dict = {'full': full, 'size': size, 'sent_at': sent_at,
+                        'done_at': None, 'matched': []}
+        if coid is not None:
+            record['coid'] = coid
+            record['leg_size'] = leg_size
 
         def add(extras: dict) -> None:
             kept = [r for r in extras.get(EXTRAS_KEY_OWN_CLOSES) or ()
@@ -2365,6 +2378,59 @@ class _InterventionMixin(_CapitalComBase, ABC):
             if sent_at is not None and now - sent_at < _UNSETTLED_WRITE_S:
                 return True
         return False
+
+    def _note_outlived_leg_closes(
+            self, positions_by_deal: dict[str, dict], read_started_at: float | None,
+    ) -> None:
+        """Mark every core leg close the ``/positions`` snapshot proves did not execute.
+
+        A leg close's DELETE removes the whole deal, and an own close request
+        lands within :data:`_UNSETTLED_WRITE_S` of its send or not at all. A
+        snapshot whose read started after that bound, plus
+        :data:`_CLOCK_SKEW_S` for the eventually consistent REST views, and
+        still lists the deal proves the DELETE did not close it: the record is
+        stamped :data:`~pynecore_capitalcom.helpers.OWN_CLOSE_LEG_OUTLIVED`,
+        so a later disappearance of the deal is not taken for that close's
+        unknown outcome (:meth:`~pynecore_capitalcom.reconcile._ReconcileMixin._unresolved_leg_close`).
+        A failed write is retried on the next snapshot.
+
+        :param positions_by_deal: The ``/positions`` snapshot by ``dealId``.
+        :param read_started_at: Wall-clock time the read started; ``None``
+            proves nothing.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None or read_started_at is None:
+            return
+
+        def outlived(record: object) -> bool:
+            if (not isinstance(record, dict) or not record.get('coid')
+                    or record.get(OWN_CLOSE_LEG_OUTLIVED) is not None):
+                return False
+            sent_at = _wire_float(record.get('sent_at'), finite=True)
+            if sent_at is None:
+                return False
+            done_at = _wire_float(record.get('done_at'), finite=True)
+            landed_by = max(sent_at + _UNSETTLED_WRITE_S, done_at or sent_at)
+            return read_started_at > landed_by + _CLOCK_SKEW_S
+
+        def stamp(extras: dict) -> None:
+            for record in extras.get(EXTRAS_KEY_OWN_CLOSES) or ():
+                if outlived(record):
+                    record[OWN_CLOSE_LEG_OUTLIVED] = read_started_at
+
+        for row in list(store_ctx.iter_live_orders()):
+            if (not row.exchange_order_id or row.exchange_order_id not in positions_by_deal
+                    or not any(outlived(r) for r in
+                               (row.extras or {}).get(EXTRAS_KEY_OWN_CLOSES) or ())):
+                continue
+            try:
+                self._rewrite_extras(row.client_order_id, stamp)
+            except sqlite3.Error as failed:
+                logger.error(
+                    "leg close of %s: the snapshot shows the deal outlived it, but that "
+                    "could not be journaled (%s); retried on the next snapshot",
+                    row.exchange_order_id, failed,
+                )
 
     # --- Venue clock ---------------------------------------------------------
 
@@ -2441,6 +2507,8 @@ class _InterventionMixin(_CapitalComBase, ABC):
         (:meth:`_own_close_earliest`): a close dated before it happened before
         the request left, so it is someone else's even when a full-close
         record covers the deal. The late end tolerates :data:`_CLOCK_SKEW_S`.
+        A core leg close's record (one carrying a ``coid``) is a full close of
+        a known size: it fits only an activity of the leg's whole size.
         A partial record is consumed by the first activity it explains; a
         replay of that same activity (same ``dateUTC``) still matches it. A
         full close may produce more than one activity row, so its record
@@ -2478,16 +2546,52 @@ class _InterventionMixin(_CapitalComBase, ABC):
         The fit is the one :meth:`_claim_own_close` documents; nothing is
         marked.
         """
-        store_ctx = self.store_ctx
-        if store_ctx is None:
+        return next(iter(self._fitting_own_closes(row, activity)), None)
+
+    def _own_close_leg_coid(self, row: 'OrderRow', activity: dict) -> str | None:
+        """The ``coid`` of the core leg close that closed ``row``'s position, if the records tell.
+
+        :meth:`~pynecore_capitalcom.execution._ExecutionMixin.close_leg`
+        keeps the ``coid`` the core passed on its own-close record
+        (:meth:`_own_close`), written before the DELETE leaves, so it is
+        there after a lost answer and in a later process. The close fill of
+        such a close carries it as its client order id: the core tells the
+        closes of a hedging account's netting from the strategy's own by it.
+
+        The records considered are those that fit ``activity``
+        (:meth:`_fitting_own_closes`). The answer is a ``coid`` only when
+        every one of them carries one, and all name the same core close-leg row
+        (:func:`~pynecore.core.broker.one_way_emulator.close_leg_row_client_order_id`):
+        a re-send's attempt ``coid`` names the row of the close it repeats.
+        Any other mix (an own close sent without a ``coid``, or two different
+        leg closes) cannot say which close executed, and the fill keeps the
+        position row's own client order id.
+
+        The time window alone does not identify the leg close: a manual
+        partial close of the deal inside it would fit a full-close record.
+        A leg close's DELETE removes the whole deal, so its record explains
+        only an activity of the leg's whole size (``leg_size``, within half a
+        lot step). A smaller one fits no leg-close record: it is not the
+        bot's own close (:meth:`_claim_own_close`), so it is reported as an
+        intervention, and its fill keeps the position row's id.
+
+        :param row: The position row the close reduced.
+        :param activity: The close activity.
+        :return: The oldest fitting record's ``coid``, or ``None``.
+        """
+        coids = [r.get('coid') for r in self._fitting_own_closes(row, activity)]
+        if not coids or not all(isinstance(coid, str) and coid for coid in coids):
             return None
-        fresh = store_ctx.get_order(row.client_order_id) or row
-        records = [r for r in (fresh.extras or {}).get(EXTRAS_KEY_OWN_CLOSES) or ()
-                   if isinstance(r, dict)]
-        if not records:
+        if len({close_leg_row_client_order_id(str(coid)) for coid in coids}) != 1:
             return None
-        date_utc = str(activity.get('dateUTC') or '')
-        activity_ts = _parse_iso_timestamp(date_utc)
+        return str(coids[0])
+
+    def _activity_close_size(self, row: 'OrderRow', activity: dict) -> tuple[float | None, float]:
+        """The size of the close ``activity`` and the tolerance a size match allows.
+
+        :return: The activity's size (``None`` when it reports none) and half
+            a lot step of ``row``'s instrument, never below float noise.
+        """
         details = activity.get('details') or {}
         size = _wire_float(activity.get('size') or details.get('size'), finite=True)
         rules = self._instrument_rules_cache.get(row.symbol)
@@ -2495,6 +2599,25 @@ class _InterventionMixin(_CapitalComBase, ABC):
             0.5 * rules.lot_step if rules is not None else 0.0,
             1e-9 * max(1.0, abs(size or 0.0)),
         )
+        return size, size_tolerance
+
+    def _fitting_own_closes(self, row: 'OrderRow', activity: dict) -> Iterator[dict]:
+        """Every own-close record on ``row`` that explains the close ``activity``, oldest first.
+
+        The fit is the one :meth:`_claim_own_close` documents; nothing is
+        marked.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return
+        fresh = store_ctx.get_order(row.client_order_id) or row
+        records = [r for r in (fresh.extras or {}).get(EXTRAS_KEY_OWN_CLOSES) or ()
+                   if isinstance(r, dict)]
+        if not records:
+            return
+        date_utc = str(activity.get('dateUTC') or '')
+        activity_ts = _parse_iso_timestamp(date_utc)
+        size, size_tolerance = self._activity_close_size(row, activity)
         for record in records:
             sent_at = _wire_float(record.get('sent_at'), finite=True)
             if sent_at is None:
@@ -2505,6 +2628,12 @@ class _InterventionMixin(_CapitalComBase, ABC):
                 earliest = self._own_close_earliest(sent_at)
                 if not (earliest <= activity_ts <= latest + _CLOCK_SKEW_S):
                     continue
+            if record.get('coid'):
+                # A core leg close's DELETE removes the whole leg: only a close
+                # of the leg's whole size is it (:meth:`_own_close_leg_coid`).
+                leg_size = _wire_float(record.get('leg_size'), finite=True)
+                if size is None or leg_size is None or abs(size - leg_size) > size_tolerance:
+                    continue
             matched = [str(d) for d in record.get('matched') or ()]
             if not record.get('full'):
                 if matched and date_utc not in matched:
@@ -2513,8 +2642,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
                 if (size is not None and expected is not None
                         and abs(size - expected) > size_tolerance):
                     continue
-            return record
-        return None
+            yield record
 
     def _unconfirmed_reverse_leg(
             self, positions: Iterable[dict], *, coid: str, intent_key: str | None, symbol: str,
@@ -2733,8 +2861,14 @@ class _InterventionMixin(_CapitalComBase, ABC):
         landed (``rejected``) explains nothing; a row whose deal holds its
         whole size opened that deal instead of netting. An own position entry
         dispatched before the reduction, or a working order whose execution
-        was seen, is own execution evidence. A working order with no seen
-        execution is not: it only makes the reduction ambiguous.
+        was seen, booked or queued for its price
+        (:func:`~pynecore_capitalcom.delivery.entry_executed`), is own
+        execution evidence; one whose execution activity was read, queued or
+        booked (:func:`~pynecore_capitalcom.delivery.entry_execution_date`),
+        counts only when the venue time of its execution matches the
+        reduction's, never by the local time of a late booking. A working
+        order with no seen execution, or one whose execution time cannot be
+        read, is not: it only makes the reduction ambiguous.
 
         :param row: The bot position the close activity reduced.
         :param activity_ts: The activity's venue time (epoch seconds).
@@ -2774,10 +2908,22 @@ class _InterventionMixin(_CapitalComBase, ABC):
             if size is not None and capacity < size - size_tolerance:
                 continue
             filled_at = _wire_float(extras.get('entry_filled_at'), finite=True)
-            if kind == ENTRY_KIND_WORKING and filled_at is None:
+            if kind == ENTRY_KIND_WORKING and not entry_executed(extras):
                 resting.append(other.client_order_id)
                 continue
             if other.created_ts_ms / 1000.0 > activity_ts + _CLOCK_SKEW_S:
+                continue
+            execution_date = entry_execution_date(extras)
+            if execution_date is not None:
+                # An execution whose activity was read carries its venue time,
+                # queued for its price or booked: it netted this reduction only
+                # when it executed with it, however late its booking came. A
+                # time that cannot be read decides nothing.
+                executed_ts = _parse_iso_timestamp(execution_date)
+                if executed_ts <= 0.0:
+                    resting.append(other.client_order_id)
+                elif abs(executed_ts - activity_ts) <= _CLOCK_SKEW_S:
+                    executed.append(other.client_order_id)
                 continue
             if filled_at is None or filled_at >= activity_ts - _CLOCK_SKEW_S:
                 executed.append(other.client_order_id)
@@ -3123,7 +3269,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
             return False
         extras = row.extras or {}
         if (extras.get('kind') != ENTRY_KIND_WORKING
-                or extras.get('entry_filled_at') is not None
+                or entry_executed(extras)
                 or row.filled_qty > 0.0):
             return False
         sent_at = _wire_float(extras.get(EXTRAS_KEY_OWN_CANCEL_SENT_AT), finite=True)
@@ -3171,7 +3317,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
                 or not row.exchange_order_id):
             return False
         extras = row.extras or {}
-        if extras.get('kind') != ENTRY_KIND_WORKING or extras.get('entry_filled_at') is not None:
+        if extras.get('kind') != ENTRY_KIND_WORKING or entry_executed(extras):
             return False
         order = working_by_deal.get(row.exchange_order_id)
         if order is None:
@@ -3232,7 +3378,7 @@ class _InterventionMixin(_CapitalComBase, ABC):
                 row = store_ctx.get_order(coid) if coid else None
                 if (row is not None and row.closed_ts_ms is None and size is not None
                         and (row.extras or {}).get('natural_close_at') is None
-                        and close_id in ((row.extras or {}).get(EXTRAS_KEY_BOOKED_CLOSES) or ())):
+                        and identity_delivered(row.extras or {}, close_id)):
                     remaining = max(0.0, row.filled_qty - size)
 
                     def retire(extras: dict) -> None:

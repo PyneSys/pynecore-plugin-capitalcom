@@ -56,6 +56,7 @@ from pynecore.core.broker.models import (
 
 from .exceptions import CapitalComApiError, CapitalComError, OrderNotFoundError
 from ._base import CapitalComHookCollaborator
+from .delivery import entry_executed
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
@@ -416,7 +417,9 @@ class _CapitalComCancelHooks:
     * **Bracket leg** picked up by an entry cancel (``from_entry is
       None``) → silent skip; TV semantics: ``strategy.cancel(entry_id)``
       after the entry filled must leave the protective bracket alive.
-    * **Filled position** (``kind == 'position'``) → silent
+    * **Filled position** (``kind == 'position'``, or a working-order row
+      whose execution was read,
+      :func:`~pynecore_capitalcom.delivery.entry_executed`) → silent
       ``cancel_noop`` audit event; never DELETE a filled position from
       a cancel intent.
     * **Entry submission without a deal id yet** (a pending dispatch
@@ -701,8 +704,11 @@ class _CapitalComCancelHooks:
             # position from a cancel intent. (Same rule as
             # ``Position._remove_order_by_id`` upstream; this is the
             # broker-side guard against a stale/ambiguous cancel intent
-            # still reaching the plugin.)
-            if kind == 'position':
+            # still reaching the plugin.) A working-order row whose execution
+            # was read (:func:`~pynecore_capitalcom.delivery.entry_executed`)
+            # is a filled position too: its order is gone, so no DELETE is
+            # sent for it.
+            if kind == 'position' or entry_executed(extras):
                 if store_ctx is not None:
                     store_ctx.log_event(
                         'cancel_noop',
@@ -758,13 +764,17 @@ class _CapitalComCancelHooks:
                 # stamped it as a held take-over while the DELETE was in
                 # flight (its order had executed), or booked its fill onto
                 # it: closing it would release the entry for a second send,
-                # or retire a live position.
+                # or retire a live position. A row still on its working
+                # order's ``dealId`` whose execution was read
+                # (:func:`~pynecore_capitalcom.delivery.entry_executed`) is a
+                # live position too: the 404 is its execution.
                 with store_ctx.transaction():
                     current = store_ctx.get_order(row.client_order_id)
                     current_extras = (current.extras or {}) if current is not None else {}
                     held = current_extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None
                     filled = (current is not None
-                              and current_extras.get('kind') == ENTRY_KIND_POSITION)
+                              and (current_extras.get('kind') == ENTRY_KIND_POSITION
+                                   or entry_executed(current_extras)))
                     unsettled = (not held and not filled and current is not None
                                  and target_already_gone and _unbooked_take_over(current)
                                  and gone_outcome not in (

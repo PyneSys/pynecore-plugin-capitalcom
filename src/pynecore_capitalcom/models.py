@@ -306,27 +306,6 @@ def _parse_bracket_leg_id(composite: str) -> tuple[str, str | None]:
     return composite, None
 
 
-def _compute_cumulative_fill(row_qty: float, current_exchange_size: float) -> float:
-    """Single source of truth for cumulative fill computation.
-
-    Capital.com reports the *remaining* ``size`` on a position snapshot
-    (``/positions``) — there is no per-fill delta. The plugin therefore
-    derives the fill as ``row_qty - current_exchange_size`` in several
-    places (snapshot reconcile, partial-fill emission, recovery). Keeping
-    the formula in one place prevents drift when a future code path
-    changes the sign convention.
-
-    :param row_qty: The total qty the plugin submitted for the order.
-    :param current_exchange_size: The remaining size reported by Capital
-        now. Clamped at zero (snapshot can trail by a poll cycle and
-        briefly overshoot the submitted total).
-    :return: Cumulative filled qty. Monotonically non-decreasing *per
-        position row* over the row's lifetime.
-    """
-    filled = row_qty - current_exchange_size
-    return filled if filled > 0.0 else 0.0
-
-
 def _activity_fingerprint(activity: dict) -> str:
     """Deterministic fingerprint for a Capital.com activity row.
 

@@ -218,9 +218,17 @@ EXTRAS_KEY_TAKEN_OVER_AT = 'taken_over_at'
 EXTRAS_KEY_TAKE_OVER_UNPROVEN = 'take_over_unproven'
 
 #: ``orders.extras`` key on a position row: the own closes sent against the
-#: position, each ``{'full', 'size', 'sent_at', 'done_at', 'matched'}``. A
-#: close activity one of them explains is the bot's own, not an operator's.
+#: position, each ``{'full', 'size', 'sent_at', 'done_at', 'matched'}``, plus
+#: ``'coid'`` and ``'leg_size'`` (the whole leg's venue size) on a core leg
+#: close. A close activity one of them explains is the bot's own, not an
+#: operator's.
 EXTRAS_KEY_OWN_CLOSES = 'own_close_expected'
+
+#: ``orders.extras`` key on a position row: the ``coid`` of the core leg close
+#: whose DELETE the venue accepted, written in the same transaction that marks
+#: the row ``closing``. The close fill booked from the position's disappearance
+#: reports it as its client order id.
+EXTRAS_KEY_CLOSE_LEG_DISPATCHED = 'close_leg_dispatched_coid'
 
 #: ``orders.extras`` key on a position row: epoch seconds since the core
 #: native fail-safe manager writes the position's stop. The protection guard
@@ -275,10 +283,27 @@ EXTRAS_KEY_NETTED_FOREIGN_DEAL = 'netted_foreign_deal'
 EXTRAS_KEY_NETTED_RESIDUAL_PENDING = 'netted_residual_pending'
 
 #: ``orders.extras`` key on a position row: the closes a held partly netted
-#: entry deferred, still unbooked after the entry was, ``{close_id: dateUTC}``.
+#: entry deferred, still unbooked after the entry was, and the fills held
+#: behind an entry deferred for its price (:data:`EXTRAS_KEY_ENTRY_PRICE_PENDING`),
+#: still unbooked, ``{close_id: dateUTC}``.
 #: The activity read keeps reaching back to them until each close's identity
 #: is booked (:data:`EXTRAS_KEY_BOOKED_CLOSES`); booking the close drops it.
 EXTRAS_KEY_DEFERRED_CLOSES = 'deferred_close_dates'
+
+#: ``orders.extras`` key on a position row: the ``dateUTC`` of its entry
+#: activity, deferred because no source priced it, while the entry is not
+#: booked. Every later fill of the deal (a reduction or close) is deferred
+#: behind it, so the book never reduces an entry it has not received; the
+#: activity read keeps reaching back to the entry, and the first booking of the
+#: entry (``entry_filled_at``) drops the key.
+EXTRAS_KEY_ENTRY_PRICE_PENDING = 'entry_price_pending'
+
+#: ``orders.extras`` key on a position or working-order row: the ``dateUTC`` of
+#: its entry's execution activity, kept once the entry is booked. The booking
+#: stamp (``entry_filled_at``) is the local time of the booking, which trails
+#: the execution by however late its priced activity was read; what the venue
+#: did at a given time is judged by this date.
+EXTRAS_KEY_ENTRY_EXECUTED_UTC = 'entry_executed_date_utc'
 
 #: ``orders.extras`` key on a position row: the partial-close commands whose
 #: reduction the run-owned exposure cursor (``filled_qty``) already reflects.
@@ -327,6 +352,12 @@ EXTRAS_KEY_WORKING_ORDER_END = 'working_order_end'
 #: exposure cursor already dropped by this partial close, so a process that
 #: adopts the venue size after a restart must not book its activity as a fill.
 OWN_CLOSE_CURSOR_RETIRED = 'cursor_retired'
+
+#: Key on a core leg close's own-close record (one carrying a ``'coid'``,
+#: :data:`EXTRAS_KEY_OWN_CLOSES`): the wall-clock start of a ``/positions``
+#: read that still listed the deal after the DELETE could no longer land, so
+#: the DELETE did not close it. A later disappearance is not that close.
+OWN_CLOSE_LEG_OUTLIVED = 'leg_close_outlived_at'
 
 #: ``orders.extras`` key on a working-order row: the order attributes the bot
 #: never sets that an operator resume accepted as the venue showed them,

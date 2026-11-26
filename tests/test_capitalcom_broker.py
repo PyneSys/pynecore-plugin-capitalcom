@@ -7,7 +7,7 @@ import logging
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -38,13 +38,20 @@ from pynecore_capitalcom import (
     CapitalComConfig,
     CapitalComError,
 )
+from pynecore_capitalcom.delivery import book_entry
 from pynecore_capitalcom.exceptions import HistoricalPricesNotFoundError
 from pynecore_capitalcom.helpers import (
+    EXTRAS_KEY_DEFERRED_CLOSES,
+    EXTRAS_KEY_ENTRY_EXECUTED_UTC,
+    EXTRAS_KEY_ENTRY_PRICE_PENDING,
+    EXTRAS_KEY_OWN_CLOSES,
+    OWN_CLOSE_LEG_OUTLIVED,
     _UNANNOUNCED_FILL_GRACE_S,
     _WS_VOLUME_BASELINE_BARS,
     _is_session_error,
     _parse_iso_timestamp,
 )
+from pynecore_capitalcom.models import _close_identity
 from pynecore_capitalcom.plugin import _activity_fingerprint
 from pynecore_capitalcom.rest import _HTTP_CLIENT, _RestSessionMixin
 
@@ -1469,11 +1476,37 @@ def _live_position(deal_id='deal-L', *, size=2.0, stop_level=None,
 
 
 def _capture_quarantine(broker):
-    """Install a recording quarantine sink, returning its call log."""
+    """Install a recording quarantine sink, returning its call log.
+
+    Like the engine's sink, it stores an external-intervention latch in the
+    broker's store, so a caller that waits for the stored latch proceeds.
+    """
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
-        (reason, context, kind))
+
+    def sink(reason, context, *, kind):
+        latched.append((reason, context, kind))
+        _store_test_latch(broker, reason, context, kind)
+
+    broker.quarantine_sink = sink
     return latched
+
+
+def _store_test_latch(broker, reason, context, kind):
+    """Store a test sink's external-intervention latch the way the engine does."""
+    if kind is QuarantineKind.EXTERNAL_INTERVENTION and broker.store_ctx is not None:
+        broker.store_ctx.record_quarantine(
+            'q-test', kind=str(kind), reason=reason, intent_key=None,
+            context=context, entered_ts_ms=int(time.time() * 1000))
+
+
+def _recording_sink(broker, latched):
+    """A quarantine sink appending each request's kind to ``latched``, storing its latch."""
+
+    def sink(reason, context, *, kind):
+        latched.append(kind)
+        _store_test_latch(broker, reason, context, kind)
+
+    return sink
 
 
 def _seed_own_close(ctx, coid, activity, *, full=True, size=None):
@@ -2344,6 +2377,125 @@ def __test_execute_cancel_does_not_sweep_unrelated_entries__(tmp_path):
     store.close()
 
 
+@pytest.mark.parametrize('executed', ['entry_queued', 'entry_booked'])
+def __test_cancel_sweep_never_retires_an_executed_working_order_row__(tmp_path, executed):
+    """A working-order row whose execution the activity read already saw is never cancelled.
+
+    Before its promotion onto the deal it opened, a working-order row can
+    carry its execution: queued for its price (no source priced the
+    ``WORKING_ORDER EXECUTED`` activity yet) or booked with the promotion
+    deferred (no clean position ``dealId`` in that poll). The DELETE of a
+    later ``strategy.cancel`` then answers 404, exactly as for a cancelled
+    order: closing the row with a ``cancelled`` verdict would settle the
+    owed entry unbooked, or drop the engine's booked fill, and leave the
+    live deal unowned.
+    """
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'):
+            OrderNotFoundError('gone', ref_type='deal_id'),
+    })
+    executed_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000')
+    extras = ({'kind': 'working', EXTRAS_KEY_ENTRY_PRICE_PENDING: executed_at}
+              if executed == 'entry_queued'
+              else {'kind': 'working', 'entry_filled_at': time.time()})
+    ctx.upsert_order('coid-w', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='w1', extras=extras)
+
+    assert asyncio.run(broker.execute_cancel(_cancel_outcome_env())) is True
+
+    row = ctx.get_order('coid-w')
+    assert row is not None and row.closed_ts_ms is None
+    assert 'cancelled' not in _event_kinds(ctx, 'coid-w')
+    assert 'cancel_noop' in _event_kinds(ctx, 'coid-w')
+    store.close()
+
+
+def __test_helper_executed_working_extras(executed):
+    """The ``extras`` of a working-order row whose execution was queued or booked."""
+    if executed == 'entry_queued':
+        executed_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000')
+        return {'kind': 'working', EXTRAS_KEY_ENTRY_PRICE_PENDING: executed_at}
+    return {'kind': 'working', 'entry_filled_at': time.time()}
+
+
+@pytest.mark.parametrize('executed', ['entry_queued', 'entry_booked'])
+def __test_cancel_sends_no_delete_for_an_executed_working_order_row__(tmp_path, executed):
+    """A cancel of a working-order row whose execution was read sends no DELETE.
+
+    The order is gone because it executed: both cancel paths (the sweep and
+    the cancel-with-outcome probe) treat the row as the filled position it
+    is, log ``cancel_noop`` and keep it live; the probe reports
+    ``ALREADY_FILLED`` without a venue write.
+    """
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-w', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='w1',
+                     extras=__test_helper_executed_working_extras(executed))
+
+    assert asyncio.run(broker.execute_cancel(_cancel_outcome_env())) is True
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+
+    assert outcome == CancelDispositionOutcome.ALREADY_FILLED
+    assert [c[0] for c in broker._calls if c[1] == 'delete'] == []
+    row = ctx.get_order('coid-w')
+    assert row is not None and row.closed_ts_ms is None
+    assert 'cancelled' not in _event_kinds(ctx, 'coid-w')
+    assert _event_kinds(ctx, 'coid-w').count('cancel_noop') == 2
+    store.close()
+
+
+def __test_cancel_sweep_keeps_a_working_row_executed_while_its_delete_was_in_flight__(tmp_path):
+    """The poll reads the working order's execution, queued for its price, while
+    the sweep's DELETE is in flight, and the DELETE answers 404: the 404 is that
+    execution, so the sweep keeps the row live as the filled position it is."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'workingorders/w1', 'delete'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+    })
+    _seed_working_order(ctx)
+    fake_response = broker._fake_response
+
+    def executed_meanwhile(endpoint, *, data=None, method='post'):
+        if (endpoint, method) == ('workingorders/w1', 'delete'):
+            ctx.upsert_order('coid-w', symbol='EURUSD', side='buy', qty=1.0,
+                             state='confirmed', pine_entry_id='Long',
+                             exchange_order_id='w1',
+                             extras=__test_helper_executed_working_extras('entry_queued'))
+        return fake_response(endpoint, data=data, method=method)
+
+    broker._fake_response = executed_meanwhile
+    assert asyncio.run(broker.execute_cancel(_cancel_outcome_env())) is True
+
+    assert [c[0] for c in broker._calls if c[1] == 'delete'] == ['workingorders/w1']
+    row = ctx.get_order('coid-w')
+    assert row is not None and row.closed_ts_ms is None
+    kinds = _event_kinds(ctx, 'coid-w')
+    assert 'cancelled' not in kinds
+    assert 'cancel_noop' in kinds
+    store.close()
+
+
+def __test_cancel_reports_a_closed_queued_working_execution_as_filled_and_closed__(tmp_path):
+    """The entry's last order is a closed working-order row whose execution was
+    queued for its price: it filled, so the cancel probe reports
+    ``FILLED_AND_CLOSED``, never a confirmed cancel of an unfilled order."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-w', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='w1',
+                     extras=__test_helper_executed_working_extras('entry_queued'))
+    ctx.close_order('coid-w')
+
+    outcome = asyncio.run(broker.execute_cancel_with_outcome(_cancel_outcome_env()))
+
+    assert outcome == CancelDispositionOutcome.FILLED_AND_CLOSED
+    assert [c[0] for c in broker._calls if c[1] == 'delete'] == []
+    store.close()
+
+
 def _cancel_outcome_env(pine_id='Long', symbol='EURUSD', from_entry=None):
     return DispatchEnvelope(
         intent=CancelIntent(pine_id=pine_id, symbol=symbol,
@@ -3056,11 +3208,51 @@ def _assert_promoted(ctx, coid, new_deal_id):
     assert row.filled_qty == pytest.approx(1.0), (
         "the activity-path entry fill must stamp the journal exposure "
         "cursor — once the row is kind='position' the snapshot's "
-        "working→position stamp can never run and a full fill is "
-        "excluded from the partial-fill detector, so a zero cursor "
+        "working→position stamp can never run, so a zero cursor "
         "would understate the cycle-end book forever (cycle 51: "
         f"venue -0.01 vs journal 0). Got {row.filled_qty!r}"
     )
+
+
+@pytest.mark.parametrize('entry', ['working_order', 'working_order_executed_only', 'position'])
+def __test_entry_booked_from_its_activity_keeps_the_venue_execution_time__(tmp_path, entry):
+    """Booking an entry from its execution activity, a working order's
+    promotion or a position's first fill, keeps the activity's ``dateUTC``
+    beside the local booking stamp: the execution is judged by when the venue
+    executed it, however late the activity was read."""
+    broker, store, ctx = _make_broker(tmp_path)
+    position_act, executed_act = _wo_fill_activities()
+    if entry == 'working_order':
+        coid = _seed_working_order_row(ctx)
+        activities = [position_act, executed_act]
+    elif entry == 'working_order_executed_only':
+        coid = _seed_working_order_row(ctx)
+        activities = [executed_act]
+        snapshot = {'pos-1': {'position': {'dealId': 'pos-1', 'workingOrderId': 'wo-1',
+                                           'size': 1.0, 'direction': 'BUY',
+                                           'level': 62895.55},
+                              'market': {'epic': 'BTCUSD'}}}
+    else:
+        coid = 'coid-p'
+        ctx.upsert_order(coid, symbol='BTCUSD', side='buy', qty=1.0, filled_qty=1.0,
+                         state='confirmed', pine_entry_id='L', exchange_order_id='pos-1',
+                         extras={'kind': 'position', 'confirm_level': 62895.55})
+        ctx.add_ref(coid, 'deal_id', 'pos-1')
+        activities = [{**position_act, 'status': 'EXECUTED',
+                       'size': 1.0, 'direction': 'BUY', 'level': 62895.55}]
+
+    async def drain(acts):
+        positions = snapshot if entry == 'working_order_executed_only' else None
+        return [ev async for ev in broker._process_activity(acts, positions)]
+
+    events = asyncio.run(drain(activities))
+    assert [e.event_type for e in events if e.event_type == 'filled'] == ['filled']
+    row = ctx.get_order(coid)
+    assert row is not None
+    extras = row.extras or {}
+    assert extras.get('entry_filled_at') is not None
+    assert extras.get(EXTRAS_KEY_ENTRY_EXECUTED_UTC) == '2026-08-16T22:15:11.350'
+    store.close()
 
 
 def __test_working_order_fill_migrates_the_row_to_the_position_deal__(tmp_path):
@@ -3740,9 +3932,7 @@ def __test_missing_pending_tracker_stop_with_sink_quarantines__(tmp_path):
             "API error occured: error.not-found.dealId", ref_type='deal_id',
         ),
     })
-    latched = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
-        (reason, context, kind))
+    latched = _capture_quarantine(broker)
     old_ts = __import__('time').time() - 120.0
     ctx.upsert_order('lost', symbol='EURUSD', side='buy', qty=1.0,
                      state='confirmed', pine_entry_id='Long',
@@ -8568,7 +8758,7 @@ def __test_reconcile_snapshot_working_to_position_stamps_kind_and_entry_filled__
     from ``'working'`` to ``'position'`` AND ``extras['entry_filled_at']``
     must be stamped. Several downstream paths gate on these fields:
     :meth:`_find_active_entry_rows` (modify_exit lookup),
-    partial-fill detection, and manual ``USER`` / ``DEALER`` close
+    the snapshot fill fallback, and manual ``USER`` / ``DEALER`` close
     detection. Without the stamps, a manual close activity for a
     limit-fill entry would route as ``LegType.ENTRY`` and
     ``BrokerPosition.record_fill`` would ADD to the local position
@@ -8612,7 +8802,7 @@ def __test_reconcile_snapshot_working_to_position_stamps_kind_and_entry_filled__
     extras = row.extras or {}
     assert extras.get('kind') == 'position', (
         f"working→position promote must flip kind so subsequent paths "
-        f"(modify_exit lookup, partial-fill detection, manual-close "
+        f"(modify_exit lookup, snapshot fill fallback, manual-close "
         f"detection) recognise the row as a position; got "
         f"kind={extras.get('kind')!r}"
     )
@@ -14349,6 +14539,7 @@ def __test_ws_volume_listener_buckets_quotes_by_timestamp__():
 # =======================================================================
 
 from pynecore.core.broker.exceptions import OrderSkippedByPlugin  # noqa: E402
+from pynecore.core.broker.one_way_emulator import close_leg_row_client_order_id  # noqa: E402
 from pynecore.core.broker.store_helpers import (  # noqa: E402
     EXTRAS_KEY_CLOSE_LEG_ID,
     STATE_CLOSE_LEG,
@@ -14673,6 +14864,1749 @@ def __test_close_leg_transport_maps_to_disposition_unknown__(tmp_path):
     })
     with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'coid-close:L1'))
+    store.close()
+
+
+# --- The close fill of a core leg close carries the close-leg coid ---------
+#
+# The core tells a hedging account's netting closes from the strategy's own
+# closes by the close fill's ``client_order_id``
+# (``OneWayEmulator.netting_close_owner``): it must be the coid ``close_leg``
+# received, on every path that delivers that fill.
+
+
+def __test_helper_leg_close_setup(tmp_path, responses=None):
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('positions/L1', 'delete'): {},
+        **(responses or {}),
+    })
+    _hedged(broker)
+    ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=1.0,
+                     filled_qty=1.0, state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='L1',
+                     extras={'kind': 'position', 'entry_filled_at': 1.0})
+    ctx.add_ref('coid-entry', 'deal_id', 'L1')
+    create_close_leg_row(
+        ctx, coid='pcl:Long:L1', symbol='EURUSD', side='sell', qty=1.0,
+        intent_key='Long\x00', pine_entry_id='Long',
+        parent_close_coid='pcl:Long', leg_id='L1', leg_volume=100,
+        leg_pre_volume=100,
+    )
+    # The core quantizes the leg volume before it sends a leg close.
+    asyncio.run(broker.get_volume_quantizer('EURUSD'))
+    return broker, store, ctx
+
+
+def __test_helper_leg_close_activity():
+    return {
+        'dateUTC': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+        'dealId': 'L1', 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'USER',
+        'epic': 'EURUSD',
+        'details': {'direction': 'SELL', 'size': 1.0, 'level': 1.2},
+    }
+
+
+def __test_helper_names_the_close_leg_row(ctx, coid):
+    row = ctx.get_order(close_leg_row_client_order_id(coid))
+    return row is not None and row.state == STATE_CLOSE_LEG
+
+
+def __test_leg_close_activity_fill_carries_the_close_leg_coid__(tmp_path):
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    events = asyncio.run(_drain_agen(broker._process_activity(
+        [__test_helper_leg_close_activity()])))
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.leg_type == LegType.CLOSE and ev.event_type == 'filled'
+    assert ev.order.client_order_id == 'pcl:Long:L1'
+    assert __test_helper_names_the_close_leg_row(ctx, ev.order.client_order_id)
+    assert ev.order.id == 'L1' and ev.pine_id == 'Long'
+    store.close()
+
+
+def __test_leg_close_resend_fill_carries_the_attempt_coid__(tmp_path):
+    """A replay re-send's attempt id is what its fill reports; the core maps it
+    back to the close-leg row."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1#r1'))
+    events = asyncio.run(_drain_agen(broker._process_activity(
+        [__test_helper_leg_close_activity()])))
+    assert [ev.order.client_order_id for ev in events] == ['pcl:Long:L1#r1']
+    assert __test_helper_names_the_close_leg_row(ctx, events[0].order.client_order_id)
+    store.close()
+
+
+def __test_leg_close_with_a_lost_answer_keeps_the_coid_for_its_fill__(tmp_path):
+    """The DELETE's answer is lost: the own-close record written before it
+    left still names the leg close, so the fill reports its coid."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    events = asyncio.run(_drain_agen(broker._process_activity(
+        [__test_helper_leg_close_activity()])))
+    assert [ev.order.client_order_id for ev in events] == ['pcl:Long:L1']
+    store.close()
+
+
+def __test_leg_close_fill_after_a_restart_carries_the_close_leg_coid__(tmp_path):
+    """A later process, with nothing of the send in memory, reads the coid
+    from the journal."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    restarted = _hedged(_FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+    }))
+    restarted.store_ctx = ctx
+    events = asyncio.run(_drain_agen(restarted._process_activity(
+        [__test_helper_leg_close_activity()])))
+    assert [ev.order.client_order_id for ev in events] == ['pcl:Long:L1']
+    store.close()
+
+
+def __test_vanished_leg_close_fill_carries_the_close_leg_coid__(tmp_path):
+    """No activity is published for the DELETE: the close fill booked from
+    the position's disappearance reports the leg close's coid too."""
+    market = dict(_RULES_RESP)
+    market['snapshot'] = {'bid': 1.2000, 'offer': 1.2002}
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('markets/EURUSD', 'get'): market,
+    })
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.state == 'closing'
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.CLOSE
+    assert events[0].order.client_order_id == 'pcl:Long:L1'
+    store.close()
+
+
+def __test_vanished_leg_close_fill_ignores_an_earlier_attempt_record__(tmp_path):
+    """An hour-old leg close attempt under another close-leg row is still on
+    the row's own-close records; the disappearance fill of the accepted DELETE
+    reports the accepted close's coid, not the entry's."""
+    market = dict(_RULES_RESP)
+    market['snapshot'] = {'bid': 1.2000, 'offer': 1.2002}
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('markets/EURUSD', 'get'): market,
+    })
+    earlier = time.time() - 3600.0
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    ctx.upsert_order('coid-entry', extras={
+        **(row.extras or {}),
+        EXTRAS_KEY_OWN_CLOSES: [{'full': True, 'size': None, 'sent_at': earlier,
+                                 'done_at': earlier + 1.0, 'matched': [],
+                                 'coid': 'pcl:Old:L1'}],
+    })
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    events = asyncio.run(_drain_agen(broker._reconcile_snapshot({}, {})))
+    assert len(events) == 1
+    assert events[0].order.client_order_id == 'pcl:Long:L1'
+    store.close()
+
+
+def __test_close_without_a_leg_close_record_keeps_the_entry_coid__(tmp_path):
+    """Someone else's close, and an own close sent without a core coid, name
+    no leg close: their fills keep the position row's client order id."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    broker.on_unexpected_cancel = 'ignore'
+    foreign = asyncio.run(_drain_agen(broker._process_activity(
+        [__test_helper_leg_close_activity()])))
+    assert [ev.order.client_order_id for ev in foreign] == ['coid-entry']
+    store.close()
+
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path / 'own')
+    activity = __test_helper_leg_close_activity()
+    _seed_own_close(ctx, 'coid-entry', activity)
+    own = asyncio.run(_drain_agen(broker._process_activity([activity])))
+    assert [ev.order.client_order_id for ev in own] == ['coid-entry']
+    store.close()
+
+
+def __test_manual_partial_close_in_a_leg_close_window_keeps_the_entry_coid__(tmp_path):
+    """A manual 0.25 reduction just before the DELETE and the DELETE's 0.75
+    close of the rest arrive in one poll. Neither is the 1.0 leg close the
+    core dispatched, so neither is the bot's own close: both are reported as
+    an intervention and neither fill reports the leg close's coid, so the
+    manual reduction is never booked as the core's close."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    manual = __test_helper_leg_close_activity()
+    manual['details'] = {**manual['details'], 'size': 0.25}
+    rest = __test_helper_leg_close_activity()
+    rest['dateUTC'] = (datetime.now(timezone.utc) + timedelta(milliseconds=5)).strftime(
+        '%Y-%m-%dT%H:%M:%S.%f')[:-3]
+    rest['details'] = {**rest['details'], 'size': 0.75}
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    for activity in (manual, rest):
+        assert broker._own_close_leg_coid(row, activity) is None
+        assert broker._matching_own_close(row, activity) is None
+    broker.on_unexpected_cancel = 'ignore'
+    events = asyncio.run(_drain_agen(broker._process_activity([manual, rest])))
+    assert events and all(ev.order.client_order_id == 'coid-entry' for ev in events)
+    kinds = _event_kinds(ctx, 'coid-entry')
+    assert 'own_close_activity_attributed' not in kinds
+    assert kinds.count('manual_close_report_pending') == 2
+    store.close()
+
+
+def __test_close_leg_sends_the_delete_without_reading_market_metadata__(tmp_path):
+    """The DELETE needs only the dealId: with no cached lot step and a market
+    read that would fail, the leg close still goes out, and its record
+    explains no activity (nothing identifies the leg close's size)."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    broker._responses[('error', 'markets/EURUSD', 'get')] = ValueError(
+        'malformed market metadata')
+    broker._instrument_rules_cache.clear()
+    broker._calls.clear()
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    assert [(endpoint, method) for endpoint, method, _ in broker._calls] == [
+        ('positions/L1', 'delete')]
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.state == 'closing'
+    assert broker._own_close_leg_coid(row, __test_helper_leg_close_activity()) is None
+    store.close()
+
+
+def __test_vanish_after_a_lost_leg_close_answer_requests_quarantine__(tmp_path):
+    """The DELETE's answer is lost and the deal leaves the venue with no
+    activity: an SL or a manual close look the same, so no fill is booked and
+    an external-intervention quarantine is requested."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    latched = []
+    broker.quarantine_sink = _recording_sink(broker, latched)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.state == 'confirmed'
+    verdict = broker._unattributed_vanish(row)
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert latched == [QuarantineKind.EXTERNAL_INTERVENTION]
+    assert len([k for k in _event_kinds(ctx, 'coid-entry') if k == 'leg_close_unresolved_vanish']) == 1
+    assert [k for k in _event_kinds(ctx, 'coid-entry') if k == 'position_vanished_unattributed'] == []
+    store.close()
+
+
+def __test_unresolved_vanish_without_a_sink_keeps_the_row_live__(tmp_path):
+    """A run without a quarantine sink cannot latch: the deal whose leg close
+    had an unknown outcome is not retired, at runtime nor at startup. The
+    verdict stays inconclusive, no fill and no retirement event is written,
+    and the row stays live for the next pass; a sink wired later latches and
+    retires it."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    assert broker.quarantine_sink is None
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    for _ in range(2):
+        verdict = broker._unattributed_vanish(row)
+        assert verdict.resolution is MissingResolution.INCONCLUSIVE
+    broker._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is None
+    kinds = _event_kinds(ctx, 'coid-entry')
+    assert 'leg_close_unresolved_vanish' not in kinds
+    assert 'position_vanished_unattributed' not in kinds
+    assert ctx.iter_open_quarantines() == []
+
+    latched = []
+    broker.quarantine_sink = _recording_sink(broker, latched)
+    assert broker._unattributed_vanish(row).resolution is MissingResolution.CLOSED
+    assert latched == [QuarantineKind.EXTERNAL_INTERVENTION]
+    assert _event_kinds(ctx, 'coid-entry').count('leg_close_unresolved_vanish') == 1
+    store.close()
+
+
+def __test_vanish_without_a_leg_close_requests_no_quarantine__(tmp_path):
+    """Without an unresolved leg close the unattributed disappearance keeps
+    its retire-and-audit outcome."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    latched = []
+    broker.quarantine_sink = _recording_sink(broker, latched)
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    broker._unattributed_vanish(row)
+    assert latched == []
+    assert len([k for k in _event_kinds(ctx, 'coid-entry') if k == 'position_vanished_unattributed']) == 1
+    store.close()
+
+
+def __test_startup_vanish_after_a_lost_leg_close_answer_requests_quarantine__(tmp_path):
+    """The DELETE's answer is lost, the process restarts and the deal is gone
+    with no close activity: the startup retirement requests the same
+    external-intervention quarantine the runtime path does, before the row is
+    retired, so the restart cannot drop the unresolved close."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    restarted = _hedged(_FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+    }))
+    restarted.store_ctx = ctx
+    latched = []
+
+    def sink(reason, context, *, kind):
+        row_now = ctx.get_order('coid-entry')
+        latched.append((kind, row_now is not None and row_now.closed_ts_ms is None))
+        _store_test_latch(restarted, reason, context, kind)
+
+    restarted.quarantine_sink = sink
+    restarted._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    assert latched == [(QuarantineKind.EXTERNAL_INTERVENTION, True)]
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is not None
+    kinds = _event_kinds(ctx, 'coid-entry')
+    assert kinds.count('leg_close_unresolved_vanish') == 1
+    assert 'position_vanished_unattributed' not in kinds
+    store.close()
+
+
+def __test_startup_vanish_without_a_leg_close_requests_no_quarantine__(tmp_path):
+    """Without an unresolved leg close the startup retirement keeps its
+    retire-and-audit outcome."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    latched = []
+    broker.quarantine_sink = _recording_sink(broker, latched)
+    broker._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    assert latched == []
+    assert _event_kinds(ctx, 'coid-entry').count('position_vanished_unattributed') == 1
+    store.close()
+
+
+def __test_leg_close_the_snapshot_outlived_requests_no_quarantine_on_a_later_vanish__(tmp_path):
+    """A week-old leg close lost its answer, and a snapshot read long after it
+    could have landed still listed the deal: that DELETE did not close it, so
+    a later disappearance without activity (an SL, a manual close) keeps the
+    retire-and-audit outcome instead of a quarantine."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    latched = []
+    broker.quarantine_sink = _recording_sink(broker, latched)
+    week_ago = time.time() - 7 * 86400.0
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    ctx.upsert_order('coid-entry', extras={
+        **(row.extras or {}),
+        EXTRAS_KEY_OWN_CLOSES: [{'full': True, 'size': None, 'sent_at': week_ago,
+                                 'done_at': week_ago + 30.0, 'matched': [],
+                                 'coid': 'pcl:Long:L1', 'leg_size': 1.0}],
+    })
+    row = ctx.get_order('coid-entry')
+    assert row is not None and broker._unresolved_leg_close(row)
+    broker._note_outlived_leg_closes({'L1': {'position': {'dealId': 'L1'}}},
+                                     week_ago + 3600.0)
+    row = ctx.get_order('coid-entry')
+    assert row is not None and not broker._unresolved_leg_close(row)
+    record = (row.extras or {})[EXTRAS_KEY_OWN_CLOSES][0]
+    assert record[OWN_CLOSE_LEG_OUTLIVED] == week_ago + 3600.0
+    broker._unattributed_vanish(row)
+    assert latched == []
+    assert _event_kinds(ctx, 'coid-entry').count('position_vanished_unattributed') == 1
+    store.close()
+
+
+def __test_leg_close_snapshot_inside_its_landing_window_proves_nothing__(tmp_path):
+    """A snapshot read while the lost DELETE may still land, one without a
+    read start, and one that no longer lists the deal leave the leg close
+    unresolved: its later disappearance still requests the quarantine."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    latched = []
+    broker.quarantine_sink = _recording_sink(broker, latched)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    listed = {'L1': {'position': {'dealId': 'L1'}}}
+    broker._note_outlived_leg_closes(listed, time.time())
+    broker._note_outlived_leg_closes(listed, None)
+    broker._note_outlived_leg_closes({}, time.time() + 7 * 86400.0)
+    row = ctx.get_order('coid-entry')
+    assert row is not None and broker._unresolved_leg_close(row)
+    assert OWN_CLOSE_LEG_OUTLIVED not in (row.extras or {})[EXTRAS_KEY_OWN_CLOSES][0]
+    broker._unattributed_vanish(row)
+    assert latched == [QuarantineKind.EXTERNAL_INTERVENTION]
+    store.close()
+
+
+def __test_startup_unresolved_vanish_quarantine_survives_a_failed_retirement__(tmp_path):
+    """The engine's quarantine write joins an enclosing store transaction, so
+    it is requested outside the row's retirement: a retirement that fails
+    after the request leaves the row live under a committed latch, a retry
+    retires it, and a fresh engine restores the external-intervention
+    quarantine."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    restarted = _hedged(_FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+    }))
+    restarted.store_ctx = ctx
+    engine = OrderSyncEngine(broker=restarted, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    restarted.quarantine_sink = engine.record_quarantine
+    close_order = ctx.close_order
+
+    def failing(coid, *args, **kwargs):
+        if coid == 'coid-entry':
+            del ctx.close_order
+            raise sqlite3.OperationalError("disk I/O error")
+        return close_order(coid, *args, **kwargs)
+
+    ctx.close_order = failing
+    with pytest.raises(sqlite3.OperationalError):
+        restarted._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is None
+    assert 'leg_close_unresolved_vanish' not in _event_kinds(ctx, 'coid-entry')
+    assert [q.kind for q in ctx.iter_open_quarantines()] == [
+        str(QuarantineKind.EXTERNAL_INTERVENTION)]
+
+    restarted._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is not None
+    assert _event_kinds(ctx, 'coid-entry').count('leg_close_unresolved_vanish') == 1
+    assert len(ctx.iter_open_quarantines()) == 1
+
+    fresh = OrderSyncEngine(broker=restarted, position=BrokerPosition(), symbol='EURUSD',
+                            run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    assert fresh.venue_writes_blocked
+    store.close()
+
+
+def __test_startup_snapshot_rules_out_an_outlived_leg_close__(tmp_path):
+    """A week-old leg close lost its answer, and the startup snapshot still
+    lists the deal: startup rules that DELETE out like a runtime snapshot
+    does, so the deal's disappearance before any runtime snapshot keeps the
+    retire-and-audit outcome instead of a quarantine."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('positions', 'get'): {'positions': [_live_position('L1', size=1.0)]},
+        ('workingorders', 'get'): {'workingOrders': []},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    latched = _capture_quarantine(broker)
+    week_ago = time.time() - 7 * 86400.0
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    ctx.upsert_order('coid-entry', extras={
+        **(row.extras or {}),
+        EXTRAS_KEY_OWN_CLOSES: [{'full': True, 'size': None, 'sent_at': week_ago,
+                                 'done_at': week_ago + 30.0, 'matched': [],
+                                 'coid': 'pcl:Long:L1', 'leg_size': 1.0}],
+    })
+    asyncio.run(broker._recover_in_flight_submissions())
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is None
+    assert not broker._unresolved_leg_close(row)
+    broker._unattributed_vanish(row)
+    assert latched == []
+    assert _event_kinds(ctx, 'coid-entry').count('position_vanished_unattributed') == 1
+    store.close()
+
+
+def __test_missing_unfilled_market_entry_waits_the_activity_lag__(tmp_path):
+    """A market entry the venue accepted without opening it at once has no
+    fill booked; its deal gone from ``/positions`` may still have executed
+    under a fresh dealId. Its cancelled event would report a filled quantity
+    of 0 as the venue's, so the verdict waits until the execution's activity
+    would have been read, like a resting order's."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/pos-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+    })
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='pos-1',
+                     extras={'kind': 'position', 'missing_pending_since': time.time() - 10.0})
+    row = ctx.get_order('coid-p')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.INCONCLUSIVE
+    ctx.upsert_order('coid-p', extras={'kind': 'position',
+                                       'missing_pending_since': time.time() - 120.0})
+    row = ctx.get_order('coid-p')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.CANCELLED
+    store.close()
+
+
+def __test_unresolved_vanish_waits_for_a_stored_quarantine_latch__(tmp_path):
+    """The engine keeps a latch whose store write failed in memory only. A
+    position only that latch guards is never retired before the store holds
+    it: at startup the row stays live, so a fresh engine still has it to
+    judge, and the runtime verdict stays inconclusive until the engine's
+    retry stored the latch, then retires the row."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    restarted = _hedged(_FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+    }))
+    restarted.store_ctx = ctx
+    engine = OrderSyncEngine(broker=restarted, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    restarted.quarantine_sink = engine.record_quarantine
+    record_quarantine = ctx.record_quarantine
+
+    def failing(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ctx.record_quarantine = failing
+    restarted._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    assert engine.venue_writes_blocked
+    assert ctx.iter_open_quarantines() == []
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is None
+    assert 'leg_close_unresolved_vanish' not in _event_kinds(ctx, 'coid-entry')
+    fresh = OrderSyncEngine(broker=restarted, position=BrokerPosition(), symbol='EURUSD',
+                            run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    assert not fresh.venue_writes_blocked
+
+    verdict = restarted._unattributed_vanish(row)
+    assert verdict.resolution is MissingResolution.INCONCLUSIVE
+    row = ctx.get_order('coid-entry')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is None
+
+    del ctx.record_quarantine
+    assert ctx.record_quarantine == record_quarantine
+    engine._persist_quarantine()
+    verdict = restarted._unattributed_vanish(row)
+    assert verdict.resolution is MissingResolution.CLOSED
+    row = ctx.get_order('coid-entry')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is not None
+    assert _event_kinds(ctx, 'coid-entry').count('leg_close_unresolved_vanish') == 1
+    restored = OrderSyncEngine(broker=restarted, position=BrokerPosition(), symbol='EURUSD',
+                               run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    assert restored.venue_writes_blocked
+    store.close()
+
+
+def __test_unresolved_vanish_ignores_a_resumed_older_latch__(tmp_path):
+    """An older external-intervention latch the operator already resumed
+    blocks nothing across a restart: it never stands in for a latch whose
+    store write failed, so the position it would guard stays live."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg('EURUSD', 'L1', 100, 'pcl:Long:L1'))
+    ctx.record_quarantine(
+        'q-old', kind=str(QuarantineKind.EXTERNAL_INTERVENTION), reason='older',
+        intent_key=None, context=None, entered_ts_ms=int(time.time() * 1000) - 60_000)
+    assert store.request_quarantine_resume(ctx.run_id, 'q-old') is not None
+    restarted = _hedged(_FakeBroker(config=_make_config(), responses={
+        ('markets/EURUSD', 'get'): _RULES_RESP,
+    }))
+    restarted.store_ctx = ctx
+    engine = OrderSyncEngine(broker=restarted, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=ctx.run_tag, mintick=0.00001, store_ctx=ctx)
+    restarted.quarantine_sink = engine.record_quarantine
+
+    def failing(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ctx.record_quarantine = failing
+    restarted._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    assert engine.venue_writes_blocked
+    row = ctx.get_order('coid-entry')
+    assert row is not None and row.closed_ts_ms is None
+    assert 'leg_close_unresolved_vanish' not in _event_kinds(ctx, 'coid-entry')
+    verdict = restarted._unattributed_vanish(row)
+    assert verdict.resolution is MissingResolution.INCONCLUSIVE
+    store.close()
+
+
+def __test_missing_unbooked_market_entry_follows_a_live_backlinked_deal__(tmp_path):
+    """A market entry the venue accepted without opening it at once, its deal
+    gone and no activity read: a live deal back-linking it in
+    ``workingOrderId`` is its execution. The grace-expiry verdict moves the
+    row onto that deal instead of cancelling it unfilled, and leaves the fill
+    to the deal's activity (no ``entry_filled_at`` stamp)."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/old-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                          'size': 1.0, 'direction': 'BUY', 'level': 77573.65},
+             'market': {'epic': 'BTCUSD'}},
+        ]},
+    })
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='old-1',
+                     extras={'kind': 'position',
+                             'missing_pending_since': time.time() - 120.0})
+    ctx.add_ref('coid-m', 'deal_id', 'old-1')
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.STILL_PRESENT
+    migrated = ctx.get_order('coid-m')
+    assert migrated is not None and migrated.exchange_order_id == 'new-1'
+    assert migrated.filled_qty == 0.0
+    assert (migrated.extras or {}).get('entry_filled_at') is None
+    assert (migrated.extras or {}).get('missing_pending_since') is None
+    store.close()
+
+
+def __test_helper_seed_executed_working_row(ctx, executed):
+    """Seed a working-order row still on its order's ``dealId`` whose execution was read."""
+    executed_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000')
+    extras = {'kind': 'working', 'missing_pending_since': time.time() - 3600.0}
+    if executed == 'entry_queued':
+        extras[EXTRAS_KEY_ENTRY_PRICE_PENDING] = executed_at
+    else:
+        extras['entry_filled_at'] = time.time() - 3600.0
+    ctx.upsert_order('coid-w', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     filled_qty=1.0 if executed == 'entry_booked' else 0.0,
+                     exchange_order_id='old-1', extras=extras)
+    ctx.add_ref('coid-w', 'deal_id', 'old-1')
+
+
+@pytest.mark.parametrize('executed', ['entry_queued', 'entry_booked'])
+def __test_missing_executed_working_row_follows_its_backlinked_deal__(tmp_path, executed):
+    """A working-order row whose execution was read, its order gone and the deal
+    it opened missed by the poll: the grace-expiry verdict probes for the live
+    deal back-linking it and moves the row onto it, never cancelling the
+    executed order. A booked execution stays booked, a queued one unbooked."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/old-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                          'size': 1.0, 'direction': 'BUY', 'level': 77573.65},
+             'market': {'epic': 'BTCUSD'}},
+        ]},
+    })
+    __test_helper_seed_executed_working_row(ctx, executed)
+    row = ctx.get_order('coid-w')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.STILL_PRESENT
+    moved = ctx.get_order('coid-w')
+    assert moved is not None and moved.exchange_order_id == 'new-1'
+    assert (moved.extras or {}).get('kind') == 'position'
+    assert (((moved.extras or {}).get('entry_filled_at') is not None)
+            is (executed == 'entry_booked'))
+    store.close()
+
+
+def __test_missing_booked_working_row_without_a_live_deal_is_never_cancelled__(tmp_path):
+    """A working-order row whose execution was booked and whose deal no read
+    lists is a vanished position: the verdict retires it like one, never as an
+    unfilled cancel."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/old-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+        ('positions', 'get'): {'positions': []},
+    })
+    __test_helper_seed_executed_working_row(ctx, 'entry_booked')
+    row = ctx.get_order('coid-w')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert 'position_vanished_unattributed' in _event_kinds(ctx, 'coid-w')
+    store.close()
+
+
+@pytest.mark.parametrize('kind', ['working', 'position'])
+def __test_missing_queued_entry_row_past_the_lookback_is_never_cancelled__(tmp_path, kind):
+    """A row whose entry was queued for its price, its deal gone, no read lists a
+    deal back-linking it and the queued activity is older than the venue's
+    lookback: the execution was read, so the terminal verdict retires the row
+    as a vanished position, never as an unfilled cancel."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/old-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+        ('positions', 'get'): {'positions': []},
+    })
+    executed_at = (datetime.now(timezone.utc) - timedelta(days=2)).strftime(
+        '%Y-%m-%dT%H:%M:%S.000')
+    ctx.upsert_order('coid-w', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=0.0,
+                     exchange_order_id='old-1',
+                     extras={'kind': kind,
+                             'missing_pending_since': time.time() - 3600.0,
+                             EXTRAS_KEY_ENTRY_PRICE_PENDING: executed_at})
+    ctx.add_ref('coid-w', 'deal_id', 'old-1')
+    row = ctx.get_order('coid-w')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.CLOSED
+    assert 'position_vanished_unattributed' in _event_kinds(ctx, 'coid-w')
+    store.close()
+
+
+@pytest.mark.parametrize('reduction_after_s, expected', [
+    (0.0, (['coid-w'], [])),
+    (3600.0, ([], [])),
+    (None, ([], ['coid-w'])),
+])
+def __test_netting_candidates_judge_a_queued_working_execution_by_its_time__(
+        tmp_path, reduction_after_s, expected):
+    """An own opposite working order whose execution was read but is still queued
+    for its price executed: it is own execution evidence for a reduction at the
+    venue time of its execution, never a resting order. A reduction an hour
+    later is not its netting, and a queued time that cannot be read only makes
+    the reduction ambiguous."""
+    broker, store, ctx = _make_broker(tmp_path)
+    executed_at = (datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000')
+                   if reduction_after_s is not None else 'not-a-date')
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+                     exchange_order_id='p1',
+                     extras={'kind': 'position', 'entry_filled_at': time.time()})
+    ctx.upsert_order('coid-w', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Short', filled_qty=0.0,
+                     exchange_order_id='w1',
+                     extras={'kind': 'working', EXTRAS_KEY_ENTRY_PRICE_PENDING: executed_at})
+    row = ctx.get_order('coid-p')
+    assert row is not None
+    activity_ts = time.time() + (reduction_after_s or 0.0)
+    assert broker._own_netting_candidates(row, activity_ts, 1.0, {}) == expected
+    store.close()
+
+
+@pytest.mark.parametrize('booking', ['priced_copy_of_queued', 'activity_read_late'])
+@pytest.mark.parametrize('reduction_at, expected', [
+    ('booking', ([], [])),
+    ('execution', (['coid-w'], [])),
+])
+def __test_netting_candidates_judge_a_late_booked_execution_by_its_venue_time__(
+        tmp_path, booking, reduction_at, expected):
+    """An own opposite working order executed an hour ago and its entry was
+    booked only now: its priced copy arrived late after it was queued, or its
+    activity was read late. The booking stamp is local time; a manual
+    reduction at booking time is not its netting, while one at the venue time
+    of its execution is."""
+    broker, store, ctx = _make_broker(tmp_path)
+    now = time.time()
+    executed_ts = now - 3600.0
+    executed_at = datetime.fromtimestamp(executed_ts, timezone.utc).strftime(
+        '%Y-%m-%dT%H:%M:%S.000')
+    if booking == 'priced_copy_of_queued':
+        extras = {'kind': 'working', EXTRAS_KEY_ENTRY_PRICE_PENDING: executed_at}
+        book_entry(extras, now)
+    else:
+        extras = {'kind': 'working'}
+        book_entry(extras, now, executed_at)
+    ctx.upsert_order('coid-p', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long', filled_qty=1.0,
+                     exchange_order_id='p1',
+                     extras={'kind': 'position', 'entry_filled_at': executed_ts - 60.0})
+    ctx.upsert_order('coid-w', symbol='EURUSD', side='sell', qty=1.0,
+                     state='confirmed', pine_entry_id='Short', filled_qty=0.0,
+                     exchange_order_id='w1', extras=extras)
+    ctx._store._conn.execute(
+        "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
+        (int((executed_ts - 120.0) * 1000), 'coid-w'),
+    )
+    row = ctx.get_order('coid-p')
+    assert row is not None
+    activity_ts = now if reduction_at == 'booking' else executed_ts
+    assert broker._own_netting_candidates(row, activity_ts, 1.0, {}) == expected
+    store.close()
+
+
+@pytest.mark.parametrize('executed', ['entry_queued', 'entry_booked'])
+def __test_startup_keeps_an_executed_working_row_until_its_deal_appears__(tmp_path, executed):
+    """A fresh start whose snapshots show neither the executed working order
+    nor the deal it opened keeps the row live; the next poll's snapshot, which
+    lists the back-linked deal, moves the row onto it."""
+    broker, store, ctx = _make_broker(tmp_path)
+    __test_helper_seed_executed_working_row(ctx, executed)
+    broker._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    kept = ctx.get_order('coid-w')
+    assert kept is not None and kept.closed_ts_ms is None
+    kinds = _event_kinds(ctx, 'coid-w')
+    assert 'startup_executed_working_row_kept' in kinds
+    assert 'startup_orphan_retired' not in kinds
+    assert 'working_order_vanished_unattributed' not in kinds
+    snapshot = {
+        'new-1': {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                               'size': 1.0, 'direction': 'BUY',
+                               'level': 77573.65},
+                  'market': {'epic': 'BTCUSD'}},
+    }
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(snapshot, {})))
+    migrated = ctx.get_order('coid-w')
+    assert migrated is not None and migrated.closed_ts_ms is None
+    assert migrated.exchange_order_id == 'new-1'
+    assert (((migrated.extras or {}).get('entry_filled_at') is not None)
+            is (executed == 'entry_booked'))
+    store.close()
+
+
+def __test_startup_keeps_a_queued_entry_position_missing_from_its_snapshot__(tmp_path):
+    """A position row whose entry is queued for its price, its deal missing from
+    the startup snapshot, is kept live: the engine holds none of its exposure,
+    and the next poll whose snapshot lists the deal still finds the row owning
+    it, its entry owed. Neither silent residue nor a vanished position."""
+    broker, store, ctx = _make_broker(tmp_path)
+    executed_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000')
+    ctx.upsert_order('coid-p', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=0.0,
+                     exchange_order_id='deal-1',
+                     extras={'kind': 'position',
+                             EXTRAS_KEY_ENTRY_PRICE_PENDING: executed_at})
+    ctx.add_ref('coid-p', 'deal_id', 'deal-1')
+    broker._retire_startup_orphans({}, {}, closed_deals=set(), activities=[])
+    row = ctx.get_order('coid-p')
+    assert row is not None and row.closed_ts_ms is None
+    kinds = _event_kinds(ctx, 'coid-p')
+    assert 'startup_queued_entry_position_kept' in kinds
+    assert 'position_vanished_unattributed' not in kinds
+    assert 'startup_orphan_retired' not in kinds
+    snapshot = {
+        'deal-1': {'position': {'dealId': 'deal-1', 'size': 1.0, 'direction': 'BUY',
+                                'level': 77573.65},
+                   'market': {'epic': 'BTCUSD'}},
+    }
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(snapshot, {})))
+    owned = ctx.get_order('coid-p')
+    assert owned is not None and owned.closed_ts_ms is None
+    assert owned.exchange_order_id == 'deal-1'
+    assert (owned.extras or {}).get(EXTRAS_KEY_ENTRY_PRICE_PENDING) == executed_at
+    store.close()
+
+
+def __test_snapshot_pass_migrates_a_working_row_whose_execution_is_queued__(tmp_path):
+    """The per-poll snapshot pass moves a working-order row whose execution is
+    queued for its price onto the live deal back-linking it, the entry left
+    unbooked for its priced activity or the snapshot fallback."""
+    broker, store, ctx = _make_broker(tmp_path)
+    __test_helper_seed_executed_working_row(ctx, 'entry_queued')
+    snapshot = {
+        'new-1': {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                               'size': 1.0, 'direction': 'BUY',
+                               'level': 77573.65},
+                  'market': {'epic': 'BTCUSD'}},
+    }
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(snapshot, {})))
+    migrated = ctx.get_order('coid-w')
+    assert migrated is not None and migrated.exchange_order_id == 'new-1'
+    assert (migrated.extras or {}).get('entry_filled_at') is None
+    store.close()
+
+
+def __test_snapshot_pass_migrates_an_unbooked_rekeyed_market_entry__(tmp_path):
+    """The per-poll snapshot pass moves an unbooked accepted market entry onto
+    the live deal back-linking it, the fill left to that deal's activity."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='old-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'old-1')
+    snapshot = {
+        'new-1': {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                               'size': 1.0, 'direction': 'BUY',
+                               'level': 77573.65},
+                  'market': {'epic': 'BTCUSD'}},
+    }
+    asyncio.run(_drain_agen(broker._reconcile_snapshot(snapshot, {})))
+    migrated = ctx.get_order('coid-m')
+    assert migrated is not None and migrated.exchange_order_id == 'new-1'
+    assert (migrated.extras or {}).get('entry_filled_at') is None
+    store.close()
+
+
+def __test_helper_seed_migrated_unbooked_entry(ctx):
+    """Seed an accepted, unbooked market entry already moved onto its live deal."""
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L',
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'new-1')
+
+
+def __test_helper_unbooked_snapshot(size=1.0):
+    return {'new-1': {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                                   'size': size, 'direction': 'BUY',
+                                   'level': 77573.65},
+                      'market': {'epic': 'BTCUSD'}}}
+
+
+def __test_unbooked_entry_on_its_live_deal_is_booked_from_the_snapshot__(tmp_path):
+    """An accepted market entry moved onto the deal back-linking it has no
+    confirmed fill. No activity announcing it, the deal listed at the full
+    requested size past the grace is booked once from the snapshot, at the
+    deal's level, with the exposure cursor and the stamp written together;
+    the activity arriving late is a suppressed replay."""
+    broker, store, ctx = _make_broker(tmp_path)
+    __test_helper_seed_migrated_unbooked_entry(ctx)
+    snapshot = __test_helper_unbooked_snapshot()
+    assert _reconcile_events(broker, snapshot) == []
+    broker._unannounced_fills_seen['coid-m'] -= _UNANNOUNCED_FILL_GRACE_S
+
+    events = _reconcile_events(broker, snapshot)
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == 'filled' and event.leg_type == LegType.ENTRY
+    assert event.fill_qty == pytest.approx(1.0)
+    assert event.journal_fill_qty == pytest.approx(1.0)
+    assert event.fill_price == pytest.approx(77573.65)
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get('entry_filled_at') is not None
+    assert _reconcile_events(broker, snapshot) == [], "a booked fill is never booked twice"
+
+    late_activity = {
+        'dateUTC': '2026-04-21T09:00:00.000', 'dealId': 'new-1',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'level': 77573.65, 'size': 1.0,
+                    'workingOrderId': 'old-1'},
+    }
+    assert asyncio.run(_drain_agen(broker._process_activity([late_activity]))) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    store.close()
+
+
+def __test_unbooked_entry_waits_for_its_activity_on_a_size_mismatch__(tmp_path):
+    """A live deal whose size differs from the requested quantity does not
+    prove what the unbooked entry filled: nothing is booked from it."""
+    broker, store, ctx = _make_broker(tmp_path)
+    __test_helper_seed_migrated_unbooked_entry(ctx)
+    snapshot = __test_helper_unbooked_snapshot(size=1.5)
+    assert _reconcile_events(broker, snapshot) == []
+    broker._unannounced_fills_seen['coid-m'] = 0.0
+    assert _reconcile_events(broker, snapshot) == []
+    assert 'coid-m' not in broker._unannounced_fills_seen
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == 0.0
+    assert (row.extras or {}).get('entry_filled_at') is None
+    store.close()
+
+
+def __test_smaller_live_deal_books_no_fill_of_an_unbooked_entry__(tmp_path):
+    """A live deal smaller than the requested quantity proves no entry fill
+    either: its size is its open exposure, not the unfilled rest. Repeated
+    snapshots past the grace book nothing, so the deal's activity books the
+    fill once."""
+    broker, store, ctx = _make_broker(tmp_path)
+    __test_helper_seed_migrated_unbooked_entry(ctx)
+    snapshot = __test_helper_unbooked_snapshot(size=0.6)
+    assert _reconcile_events(broker, snapshot) == []
+    broker._unannounced_fills_seen['coid-m'] = 0.0
+    assert _reconcile_events(broker, snapshot) == []
+    assert _reconcile_events(broker, snapshot) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == 0.0
+    assert (row.extras or {}).get('entry_filled_at') is None
+    assert 'partial_fill_detected' not in _event_kinds(ctx, 'coid-m')
+    store.close()
+
+
+def __test_helper_working_fill_snapshot(level):
+    position = {'dealId': 'deal-W', 'size': 1.0, 'direction': 'BUY'}
+    if level is not None:
+        position['level'] = level
+    return {'deal-W': {'position': position, 'market': {'epic': 'EURUSD'}}}
+
+
+def __test_unpriced_snapshot_promotes_no_working_entry__(tmp_path):
+    """A working order the snapshot shows executed, but without the deal's
+    level, is not promoted: the book drops an unpriced fill, and stamping it
+    booked would suppress the priced fill. The next priced snapshot books
+    the entry once."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-work', symbol='EURUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='Long',
+                     exchange_order_id='deal-W', extras={'kind': 'working'})
+    assert _reconcile_events(broker, __test_helper_working_fill_snapshot(None)) == []
+    row = ctx.get_order('coid-work')
+    assert row is not None and (row.extras or {}).get('kind') == 'working'
+    assert (row.extras or {}).get('entry_filled_at') is None
+    assert row.filled_qty == 0.0
+
+    events = _reconcile_events(broker, __test_helper_working_fill_snapshot(1.105))
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.ENTRY
+    assert events[0].fill_price == pytest.approx(1.105)
+    assert events[0].fill_qty == pytest.approx(1.0)
+    assert _reconcile_events(broker, __test_helper_working_fill_snapshot(1.105)) == []
+    store.close()
+
+
+def __test_unpriced_snapshot_books_no_confirmed_entry_fill__(tmp_path):
+    """The snapshot fallback for a confirmed entry no activity announced
+    books nothing while neither the confirm nor the deal prices the fill;
+    the elapsed grace is kept, so the first priced snapshot books it once."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=1.0,
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    unpriced = __test_helper_unbooked_snapshot()
+    del unpriced['new-1']['position']['level']
+    assert _reconcile_events(broker, unpriced) == []
+    broker._unannounced_fills_seen['coid-m'] -= _UNANNOUNCED_FILL_GRACE_S
+    assert _reconcile_events(broker, unpriced) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get('entry_filled_at') is None
+    assert 'coid-m' in broker._unannounced_fills_seen
+
+    events = _reconcile_events(broker, __test_helper_unbooked_snapshot())
+    assert len(events) == 1
+    assert events[0].fill_price == pytest.approx(77573.65)
+    assert _reconcile_events(broker, __test_helper_unbooked_snapshot()) == []
+    store.close()
+
+
+def __test_unpriced_entry_activity_is_deferred__(tmp_path):
+    """An entry activity no source prices is deferred, not consumed: the
+    entry is not stamped booked, and its priced copy books it once."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=1.0,
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'new-1')
+    unpriced = {
+        'dateUTC': '2026-04-21T09:00:00.000', 'dealId': 'new-1',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'size': 1.0},
+    }
+    assert asyncio.run(_drain_agen(broker._process_activity([unpriced]))) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get('entry_filled_at') is None
+    assert 'activity_entry_deferred_no_price' in _event_kinds(ctx, 'coid-m')
+
+    priced = {**unpriced, 'details': {**unpriced['details'], 'level': 77573.65}}
+    events = asyncio.run(_drain_agen(broker._process_activity([priced])))
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.ENTRY
+    assert events[0].fill_price == pytest.approx(77573.65)
+    assert asyncio.run(_drain_agen(broker._process_activity([priced]))) == []
+    store.close()
+
+
+@pytest.mark.parametrize('bad_level', ['NaN', 'inf', '-inf', float('nan')])
+def __test_non_finite_entry_activity_price_is_deferred__(tmp_path, bad_level):
+    """A non-finite activity price is no price: the entry is deferred, not
+    stamped booked, and its priced copy books it once."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=1.0,
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'new-1')
+    unpriced = {
+        'dateUTC': '2026-04-21T09:00:00.000', 'dealId': 'new-1',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'size': 1.0, 'level': bad_level},
+    }
+    assert asyncio.run(_drain_agen(broker._process_activity([unpriced]))) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get('entry_filled_at') is None
+    assert 'activity_entry_deferred_no_price' in _event_kinds(ctx, 'coid-m')
+
+    priced = {**unpriced, 'details': {**unpriced['details'], 'level': 77573.65}}
+    events = asyncio.run(_drain_agen(broker._process_activity([priced])))
+    assert len(events) == 1
+    assert events[0].leg_type == LegType.ENTRY
+    assert events[0].fill_price == pytest.approx(77573.65)
+    store.close()
+
+
+def __test_reduction_waits_behind_an_unpriced_entry__(tmp_path):
+    """A priced reduction of a deal whose entry activity is deferred for its
+    price waits for the entry, across polls and a restart: the entry books
+    first, the reduction once, and the journal ends at the venue's 0.6."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=1.0,
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'new-1')
+    opened_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    entry = {
+        'dateUTC': opened_at.strftime('%Y-%m-%dT%H:%M:%S.000'), 'dealId': 'new-1',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'size': 1.0},
+    }
+    reduction = {
+        'dateUTC': (opened_at + timedelta(seconds=5)).strftime('%Y-%m-%dT%H:%M:%S.000'),
+        'dealId': 'new-1', 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SYSTEM',
+        'epic': 'BTCUSD', 'details': {'direction': 'SELL', 'size': 0.4, 'level': 77600.0},
+    }
+    snapshot = {'new-1': {'position': {'dealId': 'new-1', 'direction': 'BUY',
+                                       'size': 0.6, 'level': 0.0}}}
+    first = asyncio.run(_drain_agen(broker._process_activity(
+        [entry, reduction], positions_by_deal=snapshot)))
+    assert first == []
+    assert 'activity_held_entry_price_pending' in _event_kinds(ctx, 'coid-m')
+    held_deals, _ = broker._pending_activity_keys()
+    assert 'new-1' in held_deals
+    assert broker._oldest_pending_activity_ts() is not None
+
+    # A fresh process: none of the in-memory activity cursor survives.
+    restarted = _FakeBroker(config=_make_config(),
+                            responses={('markets/EURUSD', 'get'): _RULES_RESP})
+    restarted._account_id = 'capitalcom-demo-test-account'
+    restarted.store_ctx = ctx2 = ctx
+    priced_entry = {**entry, 'details': {**entry['details'], 'level': 77573.65}}
+    events = asyncio.run(_drain_agen(restarted._process_activity(
+        [priced_entry, reduction], positions_by_deal=snapshot)))
+    fills = [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled']
+    assert fills == [(LegType.ENTRY, 1.0), (LegType.CLOSE, 0.4)]
+    row = ctx2.get_order('coid-m')
+    assert row is not None
+    assert row.filled_qty == pytest.approx(0.6)
+    assert EXTRAS_KEY_ENTRY_PRICE_PENDING not in (row.extras or {})
+    assert asyncio.run(_drain_agen(restarted._process_activity(
+        [priced_entry, reduction], positions_by_deal=snapshot))) == []
+    store.close()
+
+
+def __test_snapshot_booked_entry_keeps_its_held_reduction_in_reach__(tmp_path):
+    """The entry activity is deferred for its price, a later read returns only
+    the priced 0.4 reduction (held behind the entry), and the snapshot then
+    books the entry: the held reduction stays owed, so the next read still
+    reaches back to it and lets it pass the watermark, and it books once.
+    The journal ends at the venue's 0.6."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=1.0,
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'new-1')
+    opened_at = datetime.now(timezone.utc) - timedelta(seconds=180)
+    entry = {
+        'dateUTC': opened_at.strftime('%Y-%m-%dT%H:%M:%S.000'), 'dealId': 'new-1',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'size': 1.0},
+    }
+    reduced_at = opened_at + timedelta(seconds=5)
+    reduction = {
+        'dateUTC': reduced_at.strftime('%Y-%m-%dT%H:%M:%S.000'),
+        'dealId': 'new-1', 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SYSTEM',
+        'epic': 'BTCUSD', 'details': {'direction': 'SELL', 'size': 0.4, 'level': 77600.0},
+    }
+    later = {
+        'dateUTC': (reduced_at + timedelta(seconds=120)).strftime('%Y-%m-%dT%H:%M:%S.000'),
+        'dealId': 'foreign-9', 'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER',
+        'epic': 'BTCUSD', 'details': {'direction': 'BUY', 'size': 1.0, 'level': 77650.0},
+    }
+    listed = {'new-1': {'market': {'epic': 'BTCUSD'},
+                        'position': {'dealId': 'new-1', 'direction': 'BUY',
+                                     'size': 0.6, 'level': 77573.65}}}
+    assert asyncio.run(_drain_agen(broker._process_activity([entry]))) == []
+    assert asyncio.run(_drain_agen(broker._process_activity(
+        [reduction], positions_by_deal=listed))) == []
+    assert 'activity_held_entry_price_pending' in _event_kinds(ctx, 'coid-m')
+    # A newer row moves the watermark past the held reduction.
+    asyncio.run(_drain_agen(broker._process_activity([later])))
+
+    assert _reconcile_events(broker, listed) == []
+    broker._unannounced_fills_seen['coid-m'] -= _UNANNOUNCED_FILL_GRACE_S
+    booked = _reconcile_events(broker, listed)
+    assert [(e.leg_type, e.fill_qty) for e in booked if e.event_type == 'filled'] == [
+        (LegType.ENTRY, 1.0)]
+    row = ctx.get_order('coid-m')
+    assert row is not None and EXTRAS_KEY_ENTRY_PRICE_PENDING not in (row.extras or {})
+
+    oldest = broker._oldest_pending_activity_ts()
+    assert oldest is not None and oldest <= _parse_iso_timestamp(reduction['dateUTC'])
+    _, owed = broker._pending_activity_keys()
+    assert _close_identity(reduction) in owed
+
+    events = asyncio.run(_drain_agen(broker._process_activity(
+        [reduction, later], positions_by_deal=listed)))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.CLOSE, 0.4)]
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    assert broker._pending_activity_keys()[1] == set()
+    assert asyncio.run(_drain_agen(broker._process_activity(
+        [reduction, later], positions_by_deal=listed))) == []
+    store.close()
+
+
+def __test_terminal_close_waits_behind_an_owed_reduction__(tmp_path):
+    """A 0.2 reduction is held behind an entry deferred for its price, the
+    snapshot books the 1.0 entry, and the next read returns only the terminal
+    0.8 close: the close waits behind the owed reduction (owed itself), so it
+    cannot tear the row down first. The read returning both books 0.2, then
+    0.8, and a replay books nothing."""
+    broker, store, ctx = _make_broker(tmp_path)
+    entry, _ = __test_helper_defer_entry_for_its_price(broker, ctx, 'new-1')
+    reduction = __test_helper_reduction('new-1', entry, size=0.2)
+    terminal = {**__test_helper_reduction('new-1', reduction, size=0.8)}
+    listed = {'new-1': {'market': {'epic': 'BTCUSD'},
+                        'position': {'dealId': 'new-1', 'direction': 'BUY',
+                                     'size': 0.8, 'level': 77573.65}}}
+    assert asyncio.run(_drain_agen(broker._process_activity(
+        [reduction], positions_by_deal=listed))) == []
+    assert _reconcile_events(broker, listed) == []
+    broker._unannounced_fills_seen['coid-m'] -= _UNANNOUNCED_FILL_GRACE_S
+    booked = _reconcile_events(broker, listed)
+    assert [(e.leg_type, e.fill_qty) for e in booked if e.event_type == 'filled'] == [
+        (LegType.ENTRY, 1.0)]
+
+    assert asyncio.run(_drain_agen(broker._process_activity([terminal]))) == []
+    assert 'activity_held_behind_owed_fill' in _event_kinds(ctx, 'coid-m')
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get('natural_close_at') is None
+    _, owed = broker._pending_activity_keys()
+    assert {_close_identity(reduction), _close_identity(terminal)} <= owed
+
+    events = asyncio.run(_drain_agen(broker._process_activity([reduction, terminal])))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.CLOSE, 0.2), (LegType.CLOSE, 0.8)]
+    assert broker._pending_activity_keys()[1] == set()
+    assert asyncio.run(_drain_agen(broker._process_activity([reduction, terminal]))) == []
+    store.close()
+
+
+def __test_helper_owe_reduction_and_terminal_close(broker, ctx):
+    """Owe a 0.2 reduction and the terminal 0.8 close of a booked 1.0 entry.
+
+    The reduction is held behind the entry deferred for its price, the
+    snapshot books the entry, and a read returning only the terminal close
+    holds it behind the owed reduction.
+
+    :return: The reduction and the terminal close activities.
+    """
+    entry, _ = __test_helper_defer_entry_for_its_price(broker, ctx, 'new-1')
+    reduction = __test_helper_reduction('new-1', entry, size=0.2)
+    terminal = __test_helper_reduction('new-1', reduction, size=0.8)
+    listed = {'new-1': {'market': {'epic': 'BTCUSD'},
+                        'position': {'dealId': 'new-1', 'direction': 'BUY',
+                                     'size': 0.8, 'level': 77573.65}}}
+    assert asyncio.run(_drain_agen(broker._process_activity(
+        [reduction], positions_by_deal=listed))) == []
+    assert _reconcile_events(broker, listed) == []
+    broker._unannounced_fills_seen['coid-m'] -= _UNANNOUNCED_FILL_GRACE_S
+    booked = _reconcile_events(broker, listed)
+    assert [(e.leg_type, e.fill_qty) for e in booked if e.event_type == 'filled'] == [
+        (LegType.ENTRY, 1.0)]
+    assert asyncio.run(_drain_agen(broker._process_activity([terminal]))) == []
+    _, owed = broker._pending_activity_keys()
+    assert {_close_identity(reduction), _close_identity(terminal)} <= owed
+    return reduction, terminal
+
+
+def __test_owed_terminal_close_keeps_waiting_on_a_repeated_read__(tmp_path):
+    """The terminal 0.8 close is owed behind the owed 0.2 reduction, and a
+    second read again returns only the terminal close: being owed itself does
+    not let it pass the earlier owed reduction, so it books nothing and the
+    row stays up. The reduction then books 0.2, and the close 0.8."""
+    broker, store, ctx = _make_broker(tmp_path)
+    reduction, terminal = __test_helper_owe_reduction_and_terminal_close(broker, ctx)
+
+    assert asyncio.run(_drain_agen(broker._process_activity([terminal]))) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get('natural_close_at') is None
+
+    events = asyncio.run(_drain_agen(broker._process_activity([reduction])))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.CLOSE, 0.2)]
+    events = asyncio.run(_drain_agen(broker._process_activity([terminal])))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.CLOSE, 0.8)]
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is not None
+    assert broker._pending_activity_keys()[1] == set()
+    store.close()
+
+
+def __test_close_booked_while_another_fill_is_owed_keeps_the_row_up__(tmp_path):
+    """Both closes are owed and the deal is gone from ``/positions``. A read
+    returning only the 0.2 reduction books it, but the owed 0.8 close is still
+    readable: neither the activity pass nor the snapshot pass tears the row
+    down (the teardown would settle the 0.8 unbooked). The read returning the
+    0.8 books it and tears the row down; a replay books nothing."""
+    broker, store, ctx = _make_broker(tmp_path)
+    reduction, terminal = __test_helper_owe_reduction_and_terminal_close(broker, ctx)
+
+    events = asyncio.run(_drain_agen(broker._process_activity([reduction], positions_by_deal={})))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.CLOSE, 0.2)]
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is None
+    assert (row.extras or {}).get('close_event_yielded_at') is not None
+    broker._current_poll_id += 1
+    assert _reconcile_events(broker, {}) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is None
+    assert 'owed_fills_settled_by_close' not in _event_kinds(ctx, 'coid-m')
+
+    events = asyncio.run(_drain_agen(broker._process_activity([terminal], positions_by_deal={})))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.CLOSE, 0.8)]
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get('natural_close_at') is not None
+    assert broker._pending_activity_keys()[1] == set()
+    assert asyncio.run(_drain_agen(broker._process_activity(
+        [reduction, terminal], positions_by_deal={}))) == []
+    store.close()
+
+
+def __test_helper_close_reads(pattern, count):
+    """The indexes of the closes each read of a delivery-queue case returns."""
+    every = list(range(count))
+    if pattern == 'together':
+        return [every]
+    if pattern == 'one_by_one':
+        return [[index] for index in every]
+    if pattern == 'reverse':
+        return [[index] for index in reversed(every)]
+    if pattern == 'last_twice_first':
+        return [[count - 1], [count - 1]] + [[index] for index in every]
+    raise AssertionError(pattern)
+
+
+def __test_helper_delivery_cases():
+    """Every delivery-queue case: ``(entry, sizes, pattern, restart, closing, confirmed)``.
+
+    * ``entry``: ``priced`` books the entry from its first read; ``unpriced``
+      queues it until a last read prices it; ``snapshot`` queues it and the
+      snapshot fallback books it after the first read.
+    * ``sizes``: the closes of the 1.0 deal in venue order, terminal when
+      they add up to 1.0.
+    * ``pattern``: which closes each read returns
+      (:func:`__test_helper_close_reads`); a priced entry queues nothing, so
+      only in-order reads apply to it.
+    * ``restart``: a fresh process before every read.
+    * ``closing``: an own close of the deal was accepted once the entry was
+      booked (the snapshot pass would synthesize its fill).
+    * ``confirmed``: the fill the row holds before the entry's activity is
+      read, ``1.0`` for a confirm that reported it, ``0.0`` for a market
+      entry the venue accepted without opening it at once. The snapshot
+      books an unconfirmed entry only from a deal listed at its full size,
+      which a deal already reduced is not, so ``snapshot`` runs confirmed
+      only.
+    """
+    cases = []
+    for entry in ('priced', 'unpriced', 'snapshot'):
+        patterns = (('together', 'one_by_one') if entry == 'priced'
+                    else ('together', 'one_by_one', 'reverse', 'last_twice_first'))
+        for sizes in ((1.0,), (0.4,), (0.2, 0.8), (0.2, 0.3), (0.2, 0.3, 0.5), (0.1, 0.2, 0.3)):
+            terminal = abs(sum(sizes) - 1.0) < 1e-9
+            for pattern in patterns:
+                for restart in (False, True):
+                    for closing in ((False, True) if terminal and entry != 'unpriced'
+                                    else (False,)):
+                        for confirmed in ((1.0,) if entry == 'snapshot' else (1.0, 0.0)):
+                            cases.append((entry, sizes, pattern, restart, closing, confirmed))
+    return cases
+
+
+@pytest.mark.parametrize('entry,sizes,pattern,restart,closing,confirmed',
+                         __test_helper_delivery_cases())
+def __test_delivery_queue_books_every_fill_once_in_venue_order__(
+        tmp_path, entry, sizes, pattern, restart, closing, confirmed):
+    """The deal's fills reach the engine exactly once, entry first and then
+    every close in venue order, whatever the reads return: an entry priced
+    late or booked by the snapshot, one to three closes, partial or terminal,
+    split across reads in any order, a restart between any two reads, with or
+    without the fill confirmed on the row before. After every read the
+    snapshot pass and, once the deal is gone, the grace-expiry disappearance
+    verdict run too: none of them books a fill out of order, and neither a
+    teardown nor a terminal disappearance verdict comes while a fill is still
+    owed."""
+    responses = {
+        ('error', 'positions/new-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id'),
+        ('positions', 'get'): {'positions': []},
+        ('confirms/close-ref', 'get'): {'dealStatus': 'ACCEPTED', 'level': 77000.0},
+    }
+    broker, store, ctx = _make_broker(tmp_path, responses=responses)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=confirmed,
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'new-1')
+    opened_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    unpriced = {
+        'dateUTC': opened_at.strftime('%Y-%m-%dT%H:%M:%S.000'), 'dealId': 'new-1',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'size': 1.0},
+    }
+    priced = {**unpriced, 'details': {**unpriced['details'], 'level': 77573.65}}
+    closes = [{
+        'dateUTC': (opened_at + timedelta(seconds=5 * (index + 1))).strftime(
+            '%Y-%m-%dT%H:%M:%S.000'),
+        'dealId': 'new-1', 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SYSTEM',
+        'epic': 'BTCUSD', 'details': {'direction': 'SELL', 'size': size, 'level': 77600.0},
+    } for index, size in enumerate(sizes)]
+    terminal = abs(sum(sizes) - 1.0) < 1e-9
+    expected = [(LegType.ENTRY, 1.0)] + [(LegType.CLOSE, size) for size in sizes]
+    delivered: list = []
+    horizon = -1
+
+    def listing(level=0.0):
+        # The venue has executed every close up to the latest one a read returned.
+        left = 1.0 - sum(sizes[:horizon + 1])
+        if left <= 1e-9:
+            return {}
+        return {'new-1': {'market': {'epic': 'BTCUSD'},
+                          'position': {'dealId': 'new-1', 'direction': 'BUY',
+                                       'size': round(left, 9), 'level': level}}}
+
+    def collect(events):
+        delivered.extend((e.leg_type, round(float(e.fill_qty or 0.0), 9))
+                         for e in events if e.event_type == 'filled')
+        assert delivered == expected[:len(delivered)], delivered
+        current = ctx.get_order('coid-m')
+        assert current is not None
+        if (current.extras or {}).get('natural_close_at') is not None:
+            assert delivered == expected, delivered
+
+    def fresh_broker():
+        restarted = _FakeBroker(config=_make_config(), responses={
+            ('markets/EURUSD', 'get'): _RULES_RESP, **responses})
+        restarted._account_id = 'capitalcom-demo-test-account'
+        restarted.store_ctx = ctx
+        return restarted
+
+    def read(activities):
+        nonlocal broker, horizon
+        if restart:
+            broker = fresh_broker()
+        horizon = max([horizon] + [closes.index(a) for a in activities if a in closes])
+        collect(asyncio.run(_drain_agen(broker._process_activity(
+            activities, positions_by_deal=listing()))))
+        probe()
+
+    def probe():
+        broker._current_poll_id += 1
+        collect(_reconcile_events(broker, listing()))
+        current = ctx.get_order('coid-m')
+        if (listing() or current is None or current.closed_ts_ms is not None
+                or (current.extras or {}).get('natural_close_at') is not None):
+            return
+        broker._rewrite_extras('coid-m', lambda extras: extras.__setitem__(
+            'missing_pending_since', time.time() - 3600.0))
+        verdict = asyncio.run(broker._confirm_missing_cancelled(ctx.get_order('coid-m')))
+        broker._rewrite_extras('coid-m', lambda extras: extras.pop('missing_pending_since', None))
+        collect([])
+        # A terminal verdict retires the row: it may come only once every fill
+        # of the deal has been delivered.
+        if verdict.resolution in (MissingResolution.CLOSED, MissingResolution.CANCELLED):
+            assert delivered == expected, (verdict.resolution, delivered)
+
+    def accept_own_close():
+        current = ctx.get_order('coid-m')
+        if (closing and current is not None
+                and (current.extras or {}).get('natural_close_at') is None):
+            ctx.upsert_order('coid-m', state='closing')
+            broker._rewrite_extras('coid-m', lambda extras: extras.__setitem__(
+                'close_deal_reference', 'close-ref'))
+
+    reads = __test_helper_close_reads(pattern, len(closes))
+    if entry == 'priced':
+        for number, indexes in enumerate(reads):
+            read([priced] + [closes[index] for index in indexes])
+            if number == 0:
+                accept_own_close()
+    elif entry == 'unpriced':
+        for indexes in reads:
+            read([unpriced] + [closes[index] for index in indexes])
+        read([priced] + closes)
+    else:
+        first = closes[:-1] if terminal else closes
+        read([unpriced] + first)
+        broker._unannounced_fills_seen['coid-m'] = time.time() - 2 * _UNANNOUNCED_FILL_GRACE_S
+        collect(_reconcile_events(broker, listing(77573.65)))
+        assert delivered == expected[:1]
+        accept_own_close()
+        for indexes in reads:
+            read([closes[index] for index in indexes])
+        read(closes)
+
+    assert delivered == expected
+    read([priced] + closes)
+    assert delivered == expected
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    assert broker._pending_activity_keys() == (set(), set())
+    assert ((row.extras or {}).get('natural_close_at') is not None) is terminal
+    if not terminal:
+        assert row.filled_qty == pytest.approx(1.0 - sum(sizes))
+    store.close()
+
+
+@pytest.mark.parametrize('confirmed_qty', [0.0, 1.0])
+def __test_startup_keeps_a_reduction_behind_an_unpriced_entry__(tmp_path, confirmed_qty):
+    """The process restarts while a reduction waits behind an entry deferred
+    for its price, and its ``/positions`` read, well after the reduction,
+    lists the deal at 0.6. With no confirmed fill on the exposure cursor the
+    adopted size holds neither, so startup leaves the reduction to the poll:
+    the priced entry books 1.0, then the reduction 0.4. With the confirmed
+    fill on the cursor the adopted size holds both: startup judges the
+    reduction and stamps the entry accounted, and the poll books nothing.
+    Either way 0.6 is left, the venue's size."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', filled_qty=confirmed_qty,
+                     exchange_order_id='new-1', extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', 'new-1')
+    opened_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    entry = {
+        'dateUTC': opened_at.strftime('%Y-%m-%dT%H:%M:%S.000'), 'dealId': 'new-1',
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'size': 1.0},
+    }
+    reduction = {
+        'dateUTC': (opened_at + timedelta(seconds=5)).strftime('%Y-%m-%dT%H:%M:%S.000'),
+        'dealId': 'new-1', 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SYSTEM',
+        'epic': 'BTCUSD', 'details': {'direction': 'SELL', 'size': 0.4, 'level': 77600.0},
+    }
+    listed = {'market': {'epic': 'BTCUSD'},
+              'position': {'dealId': 'new-1', 'direction': 'BUY', 'size': 0.6, 'level': 0.0}}
+    snapshot = {'new-1': listed}
+    assert asyncio.run(_drain_agen(broker._process_activity(
+        [entry, reduction], positions_by_deal=snapshot))) == []
+
+    restarted = _FakeBroker(config=_make_config(),
+                            responses={('markets/EURUSD', 'get'): _RULES_RESP})
+    restarted._account_id = 'capitalcom-demo-test-account'
+    restarted.store_ctx = ctx
+    read_started_at = time.time() + 3600.0
+    assert (_parse_iso_timestamp(reduction['dateUTC'])
+            < restarted._venue_time_floor(read_started_at))
+    closed_deals, reports = restarted._account_downtime_closes(
+        [entry, reduction], snapshot, read_started_at)
+    assert reports == []
+    restarted._stamp_surviving_entry_fills(snapshot)
+    accounted = _activity_fingerprint(reduction) in restarted._activity_cursor.seen_fingerprints
+    assert accounted is (confirmed_qty > 0.0)
+    assert closed_deals == ({'new-1'} if confirmed_qty > 0.0 else set())
+
+    priced_entry = {**entry, 'details': {**entry['details'], 'level': 77573.65}}
+    events = asyncio.run(_drain_agen(restarted._process_activity(
+        [priced_entry, reduction], positions_by_deal=snapshot)))
+    fills = [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled']
+    assert fills == ([] if confirmed_qty > 0.0
+                     else [(LegType.ENTRY, 1.0), (LegType.CLOSE, 0.4)])
+    assert asyncio.run(_drain_agen(restarted._process_activity(
+        [priced_entry, reduction], positions_by_deal=snapshot))) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    assert row.filled_qty == pytest.approx(0.6)
+    store.close()
+
+
+def __test_helper_defer_entry_for_its_price(broker, ctx, deal_id, *, state='confirmed'):
+    """Seed a confirmed 1.0 market entry on ``deal_id`` whose activity is deferred for its price.
+
+    :return: The unpriced entry activity and its priced copy.
+    """
+    ctx.upsert_order('coid-m', symbol='BTCUSD', side='buy', qty=1.0,
+                     state=state, pine_entry_id='L', filled_qty=1.0,
+                     exchange_order_id=deal_id, extras={'kind': 'position'})
+    ctx.add_ref('coid-m', 'deal_id', deal_id)
+    opened_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    entry = {
+        'dateUTC': opened_at.strftime('%Y-%m-%dT%H:%M:%S.000'), 'dealId': deal_id,
+        'type': 'POSITION', 'status': 'ACCEPTED', 'source': 'USER', 'epic': 'BTCUSD',
+        'details': {'direction': 'BUY', 'size': 1.0},
+    }
+    assert asyncio.run(_drain_agen(broker._process_activity([entry]))) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and (row.extras or {}).get(EXTRAS_KEY_ENTRY_PRICE_PENDING)
+    return entry, {**entry, 'details': {**entry['details'], 'level': 77573.65}}
+
+
+def __test_helper_reduction(deal_id, entry, size=0.4):
+    """A priced SYSTEM reduction of ``deal_id`` five seconds after ``entry``."""
+    reduced_at = _parse_iso_timestamp(entry['dateUTC']) + 5.0
+    return {
+        'dateUTC': datetime.fromtimestamp(reduced_at, timezone.utc).strftime(
+            '%Y-%m-%dT%H:%M:%S.000'),
+        'dealId': deal_id, 'type': 'POSITION', 'status': 'EXECUTED', 'source': 'SYSTEM',
+        'epic': 'BTCUSD', 'details': {'direction': 'SELL', 'size': size, 'level': 77600.0},
+    }
+
+
+def __test_rekeyed_entry_deferred_for_its_price_stays_unbooked__(tmp_path):
+    """The snapshot pass moves a market entry whose activity is deferred for
+    its price onto the deal back-linking it: the move does not stamp the
+    entry booked (the engine never received it), the deferred activity under
+    the old deal stays past the watermark, a reduction of the new deal waits
+    behind it, and the priced entry then books 1.0 before the 0.4."""
+    broker, store, ctx = _make_broker(tmp_path)
+    entry, priced_entry = __test_helper_defer_entry_for_its_price(broker, ctx, 'old-1')
+    listed = {'new-1': {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                                     'size': 0.6, 'direction': 'BUY', 'level': 77573.65},
+                        'market': {'epic': 'BTCUSD'}}}
+    assert _reconcile_events(broker, listed) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.exchange_order_id == 'new-1'
+    assert (row.extras or {}).get('entry_filled_at') is None
+    held_deals, _ = broker._pending_activity_keys()
+    assert held_deals == {'old-1', 'new-1'}
+
+    reduction = __test_helper_reduction('new-1', entry)
+    assert asyncio.run(_drain_agen(broker._process_activity(
+        [reduction], positions_by_deal=listed))) == []
+    assert 'activity_held_entry_price_pending' in _event_kinds(ctx, 'coid-m')
+
+    events = asyncio.run(_drain_agen(broker._process_activity(
+        [priced_entry, reduction], positions_by_deal=listed)))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.ENTRY, 1.0), (LegType.CLOSE, 0.4)]
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == pytest.approx(0.6)
+    store.close()
+
+
+def __test_missing_entry_deferred_for_its_price_moves_unbooked__(tmp_path):
+    """The grace-expiry probe moves a filled market entry whose activity is
+    deferred for its price onto the live deal back-linking it without
+    stamping the entry booked, and so does the write-time deal probe."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('error', 'positions/old-1', 'get'): OrderNotFoundError(
+            "API error occured: error.not-found.dealId", ref_type='deal_id',
+        ),
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                          'size': 1.0, 'direction': 'BUY', 'level': 77573.65},
+             'market': {'epic': 'BTCUSD'}},
+        ]},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    __test_helper_defer_entry_for_its_price(broker, ctx, 'old-1')
+    broker._rewrite_extras('coid-m', lambda extras: extras.__setitem__(
+        'missing_pending_since', time.time() - 3600.0))
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    verdict = asyncio.run(broker._confirm_missing_cancelled(row))
+    assert verdict.resolution is MissingResolution.STILL_PRESENT
+    moved = ctx.get_order('coid-m')
+    assert moved is not None and moved.exchange_order_id == 'new-1'
+    assert (moved.extras or {}).get('entry_filled_at') is None
+    store.close()
+
+    broker, store, ctx = _make_broker(tmp_path / 'write-probe', responses={
+        ('positions', 'get'): {'positions': [
+            {'position': {'dealId': 'new-1', 'workingOrderId': 'old-1',
+                          'size': 1.0, 'direction': 'BUY', 'level': 77573.65},
+             'market': {'epic': 'BTCUSD'}},
+        ]},
+        ('history/activity', 'get'): {'activities': []},
+    })
+    __test_helper_defer_entry_for_its_price(broker, ctx, 'old-1')
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    verdict, deal = asyncio.run(broker._resolve_own_deal(row, 'old-1'))
+    assert deal == 'new-1'
+    moved = ctx.get_order('coid-m')
+    assert moved is not None and moved.exchange_order_id == 'new-1'
+    assert (moved.extras or {}).get('entry_filled_at') is None
+    store.close()
+
+
+def __test_working_promotion_waits_for_an_entry_with_held_fills__(tmp_path):
+    """A working order whose execution activity is deferred for its price,
+    with a fill of its deal held behind it: the snapshot's deal size is net of
+    that fill, so the working-to-position promotion books nothing."""
+    broker, store, ctx = _make_broker(tmp_path)
+    ctx.upsert_order('coid-w', symbol='BTCUSD', side='buy', qty=1.0,
+                     state='confirmed', pine_entry_id='L', exchange_order_id='wo-1',
+                     extras={'kind': 'working',
+                             EXTRAS_KEY_ENTRY_PRICE_PENDING: '2026-04-21T09:00:00.000',
+                             EXTRAS_KEY_DEFERRED_CLOSES: {'close-x': '2026-04-21T09:00:05.000'}})
+    ctx.add_ref('coid-w', 'deal_id', 'wo-1')
+    listed = {'wo-1': {'position': {'dealId': 'wo-1', 'size': 0.6, 'direction': 'BUY',
+                                    'level': 77573.65},
+                       'market': {'epic': 'BTCUSD'}}}
+    assert _reconcile_events(broker, listed) == []
+    row = ctx.get_order('coid-w')
+    assert row is not None and (row.extras or {}).get('kind') == 'working'
+    assert (row.extras or {}).get('entry_filled_at') is None
+    store.close()
+
+
+def __test_vanished_closing_row_books_no_close_before_its_unpriced_entry__(tmp_path):
+    """Our close of an entry whose activity is deferred for its price lands
+    and the deal vanishes: no close is booked from the DELETE's confirm (the
+    engine never received the entry), and the priced entry still books."""
+    broker, store, ctx = _make_broker(tmp_path, responses={
+        ('confirms/ref-close', 'get'): {'dealStatus': 'ACCEPTED', 'level': 77600.0},
+    })
+    entry, priced_entry = __test_helper_defer_entry_for_its_price(
+        broker, ctx, 'new-1', state='closing')
+    broker._rewrite_extras('coid-m', lambda extras: extras.__setitem__(
+        'close_deal_reference', 'ref-close'))
+    assert _reconcile_events(broker, {}) == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == pytest.approx(1.0)
+    assert (row.extras or {}).get('natural_close_at') is None
+    events = asyncio.run(_drain_agen(broker._process_activity([priced_entry])))
+    assert [(e.leg_type, e.fill_qty) for e in events if e.event_type == 'filled'] == [
+        (LegType.ENTRY, 1.0)]
+    store.close()
+
+
+def __test_teardown_settles_an_entry_deferred_for_its_price__(tmp_path):
+    """A deal gone while its entry activity waits for a price and a reduction
+    waits behind it is torn down with neither booked: a priced copy of the
+    entry read afterwards is a suppressed replay, the reduction is no longer
+    owed, and the read stops reaching back to them."""
+    broker, store, ctx = _make_broker(tmp_path)
+    entry, priced_entry = __test_helper_defer_entry_for_its_price(broker, ctx, 'new-1')
+    reduction = __test_helper_reduction('new-1', entry)
+    assert asyncio.run(_drain_agen(broker._process_activity([reduction]))) == []
+    assert broker._oldest_pending_activity_ts() is not None
+    row = ctx.get_order('coid-m')
+    assert row is not None
+    broker._tear_down_natural_close(row)
+    assert 'owed_fills_settled_by_close' in _event_kinds(ctx, 'coid-m')
+    assert broker._oldest_pending_activity_ts() is None
+    assert broker._pending_activity_keys() == (set(), set())
+    events = asyncio.run(_drain_agen(broker._process_activity([priced_entry, reduction])))
+    assert [e for e in events if e.event_type == 'filled'] == []
+    row = ctx.get_order('coid-m')
+    assert row is not None and row.filled_qty == 0.0
+    store.close()
+
+
+def __test_leg_close_of_a_resend_matches_its_residual_size__(tmp_path):
+    """A replay re-sends the open residual (40 units) under an attempt coid:
+    the fill of exactly that size reports the attempt coid, a fill of the
+    first send's whole size does not."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path)
+    asyncio.run(broker.close_leg('EURUSD', 'L1', 40, 'pcl:Long:L1#r1'))
+    row = ctx.get_order('coid-entry')
+    assert row is not None
+    residual = __test_helper_leg_close_activity()
+    residual['details'] = {**residual['details'], 'size': 0.4}
+    assert broker._own_close_leg_coid(row, residual) == 'pcl:Long:L1#r1'
+    assert broker._own_close_leg_coid(row, __test_helper_leg_close_activity()) is None
+    store.close()
+
+
+def __test_close_fitting_two_different_leg_closes_keeps_the_entry_coid__(tmp_path):
+    """Two leg closes of different close-leg rows fit one close: which one
+    executed is unknown, so the fill names neither."""
+    broker, store, ctx = __test_helper_leg_close_setup(tmp_path, responses={
+        ('error', 'positions/L1', 'delete'): ExchangeConnectionError('drop'),
+    })
+    for coid in ('pcl:Long:L1', 'pcl:Other:L1'):
+        with pytest.raises(OrderDispositionUnknownError):
+            asyncio.run(broker.close_leg('EURUSD', 'L1', 100, coid))
+    events = asyncio.run(_drain_agen(broker._process_activity(
+        [__test_helper_leg_close_activity()])))
+    assert [ev.order.client_order_id for ev in events] == ['coid-entry']
     store.close()
 
 

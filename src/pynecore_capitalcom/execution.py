@@ -75,6 +75,7 @@ from pynecore.core.plugin import override
 from pynecore.lib.log import broker_error, broker_warning
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
+from .delivery import entry_executed
 from .exceptions import (
     CapitalComApiError,
     CapitalComError,
@@ -85,6 +86,7 @@ from .exceptions import (
     PositionSnapshotUnavailableError,
 )
 from .helpers import (
+    EXTRAS_KEY_CLOSE_LEG_DISPATCHED,
     EXTRAS_KEY_ORDER_LEVEL,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _extract_reject_reason,
@@ -535,7 +537,20 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         wire — the DELETE carries no client reference — idempotency is
         owned by the core persist-first close-leg ledger. The resulting
         fill surfaces through the activity stream as an ordinary natural
-        close (``LegType.CLOSE`` on the tracked dealId).
+        close (``LegType.CLOSE`` on the tracked dealId), or from the
+        position's disappearance when no activity is published. That fill
+        carries ``coid`` as its client order id, also after a restart: the
+        activity's from the own-close record written before the DELETE leaves
+        (:meth:`~pynecore_capitalcom.intervention._InterventionMixin._own_close`,
+        :meth:`~pynecore_capitalcom.intervention._InterventionMixin._own_close_leg_coid`),
+        so a lost answer keeps it too, and only on an activity of the whole
+        leg's ``volume``: a smaller one inside the record's window may be a
+        manual partial close, is not the bot's own and keeps the position
+        row's id; the
+        disappearance's from the
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_CLOSE_LEG_DISPATCHED`
+        stamp written with the ``closing`` state once the venue accepted the
+        DELETE, so an earlier attempt's record never masks it.
 
         An ambiguous transport fault maps to
         :class:`OrderDispositionUnknownError`: the emulator's close-leg
@@ -565,10 +580,18 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             store_ctx.find_by_ref('deal_id', leg_id)
             if store_ctx is not None else None
         )
+        # The venue size of the whole leg the core closes: only a close
+        # activity of exactly this size is identified as this DELETE's. The
+        # lot step is the one the core quantized ``volume`` with
+        # (:meth:`get_volume_quantizer`); nothing is read before the DELETE,
+        # which needs only the dealId. Without it no activity is identified.
+        rules = self._instrument_rules_cache.get(symbol)
+        leg_size = _size_from_units(volume, rules.lot_step) if rules is not None else None
         deal_id = leg_id
         for attempt in range(2):
             try:
-                with self._own_close([deal_id], full=True, size=None):
+                with self._own_close([deal_id], full=True, size=None,
+                                     coid=coid, leg_size=leg_size):
                     await self._call(f'positions/{deal_id}', method='delete')
                 break
             except OrderNotFoundError as missing:
@@ -650,6 +673,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             try:
                 with store_ctx.transaction():
                     store_ctx.set_order_state(entry_row.client_order_id, 'closing')
+                    self._rewrite_extras(
+                        entry_row.client_order_id,
+                        lambda extras: extras.__setitem__(EXTRAS_KEY_CLOSE_LEG_DISPATCHED, coid),
+                    )
                     store_ctx.log_event(
                         'close_dispatched',
                         client_order_id=entry_row.client_order_id,
@@ -2703,7 +2730,11 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         poll stamps while its DELETE is in flight counts the same way, and a
         row whose fill the poll books meanwhile is never closed and counts as
         :attr:`CancelDispositionOutcome.ALREADY_FILLED`
-        (:meth:`_finalize_cancel_outcome_row` reads it again first).
+        (:meth:`_finalize_cancel_outcome_row` reads it again first). A
+        working row whose execution was read before the cancel
+        (:func:`~pynecore_capitalcom.delivery.entry_executed`) is not
+        DELETEd: it counts as
+        :attr:`CancelDispositionOutcome.ALREADY_FILLED` at once.
 
         Aggregation across multiple working-order targets is conservative:
         any ``ALREADY_FILLED`` wins (the engine must restore legs onto a
@@ -2743,6 +2774,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 self._hold_take_over_dispatch(row, 'cancel')
                 outcomes.append(CancelDispositionOutcome.UNKNOWN)
                 continue
+            if entry_executed(extras):
+                # Its execution was read before its promotion: the order is
+                # gone because it executed, so the row is a live position
+                # and no DELETE is sent.
+                outcomes.append(self._finalize_cancel_outcome_row(
+                    row.client_order_id, row.exchange_order_id or '',
+                    CancelDispositionOutcome.ALREADY_FILLED,
+                    intent=intent, already_gone=False,
+                ))
+                continue
             if row.exchange_order_id:
                 targets.append((row.client_order_id, row.exchange_order_id))
 
@@ -2751,6 +2792,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 ended = self._ended_working_order_outcome(intent, promoted)
                 if ended is not None:
                     return ended
+            if CancelDispositionOutcome.ALREADY_FILLED in outcomes:
+                return CancelDispositionOutcome.ALREADY_FILLED
             return CancelDispositionOutcome.UNKNOWN
 
         for coid, deal_id in targets:
@@ -2819,7 +2862,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         live or closed. Closed without a fill, the order is gone without one,
         which the probe reports as a confirmed cancel; still live on its
         open position, the order filled, which the probe reports as filled.
-        A row whose fill is booked (``filled_qty`` or ``entry_filled_at``) and
+        A row whose fill is booked (``filled_qty``) or whose execution was read
+        (:func:`~pynecore_capitalcom.delivery.entry_executed`) and
         whose position closed (a closed row, or a live one its bracket's fill
         stamped ``natural_close_at``) is reported as filled and closed: the
         order filled, but its position is no longer open to restore
@@ -2853,7 +2897,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         if ended is None:
             return None
         extras = ended.extras or {}
-        fill_booked = ended.filled_qty > 0.0 or extras.get('entry_filled_at') is not None
+        fill_booked = ended.filled_qty > 0.0 or entry_executed(extras)
         if ended.closed_ts_ms is None:
             if extras.get('natural_close_at') is None:
                 return CancelDispositionOutcome.ALREADY_FILLED
@@ -2920,7 +2964,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
           the row is left as it is whatever the outcome, the operator is
           warned (:meth:`_hold_take_over_dispatch`), and the cancel counts as
           :attr:`CancelDispositionOutcome.UNKNOWN`.
-        * Its fill booked (``kind`` is a position): the row is a live
+        * Its fill booked (``kind`` is a position, or its execution was read
+          before its promotion,
+          :func:`~pynecore_capitalcom.delivery.entry_executed`): the row is a live
           position and is never closed from a cancel; a ``cancel_noop`` event
           is logged and the cancel counts as
           :attr:`CancelDispositionOutcome.ALREADY_FILLED`, whatever the
@@ -2955,7 +3001,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             current = store_ctx.get_order(coid)
             current_extras = (current.extras or {}) if current is not None else {}
             booked = (current is not None
-                      and current_extras.get('kind') == ENTRY_KIND_POSITION)
+                      and (current_extras.get('kind') == ENTRY_KIND_POSITION
+                           or entry_executed(current_extras)))
             if current_extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
                 held = current
             elif booked:
