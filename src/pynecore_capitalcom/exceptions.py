@@ -153,8 +153,9 @@ class ForeignDealBlocksWriteError(ExchangeOrderRejectedError):
     reduce. While a deal someone else opened sits on that side, the POST could
     consume it, so the plugin refuses it instead of touching another party's
     exposure. Raised inside the dispatch journal (the command row is marked
-    rejected and stays as the audit trail) and turned into a non-halting skip at
-    the ``execute_*`` boundary.
+    rejected and stays as the audit trail) and turned into an
+    :class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin` skip at the
+    ``execute_*`` boundary: that write is dropped and the run continues.
 
     :ivar reason: Stable token: ``'foreign_deal_blocks_partial_close'`` or
         ``'foreign_deal_blocks_opposite_entry'``.

@@ -2299,11 +2299,14 @@ class _InterventionMixin(_CapitalComBase, ABC):
         :param full: The whole position is closed (any activity size matches).
         :param size: The reduced size of a partial close.
         :param coid: The client order id the core gave a leg close
-            (:meth:`~pynecore_capitalcom.execution._ExecutionMixin.close_leg`),
+            (:meth:`~pynecore_capitalcom.execution._ExecutionMixin.close_leg`)
+            or a ``held_execution_close``
+            (:meth:`~pynecore_capitalcom.execution._ExecutionMixin._execute_held_execution_close`),
             kept on the record for the close's fill
             (:meth:`_own_close_leg_coid`); ``None`` for every other close.
-        :param leg_size: The venue size of the whole leg a leg close closes,
-            kept with ``coid``; ``None`` when it is not known.
+            Both DELETE the whole deal.
+        :param leg_size: The venue size of the whole deal such a close
+            closes, kept with ``coid``; ``None`` when it is not known.
         :return: A handle whose :meth:`~._OwnCloseHandle.failed` withdraws the
             record when the refusal only shows after the request returned.
         """
@@ -2557,6 +2560,8 @@ class _InterventionMixin(_CapitalComBase, ABC):
         there after a lost answer and in a later process. The close fill of
         such a close carries it as its client order id: the core tells the
         closes of a hedging account's netting from the strategy's own by it.
+        A ``held_execution_close`` keeps its ``coid`` the same way, so its
+        fill is reported as that close's.
 
         The records considered are those that fit ``activity``
         (:meth:`_fitting_own_closes`). The answer is a ``coid`` only when
@@ -3468,9 +3473,11 @@ class _InterventionMixin(_CapitalComBase, ABC):
         re-issued activity of the same close, a booking deferred for its
         price, a close a startup pass judges again. The mark follows the
         policy's action, so a process that dies in between sends it again on
-        restart (the quarantine latch is idempotent). A halting policy's
-        exception counts as sent: the halt is the action, and repeating it
-        would stop every restart. The close's venue time goes with the
+        restart (the quarantine latch is idempotent). The fail-safe
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` (the
+        ``stop`` policy without a working quarantine sink) counts as sent: the
+        engine latches the external-intervention quarantine on it, and
+        repeating it would report the same close on every restart. The close's venue time goes with the
         report: a close dated before the operator resume this process applies
         was accepted by that resume and applies no policy.
         """

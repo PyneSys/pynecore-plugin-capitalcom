@@ -217,9 +217,10 @@ class _BracketMixin(_CapitalComBase, ABC):
             return
         rextras = row.extras or {}
         parent_deal_id = rextras.get('parent_deal_id')
-        if not parent_deal_id:
-            return
         parent_coid = rextras.get('parent_coid')
+        if not parent_deal_id or not parent_coid:
+            return
+        parent_coid = str(parent_coid)
 
         is_trailing_leg = leg_kind == 'sl' and bool(
             row.trailing_distance or rextras.get('trail_offset')
@@ -299,7 +300,7 @@ class _BracketMixin(_CapitalComBase, ABC):
     def _record_bracket_resolution(
             self, *, row: 'OrderRow', leg_kind: str,
             resolution_label: str, attached: bool,
-            parent_deal_id: str, parent_coid: str | None,
+            parent_deal_id: str, parent_coid: str,
             bracket_resolutions: dict[str, bool] | None = None,
             bracket_attached_coids: dict[str, list[str]] | None = None,
     ) -> None:
@@ -314,13 +315,8 @@ class _BracketMixin(_CapitalComBase, ABC):
         so the engine drops the active ExitIntent and re-dispatches on
         the next sync, restoring protection.
 
-        ``parent_coid`` is taken from the leg's extras (written by
-        :meth:`execute_exit` at row creation time). When it is missing
-        — pre-migration rows on a freshly upgraded process — the row
-        state still flips correctly but the engine cannot re-dispatch
-        until the next manual operator nudge; that is the safest
-        degradation, the alternative would be guessing which COID to
-        unpark.
+        ``parent_coid`` is taken from the leg's extras, written with the
+        leg row by :meth:`execute_exit` and the bracket amend paths.
 
         :param bracket_resolutions: When provided, the parent-level
             resolution is *aggregated* into this dict (one leg's
@@ -342,7 +338,7 @@ class _BracketMixin(_CapitalComBase, ABC):
             else:
                 self.store_ctx.set_order_state(row.client_order_id, 'rejected')
                 self.store_ctx.close_order(row.client_order_id)
-            if parent_coid is not None and bracket_resolutions is None:
+            if bracket_resolutions is None:
                 self.store_ctx.record_resolution(
                     parent_coid, 'attached' if attached else 'rejected',
                 )
@@ -356,26 +352,25 @@ class _BracketMixin(_CapitalComBase, ABC):
                     'parent_coid': parent_coid,
                 },
             )
-        if parent_coid is not None:
-            if bracket_resolutions is not None:
-                # AND-aggregate: any rejected leg wins over attached.
-                # ``setdefault`` seeds with True so the first leg's
-                # outcome holds; subsequent legs only flip True → False.
-                bracket_resolutions[parent_coid] = (
-                    bracket_resolutions.setdefault(parent_coid, True)
-                    and attached
-                )
-                # Track every leg promoted to ``confirmed`` in this
-                # batch so the aggregate flush can retire them if a
-                # sibling later flips the parent to ``rejected``.
-                # Without this, a mixed outcome (e.g. TP attached, SL
-                # not_attached) leaves the TP row live while the engine
-                # drops the parent dispatch and re-dispatches with new
-                # COIDs — duplicate bracket rows under the same parent.
-                if attached and bracket_attached_coids is not None:
-                    bracket_attached_coids.setdefault(
-                        parent_coid, [],
-                    ).append(row.client_order_id)
+        if bracket_resolutions is not None:
+            # AND-aggregate: any rejected leg wins over attached.
+            # ``setdefault`` seeds with True so the first leg's
+            # outcome holds; subsequent legs only flip True → False.
+            bracket_resolutions[parent_coid] = (
+                bracket_resolutions.setdefault(parent_coid, True)
+                and attached
+            )
+            # Track every leg promoted to ``confirmed`` in this
+            # batch so the aggregate flush can retire them if a
+            # sibling later flips the parent to ``rejected``.
+            # Without this, a mixed outcome (e.g. TP attached, SL
+            # not_attached) leaves the TP row live while the engine
+            # drops the parent dispatch and re-dispatches with new
+            # COIDs — duplicate bracket rows under the same parent.
+            if attached and bracket_attached_coids is not None:
+                bracket_attached_coids.setdefault(
+                    parent_coid, [],
+                ).append(row.client_order_id)
 
     async def _trailing_activation_monitor(
             self, positions_by_deal: dict[str, dict],

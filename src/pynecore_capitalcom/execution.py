@@ -52,6 +52,9 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     EXTRAS_KEY_CLOSE_LEG_ID,
+    EXTRAS_KEY_LEG_KIND,
+    KIND_FULL_CLOSE,
+    KIND_PARTIAL_CLOSE,
     PENDING_DISPATCH_STATES,
     STATE_DISPOSITION_UNKNOWN,
     mark_disposition_unknown,
@@ -73,9 +76,11 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.plugin import override
 from pynecore.lib.log import broker_error, broker_warning
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .delivery import entry_executed
+from .dispatch_hooks import _CapitalComCloseHooks
 from .exceptions import (
     CapitalComApiError,
     CapitalComError,
@@ -87,6 +92,8 @@ from .exceptions import (
 )
 from .helpers import (
     EXTRAS_KEY_CLOSE_LEG_DISPATCHED,
+    EXTRAS_KEY_HELD_CLOSE,
+    EXTRAS_KEY_HELD_CLOSE_SEEDED,
     EXTRAS_KEY_ORDER_LEVEL,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _extract_reject_reason,
@@ -99,6 +106,7 @@ from .helpers import (
     _size_from_units,
     _venue_rendered_level,
     _wire_float,
+    _wire_id,
 )
 from .models import _DealVerdict, _InstrumentRules, _bracket_leg_id
 
@@ -276,8 +284,14 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         (:meth:`_owned_deal_ids`): a deal someone else opened on the epic is
         not the bot's exposure, and counting it would hide an own deal's
         disappearance behind it. Without a journal (a raw account read)
-        every row counts. An own deal whose fill the venue confirmed but
-        that ``/positions`` does not list yet counts from the journal
+        every row counts. The deal of an order of an entry the engine holds
+        for its execution evidence counts too, also when no live row tracks
+        it (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._held_execution_order_ids`):
+        the engine sizes its ``held_execution_close`` from this read, and that
+        close must reach the execution its book does not hold
+        (:meth:`_execute_held_execution_close`). An own deal whose fill the
+        venue confirmed but that ``/positions`` does not list yet counts from
+        the journal
         (:meth:`~pynecore_capitalcom.identity._DealIdentityMixin._materialising_position_rows`):
         the read lagging the venue is no close, and a position that left it
         out would let the engine book one (measured live: capitalcom cycle
@@ -452,7 +466,10 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         (:meth:`_owned_deal_ids`): the emulator plans closes, reversals and
         bracket replication over exactly these, so a leg someone else opened
         is never closed, amended or netted against the bot's legs. Without a
-        journal every leg is returned.
+        journal every leg is returned. A leg an order of an entry the engine
+        holds for its execution evidence opened is the run's too, also when no
+        live row tracks it: the one-way emulator's ``held_execution_close``
+        closes it (:meth:`close_leg`).
 
         On a hedging account each leg carries
         :attr:`~pynecore.core.broker.models.PositionLeg.entry_id`, the Pine
@@ -494,7 +511,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
     async def reject_out_of_range(
             self, envelope: DispatchEnvelope, qty: float,
     ) -> None:
-        """Raise the non-halting volume-bounds skip when ``qty`` is out of range.
+        """Raise the volume-bounds :class:`OrderSkippedByPlugin` skip when ``qty`` is out of range.
+
+        The skip drops this order only; the run continues.
 
         :class:`~pynecore.core.plugin.broker.PositionPort` transport
         primitive: core's reversal pre-flights the residual size through
@@ -572,14 +591,41 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         close-leg row stays pending for the replay. Without a journal row for
         the leg there is nothing to judge it by, and the not-found stays
         benign.
+
+        A leg no journal row tracks that an order of an entry the engine holds
+        for its execution evidence opened (a ``held_execution_close`` closes
+        it) gets a seeded row before the DELETE (:meth:`_held_close_leg_row`),
+        read from a fresh ``GET /positions``; a failed read raises
+        :class:`ExchangeConnectionError` with nothing sent. The deal of a
+        take-over held for its unproven fill
+        (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._held_take_over_refs`)
+        raises :class:`OrderDispositionUnknownError` with nothing sent: it is
+        closed once the bot has booked that fill from the venue's history
+        (:mod:`~pynecore_capitalcom.order_history`).
         """
         # ``volume`` is audit-only here: full-leg by contract, and a size is
         # not expressible on the DELETE wire anyway.
+        if leg_id in self._held_take_over_refs():
+            # The deal of a take-over held for its unproven fill: owned, but
+            # closed only once the bot has booked that fill from the venue's
+            # history (``order_history.py``); a DELETE before would leave a
+            # close activity the bot could not attribute to itself.
+            raise OrderDispositionUnknownError(
+                f"Capital DELETE positions/{leg_id} ({symbol}) not sent: the deal is a "
+                f"take-over whose fill the bot is proving from the venue's history; the "
+                f"leg close did not go out",
+                client_order_id=coid,
+            )
         store_ctx = self.store_ctx
         entry_row = (
             store_ctx.find_by_ref('deal_id', leg_id)
             if store_ctx is not None else None
         )
+        if entry_row is None and store_ctx is not None:
+            # The deal of a held entry no journal row tracks: seeded before the
+            # DELETE, so the close's activity routes to a row and its fill is
+            # reported under ``coid``.
+            entry_row = await self._held_close_leg_row(symbol, leg_id)
         # The venue size of the whole leg the core closes: only a close
         # activity of exactly this size is identified as this DELETE's. The
         # lot step is the one the core quantized ``volume`` with
@@ -785,7 +831,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # obviously-rejectable level into the typed distance error before
         # the round-trip. Distance violations subclass
         # ``ExchangeOrderRejectedError``, so the attach path still ends in
-        # the defensive flatten rather than a halt. The quote read refreshes
+        # the defensive flatten rather than an untranslated write fault. The quote read refreshes
         # the rules cache, so the rules are read after it: the minimum
         # distance checked is the one the same market response carried.
         mid_price = await self._get_current_mid_price(symbol)
@@ -830,8 +876,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 # An unmapped Capital.com API error on the PUT is a definitive
                 # refusal of THIS amend — classify it so the attach path runs
                 # the defensive flatten instead of escaping as an untyped
-                # provider error (which the engine's write-side net would
-                # escalate to a halt).
+                # provider error (which the engine would only take as an
+                # untranslated write fault: an entry block, no flatten).
                 raise ExchangeOrderRejectedError(
                     f"Capital PUT positions/{leg_id} bracket amend refused: {exc}",
                 ) from exc
@@ -982,16 +1028,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
     def _reject_out_of_range_entry(
             self, intent: EntryIntent, rules: _InstrumentRules, qty: float,
     ) -> None:
-        """Raise the non-halting :class:`OrderSkippedByPlugin` when ``qty``
-        is outside the instrument's tradable size bounds.
+        """Raise :class:`OrderSkippedByPlugin` when ``qty`` is outside the instrument's size bounds.
+
+        The skip drops this entry only; the run continues.
 
         Preserves the historical asymmetry: the minimum gates the RAW
         requested qty (rounding an undersized request up to the grid would
         be silent up-inflation), the maximum gates the QUANTIZED qty —
         i.e. what actually reaches the broker. Capital.com rejects sizes
         above ``maxDealSize`` with ``error.invalid.size.maxvalue``, which
-        surfaces as a fatal :class:`ExchangeOrderRejectedError` and would
-        halt the live run — pre-empting both bounds here turns them into
+        surfaces as a venue reject of the dispatch — pre-empting both bounds here turns them into
         logged skips (no silent clamp; the size is the caller's concern).
         """
         if rules.min_size > 0 and qty < rules.min_size:
@@ -1359,8 +1405,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             # findable BrokerStore entry row is structurally identical to
             # "bracket attach rejected after parent fill" — the fill is on
             # the exchange and unprotected. Raising a plain
-            # ``ExchangeOrderRejectedError`` here halts the bot and leaves
-            # the position exposed; instead, surface the rich
+            # ``ExchangeOrderRejectedError`` here leaves the position
+            # exposed; instead, surface the rich
             # ``BracketAttachAfterFillRejectedError`` so the sync engine's
             # ``_handle_bracket_attach_after_fill_reject`` flattens the
             # position with a defensive market close and the runner
@@ -1407,8 +1453,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                 if not symbol_positions:
                     # The venue holds NOTHING on this symbol: no entry row,
                     # no sibling, no exposure — there is nothing an exit
-                    # could protect. A raw reject would halt the engine
-                    # (exit contract); skip instead, the next bar
+                    # could protect. A raw reject would count as a refused
+                    # protective exit (exit contract); skip instead, the next bar
                     # re-evaluates against fresh book state.
                     raise OrderSkippedByPlugin(
                         f"Exit {intent.intent_key} skipped: no entry row "
@@ -1467,7 +1513,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         # The parent entry is already FILLED here, so a level the venue
         # would refuse leaves the position open and unprotected — exactly
         # the venue-side attach-reject case below. Classify it identically
-        # (the sync engine dispatches a defensive close instead of halting;
+        # (the sync engine dispatches a defensive close;
         # Pine-wise a level inside the minimum band is at-market anyway).
         # The levels are the same for every deal, so the check runs once and
         # names the oldest deal; the re-dispatch next sync reaches the rest.
@@ -1922,9 +1968,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
                     # The parent ENTRY is filled and committed; only the
                     # bracket attach failed, so the position is OPEN AND
                     # UNPROTECTED. Surface this distinctly so the sync
-                    # engine can dispatch a defensive market close instead
-                    # of halting (which would leave the unprotected fill
-                    # exposed indefinitely). The original mapped exception
+                    # engine can dispatch a defensive market close (anything
+                    # else would leave the unprotected fill exposed
+                    # indefinitely). The original mapped exception
                     # is preserved on ``__cause__`` for log correlation.
                     raise BracketAttachAfterFillRejectedError(
                         f"Capital bracket attach rejected after entry fill "
@@ -2141,19 +2187,16 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         calls, and recovery on next start verifies each target ``dealId``
         against the positions snapshot (full close) or the
         ``deal_reference`` confirm GET (partial close).
+
+        A ``held_execution_close`` is sized against the venue, not the
+        journal: :meth:`_execute_held_execution_close`.
         """
-        from pynecore.core.broker.journal import DispatchJournal
-        from pynecore.core.broker.store_helpers import (
-            KIND_FULL_CLOSE,
-            KIND_PARTIAL_CLOSE,
-        )
-
-        from .dispatch_hooks import _CapitalComCloseHooks
-
         intent = envelope.intent
         assert isinstance(intent, CloseIntent)
         coid = envelope.client_order_id(KIND_CLOSE)
         rules = await self._get_instrument_rules(intent.symbol)
+        if intent.synthetic_kind == 'held_execution_close':
+            return await self._execute_held_execution_close(envelope, rules)
 
         # A keyed ``strategy.close(id)`` owns only the position rows opened by
         # that Pine entry id. Capital.com keeps same-direction entries as
@@ -2577,6 +2620,321 @@ class _ExecutionMixin(_CapitalComBase, ABC):
             ) from unavailable
         return exch_order
 
+    #: A ``held_execution_close`` (the engine's close of the venue position over
+    #: an entry whose execution evidence never arrived) is honoured on both
+    #: account modes. On a netting account :meth:`execute_close` DELETEs whole
+    #: own deals, the held entry's included, summing to at most ``intent.qty``
+    #: (:meth:`_execute_held_execution_close`); on a hedging account the core
+    #: one-way emulator closes the legs :meth:`fetch_raw_positions` lists, the
+    #: held entry's included (:meth:`close_leg`).
+    supports_held_execution_close = True
+
+    async def _execute_held_execution_close(
+            self, envelope: DispatchEnvelope, rules: _InstrumentRules,
+    ) -> ExchangeOrder:
+        """Close the run's venue position over an entry whose execution evidence never came.
+
+        The engine read the venue position (:meth:`get_position`), which counts
+        the deal of the held entry's order although no booked fill (and
+        possibly no live journal row) stands behind it
+        (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._held_execution_order_ids`),
+        and sends that quantity as a symbol-wide ``held_execution_close``. It
+        is closed here against a fresh ``GET /positions`` read, never against
+        the journal's rows:
+
+        * **Only own deals.** The targets are the deals on the reducing side
+          the run owns (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._owned_deal_ids`),
+          the held entry's included; a deal someone else opened is never
+          touched. The deal of a take-over held for its unproven fill
+          (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._held_take_over_refs`)
+          waits until the bot has proven and booked that fill from the venue's
+          history (:mod:`~pynecore_capitalcom.order_history`, the next poll
+          that reads it): a close sent before would leave a close activity
+          the bot could not attribute to itself. It is left open meanwhile,
+          like a deal that does not fit; the engine reads the venue again
+          before it sends another close.
+        * **Never more than** ``intent.qty`` **and never the other side.** Each
+          target is closed whole by ``DELETE /positions/{dealId}``, which
+          closes exactly that deal and cannot open a position (research
+          dossier §4 and §8; the DELETE ignores any ``size``, measured on demo
+          2026-07-10). A partial close would need the opposite-direction
+          ``POST /positions``, which nets FIFO into the oldest deal of the
+          side, someone else's included, and opens the other side when the
+          deal is gone meanwhile (§8, §9 #13): it is never used here. A deal
+          whose own close is already in flight (``closing``) counts against
+          the quantity and is not sent again; the rest go oldest first
+          (``createdDateUTC``, then ``dealId``) while their whole size fits.
+          A deal that does not fit is left open with a warning: the engine
+          reads the venue again before it sends another close.
+        * **Rows for the activity.** A target no live journal row tracks gets
+          a seeded row (:meth:`_held_close_row`), so the close's activity
+          routes to it like any own close. Every target row is stamped with
+          the close's client order id, Pine id and the deal's venue size
+          (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_HELD_CLOSE`) before
+          the DELETE leaves; the fills are then reported under the close's
+          client order id (the own-close record and the ``closing`` stamp
+          carry it) and labelled with its Pine id
+          (:func:`~pynecore_capitalcom.helpers._held_close_label`), and they
+          are delivered through the deal's fill queue
+          (:mod:`~pynecore_capitalcom.delivery`) behind any fill of the deal
+          still owed, the held entry's included.
+
+        The close is journaled under ``envelope.client_order_id(KIND_CLOSE)``
+        as a full close of the targets
+        (:meth:`~pynecore.core.broker.journal.DispatchJournal.run_close`), so
+        a restart recovers it like any full close.
+
+        :param envelope: The dispatch envelope of the ``held_execution_close``.
+        :param rules: The instrument's dealing rules.
+        :return: The close, reported at the sum of the targets' venue sizes.
+        :raises OrderSkippedByPlugin: Nothing is sent: no own deal on the
+            reducing side, every one already closing, or none that fits
+            ``intent.qty`` whole.
+        """
+        intent = envelope.intent
+        assert isinstance(intent, CloseIntent)
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            raise RuntimeError(
+                "execute_close requires an active store_ctx; the journal "
+                "owns persistence and cannot operate without it.",
+            )
+        coid = envelope.client_order_id(KIND_CLOSE)
+        snapshot = await self._call('positions', method='get')
+        symbol_rows = [raw for raw in snapshot.get('positions') or []
+                       if (raw.get('market') or {}).get('epic') == intent.symbol]
+        # A held take-over's deal is owned, but its close waits for the fill
+        # the bot proves from the venue's history: its close activity could
+        # not be attributed before (see ``order_history.py``).
+        owned = (self._owned_deal_ids(symbol_rows) or set()) - self._held_take_over_refs()
+        direction = 'BUY' if intent.side == 'sell' else 'SELL'
+        step = rules.lot_step if rules.lot_step > 0.0 else 0.0
+
+        def units(qty: float) -> float:
+            return float(round(qty / step)) if step > 0.0 else qty
+
+        candidates: list[tuple[float, str, float, dict]] = []
+        for raw in symbol_rows:
+            position = raw.get('position') or {}
+            deal_id = _wire_id(position.get('dealId'))
+            size = _wire_float(position.get('size'), finite=True)
+            if (deal_id is None or deal_id not in owned or size is None or size <= 0.0
+                    or str(position.get('direction') or '').upper() != direction):
+                continue
+            created = _parse_iso_timestamp(str(position.get('createdDateUTC') or ''))
+            candidates.append((created, deal_id, size, position))
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+
+        budget = units(intent.qty)
+        tolerance = 1e-9 * max(1.0, abs(budget))
+        in_flight: list[str] = []
+        open_targets: list[tuple[str, float, dict, 'OrderRow | None']] = []
+        for _, deal_id, size, position in candidates:
+            row = self._held_close_target_row(position)
+            if row is not None and row.state == 'closing':
+                in_flight.append(deal_id)
+                budget -= units(size)
+                continue
+            open_targets.append((deal_id, size, position, row))
+        selected: list[tuple[str, float, dict, 'OrderRow | None']] = []
+        left: list[str] = []
+        for target in open_targets:
+            if units(target[1]) <= budget + tolerance:
+                selected.append(target)
+                budget -= units(target[1])
+            else:
+                left.append(target[0])
+        context = {'symbol': intent.symbol, 'side': intent.side, 'qty': intent.qty,
+                   'owned_deals': [candidate[1] for candidate in candidates],
+                   'in_flight': in_flight, 'left_open': left}
+        if not selected:
+            if left:
+                reason = 'held_close_exceeds_qty'
+                message = (f"every own deal on the reducing side is larger than the "
+                           f"{intent.qty} left to close; a whole-deal DELETE would "
+                           f"close more than the venue position the engine read")
+            elif in_flight:
+                reason = 'close_already_in_flight'
+                message = "every own deal on the reducing side is already closing"
+            else:
+                reason = 'nothing_to_close'
+                message = "no own deal on the reducing side"
+            store_ctx.log_event('held_execution_close_skipped', client_order_id=coid,
+                                intent_key=intent.intent_key,
+                                payload={**context, 'reason': reason})
+            raise OrderSkippedByPlugin(
+                f"Capital execute_close {intent.intent_key!r} (held_execution_close, "
+                f"{intent.symbol}): {message}; nothing sent",
+                intent_key=intent.intent_key, reason=reason, context=context,
+            )
+        if left:
+            broker_warning(
+                "held-execution close %s on %s: own deal(s) %s do not fit the %s left to "
+                "close whole and stay open; the engine reads the venue again before it "
+                "sends another close",
+                intent.pine_id, intent.symbol, ', '.join(left), intent.qty,
+            )
+
+        targets: list['OrderRow'] = []
+        held_sizes: dict[str, float] = {}
+        with store_ctx.transaction():
+            for deal_id, size, position, row in selected:
+                if row is None:
+                    row = self._held_close_row(intent.symbol, position)
+                current = store_ctx.get_order(row.client_order_id) or row
+                store_ctx.upsert_order(row.client_order_id, extras={
+                    **(current.extras or {}),
+                    EXTRAS_KEY_HELD_CLOSE: {'coid': coid, 'pine_id': intent.pine_id,
+                                            'size': size},
+                })
+                targets.append(store_ctx.get_order(row.client_order_id) or current)
+                held_sizes[row.client_order_id] = size
+            store_ctx.log_event(
+                'held_execution_close_targets', client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={**context, 'targets': [target[0] for target in selected]},
+            )
+        hooks = _CapitalComCloseHooks(
+            plugin=self,
+            rules=rules,
+            target_deal_ids=frozenset(
+                row.exchange_order_id for row in targets if row.exchange_order_id),
+            held_sizes=held_sizes,
+        )
+        return await DispatchJournal(store_ctx).run_close(
+            coid=coid,
+            intent=intent,
+            kind=KIND_FULL_CLOSE,
+            targets=targets,
+            hooks=hooks,
+            audit_payload={'pine_id': intent.pine_id, 'held_execution_close': True},
+        )
+
+    def _held_close_target_row(self, position: dict) -> 'OrderRow | None':
+        """The live own journal row that tracks the deal of ``position``, if any.
+
+        The row whose ``exchange_order_id`` is the deal's ``dealId`` first;
+        else an own entry row the deal's ``workingOrderId`` back-links (its
+        working order executed into the deal, or it was promoted from that
+        order). A full-close DELETE on a working row's order id answers
+        not-found and moves the row onto the deal it back-links before the
+        DELETE is sent there (:meth:`~pynecore_capitalcom.identity._DealIdentityMixin._resolve_own_deal`).
+        Bracket-leg rows never qualify, and a back-link to a row a previous
+        design seeded at startup or a held take-over does not either.
+
+        :param position: The ``position`` object of a ``GET /positions`` row.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return None
+        deal_id = _wire_id(position.get('dealId'))
+        working_order_id = _wire_id(position.get('workingOrderId'))
+        linked: 'OrderRow | None' = None
+        for row in store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            if (row.state not in ('confirmed', 'closing')
+                    or extras.get(EXTRAS_KEY_LEG_KIND) is not None
+                    or extras.get('kind') not in (ENTRY_KIND_POSITION, ENTRY_KIND_WORKING)):
+                continue
+            if deal_id is not None and row.exchange_order_id == deal_id:
+                return row
+            if (linked is None and working_order_id is not None
+                    and not extras.get(ADOPTED_STARTUP_EXTRA_KEY)
+                    and extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is None
+                    and working_order_id in (
+                        row.exchange_order_id,
+                        _wire_id(extras.get('promoted_from_working_order_id')))):
+                linked = row
+        return linked
+
+    def _held_close_row(self, symbol: str, position: dict) -> 'OrderRow':
+        """Seed the position row of a held entry's deal no live journal row tracks.
+
+        The deal is the run's own (its ``dealId`` or ``workingOrderId`` is an
+        order of an entry the engine holds,
+        :meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._held_execution_order_ids`),
+        but no row would route its close activity: the activity of a deal
+        without a row is someone else's. The seeded row is a ``confirmed``
+        position on the deal, sized from the venue, with the ``deal_id``
+        reference the activity loop resolves deals by. It books no exposure of
+        the run (``filled_qty`` ``0.0``,
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_HELD_CLOSE_SEEDED`):
+        the engine's book does not hold the execution. Its entry counts as
+        accounted (``entry_filled_at``), so the deal's opening activity read
+        later is not booked as a fresh entry of no Pine id; a close
+        activity of the deal is a close.
+
+        :param symbol: The epic.
+        :param position: The deal's ``position`` object from ``GET /positions``.
+        :return: The seeded row.
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        deal_id = str(_wire_id(position.get('dealId')))
+        size = _wire_float(position.get('size'), finite=True) or 0.0
+        direction = str(position.get('direction') or '').upper()
+        seeded_coid = f"__pyne_held_close__{symbol}__{deal_id}"
+        now = epoch_time()
+        with store_ctx.transaction():
+            store_ctx.upsert_order(
+                seeded_coid,
+                symbol=symbol,
+                side='buy' if direction == 'BUY' else 'sell',
+                qty=size,
+                filled_qty=0.0,
+                state='confirmed',
+                exchange_order_id=deal_id,
+                extras={
+                    'kind': ENTRY_KIND_POSITION,
+                    'entry_filled_at': now,
+                    EXTRAS_KEY_HELD_CLOSE_SEEDED: now,
+                },
+            )
+            store_ctx.add_ref(seeded_coid, 'deal_id', deal_id)
+            store_ctx.log_event(
+                'held_execution_close_target_seeded',
+                client_order_id=seeded_coid,
+                exchange_order_id=deal_id,
+                payload={'symbol': symbol, 'direction': direction, 'size': size,
+                         'working_order_id': _wire_id(position.get('workingOrderId'))},
+            )
+            seeded = store_ctx.get_order(seeded_coid)
+        assert seeded is not None
+        return seeded
+
+    async def _held_close_leg_row(self, symbol: str, leg_id: str) -> 'OrderRow | None':
+        """The row a core leg close of a held entry's untracked deal routes its fill through.
+
+        :meth:`close_leg` found no journal row for ``leg_id``. The leg came from
+        :meth:`fetch_raw_positions`, which lists a deal an order of a held entry
+        opened (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._held_execution_order_ids`)
+        even without one. Such a deal gets a seeded row (:meth:`_held_close_row`)
+        before the DELETE leaves, so its close activity routes to a row and is
+        reported under the leg close's ``coid``; any other deal stays as it is.
+
+        :param symbol: The epic.
+        :param leg_id: The leg's ``dealId``.
+        :return: The seeded row, or ``None`` when the deal is not listed or is
+            not a held entry's.
+        :raises ExchangeConnectionError: The ``GET /positions`` read failed;
+            nothing was sent.
+        """
+        held = self._held_execution_order_ids() - self._held_take_over_refs()
+        if not held:
+            return None
+        snapshot = await self._call('positions', method='get')
+        for raw in snapshot.get('positions') or []:
+            if (raw.get('market') or {}).get('epic') != symbol:
+                continue
+            position = raw.get('position') or {}
+            if _wire_id(position.get('dealId')) != leg_id:
+                continue
+            working_order_id = _wire_id(position.get('workingOrderId'))
+            if leg_id in held or (working_order_id is not None and working_order_id in held):
+                return self._held_close_row(symbol, position)
+            return None
+        return None
+
     async def execute_cancel(
             self, envelope: DispatchEnvelope,
     ) -> bool:
@@ -2592,17 +2950,20 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
         is never swept: its working order already executed into a live
         position, so a DELETE answers 404 and closing the row would release
-        the entry for a second send. The row stays as it is, the operator is
-        warned (:meth:`_hold_take_over_dispatch`), and the call returns
-        ``False``: the cancel did not land, so the engine keeps the entry and
-        sends no replacement. The same holds for a row the poll stamps while
+        the entry for a second send. The row stays as it is until the bot has
+        proven its fill from the venue's history (:mod:`~pynecore_capitalcom.order_history`),
+        a warning says so (:meth:`_hold_take_over_dispatch`), and the call
+        returns ``False``: the cancel did not land, so the engine keeps the
+        entry, sends no replacement and retries; once the fill is booked the
+        cancel is a no-op on a filled position. The same holds for a row the poll stamps while
         its DELETE is in flight: the sweep reads it again before closing it
-        and leaves it live. A taken-over working entry whose fill is not
-        booked and whose DELETE answers 404 is not closed either unless the
-        venue's activity shows the order ended without a fill: the order may
-        have executed before its id was known, and its position, once it
-        surfaces, is booked onto the row. Until then the call returns
-        ``False`` too, so no cancel+create sends the entry a second time.
+        and leaves it live. A resting entry with no execution read whose
+        DELETE answers 404 is not closed either unless the venue's activity
+        shows the order ended without a fill: the order may have executed (a
+        taken-over one before its id was known, an own one before its
+        activity was read), and the execution is booked onto the live row.
+        Until then the call returns ``False`` too, so no cancel+create sends
+        the entry a second time.
 
         The per-target sweep runs through the Core
         :class:`~pynecore.core.broker.journal.DispatchJournal` so a
@@ -2723,8 +3084,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
 
         A take-over held because its fill could not be proven
         (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
-        is not DELETEd and not classified: it stays as it is, the operator is
-        warned, and it counts as
+        is not DELETEd and not classified: it stays as it is until the bot has
+        proven its fill from the venue's history, a warning says so, and it
+        counts as
         :attr:`CancelDispositionOutcome.UNKNOWN`, so the engine neither
         settles the cancel nor books a fill the venue never proved. A row the
         poll stamps while its DELETE is in flight counts the same way, and a
@@ -2912,12 +3274,13 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         The row is stamped
         :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`:
         its working order executed into a position whose fill the snapshot
-        could not prove. Only the operator settles it, so the engine's cancel
-        or amend leaves the row as it is, also when the stamp came while the
-        cancel's DELETE was in flight. The operator is warned with a
-        ``take_over_unproven_dispatch_held`` audit event, once per row and
-        action for the process (the engine retries an unlanded cancel every
-        sync).
+        could not prove. Until the bot has proven that fill from the venue's
+        history (:mod:`~pynecore_capitalcom.order_history`), the engine's
+        cancel or amend leaves the row as it is, also when the stamp came
+        while the cancel's DELETE was in flight. One warning and a
+        ``take_over_unproven_dispatch_held`` audit event per row and action
+        for the process say so (the engine retries an unlanded cancel every
+        sync, and once the fill is booked the row is a filled position).
 
         :param row: The stamped entry row.
         :param action: ``'cancel'`` or ``'modify'``.
@@ -2929,8 +3292,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         unproven = (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) or {}
         broker_warning(
             "%s of entry %s (submission %s) not sent or not settled: its deal %s showed "
-            "size %s instead of the submitted %s, so the entry stays held — check the "
-            "account and settle the row by hand",
+            "size %s instead of the submitted %s, so the entry stays held until the "
+            "bot has proven its fill from the venue's history",
             action, row.intent_key, coid, unproven.get('deal_id'), unproven.get('size'),
             row.qty,
         )
@@ -2961,8 +3324,8 @@ class _ExecutionMixin(_CapitalComBase, ABC):
 
         * Stamped
           :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`:
-          the row is left as it is whatever the outcome, the operator is
-          warned (:meth:`_hold_take_over_dispatch`), and the cancel counts as
+          the row is left as it is whatever the outcome, a warning says so
+          (:meth:`_hold_take_over_dispatch`), and the cancel counts as
           :attr:`CancelDispositionOutcome.UNKNOWN`.
         * Its fill booked (``kind`` is a position, or its execution was read
           before its promotion,
@@ -3130,8 +3493,9 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`)
         is neither amended nor cancelled and re-sent: its working order
         already executed into a live position, so a cancel+create would open
-        the entry a second time. The held row is returned unchanged and the
-        operator is warned (:meth:`_hold_take_over_dispatch`). The same holds
+        the entry a second time. The held row is returned unchanged, with a
+        warning (:meth:`_hold_take_over_dispatch`), until the bot has proven
+        its fill from the venue's history. The same holds
         when the poll holds the row while the cancel+create runs
         (:meth:`_cancel_and_replace_entry`).
         """
@@ -3220,7 +3584,7 @@ class _ExecutionMixin(_CapitalComBase, ABC):
         Nor does it land on an unbooked take-over whose order is gone without
         the venue's word that it ended unfilled (:meth:`execute_cancel`).
         Then nothing is sent and the entry's rows are returned unchanged; for
-        a held take-over the operator is warned (:meth:`_hold_take_over_dispatch`).
+        a held take-over a warning says so (:meth:`_hold_take_over_dispatch`).
 
         :param old: The entry as the venue holds it.
         :param new: The entry Pine wants.
@@ -3917,10 +4281,10 @@ class _CapitalComEntryHooks:
         except CapitalComApiError as exc:
             # A parsed error response: the venue evaluated and synchronously
             # refused the POST — nothing landed, so this is a definitive
-            # reject. The engine converts an ENTRY reject into a non-halting
-            # skip (signal dropped, next bar re-evaluates); letting the raw
-            # provider error escape instead killed the whole run through the
-            # generic dispatch net (live incident:
+            # reject. The engine converts an ENTRY reject into a skip (signal
+            # dropped, next bar re-evaluates); the raw provider error would
+            # only reach the generic dispatch net as an untranslated write
+            # fault (live incident, which then ended the run:
             # ``error.validation.stop.price`` on a stop entry).
             if _is_market_closed_reject(str(exc)):
                 raise MarketClosedError(

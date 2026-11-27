@@ -22,7 +22,12 @@ non-terminal row:
   route in ``recovery_path``.
 * ``_inherited_submission_verdict`` — the in-run lookup of an entry
   submission an earlier process left pending and the startup pass could not
-  resolve yet: the same activity matching, against a fresh activity read.
+  resolve yet: the same activity matching against a fresh activity read (or
+  the open book for a row older than the activity history), settling it with
+  every pending submission its deals match. Each deal goes to its own
+  submission in a fixed order; more deals than the submissions explain are
+  someone else's trading on the epic, reported as an external intervention.
+  None of these stops the process or waits without an end.
 
 Bracket leg ``disposition_unknown`` rows are NOT handled here — they
 are owned by ``_reconcile_snapshot``'s ``_resolve_bracket_leg_disposition``
@@ -34,15 +39,14 @@ State touched: BrokerStore through ``self.store_ctx``,
 import logging
 import math
 from abc import ABC
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from time import time as epoch_time
 from typing import TYPE_CHECKING, cast
 
 import httpx
 
 from pynecore.core.broker.exceptions import (
-    BrokerManualInterventionError,
     ExchangeConnectionError,
     ExchangeRateLimitError,
 )
@@ -71,12 +75,15 @@ from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 from ._base import _CapitalComBase, CapitalComHookCollaborator
 from .delivery import book_fill, entry_executed, entry_pending_since, is_delivered
 from .exceptions import CapitalComError, OrderNotFoundError
+from .foreign import _UNCONFIRMED_ENTRY_SKEW_S
 from .helpers import (
     CLOSE_VERDICT_FOREIGN,
     CLOSE_VERDICT_VENUE,
     EXTERNAL_REDUCTION_VERDICTS,
     EXTRAS_KEY_CANCEL_REQUESTED,
+    EXTRAS_KEY_EXECUTION_HELD,
     EXTRAS_KEY_NETTED_RESIDUAL_PENDING,
+    EXTRAS_KEY_ORDER_LEVEL,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     _ACTIVITY_LAG_S,
     _ACTIVITY_MAX_PERIOD_S,
@@ -94,7 +101,7 @@ from .helpers import (
 from .models import _activity_fingerprint, _close_identity
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.storage import OrderRow
+    from pynecore.core.broker.storage import OrderRow, RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +109,274 @@ logger = logging.getLogger(__name__)
 #: its POST) and the activity of the deal the POST opened, for the activity to
 #: count as that POST's trace.
 _ACTIVITY_MATCH_WINDOW_S = 3.0
+
+@dataclass(frozen=True)
+class _DealEvidence:
+    """What the venue shows of one deal that may be a pending submission's.
+
+    :ivar when: The deal's venue creation time (epoch seconds), ``0.0`` when
+        unknown.
+    :ivar pinned: Created within :data:`_ACTIVITY_MATCH_WINDOW_S` of the
+        submission (clock offset applied): the clock agreement every landing
+        verdict rests on.
+    :ivar refutable: Its creation time is the submission's send time, so a
+        measured venue clock refutes it when it is not pinned. An executed
+        working order's position carries its execution time instead.
+    """
+    when: float
+    pinned: bool
+    refutable: bool = True
+
+
+@dataclass(frozen=True)
+class _GroupCase:
+    """One inherited submission judged together with every submission its deals match.
+
+    :ivar outcome: ``'landed'`` (on :attr:`deal_id`), ``'absent'``,
+        ``'surplus'`` (more deals than the group's submissions explain) or
+        ``'inconclusive'`` (a matching activity carries no deal id).
+    :ivar members: The group's submissions, by creation time then client
+        order id.
+    :ivar deals: The group's deals, by venue creation time then id.
+    :ivar compat: Per member client order id, the deals it may have opened.
+    :ivar when: Per deal, its venue creation time (``0.0`` unknown).
+    """
+    outcome: str
+    deal_id: str | None = None
+    members: tuple['OrderRow', ...] = ()
+    deals: tuple[str, ...] = ()
+    compat: Mapping[str, frozenset[str]] | None = None
+    when: Mapping[str, float] | None = None
+
+
+def _deal_out(members: Sequence['OrderRow'], compat: Mapping[str, frozenset[str]],
+              deals: Sequence[str]) -> dict[str, str] | None:
+    """The first assignment, in order, that gives every deal its own compatible submission.
+
+    Deals are placed in ``deals`` order, each on the earliest free member it
+    is compatible with, backtracking when a later deal is left without one.
+    Every own POST opens one deal at most, so ``None`` (no such assignment)
+    proves a deal no pending submission explains.
+
+    :return: Client order id -> deal id, or ``None``.
+    """
+    if len(deals) > len(members):
+        return None
+    taken: dict[str, str] = {}
+
+    def place(index: int) -> bool:
+        if index == len(deals):
+            return True
+        deal = deals[index]
+        for member in members:
+            coid = member.client_order_id
+            if coid not in taken and deal in compat.get(coid, frozenset()):
+                taken[coid] = deal
+                if place(index + 1):
+                    return True
+                del taken[coid]
+        return False
+
+    return dict(taken) if place(0) else None
+
+
+def _assign_members(members: Sequence['OrderRow'], compat: Mapping[str, frozenset[str]],
+                    deals: Sequence[str]) -> dict[str, str]:
+    """The first largest assignment of submissions to distinct compatible deals, in order.
+
+    Members in ``members`` order, each tried on its compatible deals in
+    ``deals`` order before being left without one.
+
+    :return: Client order id -> deal id.
+    """
+    best: dict[str, str] = {}
+    current: dict[str, str] = {}
+
+    def search(index: int) -> None:
+        nonlocal best
+        if len(current) + len(members) - index <= len(best):
+            return
+        if index == len(members):
+            best = dict(current)
+            return
+        coid = members[index].client_order_id
+        for deal in deals:
+            if deal in compat.get(coid, frozenset()) and deal not in current.values():
+                current[coid] = deal
+                search(index + 1)
+                del current[coid]
+        search(index + 1)
+
+    search(0)
+    return best
+
+
+def _open_ids(positions: list[dict], working: list[dict]) -> set[str]:
+    """The ids the open book holds: positions by ``dealId`` and ``workingOrderId``, resting orders by ``dealId``.
+
+    ``workingOrderId`` is the back-link from a position to the order that
+    opened it, the one
+    :meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._owned_deal_ids`
+    reads.
+    """
+    ids: set[str] = set()
+    for raw in positions:
+        position = raw.get('position') or {}
+        for key in ('dealId', 'workingOrderId'):
+            if (ref := _wire_id(position.get(key))) is not None:
+                ids.add(ref)
+    for raw in working:
+        order_id = _wire_id((raw.get('workingOrderData') or {}).get('dealId'))
+        if order_id is not None:
+            ids.add(order_id)
+    return ids
+
+
+def _settle_group(
+        row: 'OrderRow', evidence: Callable[['OrderRow'], Mapping[str, _DealEvidence]],
+        pending: Sequence['OrderRow'], *, clock_measured: bool,
+        fits: Callable[['OrderRow', str], bool] | None = None,
+) -> _GroupCase:
+    """Judge ``row`` with every pending submission its deals match.
+
+    The pinned tier is used when ``row`` has a pinned deal; otherwise its
+    other deals of the candidate band, without the ones a measured clock
+    refutes (``clock_measured``). A submission with a pinned deal is judged
+    in the pinned tier only, so it never takes part in a band group. The group
+    grows to a fixed point: a pending submission joins when one of its
+    deals of the tier is already a group deal, and brings its other ones.
+    ``fits`` drops a deal a member's venue-observable attributes contradict.
+
+    * Every deal gets its own compatible submission (:func:`_deal_out`): the
+      first such assignment decides; ``row`` lands on its deal, or opened
+      nothing when it is left without one. Submissions a deal matches alike
+      are the same order for the account (Capital.com shows no client order
+      id and the entry POST carries nothing else), so which one holds it
+      changes nothing the venue or the book shows.
+    * No such assignment: a deal that no pending submission explains, so
+      someone else trades the epic on this account (``'surplus'``).
+    """
+    own = evidence(row)
+    pinned_tier = any(item.pinned for item in own.values())
+
+    def tier_deals(member: 'OrderRow') -> dict[str, _DealEvidence]:
+        seen = evidence(member)
+        if pinned_tier:
+            return {ref: item for ref, item in seen.items() if item.pinned}
+        if any(item.pinned for item in seen.values()):
+            return {}
+        return {ref: item for ref, item in seen.items()
+                if not (clock_measured and item.refutable)}
+
+    when: dict[str, float] = {}
+    members: dict[str, 'OrderRow'] = {row.client_order_id: row}
+    tiers: dict[str, dict[str, _DealEvidence]] = {row.client_order_id: tier_deals(row)}
+    if not tiers[row.client_order_id]:
+        return _GroupCase('absent')
+    deals = set(tiers[row.client_order_id])
+    grown = True
+    while grown:
+        grown = False
+        for other in pending:
+            coid = other.client_order_id
+            if coid in members:
+                continue
+            theirs = tier_deals(other)
+            if deals.intersection(theirs):
+                members[coid] = other
+                tiers[coid] = theirs
+                deals.update(theirs)
+                grown = True
+    for found in tiers.values():
+        for deal, item in found.items():
+            known = when.get(deal, 0.0)
+            when[deal] = item.when if known <= 0.0 else min(known, item.when or known)
+    ordered_members = tuple(sorted(members.values(),
+                                   key=lambda member: (member.created_ts_ms,
+                                                       member.client_order_id)))
+    ordered_deals = tuple(sorted(deals, key=lambda ref: (when.get(ref, 0.0), ref)))
+    compat = {coid: frozenset(deal for deal in found
+                              if fits is None or fits(members[coid], deal))
+              for coid, found in tiers.items()}
+    dealt = _deal_out(ordered_members, compat, ordered_deals)
+    if dealt is None:
+        return _GroupCase('surplus', members=ordered_members, deals=ordered_deals,
+                          compat=compat, when=when)
+    deal_id = dealt.get(row.client_order_id)
+    return _GroupCase('landed' if deal_id else 'absent', deal_id=deal_id,
+                      members=ordered_members, deals=ordered_deals, compat=compat, when=when)
+
+
+def _clock_offset(opened: Mapping[tuple[str, str], float],
+                  rows: Iterable['OrderRow']) -> float | None:
+    """The venue clock's lead over the local one, the median over the bot's own entries.
+
+    A live entry row that carries its deal id and whose creation (taken just
+    before its POST) is the send time is a sample: a market entry's
+    ``('POSITION', deal id)`` or a resting entry's ``('WORKING_ORDER', deal
+    id)`` venue creation time in ``opened``, less the row's creation. An
+    adopted row's creation is the adoption's, and a market entry executed
+    through a resting order carries its execution's time, so neither is a
+    sample. Samples beyond
+    :data:`~pynecore_capitalcom.foreign._UNCONFIRMED_ENTRY_SKEW_S` are dropped.
+
+    :return: The offset in seconds, or ``None`` without a sample.
+    """
+    samples: list[float] = []
+    for live in rows:
+        extras = live.extras or {}
+        if (not live.exchange_order_id or not live.created_ts_ms
+                or extras.get(ADOPTED_STARTUP_EXTRA_KEY)
+                or extras.get('leg_kind') is not None):
+            continue
+        if extras.get('kind') == ENTRY_KIND_POSITION and extras.get('order_type') == 'market':
+            key = ('POSITION', live.exchange_order_id)
+        elif extras.get('kind') == ENTRY_KIND_WORKING:
+            key = ('WORKING_ORDER', live.exchange_order_id)
+        else:
+            continue
+        if key in opened:
+            offset = opened[key] - live.created_ts_ms / 1000.0
+            if abs(offset) <= _UNCONFIRMED_ENTRY_SKEW_S:
+                samples.append(offset)
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _resting_order_fits(working: list[dict]) -> Callable[['OrderRow', str], bool]:
+    """A resting order the open book lists fits a submission only at its level and type.
+
+    ``workingOrderData.orderLevel`` and ``orderType`` of a listed order
+    against the submission's placed level
+    (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_ORDER_LEVEL`) and order
+    type, where both are known. A deal not listed as a resting order fits.
+    """
+    listed: dict[str, tuple[float | None, str]] = {}
+    for raw in working:
+        data = raw.get('workingOrderData') or {}
+        if (deal_id := _wire_id(data.get('dealId'))) is not None:
+            listed[deal_id] = (_wire_float(data.get('orderLevel'), finite=True),
+                               str(data.get('orderType') or '').upper())
+
+    def fits(member: 'OrderRow', ref: str) -> bool:
+        if ref not in listed:
+            return True
+        level, listed_type = listed[ref]
+        extras = member.extras or {}
+        placed = _wire_float(extras.get(EXTRAS_KEY_ORDER_LEVEL), finite=True)
+        order_type = str(extras.get('order_type') or '').upper()
+        if order_type and listed_type and order_type != listed_type:
+            return False
+        return (placed is None or level is None
+                or abs(level - placed) <= 1e-9 * max(1.0, abs(placed)))
+
+    return fits
+
 
 #: Fill legs that reduce a position: what a close activity books.
 _CLOSE_LEG_TYPES = frozenset({
@@ -295,6 +570,17 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         resolutions = await journal.recover_pending(
             cast(PendingHooksProvider, hooks_for),
         )
+        # Outside every transaction, before the engine's first sync: a landed
+        # submission whose execution is closed since goes to the engine.
+        landed_unlisted = []
+        for landed_coid, (landed_deal, opening, closes) in resume_hooks.landed_unlisted.items():
+            landed_row = self.store_ctx.get_order(landed_coid)
+            if landed_row is not None and landed_row.state == 'confirmed':
+                landed_unlisted.append((landed_row, landed_deal, opening, closes))
+        if landed_unlisted:
+            self._hand_over_offline_executions(
+                landed_unlisted, proof='landed_on_unlisted_deal',
+                engine_adopts_closes=self._connection_generation == 0)
 
         # The ``pos_by_deal_id`` / ``wo_by_deal_id`` maps are snapshots
         # from *before* promotions; rows resolved via activity-heuristic
@@ -336,8 +622,9 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         # bot and then closed the position manually outside it. Without
         # this pass the runtime ``_reconcile_snapshot`` would later
         # stamp ``missing_pending_since`` on those rows and the grace
-        # tracker would raise ``UnexpectedCancelError`` → halt the bot
-        # on a clean restart, even though there is nothing to recover.
+        # tracker would report an unexpected cancel → an external-
+        # intervention quarantine on a clean restart, even though there is
+        # nothing to recover.
         self._retire_startup_orphans(
             pos_by_deal_id, wo_by_deal_id, promoted_coids,
             closed_deals=closed_deals, activities=activities,
@@ -377,22 +664,38 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         The activity history is causal for this venue: a POST that opened a
         deal or a working order leaves an activity, so a complete read that
         covers the row's whole life shows whether it landed. The read reaches
-        back from now past the row's creation by :data:`_ACTIVITY_LAG_S`, and
-        is matched like the startup pass matches
-        (:meth:`_CapitalComResumeHooks.inherited_submission_verdict`).
+        back from now past the row's creation by :data:`_ACTIVITY_LAG_S`
+        (:meth:`_CapitalComResumeHooks.inherited_group_case`). A row older
+        than that history (24 hours, research dossier §4) is judged from what
+        the venue still lists open (:meth:`_open_book_case`); an absence judged
+        that way is logged and audited once
+        (``inherited_submission_absent_without_history``) as a verdict taken
+        without a history source: a flat venue is the safe state, and the
+        strategy decides whether to send the entry again. Either way the
+        row is settled together with every pending submission its deals
+        match (:func:`_settle_group`), and nothing here waits:
 
-        A row older than the venue's longest activity read cannot be proven
-        either way and stays held; so does a row whose trace another pending
-        submission matches as well. Each is logged once per row. A row stamped
+        * Every deal has its own submission: the row lands on its deal, or
+          opened nothing (absent: the engine may send the entry again).
+        * A deal no pending submission explains: someone else trades the
+          epic on this account, and which deal is the bot's cannot be
+          proven. That is reported as an external intervention
+          (:meth:`_report_inherited_surplus`); while its quarantine forbids
+          venue writes the row stays as it is. Once writes are allowed (the
+          operator resumed, or the configured policy does not quarantine),
+          the earliest open deals go to the submissions in order
+          (:func:`_assign_members`) and the rest stay someone else's.
+
+        A row stamped
         :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN` was
         already traced to its deal: a later read without the trace is never
         an absence for it.
 
         :param row: The pending entry row.
-        :return: :attr:`~ParkedOutcome.LANDED`
-            with the deal id, ``ABSENT``, or ``INCONCLUSIVE`` for a row that
-            is not an inherited entry submission, a failed read or an
-            ambiguous match.
+        :return: :attr:`~ParkedOutcome.LANDED` with the deal id,
+            ``ABSENT``, or ``INCONCLUSIVE`` for a row that is not an
+            inherited entry submission, a failed read, a matching activity
+            without a deal id, or a quarantined surplus.
         """
         store_ctx = self.store_ctx
         if (store_ctx is None
@@ -400,53 +703,278 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                 or (row.extras or {}).get('kind') not in (ENTRY_KIND_POSITION,
                                                           ENTRY_KIND_WORKING)):
             return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+        coid = row.client_order_id
+        if coid in self._inherited_surplus_rows and self._venue_writes_held():
+            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
         age_s = max(0.0, epoch_time() - row.created_ts_ms / 1000.0)
         period = math.ceil(age_s) + _ACTIVITY_LAG_S
-        if period > _ACTIVITY_MAX_PERIOD_S:
-            if row.client_order_id not in self._inherited_unprovable_reported:
-                self._inherited_unprovable_reported.add(row.client_order_id)
-                broker_warning(
-                    "inherited entry submission %s (intent %s) is older than the "
-                    "venue's activity history (%d s): whether its POST opened a "
-                    "deal cannot be read any more, so its entry stays held — "
-                    "check the account and close the row by hand",
-                    row.client_order_id, row.intent_key, _ACTIVITY_MAX_PERIOD_S,
-                )
-            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+        book: tuple[list[dict], list[dict]] | None = None
         try:
-            activity_resp = await self._call(
-                'history/activity',
-                data={'lastPeriod': period, 'detailed': 'true'},
-                method='get',
-            )
+            if period > _ACTIVITY_MAX_PERIOD_S:
+                book = await self._open_book()
+                case = self._open_book_case(row, *book)
+            else:
+                activity_resp = await self._call(
+                    'history/activity',
+                    data={'lastPeriod': period, 'detailed': 'true'},
+                    method='get',
+                )
+                activities = activity_resp.get('activities')
+                if not isinstance(activities, list):
+                    return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+                hooks = _CapitalComResumeHooks(
+                    plugin=self, activities=activities, pos_by_ref={}, wo_by_ref={},
+                    wo_by_deal_id={}, pos_by_deal_id={},
+                )
+                case = hooks.inherited_group_case(row)
+                if len(case.members) > 1 or len(case.deals) > 1:
+                    # A shared trace: the resting orders still listed show
+                    # their level and type, which tell submissions apart.
+                    listed = await self._open_book()
+                    book = listed
+                    case = hooks.inherited_group_case(row, _resting_order_fits(listed[1]))
+            if case.outcome == 'surplus':
+                self._report_inherited_surplus(row, case)
+                if self._venue_writes_held():
+                    return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+                if book is None:
+                    book = await self._open_book()
+                still_open = _open_ids(*book)
+                assert case.compat is not None
+                assignment = _assign_members(
+                    case.members,
+                    {member: frozenset(deal for deal in deals if deal in still_open)
+                     for member, deals in case.compat.items()},
+                    case.deals,
+                )
+                deal_id = assignment.get(coid)
+                case = _GroupCase('landed' if deal_id else 'absent', deal_id=deal_id)
         except (httpx.HTTPError, ConnectionError, ExchangeConnectionError,
                 ExchangeRateLimitError, OrderNotFoundError, CapitalComError):
             return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
-        activities = activity_resp.get('activities')
-        if not isinstance(activities, list):
-            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
-        hooks = _CapitalComResumeHooks(
-            plugin=self, activities=activities, pos_by_ref={}, wo_by_ref={},
-            wo_by_deal_id={}, pos_by_deal_id={},
-        )
-        verdict, ambiguous = hooks.inherited_submission_verdict(row)
-        if ambiguous and row.client_order_id not in self._inherited_ambiguity_reported:
-            self._inherited_ambiguity_reported.add(row.client_order_id)
-            broker_warning(
-                "inherited entry submission %s (intent %s) cannot be told apart from "
-                "another pending submission by the venue's activity history: which "
-                "of them opened the deal is unknown, so its entry stays held — check "
-                "the account and close the row by hand",
-                row.client_order_id, row.intent_key,
-            )
-        if (verdict.outcome is ParkedOutcome.ABSENT
-                and (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None):
+        if case.outcome == 'landed' and case.deal_id is not None:
+            return ParkedVerdict(ParkedOutcome.LANDED, order_id=case.deal_id)
+        extras = row.extras or {}
+        if case.outcome != 'absent' or (
+                extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None
+                or extras.get(EXTRAS_KEY_EXECUTION_HELD) is not None):
             # An earlier lookup traced this POST to its deal: a read that no
             # longer shows the trace (the deal claimed by another row, a read
             # cut short) does not undo that, and a rejection would send the
             # entry a second time.
             return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
-        return verdict
+        if period > _ACTIVITY_MAX_PERIOD_S and coid not in self._absent_without_history_reported:
+            # Only what the venue still lists open was read: the activity
+            # history no longer covers the submission's life, so nothing shows
+            # whether it executed into a deal closed since. The venue is flat
+            # for it, and the strategy decides whether to send the entry again.
+            self._absent_without_history_reported.add(coid)
+            logger.warning(
+                "inherited entry submission %s (intent %s, sent %.0f s ago) is judged absent "
+                "from what the venue lists open alone: the 24-hour activity history no longer "
+                "covers it, so whether it executed into a deal closed since was not checked; "
+                "nothing of it is open, and the strategy decides whether to send the entry "
+                "again", coid, row.intent_key, age_s,
+            )
+            store_ctx.log_event(
+                'inherited_submission_absent_without_history',
+                client_order_id=coid,
+                intent_key=row.intent_key,
+                payload={'age_s': age_s, 'history_period_s': _ACTIVITY_MAX_PERIOD_S,
+                         'evidence': 'open_book_only'},
+            )
+        return ParkedVerdict(ParkedOutcome.ABSENT)
+
+    def _venue_writes_held(self) -> bool:
+        """Whether an external-intervention quarantine forbids venue writes now."""
+        hook = self.venue_writes_blocked
+        return hook is not None and hook()
+
+    def _report_inherited_surplus(self, row: 'OrderRow', case: _GroupCase) -> None:
+        """Report, once per deal set, more deals than the pending submissions explain.
+
+        Each own POST opens one deal at most, deals another Pyne run owns are
+        no candidates, and every candidate matches a pending submission's
+        epic, kind, direction and size at its send time. A deal left over
+        then is someone else's trading on this epic, though which deal it is
+        cannot be told: the bot's own state is unprovable, an external
+        intervention
+        (:meth:`~pynecore.core.plugin.broker.BrokerPlugin.report_external_intervention`).
+        The change is dated by the latest deal's venue time, so the
+        operator's resume accepts it. Every member of the group is marked, so
+        none of them reads the venue while the quarantine holds.
+
+        :raises UnexpectedCancelError: The ``stop`` policy without a working
+            quarantine sink (the fail-safe signal the engine latches on).
+        """
+        for member in case.members:
+            self._inherited_surplus_rows.add(member.client_order_id)
+        key = frozenset(case.deals)
+        if key in self._inherited_surplus_reported:
+            return
+        self._inherited_surplus_reported.add(key)
+        when = case.when or {}
+        latest = max((when.get(deal, 0.0) for deal in case.deals), default=0.0)
+        if latest <= 0.0:
+            latest = max(member.created_ts_ms for member in case.members) / 1000.0
+        coids = [member.client_order_id for member in case.members]
+        message = (
+            f"{len(case.deals)} venue deal(s) {list(case.deals)} on {row.symbol} match the "
+            f"{len(coids)} entry submission(s) {coids} an earlier process sent (same epic, "
+            f"direction and size, sent at the same time): one POST opens one deal, so at "
+            f"least one of them is not the bot's and someone else trades this epic on the "
+            f"account. Which deal is the bot's cannot be proven. Close the deals that are not "
+            f"the bot's, then resume: the bot takes the earliest open matching deals as its "
+            f"own, one per submission, and leaves the rest as someone else's"
+        )
+        self.report_external_intervention(
+            message,
+            {'reason': 'inherited_submission_surplus_deals', 'symbol': row.symbol,
+             'submissions': coids, 'deals': list(case.deals)},
+            client_order_id=row.client_order_id,
+            changed_at_ms=int(latest * 1000),
+        )
+
+    async def _open_book(self) -> tuple[list[dict], list[dict]]:
+        """A fresh read of what the venue holds open: ``/positions`` and ``/workingorders`` rows.
+
+        :raises ExchangeConnectionError: Or another transport error; the
+            caller reads the result as inconclusive.
+        """
+        positions = await self._call('positions', method='get')
+        working = await self._call('workingorders', method='get')
+        return (list(positions.get('positions') or []),
+                list(working.get('workingOrders') or []))
+
+    def _open_book_case(
+            self, row: 'OrderRow', positions: list[dict], working: list[dict],
+    ) -> _GroupCase:
+        """Judge an inherited submission older than the activity history from the open book.
+
+        The POST's trace can no longer be read, but what it opened is either
+        still listed, or no longer exposure at all. A candidate is an open
+        entity of the row's epic and direction that no journal row tracks and
+        no other Pyne run owns
+        (:meth:`~pynecore.core.broker.storage.RunContext.foreign_live_exchange_order_ids`),
+        created within
+        :data:`~pynecore_capitalcom.foreign._UNCONFIRMED_ENTRY_SKEW_S` of the
+        row's send (the venue clock's measured offset applied,
+        :meth:`_book_clock_offset`), pinned within
+        :data:`_ACTIVITY_MATCH_WINDOW_S`:
+
+        * a market submission: a position no larger than the submission (a
+          reduced one included), named by its ``dealId``;
+        * a working submission: a resting working order of its size, type and
+          placed level, named by its ``dealId``; or a position no larger than
+          it that back-links an order (``workingOrderId``, the name) and was
+          created after the send less the band: its creation is the
+          execution's time, so it is never pinned and never refuted.
+
+        The row is then settled with every other pending submission past the
+        history (:func:`_settle_group`).
+        """
+        store_ctx = self.store_ctx
+        assert store_ctx is not None
+        journal: 'RunContext' = store_ctx
+        other_runs = journal.foreign_live_exchange_order_ids()
+        offset = self._book_clock_offset(positions, working)
+        offset_s = offset if offset is not None else 0.0
+
+        def free(ref: str | None, owner: 'OrderRow') -> bool:
+            if ref is None or ref in other_runs:
+                return False
+            tracked = journal.find_by_ref('deal_id', ref)
+            return tracked is None or tracked.client_order_id == owner.client_order_id
+
+        def evidence(member: 'OrderRow') -> dict[str, _DealEvidence]:
+            direction = 'BUY' if member.side == 'buy' else 'SELL'
+            sent = member.created_ts_ms / 1000.0 + offset_s
+            extras = member.extras or {}
+            working_row = extras.get('kind') == ENTRY_KIND_WORKING
+            tolerance = 1e-9 * max(1.0, abs(member.qty))
+            found: dict[str, _DealEvidence] = {}
+            for raw in positions:
+                position = raw.get('position') or {}
+                deal_id = _wire_id(position.get('dealId'))
+                name = _wire_id(position.get('workingOrderId')) if working_row else deal_id
+                size = _wire_float(position.get('size'), finite=True)
+                if ((raw.get('market') or {}).get('epic') != member.symbol
+                        or not free(deal_id, member) or name is None or not free(name, member)
+                        or str(position.get('direction') or '').upper() != direction
+                        or size is None or size <= 0.0 or size > member.qty + tolerance):
+                    continue
+                opened = _parse_iso_timestamp(str(position.get('createdDateUTC') or ''))
+                if working_row:
+                    if 0.0 < opened < sent - _UNCONFIRMED_ENTRY_SKEW_S:
+                        continue
+                    found[name] = _DealEvidence(when=opened, pinned=False, refutable=False)
+                    continue
+                if opened > 0.0 and abs(opened - sent) > _UNCONFIRMED_ENTRY_SKEW_S:
+                    continue
+                found[name] = _DealEvidence(
+                    when=opened,
+                    pinned=opened > 0.0 and abs(opened - sent) <= _ACTIVITY_MATCH_WINDOW_S)
+            if working_row:
+                placed = _wire_float(extras.get(EXTRAS_KEY_ORDER_LEVEL), finite=True)
+                order_type = str(extras.get('order_type') or '').upper()
+                for raw in working:
+                    data = raw.get('workingOrderData') or {}
+                    deal_id = _wire_id(data.get('dealId'))
+                    size = _wire_float(data.get('orderSize'), finite=True)
+                    level = _wire_float(data.get('orderLevel'), finite=True)
+                    listed_type = str(data.get('orderType') or '').upper()
+                    opened = _parse_iso_timestamp(
+                        str(data.get('createdDateUTC') or data.get('createdDate') or ''))
+                    if (((raw.get('market') or {}).get('epic') or data.get('epic'))
+                            != member.symbol
+                            or not free(deal_id, member)
+                            or str(data.get('direction') or '').upper() != direction
+                            or size is None or abs(size - member.qty) > tolerance
+                            or (order_type and listed_type and order_type != listed_type)
+                            or (opened > 0.0 and abs(opened - sent) > _UNCONFIRMED_ENTRY_SKEW_S)
+                            or (placed is not None and level is not None
+                                and abs(level - placed) > 1e-9 * max(1.0, abs(placed)))):
+                        continue
+                    assert deal_id is not None
+                    found[deal_id] = _DealEvidence(
+                        when=opened,
+                        pinned=opened > 0.0 and abs(opened - sent) <= _ACTIVITY_MATCH_WINDOW_S)
+            return found
+
+        age_floor = epoch_time() - _ACTIVITY_MAX_PERIOD_S + _ACTIVITY_LAG_S
+        pending = [other for other in find_pending_dispatch(journal)
+                   if other.client_order_id != row.client_order_id
+                   and not other.exchange_order_id
+                   and journal.is_inherited_dispatch(other.client_order_id)
+                   and other.created_ts_ms / 1000.0 < age_floor
+                   and (other.extras or {}).get('kind') in (ENTRY_KIND_POSITION,
+                                                            ENTRY_KIND_WORKING)]
+        return _settle_group(row, evidence, pending, clock_measured=offset is not None)
+
+    def _book_clock_offset(self, positions: list[dict], working: list[dict]) -> float | None:
+        """The venue clock's lead over the local one, measured on the open book.
+
+        :func:`_clock_offset` over the positions' ``createdDateUTC`` and the
+        resting orders' creation time.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return None
+        opened: dict[tuple[str, str], float] = {}
+        for raw in positions:
+            position = raw.get('position') or {}
+            deal_id = _wire_id(position.get('dealId'))
+            when = _parse_iso_timestamp(str(position.get('createdDateUTC') or ''))
+            if deal_id is not None and when > 0.0:
+                opened[('POSITION', deal_id)] = when
+        for raw in working:
+            data = raw.get('workingOrderData') or {}
+            deal_id = _wire_id(data.get('dealId'))
+            when = _parse_iso_timestamp(
+                str(data.get('createdDateUTC') or data.get('createdDate') or ''))
+            if deal_id is not None and when > 0.0:
+                opened[('WORKING_ORDER', deal_id)] = when
+        return _clock_offset(opened, store_ctx.iter_live_orders())
 
     def _stamp_surviving_entry_fills(
             self, pos_by_deal_id: dict[str, dict],
@@ -583,9 +1111,11 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         its position showed a size other than the submitted quantity. The
         recovery pass neither confirms, moves nor retires it, so no fill is
         booked from the evidence that was too weak to book one, and the entry
-        is never released for a second send. The operator is warned with a
-        ``take_over_unproven_held_at_recovery`` audit event, once per row for
-        the process.
+        is never released for a second send: the poll proves the fill from the
+        venue's history and books it
+        (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._resolve_unproven_take_overs`).
+        One warning and a ``take_over_unproven_held_at_recovery`` audit event
+        per row for the process say so.
 
         :param row: The stamped entry row.
         """
@@ -599,7 +1129,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         broker_warning(
             "entry submission %s (intent %s) is still held: its deal %s showed size %s "
             "instead of the submitted %s, so recovery does not book, move or retire "
-            "it — check the account and settle the row by hand",
+            "it; the poll proves its fill from the venue's history and books it",
             coid, row.intent_key, unproven.get('deal_id'), unproven.get('size'), row.qty,
         )
         store_ctx.log_event(
@@ -999,7 +1529,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
            from the exchange side. Close the row silently — without
            this, the runtime ``_reconcile_snapshot`` would later flag
            it via ``missing_pending_since`` and the grace tracker would
-           raise :class:`UnexpectedCancelError`, halting a bot that has
+           report an unexpected cancel, quarantining a bot that has
            nothing left to recover. On a reconnect ``confirmed`` and
            ``closing`` rows are left alone: the engine of this very
            process still books their exposure, and the activity poll,
@@ -1035,8 +1565,18 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         close activity is never booked again.
 
         A row stamped
-        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN` is
-        never retired: it stays live and held.
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN` or
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_EXECUTION_HELD` is never
+        retired: it stays live and held.
+
+        An own entry with no execution booked (a resting order, or a market
+        entry the venue accepted without opening it at once) whose order
+        executed while no process ran, into a deal closed since (the startup
+        history proves both,
+        :meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._closed_execution_evidence`),
+        is not retired either: after the pass it is handed to the engine's
+        held-execution recovery, before the engine's first sync
+        (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._hand_over_offline_executions`).
 
         A resting own entry order retired in pass 1 on a fresh start is judged
         against the startup ``activities`` the way a cancel the poll sees is
@@ -1075,6 +1615,7 @@ class _RecoveryMixin(_CapitalComBase, ABC):
         retired_count = 0
         pending_reports: list[dict] = []
         quarantine_first: list['OrderRow'] = []
+        executed_offline: list[tuple['OrderRow', str, dict, list[dict]]] = []
         store_ctx = self.store_ctx
 
         def retire_parent(retired: 'OrderRow') -> None:
@@ -1121,9 +1662,11 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                         retired_intent_keys.add(row.intent_key)
                     retired_count += 1
                     continue
-                if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
-                    # A held take-over: its order is gone because it executed,
-                    # and retiring the row would release the entry for a second
+                if (extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None
+                        or extras.get(EXTRAS_KEY_EXECUTION_HELD) is not None):
+                    # A held take-over (its order is gone because it executed),
+                    # or a row handed to the engine's held-execution recovery:
+                    # retiring the row would release the entry for a second
                     # send. It stays live and held, like in the process that
                     # stamped it.
                     kept_parent_coids.add(row.client_order_id)
@@ -1233,6 +1776,16 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                         row, closed_by_activity=closed_by_activity, report=report)
                     if report is not None:
                         pending_reports.append(report)
+                elif (row.state == 'confirmed'
+                      and extras.get('kind') in (ENTRY_KIND_WORKING, ENTRY_KIND_POSITION)
+                      and (evidence := self._closed_execution_evidence(
+                          row, activities or [], pos_by_deal_id)) is not None):
+                    # It executed while no process ran, into a deal closed
+                    # since: the engine books that execution, so the row stays
+                    # for the hand-over after this pass.
+                    executed_offline.append((row, *evidence))
+                    kept_parent_coids.add(row.client_order_id)
+                    continue
                 elif row.state == 'confirmed' and extras.get('kind') == ENTRY_KIND_WORKING:
                     report = self._judge_vanished_startup_working_order(row, activities or [])
                     if report is not None:
@@ -1262,6 +1815,10 @@ class _RecoveryMixin(_CapitalComBase, ABC):
                     row, closed_by_activity=False, report=None)
                 retire_parent(row)
             retired_count += 1
+
+        if executed_offline:
+            # Outside every transaction, before the engine's first sync.
+            self._hand_over_offline_executions(executed_offline)
 
         orphaned_exit_keys: set[str] = set()
         for row in list(self.store_ctx.iter_live_orders()):
@@ -1502,14 +2059,12 @@ class _CapitalComResumeHooks:
     submission and exchange-order construction methods are intentionally
     not part of this collaborator.
 
-    The ``submission_ambiguous`` branch is a deliberate side-channel:
-    when the activity heuristic returns multiple candidates the hook
-    writes ``state='submission_ambiguous'`` directly and raises
-    :class:`BrokerManualInterventionError`. The journal does not catch
-    the exception (intentional — operator intervention is required),
-    so the propagation matches the legacy recovery semantics. A
-    follow-up Core change is planned to canonicalise this status; M3
-    keeps the current behaviour.
+    A submission whose trace the activity history cannot pin to one deal
+    (several candidate deals, or a deal another pending submission
+    matches too) is never guessed and never stops the process: it stays
+    pending (``still_unknown``), and the in-run lookup settles it with every
+    submission its deals match (:meth:`inherited_group_case`,
+    :meth:`~_RecoveryMixin._inherited_submission_verdict`).
     """
     plugin: CapitalComHookCollaborator
     activities: list[dict]
@@ -1517,6 +2072,16 @@ class _CapitalComResumeHooks:
     wo_by_ref: dict[str, dict]
     wo_by_deal_id: dict[str, dict]
     pos_by_deal_id: dict[str, dict]
+    #: The venue order ids another Pyne run on the account owns, read once
+    #: per hook instance (:meth:`_other_run_order_ids`).
+    other_run_ids: frozenset[str] | None = None
+    #: Per client order id, the landed submission whose deal the venue no
+    #: longer lists, for the engine's held-execution recovery once the journal
+    #: confirmed it: the deal its order executed into, that deal's opening
+    #: (``None`` when the history cannot show it) and its closes
+    #: (:meth:`_verdict_landed_unlisted`).
+    landed_unlisted: dict[str, tuple[str, dict | None, list[dict]]] = field(
+        default_factory=dict)
 
     async def resume_pending_dispatch(
             self, *, row: 'OrderRow', refs: Mapping[str, str],
@@ -1661,7 +2226,7 @@ class _CapitalComResumeHooks:
 
     def _activity_matches_row(
             self, activity: Mapping, row: 'OrderRow', *,
-            window_s: float | None = _ACTIVITY_MATCH_WINDOW_S,
+            window_s: float | None = _ACTIVITY_MATCH_WINDOW_S, offset_s: float = 0.0,
     ) -> bool:
         """Whether an activity row can be the venue trace of ``row``'s POST.
 
@@ -1673,12 +2238,15 @@ class _CapitalComResumeHooks:
         traced by its ``POSITION`` open, a resting entry by the
         ``WORKING_ORDER`` it created (an ``EXECUTED`` working order is a
         market POST's internal order or a fill, never a creation). Deals
-        another journal row already tracks are not candidates.
+        another journal row already tracks, or another Pyne run on the
+        account owns (:meth:`_other_run_order_ids`), are not candidates.
 
         :param activity: One ``/history/activity`` row.
         :param row: The pending entry row.
         :param window_s: Largest distance between the activity's time and the
             row's creation; ``None`` matches at any time.
+        :param offset_s: The venue clock's measured lead over the local one,
+            taken off the activity's time first.
         """
         if (activity.get('epic') or '') != row.symbol:
             return False
@@ -1698,7 +2266,8 @@ class _CapitalComResumeHooks:
             return False
         row_created = row.created_ts_ms / 1000.0 if row.created_ts_ms else 0.0
         when = _parse_iso_timestamp(activity.get('dateUTC') or '')
-        if window_s is not None and row_created and abs(when - row_created) > window_s:
+        if (window_s is not None and row_created
+                and abs(when - offset_s - row_created) > window_s):
             return False
         deal_id = _wire_id(activity.get('dealId'))
         store_ctx = self.plugin.store_ctx
@@ -1706,7 +2275,35 @@ class _CapitalComResumeHooks:
             tracked = store_ctx.find_by_ref('deal_id', deal_id)
             if tracked is not None and tracked.client_order_id != row.client_order_id:
                 return False
+            if deal_id in self._other_run_order_ids():
+                return False
         return True
+
+    def _other_run_order_ids(self) -> frozenset[str]:
+        """The venue order ids another Pyne run on the account and epic owns.
+
+        Read once per hook instance
+        (:meth:`~pynecore.core.broker.storage.RunContext.foreign_live_exchange_order_ids`):
+        a deal another run's live journal row tracks is that run's, never
+        this submission's trace.
+        """
+        if self.other_run_ids is None:
+            store_ctx = self.plugin.store_ctx
+            self.other_run_ids = frozenset(
+                store_ctx.foreign_live_exchange_order_ids() if store_ctx is not None else ())
+        return self.other_run_ids
+
+    def _contesting_rows(self, activity: Mapping, row: 'OrderRow') -> list['OrderRow']:
+        """The other pending entry submissions without a deal id that ``activity`` matches too."""
+        store_ctx = self.plugin.store_ctx
+        if store_ctx is None:
+            return []
+        return [other for other in find_pending_dispatch(store_ctx)
+                if other.client_order_id != row.client_order_id
+                and not other.exchange_order_id
+                and (other.extras or {}).get('kind') in (ENTRY_KIND_POSITION,
+                                                         ENTRY_KIND_WORKING)
+                and self._activity_matches_row(activity, other)]
 
     def _trace_contested(self, activity: Mapping, row: 'OrderRow') -> bool:
         """Whether another pending entry submission could have left ``activity`` too.
@@ -1724,56 +2321,106 @@ class _CapitalComResumeHooks:
         :return: Whether a live pending entry row without a deal id, other
             than ``row``, matches the activity as well.
         """
+        return bool(self._contesting_rows(activity, row))
+
+    def venue_clock_offset(self) -> float | None:
+        """The venue clock's lead over the local one, measured on the bot's own deals.
+
+        :func:`_clock_offset` over each deal's first creation activity.
+
+        :return: The offset in seconds, or ``None`` without a sample.
+        """
         store_ctx = self.plugin.store_ctx
         if store_ctx is None:
-            return False
-        for other in find_pending_dispatch(store_ctx):
-            if (other.client_order_id == row.client_order_id
-                    or other.exchange_order_id
-                    or (other.extras or {}).get('kind') not in (ENTRY_KIND_POSITION,
-                                                                ENTRY_KIND_WORKING)):
+            return None
+        opened: dict[tuple[str, str], float] = {}
+        for activity in self.activities:
+            deal_id = _wire_id(activity.get('dealId'))
+            activity_type = (activity.get('type') or '').upper()
+            status = (activity.get('status') or '').upper()
+            if deal_id is None or status in ('EXECUTED', 'REJECTED'):
                 continue
-            if self._activity_matches_row(activity, other):
-                return True
-        return False
+            when = _parse_iso_timestamp(activity.get('dateUTC') or '')
+            if when <= 0.0:
+                continue
+            key = (activity_type, deal_id)
+            opened[key] = min(opened.get(key, when), when)
+        return _clock_offset(opened, store_ctx.iter_live_orders())
 
-    def inherited_submission_verdict(self, row: 'OrderRow') -> tuple[ParkedVerdict, bool]:
+    def activity_evidence(
+            self, row: 'OrderRow', offset_s: float,
+    ) -> dict[str, _DealEvidence] | None:
+        """The deals whose activities may be ``row``'s POST trace, within the candidate band.
+
+        :meth:`_activity_matches_row` within
+        :data:`~pynecore_capitalcom.foreign._UNCONFIRMED_ENTRY_SKEW_S` of the
+        row (``offset_s`` applied); pinned within
+        :data:`_ACTIVITY_MATCH_WINDOW_S`.
+
+        :return: Deal id -> evidence, or ``None`` when a matching activity
+            carries no deal id (nothing can be dealt then).
+        """
+        found: dict[str, _DealEvidence] = {}
+        for activity in self.activities:
+            if not self._activity_matches_row(activity, row, window_s=_UNCONFIRMED_ENTRY_SKEW_S,
+                                              offset_s=offset_s):
+                continue
+            deal_id = _wire_id(activity.get('dealId'))
+            if deal_id is None:
+                return None
+            when = _parse_iso_timestamp(activity.get('dateUTC') or '')
+            pinned = self._activity_matches_row(activity, row, offset_s=offset_s)
+            known = found.get(deal_id)
+            if known is not None:
+                when = min(known.when, when)
+                pinned = pinned or known.pinned
+            found[deal_id] = _DealEvidence(when=when, pinned=pinned)
+        return found
+
+    def inherited_group_case(
+            self, row: 'OrderRow', fits: Callable[['OrderRow', str], bool] | None = None,
+    ) -> _GroupCase:
         """Judge an inherited entry submission from a complete activity read.
 
-        * One deal traced inside :data:`_ACTIVITY_MATCH_WINDOW_S` of the row's
-          creation, which no other pending submission could have left
-          (:meth:`_trace_contested`): the POST landed there.
-        * No trace at all: the POST opened nothing.
-        * Anything else is inconclusive: several traced deals, a trace another
-          pending submission matches too, a trace without a deal id, or a
-          matching activity outside the window, which may be the POST's own
-          trace under a venue clock that runs off the local one.
+        The venue clock's offset is measured first (:meth:`venue_clock_offset`);
+        without a sample it is taken as zero and the candidate band is not
+        refuted. The row and the pending submissions without a deal id
+        (:func:`~pynecore.core.broker.store_helpers.find_pending_dispatch`)
+        are then settled together (:func:`_settle_group`). A group that holds
+        a parked submission of this process waits for that one's confirm.
 
         :param row: The pending entry row; :attr:`activities` must cover its
             whole life.
-        :return: The verdict, with the deal id when it landed, and whether the
-            trace is ambiguous: several deals, or one another pending
-            submission matches too. An ambiguous row stays held until the
-            operator settles it.
+        :param fits: Drops a deal a member's observable attributes contradict.
         """
-        traced: set[str | None] = set()
-        contested = False
-        outside_window = False
-        for activity in self.activities:
-            if self._activity_matches_row(activity, row):
-                traced.add(_wire_id(activity.get('dealId')))
-                contested = contested or self._trace_contested(activity, row)
-            elif self._activity_matches_row(activity, row, window_s=None):
-                outside_window = True
-        ambiguous = contested or len(traced) > 1
-        if len(traced) == 1 and not contested:
-            deal_id = next(iter(traced))
-            if deal_id is not None:
-                return ParkedVerdict(ParkedOutcome.LANDED, order_id=deal_id), False
-            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE), False
-        if traced or outside_window:
-            return ParkedVerdict(ParkedOutcome.INCONCLUSIVE), ambiguous
-        return ParkedVerdict(ParkedOutcome.ABSENT), False
+        offset = self.venue_clock_offset()
+        offset_s = offset if offset is not None else 0.0
+        own = self.activity_evidence(row, offset_s)
+        if own is None:
+            return _GroupCase('inconclusive')
+        cache: dict[str, dict[str, _DealEvidence] | None] = {row.client_order_id: own}
+
+        def evidence(member: 'OrderRow') -> Mapping[str, _DealEvidence]:
+            coid = member.client_order_id
+            if coid not in cache:
+                cache[coid] = self.activity_evidence(member, offset_s)
+            return cache[coid] or {}
+
+        store_ctx = self.plugin.store_ctx
+        pending = [other for other in (find_pending_dispatch(store_ctx) if store_ctx else [])
+                   if other.client_order_id != row.client_order_id
+                   and not other.exchange_order_id
+                   and (other.extras or {}).get('kind') in (ENTRY_KIND_POSITION,
+                                                            ENTRY_KIND_WORKING)]
+        case = _settle_group(row, evidence, pending, clock_measured=offset is not None,
+                             fits=fits)
+        if store_ctx is not None and any(
+                not store_ctx.is_inherited_dispatch(member.client_order_id)
+                for member in case.members):
+            # A submission of this process shares the trace: its confirm
+            # tells what it opened, which settles the group without a guess.
+            return _GroupCase('inconclusive')
+        return case
 
     def _verdict_submitted(
             self, row: 'OrderRow', refs: Mapping[str, str],
@@ -1787,9 +2434,12 @@ class _CapitalComResumeHooks:
            ``recovery_path='stored_ref'``, confirmed.
         2. Activity heuristic (see :meth:`_activity_matches_row`) →
            single match → ``recovery_path='activity_single_match'``;
-           multiple matches → ambiguous side-channel (see class
-           docstring); zero matches → ``still_unknown`` with
-           ``recovery_path='no_match'``.
+           a single match another pending submission matches too →
+           ``still_unknown`` with ``recovery_path='activity_contested_match'``;
+           multiple matches → ``still_unknown`` with
+           ``recovery_path='activity_ambiguous_match'`` (settled in-run, see
+           the class docstring); zero matches →
+           ``still_unknown`` with ``recovery_path='no_match'``.
         """
         stored_ref: str | None = (
             refs.get('deal_reference') or (row.extras or {}).get('deal_reference')
@@ -1842,9 +2492,9 @@ class _CapitalComResumeHooks:
                 recovery_path='no_match',
             )
         if len(candidates) == 1 and self._trace_contested(candidates[0], row):
-            # Another pending submission matches the same trace: which one
-            # landed is unknown, so neither takes the deal. The row stays
-            # pending and the in-run lookup keeps it held.
+            # Another pending submission matches the same trace: the group is
+            # settled by the in-run lookup, which judges every submission the
+            # deal matches together. The row stays pending until then.
             return ResumeOutcome(
                 status='still_unknown',
                 recovery_path='activity_contested_match',
@@ -1862,20 +2512,16 @@ class _CapitalComResumeHooks:
                 recovery_context={'activity_count': 1},
             )
 
-        # Multiple matches — cannot auto-resolve. Side-channel: write
-        # the ambiguous state directly and raise. The journal does not
-        # catch BrokerManualInterventionError, so the halt propagates
-        # to the connect-flow caller — matching the legacy behaviour.
-        assert self.plugin.store_ctx is not None
-        self.plugin.store_ctx.set_order_state(
-            row.client_order_id, 'submission_ambiguous',
-        )
-        raise BrokerManualInterventionError(
-            f"Recovery ambiguous: {len(candidates)} activity matches for "
-            f"coid={row.client_order_id!r}",
-            intent_key=row.intent_key,
-            context={'symbol': row.symbol, 'qty': row.qty, 'side': row.side,
-                     'candidate_deal_ids': [c.get('dealId') for c in candidates]},
+        # Several deals match and nothing on the venue names the one this
+        # POST opened (no client order id, research dossier §5): never a
+        # guess, never a stop. The row stays pending, so the engine keeps
+        # this entry alone held (no second send), and the in-run lookup
+        # settles it on its first pass (``_inherited_submission_verdict``).
+        deal_ids = sorted(str(deal_id) for deal_id in candidate_deal_ids)
+        return ResumeOutcome(
+            status='still_unknown',
+            recovery_path='activity_ambiguous_match',
+            recovery_context={'candidate_deal_ids': deal_ids},
         )
 
     async def _verdict_server_ref_seen(
@@ -1984,6 +2630,9 @@ class _CapitalComResumeHooks:
                 recovery_path='confirm_get_direct',
                 recovery_context={'deal_reference': ref},
             )
+        landed = self._verdict_landed_unlisted(row, deal_id, ref)
+        if landed is not None:
+            return landed
         return ResumeOutcome(
             status='rejected',
             reject_reason=(
@@ -1991,6 +2640,63 @@ class _CapitalComResumeHooks:
                 '(stale confirm for a dead deal)'
             ),
             recovery_path='confirm_get_stale_deal',
+            recovery_context={'deal_reference': ref, 'deal_id': deal_id},
+        )
+
+    def _verdict_landed_unlisted(
+            self, row: 'OrderRow', deal_id: str, ref: str,
+    ) -> ResumeOutcome | None:
+        """Verdict for an accepted submission whose deal no account snapshot lists.
+
+        The confirm proves the POST landed on ``deal_id``. Its absence from the
+        snapshots proves the order is no longer live, not that it executed
+        nothing: it may have executed into a deal closed since, or (a resting
+        order, or a market entry the venue ran through its working-order
+        machinery) into a fresh deal that back-links it. A rejection would
+        send the entry again next to that execution. So the submission is
+        confirmed on its deal, unfilled, when
+
+        * the startup history shows its execution
+          (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._execution_in_history`):
+          a deal still listed is moved onto by the startup migration, and one
+          closed since, with its close in the history, is handed to the
+          engine's held-execution recovery after the journal pass
+          (:attr:`landed_unlisted`); an execution whose close the history
+          does not show yet is left to the runtime disappearance verdict;
+        * the submission is older than the history (24 hours, research
+          dossier §4): nothing can tell what it executed, so it is handed to
+          the engine's held-execution recovery without an opening, whose
+          no-evidence rule keeps new entries waiting rather than sending one
+          twice.
+
+        Within the history, a submission whose execution the history does not
+        show executed nothing (the history is causal for this venue: an
+        execution leaves an activity), and ``None`` lets the rejection stand.
+
+        :param row: The pending submission row.
+        :param deal_id: The deal its accepted confirm names.
+        :param ref: Its ``dealReference``.
+        :return: The confirmed verdict, or ``None``.
+        """
+        executed = self.plugin.execution_in_history(row, deal_id, self.activities)
+        age_s = epoch_time() - row.created_ts_ms / 1000.0
+        if executed is not None:
+            executed_deal, opening, closes = executed
+            if closes and executed_deal not in self.pos_by_deal_id:
+                self.landed_unlisted[row.client_order_id] = (executed_deal, opening, closes)
+            path = 'confirm_get_executed_deal'
+        elif age_s > _ACTIVITY_MAX_PERIOD_S - _ACTIVITY_LAG_S:
+            self.landed_unlisted[row.client_order_id] = (deal_id, None, [])
+            path = 'confirm_get_beyond_history'
+        else:
+            return None
+        return ResumeOutcome(
+            status='confirmed',
+            exchange_id=deal_id,
+            is_filled=False,
+            filled_qty=0.0,
+            fill_price=None,
+            recovery_path=path,
             recovery_context={'deal_reference': ref, 'deal_id': deal_id},
         )
 

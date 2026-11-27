@@ -56,6 +56,7 @@ from .models import (
     _InstrumentRules,
     _activity_fingerprint,
 )
+from .order_history import _OrderHistoryMixin
 from .provider import _ProviderMixin
 from .reconcile import _ReconcileMixin
 from .recovery import _RecoveryMixin
@@ -86,6 +87,7 @@ __all__ = [
 
 
 class CapitalCom(
+    _OrderHistoryMixin,
     _RecoveryMixin,
     _InterventionMixin,
     _ForeignExposureMixin,
@@ -118,8 +120,10 @@ class CapitalCom(
     the LIMIT when the stop triggers, so the plugin only ever sees plain
     market / limit / stop entries. Partial
     closes are emulated via opposite-direction posts on a netting
-    account; on a hedging account a partial close is a loud non-halting
-    skip (``DELETE /positions/{dealId}`` is full-row only). Size changes
+    account; on a hedging account a close that asks for part of a row closes
+    that row in full, with a warning naming the asked and the closed quantity
+    (``DELETE /positions/{dealId}`` is full-row only, see
+    :attr:`~CapitalCom.supports_partial_leg_close`). Size changes
     require cancel-and-recreate — order size is not amendable.
 
     Idempotency is software-upheld via the unified
@@ -295,6 +299,14 @@ class CapitalCom(
         self._foreign_exit_latched: set[str] = set()
         self._netting_retired_orders: dict[str, dict] | None = None
         self._residual_deals_reported: set[str] = set()
+        # The bot's own ENTRY_BLOCK causes and their repairs (see
+        # ``foreign.py`` and ``order_history.py``).
+        self._own_trouble_causes: dict[str, str] = {}
+        self._residual_close_sent_at: dict[str, float] = {}
+        self._take_over_proof_read_at: float = 0.0
+        self._take_over_size_seen: dict[str, tuple[float, float]] = {}
+        self._take_over_absent_since: dict[str, float] = {}
+        self._closed_deal_read_at: dict[str, float] = {}
         self._unannounced_fills_seen: dict[str, float] = {}
         self._deferred_parks: dict[str, Callable[[], None]] = {}
         # Resolves the entry submissions an earlier process left pending; the
@@ -309,7 +321,8 @@ class CapitalCom(
             absent_after_s=self.fill_report_grace_s,
             lookup_interval_s=_INHERITED_LOOKUP_INTERVAL_S,
         )
-        self._inherited_unprovable_reported: set[str] = set()
-        self._inherited_ambiguity_reported: set[str] = set()
+        self._inherited_surplus_reported: set[frozenset[str]] = set()
+        self._inherited_surplus_rows: set[str] = set()
+        self._absent_without_history_reported: set[str] = set()
         self._take_over_held_reported: set[str] = set()
         self._take_over_dispatch_held_reported: set[tuple[str, str]] = set()

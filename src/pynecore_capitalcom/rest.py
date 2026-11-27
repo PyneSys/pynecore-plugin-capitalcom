@@ -79,7 +79,7 @@ _SESSION_REFRESH_SAFETY_S = 5 * 60
 # chain several 50s-per-phase HTTP calls inside a single read (proactive
 # session refresh, re-login retries), and the sync engine serializes
 # reads behind the in-flight one: a read that outlives the engine's
-# read-stuck grace therefore forces a manual-intervention halt even
+# read-stuck grace keeps every exposure-opening dispatch deferred even
 # after connectivity returns (measured live: capitalcom cycle 76 — a WS
 # keepalive stall left one positions GET in flight for 75s while the
 # feed itself recovered after 45s). Reads are idempotent, so abandoning

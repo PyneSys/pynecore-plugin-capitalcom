@@ -13,8 +13,17 @@ direction:
   plus a ``foreign_deal_on_epic`` audit event). A deal an own entry still
   waiting for its ``dealId`` may have opened is not provably foreign: it is
   logged only once that entry resolved elsewhere. The deal of a take-over held
-  because its fill could not be proven is neither own exposure nor logged: it
-  stays out of every write until the operator settles the row.
+  because its fill could not be proven came from the bot's own order: it is
+  own exposure, counted in the run's position, while the bot proves its fill
+  from the venue's history by itself
+  (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._resolve_unproven_take_overs`);
+  until the fill is booked no close and no netting write reaches it (its
+  close activity could not be attributed to the bot), and every close,
+  ``held_execution_close`` included, reaches it once it is.
+  A deal opened by an order of an entry the engine holds for its execution
+  evidence is the run's own whether or not a live journal row tracks it
+  (:meth:`_ForeignExposureMixin._held_execution_order_ids`): the strategy's
+  close over that entry must reach it (``held_execution_close``).
 * **Never netted.** A netting ``POST /positions`` cannot name a ``dealId``: the
   venue applies a reduce POST or an opposite market entry FIFO to the oldest
   deal on the side it reduces (measured 2026-05-28, research dossier §9 #13).
@@ -30,12 +39,24 @@ direction:
   refusal alone latches nothing. Only an exit that stays blocked, without a
   gap, for :data:`_FOREIGN_EXIT_LATCH_AFTER_S` — the bot cannot leave its own
   position without touching someone else's — latches an ``ENTRY_BLOCK``
-  quarantine with that reason. The latch rests on a fresh ``/positions`` read,
-  never on the poll's cached snapshot alone; a poll snapshot that no longer
-  shows the block ends it, so a later block is timed from its own first
-  refusal. An exit blocked only by deals an unconfirmed own entry may have
-  opened waits without a latch. A refused opposite entry or resting entry
-  order only drops that signal: a separate deal is no reason to stop the bot.
+  quarantine with that reason, under the cause
+  ``foreign_exit_block:<intent key>``. The latch rests on a fresh
+  ``/positions`` read, never on the poll's cached snapshot alone; a poll
+  snapshot that no longer shows the block ends it, and so does the exit
+  going through: the cause is released then
+  (:meth:`_ForeignExposureMixin._foreign_exit_unblocked`), and a later block
+  is timed from its own first refusal. An exit blocked only by deals an
+  unconfirmed own entry may have opened waits without a latch. A refused
+  opposite entry or resting entry order only drops that signal: a separate
+  deal is no reason to stop the bot.
+* **Never an intervention.** A foreign deal that merely sits on the epic, or
+  one an own working order netted, changed no bot-owned order or position:
+  the core's ``EXTERNAL_INTERVENTION`` (someone else changed the bot's own
+  state) does not apply, and the bot's own ``ENTRY_BLOCK`` ends by itself.
+  The netting of a foreign deal by an own working order latches under
+  ``own_working_order_netted_foreign_deal:<row>`` until the order's execution
+  is accounted (retired, or its residual booked):
+  :meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._settle_own_troubles`.
 """
 import logging
 from abc import ABC
@@ -57,6 +78,8 @@ from ._base import _CapitalComBase
 from .helpers import (
     EXTRAS_KEY_NETTED_FOREIGN_DEAL,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
+    _foreign_exit_cause,
+    _netted_foreign_deal_cause,
     _parse_iso_timestamp,
     _wire_float,
     _wire_id,
@@ -124,13 +147,16 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         A deal is the run's own when a live entry row of this run carries it
         as its ``dealId``, or when the deal's ``workingOrderId`` back-links an
         own row (a working order, or a market entry the venue executed through
-        its working-order machinery under a fresh ``dealId``). Rows a previous
+        its working-order machinery under a fresh ``dealId``), or when its
+        ``dealId`` or ``workingOrderId`` is an order of an entry the engine
+        holds for its execution evidence (:meth:`_held_execution_order_ids`),
+        whatever the journal still tracks of it. The deal of a take-over held
+        because its fill could not be proven
+        (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`,
+        :meth:`_held_take_over_refs`) is the run's own too: the bot's own
+        order opened it, though its fill is not booked yet. Rows a previous
         design seeded for untracked venue deals at startup are not evidence of
-        ownership, and neither is a take-over held because its fill could not
-        be proven (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`):
-        its deal is not the bot's booked exposure, so the one-way emulator
-        never closes or nets it and the aggregate position leaves it out
-        (:meth:`_held_take_over_refs` keeps it from reading as foreign).
+        ownership.
 
         :param positions: ``GET /positions`` rows.
         :return: The owned ``dealId`` values, or ``None`` without a journal
@@ -154,7 +180,10 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         deal a defensive close flattens
         (``extras['orphan_close_synthetic']``) carries the closing exit's
         ``from_entry``, not a dispatch of the entry, so it attributes
-        nothing.
+        nothing. A deal owned only through an order the engine holds
+        (:meth:`_held_execution_order_ids`) or through a held take-over
+        (:meth:`_held_take_over_refs`) attributes nothing either: no booked
+        entry stands behind it.
 
         :param positions: ``GET /positions`` rows.
         :return: ``{dealId: entry id or None}`` per owned deal, or ``None``
@@ -178,6 +207,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             promoted_from = _wire_id(extras.get('promoted_from_working_order_id'))
             if promoted_from is not None:
                 own_ids.setdefault(promoted_from, set()).add(entry_id)
+        held = self._held_execution_order_ids() | self._held_take_over_refs()
         owned: dict[str, str | None] = {}
         for raw in positions:
             position = raw.get('position') or {}
@@ -188,10 +218,30 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             entries = own_ids.get(deal_id, set()) | (
                 own_ids.get(working_order_id, set()) if working_order_id is not None else set()
             )
-            if not entries:
-                continue
-            owned[deal_id] = next(iter(entries)) if len(entries) == 1 else None
+            if entries:
+                owned[deal_id] = next(iter(entries)) if len(entries) == 1 else None
+            elif deal_id in held or (working_order_id is not None and working_order_id in held):
+                owned[deal_id] = None
         return owned
+
+    def _held_execution_order_ids(self) -> set[str]:
+        """The venue orders of the entries the engine holds for their execution evidence.
+
+        Read fresh from the engine's documented accessor
+        (:meth:`~pynecore.core.broker.storage.RunContext.held_execution_order_ids`):
+        the orders of every entry held for its execution evidence, and those a
+        ``held_execution_close`` took the execution of. Those ids are the ones
+        this plugin reported for the entry's order: the ``dealId`` of its
+        working order or of the deal its confirm named. A deal whose
+        ``dealId`` or ``workingOrderId`` is one of them was opened by that
+        order, whether or not a live journal row still tracks it.
+
+        :return: The order ids, empty without a journal or a hold.
+        """
+        store_ctx = self.store_ctx
+        if store_ctx is None:
+            return set()
+        return set(store_ctx.held_execution_order_ids())
 
     def _unconfirmed_own_entries(self) -> list[tuple[str, float]]:
         """Own entries sent to the venue whose ``dealId`` is not known yet.
@@ -226,9 +276,12 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         Per row stamped
         :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`: the
         deal the stamp recorded, and the row's own order id, which the deal of
-        an executed working order back-links. Such a deal is not the bot's
-        booked exposure, and not provably someone else's either: it is never
-        closed, amended or netted, and it is not reported as foreign.
+        an executed working order back-links. Such a deal came from the bot's
+        own order: it counts as own exposure (:meth:`_owned_deal_entries`),
+        it blocks netting writes until its fill is booked
+        (:meth:`_foreign_deals`), and the bot books that fill once the venue's
+        history proves it
+        (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._resolve_unproven_take_overs`).
         """
         store_ctx = self.store_ctx
         if store_ctx is None:
@@ -252,9 +305,12 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
 
         A deal that may be the result of an own entry still waiting for its
         ``dealId`` (:meth:`_unconfirmed_own_entries`: same direction, created
-        around the time the entry was sent), or the deal of a held take-over
-        (:meth:`_held_take_over_refs`), is not provably foreign: its dict
-        carries ``ownership_pending=True``.
+        around the time the entry was sent) is not provably foreign: its dict
+        carries ``ownership_pending=True``. The deal of a held take-over
+        (:meth:`_held_take_over_refs`) is listed the same way although it is
+        owned: it counts in the run's position, but until its fill is booked
+        no netting write may reach it, so it blocks one like an unconfirmed
+        deal does (waiting, never latching).
 
         :param positions: ``GET /positions`` rows (account-wide).
         :param symbol: The epic.
@@ -269,19 +325,20 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             return []
         foreign: list[dict] = []
         unconfirmed: list[tuple[str, float]] | None = None
-        held: set[str] | None = None
+        held = self._held_take_over_refs()
         for raw in rows:
             position = raw.get('position') or {}
             deal_id = _wire_id(position.get('dealId'))
-            if deal_id is None or deal_id in owned:
+            if deal_id is None:
+                continue
+            taken_over = deal_id in held or _wire_id(position.get('workingOrderId')) in held
+            if deal_id in owned and not taken_over:
                 continue
             deal_direction = str(position.get('direction') or '').upper()
             if direction is not None and deal_direction != direction:
                 continue
             deal = _describe_deal(position)
-            if held is None:
-                held = self._held_take_over_refs()
-            if deal_id in held or _wire_id(position.get('workingOrderId')) in held:
+            if taken_over:
                 deal['ownership_pending'] = True
                 foreign.append(deal)
                 continue
@@ -499,9 +556,18 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
                 and now - block.since >= _FOREIGN_EXIT_LATCH_AFTER_S)
 
     def _foreign_exit_unblocked(self, intent_key: str) -> None:
-        """The exit ``intent_key`` is no longer blocked: its block clock restarts."""
+        """The exit ``intent_key`` is no longer blocked: its block clock restarts.
+
+        A block that latched ``ENTRY_BLOCK`` releases its cause
+        (:func:`_foreign_exit_cause`): the bot can leave its position again.
+        """
         self._foreign_exit_blocks.pop(intent_key, None)
-        self._foreign_exit_latched.discard(intent_key)
+        if intent_key in self._foreign_exit_latched:
+            self._foreign_exit_latched.discard(intent_key)
+            self._release_own_trouble(
+                _foreign_exit_cause(intent_key),
+                f"own exit {intent_key!r} is no longer blocked by a foreign deal",
+            )
 
     def _foreign_exit_skip(
             self, *, reason: str, intent_key: str, symbol: str, foreign: list[dict],
@@ -574,8 +640,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
                     intent_key=intent_key,
                     payload=context,
                 )
-            if self.quarantine_sink is not None:
-                self.quarantine_sink(latch_message, context, kind=QuarantineKind.ENTRY_BLOCK)
+            self._latch_own_trouble(latch_message, context, _foreign_exit_cause(intent_key))
         return OrderSkippedByPlugin(
             message, intent_key=intent_key, reason=reason,
             context={'symbol': symbol, 'foreign_deals': foreign, 'write': write},
@@ -661,6 +726,7 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
             write={'working_order': wo_id, 'side': wo_row.side, 'qty': wo_row.qty,
                    'conflict': conflict},
             latch=True,
+            cause=_netted_foreign_deal_cause(wo_row.client_order_id),
         )
 
     def _report_unattributed_opposite(
@@ -713,14 +779,16 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
 
     def _report_foreign_block(
             self, *, reason: str, key: str, symbol: str, foreign: list[dict],
-            write: dict, latch: bool,
+            write: dict, latch: bool, cause: str | None = None,
     ) -> str:
         """Report once that an own write stopped short of a foreign deal.
 
         Logged ERROR and audited as ``foreign_deal_blocks_own_write`` once per
         ``(reason, key, foreign deals)``; with ``latch`` an ``ENTRY_BLOCK``
-        quarantine carries the same message, because the bot cannot do what
-        its strategy asks without touching someone else's deal.
+        quarantine carries the same message under ``cause``
+        (:meth:`_latch_own_trouble`), because the bot cannot do what its
+        strategy asks without touching someone else's deal; the producer of
+        the cause releases it once that is over.
 
         :param reason: Stable reason token.
         :param key: What was blocked (intent key, working-order dealId).
@@ -728,7 +796,8 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
         :param foreign: The foreign deals involved.
         :param write: What the bot was about to do, for the audit event.
         :param latch: Latch an ``ENTRY_BLOCK`` quarantine.
-        :return: The operator message.
+        :param cause: The latch's cause key, required with ``latch``.
+        :return: The message.
         """
         foreign_ids = sorted(str(deal.get('deal_id')) for deal in foreign)
         message = (
@@ -759,9 +828,45 @@ class _ForeignExposureMixin(_CapitalComBase, ABC):
                 exchange_order_id=','.join(foreign_ids) or None,
                 payload=context,
             )
-        if latch and self.quarantine_sink is not None:
-            self.quarantine_sink(message, context, kind=QuarantineKind.ENTRY_BLOCK)
+        if latch and cause is not None:
+            self._latch_own_trouble(message, context, cause)
         return message
+
+    def _latch_own_trouble(self, message: str, context: dict, cause: str) -> None:
+        """Latch an ``ENTRY_BLOCK`` for the bot's own trouble, under ``cause``.
+
+        The cause is remembered in this process
+        (:attr:`~_CapitalComBase._own_trouble_causes`)
+        so its producer releases it once the condition is gone
+        (:meth:`_release_own_trouble`); a restart ends every entry block, and
+        a producer whose condition still holds latches it again.
+
+        :param message: The reason, logged and stored with the latch.
+        :param context: The latch's context.
+        :param cause: The cause key, unique to the condition.
+        """
+        self._own_trouble_causes[cause] = message
+        if self.quarantine_sink is not None:
+            self.quarantine_sink(message, context, kind=QuarantineKind.ENTRY_BLOCK, cause=cause)
+
+    def _release_own_trouble(self, cause: str, resolution: str) -> None:
+        """Release the ``ENTRY_BLOCK`` cause ``cause`` once its condition is gone.
+
+        A cause this process did not latch is a no-op (the engine's release is
+        one too), so a producer may call it on every pass that finds the
+        condition gone.
+
+        :param cause: The cause key :meth:`_latch_own_trouble` latched.
+        :param resolution: What resolved it, for the log line.
+        """
+        if self._own_trouble_causes.pop(cause, None) is None:
+            return
+        logger.warning("ENTRY_BLOCK cause %s resolved: %s", cause, resolution)
+        if self.store_ctx is not None:
+            self.store_ctx.log_event('entry_block_cause_resolved',
+                                     payload={'cause': cause, 'resolution': resolution})
+        if self.quarantine_release_sink is not None:
+            self.quarantine_release_sink(cause, resolution)
 
     def _foreign_block_skip(
             self, *, reason: str, intent_key: str, symbol: str, foreign: list[dict],

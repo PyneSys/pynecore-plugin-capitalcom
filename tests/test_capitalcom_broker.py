@@ -496,7 +496,6 @@ def __test_watch_orders_is_async_iterator__():
 # =======================================================================
 
 from pynecore.core.broker.exceptions import (  # noqa: E402
-    BrokerManualInterventionError,
     OrderDispositionUnknownError,
     UnexpectedCancelError,
     InsufficientMarginError,
@@ -1483,7 +1482,7 @@ def _capture_quarantine(broker):
     """
     latched: list = []
 
-    def sink(reason, context, *, kind):
+    def sink(reason, context, *, kind, cause=None):
         latched.append((reason, context, kind))
         _store_test_latch(broker, reason, context, kind)
 
@@ -1502,7 +1501,7 @@ def _store_test_latch(broker, reason, context, kind):
 def _recording_sink(broker, latched):
     """A quarantine sink appending each request's kind to ``latched``, storing its latch."""
 
-    def sink(reason, context, *, kind):
+    def sink(reason, context, *, kind, cause=None):
         latched.append(kind)
         _store_test_latch(broker, reason, context, kind)
 
@@ -2158,7 +2157,7 @@ def __test_execute_close_partial_race_unattributed_opposite_parks__(tmp_path):
         ('confirms/x', 'get'): {'dealStatus': 'ACCEPTED'},
     })
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(kind)
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(kind)
     ctx.upsert_order('coid-entry', symbol='EURUSD', side='buy', qty=2.0,
                      state='confirmed', pine_entry_id='Long',
                      exchange_order_id='orig', extras={'kind': 'position'})
@@ -3709,7 +3708,12 @@ def __test_recover_disposition_unknown_promotes_via_activity_match__(tmp_path):
     store.close()
 
 
-def __test_recover_submitted_row_multi_match_raises_manual_intervention__(tmp_path):
+def __test_recover_submitted_row_multi_match_leaves_row_pending__(tmp_path):
+    """Two deals match one inherited submission: recovery neither guesses nor stops.
+
+    The row stays pending (its entry held, never sent twice) for the in-run
+    lookup to settle, and the process keeps running.
+    """
     broker, store, ctx = _make_broker(tmp_path, responses={
         ('positions', 'get'): {'positions': []},
         ('workingorders', 'get'): {'workingOrders': []},
@@ -3732,8 +3736,13 @@ def __test_recover_submitted_row_multi_match_raises_manual_intervention__(tmp_pa
         "UPDATE orders SET created_ts_ms = ? WHERE client_order_id = ?",
         (ts_ms, 'ambiguous'),
     )
-    with pytest.raises(BrokerManualInterventionError):
-        asyncio.run(broker._recover_in_flight_submissions())
+    asyncio.run(broker._recover_in_flight_submissions())
+    row = ctx.get_order('ambiguous')
+    assert row is not None
+    assert row.closed_ts_ms is None
+    assert row.state == 'submitted'
+    assert row.exchange_order_id is None
+    assert ctx.find_by_ref('deal_id', 'm1') is None and ctx.find_by_ref('deal_id', 'm2') is None
     store.close()
 
 
@@ -4048,7 +4057,7 @@ def __test_stale_natural_close_row_retired_as_closed_without_policy__(tmp_path):
         ),
     })
     latched = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(reason)
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(reason)
     now = __import__('time').time()
     ctx.upsert_order('stuck', symbol='EURUSD', side='buy', qty=0.01,
                      state='closing', pine_entry_id='Long',
@@ -15157,7 +15166,7 @@ def __test_startup_vanish_after_a_lost_leg_close_answer_requests_quarantine__(tm
     restarted.store_ctx = ctx
     latched = []
 
-    def sink(reason, context, *, kind):
+    def sink(reason, context, *, kind, cause=None):
         row_now = ctx.get_order('coid-entry')
         latched.append((kind, row_now is not None and row_now.closed_ts_ms is None))
         _store_test_latch(restarted, reason, context, kind)

@@ -116,6 +116,87 @@ strategies that only open and fully close positions, with the limits below.
 - **Deferred trailing activation** (Pine `trail_price` + `trail_points`)
   is only available on netting accounts; on a hedging account the trailing
   stop arms immediately at the given offset (logged as a warning).
+- **Closing over an entry whose fill never arrived** (PyneCore's
+  `held_execution_close`, `supports_held_execution_close = True`) works on
+  both account modes. When an entry's execution evidence never reaches the
+  bot and the strategy then closes or reverses, PyneCore reads the venue
+  position and asks the plugin to close it; the quarantine ends once the bot
+  has recovered the entry's execution from the venue (see below). The deal
+  the held entry's order opened counts as the bot's own,
+  identified by its `dealId` or `workingOrderId` naming that order. On a
+  netting account the plugin closes whole own deals with
+  `DELETE /positions/{dealId}`, oldest first, never more than the position
+  PyneCore read; a deal that does not fit whole stays open (with a warning)
+  until PyneCore reads the venue again. It never sends an opposite-direction
+  order for this close, so it cannot net someone else's deal or open the
+  other side. On a hedging account the core one-way emulator closes the
+  deals leg by leg. Deals other bots or you opened by hand are never closed.
+
+## Recovering from its own trouble
+
+The bot runs unattended. The entry blocks (`ENTRY_BLOCK` quarantines) below
+end by themselves; a change someone else made to the bot's own orders or
+positions (an external intervention) still waits for you.
+
+- **Reading an order's execution again** (`fetch_order_execution`): when an
+  entry's fill never reached PyneCore, PyneCore asks the plugin, which reads
+  the last 24 hours of `/history/activity` and answers with the deal's
+  opening (the fill the activity poll would have booked, under the same fill
+  id, so it is never booked twice). A resting order the venue ended without
+  a fill is reported as unexecuted. Capital.com reports no commission on
+  these records, so such fills are booked with the commission marked
+  unreported. An order the history does not show is never taken as absent:
+  PyneCore asks again.
+- **A taken-over entry whose deal shows another size than it sent** (after a
+  restart, or a parked submission resolved late): the deal counts as the
+  bot's own position at once. The bot proves the fill from the deal's opening
+  in the activity history, books it, then books the deal's later closes in
+  order; for a deal opened more than 24 hours ago it books the size the venue
+  shows once that size stays unchanged for two minutes. Until then no close
+  or netting order is sent to that deal.
+- **A deal the bot's own resting order opened while its execution was taken
+  as netting someone else's deal** is in no book: the bot closes it itself
+  with `DELETE /positions/{dealId}` and lifts the entry block once the venue
+  no longer lists it. It sends nothing while an external-intervention
+  quarantine stands.
+- **An entry sent just before the process ended, whose outcome it never
+  learned.** Capital.com echoes no client order id, so after the restart the
+  bot traces the entry in the activity history: a deal of the same epic,
+  direction, size and kind, opened within 3 seconds of the send (the venue
+  clock's offset, measured on the bot's own deals, applied). Until the trace
+  settles, only that entry is held: it is never sent a second time, and the
+  bot keeps running. Entries that share a deal are settled together: each
+  deal goes to its own entry in a fixed order (earliest entry, earliest
+  deal; a resting order's listed level must match), as nothing else on the
+  venue tells them apart. An entry left without a deal was not sent, and
+  PyneCore may send it again if the strategy still wants it. More matching
+  deals than entries mean someone else trades the epic on this account, and
+  which deal is the bot's cannot be proven: that is an external intervention,
+  which waits for you. Close the deals that are not the bot's, then resume:
+  the bot takes the earliest open matching deals as its own, one per entry,
+  and leaves the rest as someone else's. An entry older than the 24-hour
+  activity history is judged the same way from what the venue still lists
+  open. An entry whose deal has closed since never reaches the bot's stream
+  again: the bot hands it to PyneCore, which reads the deal's opening from
+  the activity history, books it, and takes the venue's flat position as
+  the close. New entries wait until the book matches the venue; if the
+  history no longer shows the opening, they keep waiting while PyneCore
+  reads it again. A resting entry order that executed while the bot was down,
+  into a position closed since, is handed over the same way at startup, and
+  so is one that executed and closed between two polls of a running bot
+  without the bot seeing its position: the order is not taken for a cancel.
+  The same holds for a market entry the venue accepted without opening it at
+  once, for a submission whose confirm landed on a deal no snapshot lists
+  any more, and for a resting entry whose cancel finds the order already
+  gone: the bot reads the activity history before it calls any of them
+  unfilled, and never sends such an entry a second time. A resting entry
+  that is gone while one open position names it as its order is booked at
+  once from that position's size and level, so its exits protect it right
+  away; the execution's activity read later books nothing again.
+- **Someone else's deal on the bot's epic** is not an intervention: an exit
+  it keeps blocked for longer than the latch bound blocks new entries only
+  until the exit is free again, and the netting of such a deal by the bot's
+  own resting order blocks them until that order's execution is settled.
 
 ## License
 

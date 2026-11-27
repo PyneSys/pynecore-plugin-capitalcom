@@ -210,12 +210,29 @@ EXTRAS_KEY_TAKEN_OVER_AT = 'taken_over_at'
 #: (``execution.py``, ``_hold_take_over_dispatch``: the cancel reports not
 #: landed, the amend returns the row unchanged, nothing is re-sent), the
 #: in-run lookup of an inherited row never reads it as absent (``recovery.py``,
-#: ``_inherited_submission_verdict``), its deal is neither own exposure nor
-#: reported as foreign, so no close, reversal or netting write reaches it
-#: (``foreign.py``, ``_held_take_over_refs``), and the operator is warned once,
-#: when the stamp is written.
+#: ``_inherited_submission_verdict``). Its deal came from the bot's own order:
+#: it is own exposure in every position read (``foreign.py``,
+#: ``_held_take_over_refs``), while no close or leg close is sent to it before
+#: the fill is booked (its close activity could not be attributed to the bot).
+#: The stamp is the bot's own trouble, written with one warning: the poll proves
+#: the fill from the venue's activity history and books it, then the deal's
+#: later closes (``order_history.py``, ``_resolve_unproven_take_overs``).
 #: Value: ``{'deal_id': ..., 'size': ..., 'at': ...}``.
 EXTRAS_KEY_TAKE_OVER_UNPROVEN = 'take_over_unproven'
+
+#: ``orders.extras`` key on an entry row handed to the engine's held-execution
+#: recovery (``order_history.py``, ``_hand_over_to_engine``): the submission
+#: landed on a deal that is closed since, so the stream will never deliver its
+#: execution. The engine took the row over
+#: (:meth:`~pynecore.core.plugin.broker.BrokerPlugin.request_execution_hold`),
+#: books the deal's opening from
+#: :meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin.fetch_order_execution`
+#: and the venue's flat book as an external reduction. While the stamp stands
+#: the deal's absence from the venue is no disappearance (``reconcile.py``,
+#: ``_is_disappearance_exempt``), and once the engine no longer holds the
+#: order the bot tears the row down (``_settle_execution_holds``).
+#: Value: ``{'deal_id': ..., 'at': ...}``.
+EXTRAS_KEY_EXECUTION_HELD = 'execution_held'
 
 #: ``orders.extras`` key on a position row: the own closes sent against the
 #: position, each ``{'full', 'size', 'sent_at', 'done_at', 'matched'}``, plus
@@ -224,11 +241,29 @@ EXTRAS_KEY_TAKE_OVER_UNPROVEN = 'take_over_unproven'
 #: operator's.
 EXTRAS_KEY_OWN_CLOSES = 'own_close_expected'
 
-#: ``orders.extras`` key on a position row: the ``coid`` of the core leg close
-#: whose DELETE the venue accepted, written in the same transaction that marks
-#: the row ``closing``. The close fill booked from the position's disappearance
-#: reports it as its client order id.
+#: ``orders.extras`` key on a position row: the ``coid`` of the own close whose
+#: fill carries the core's client order id (a core leg close, or a
+#: ``held_execution_close``) and whose DELETE the venue accepted, written in the
+#: same transaction that marks the row ``closing``. The close fill booked from
+#: the position's disappearance reports it as its client order id.
 EXTRAS_KEY_CLOSE_LEG_DISPATCHED = 'close_leg_dispatched_coid'
+
+#: ``orders.extras`` key on a position row a ``held_execution_close`` targets:
+#: ``{'coid': ..., 'pine_id': ..., 'size': ...}``, the close's client order id,
+#: its Pine id and the deal's venue size the close was sized against, written
+#: before the DELETE leaves (``execution.py``, ``_execute_held_execution_close``).
+#: A close fill of the row reported under that ``coid`` carries that Pine id
+#: (:func:`_held_close_label`), so the engine books it as the held-execution
+#: close it is, capped at what its book holds.
+EXTRAS_KEY_HELD_CLOSE = 'held_execution_close'
+
+#: ``orders.extras`` key on a position row the plugin seeded for a deal of an
+#: entry the engine holds for its execution evidence that no live journal row
+#: tracks, so a ``held_execution_close`` can close it and the close's activity
+#: routes to a row (``execution.py``, ``_held_close_row``). Its
+#: ``filled_qty`` stays ``0.0``: the row books no exposure of the run, the
+#: engine's book does not hold the execution. Value: epoch seconds of the seed.
+EXTRAS_KEY_HELD_CLOSE_SEEDED = 'held_execution_close_seeded'
 
 #: ``orders.extras`` key on a position row: epoch seconds since the core
 #: native fail-safe manager writes the position's stop. The protection guard
@@ -696,6 +731,59 @@ def _wire_id(value: object) -> str | None:
         parsed = str(value).strip()
         return parsed or None
     return None
+
+
+#: ``ENTRY_BLOCK`` cause prefix of an own exit a foreign deal keeps blocked.
+CAUSE_FOREIGN_EXIT_BLOCK = 'foreign_exit_block:'
+
+#: ``ENTRY_BLOCK`` cause prefix of an own working order that netted a foreign deal.
+CAUSE_NETTED_FOREIGN_DEAL = 'own_working_order_netted_foreign_deal:'
+
+#: ``ENTRY_BLOCK`` cause prefix of a deal a retired own working order opened unbooked.
+CAUSE_RESIDUAL_UNBOOKED = 'own_working_order_residual_unbooked:'
+
+
+def _foreign_exit_cause(intent_key: str) -> str:
+    """The ``ENTRY_BLOCK`` cause of an own exit a foreign deal keeps blocked."""
+    return f"{CAUSE_FOREIGN_EXIT_BLOCK}{intent_key}"
+
+
+def _netted_foreign_deal_cause(client_order_id: str) -> str:
+    """The ``ENTRY_BLOCK`` cause of an own working order that netted a foreign deal."""
+    return f"{CAUSE_NETTED_FOREIGN_DEAL}{client_order_id}"
+
+
+def _residual_deal_cause(deal_id: str) -> str:
+    """The ``ENTRY_BLOCK`` cause of a deal a retired own working order opened unbooked."""
+    return f"{CAUSE_RESIDUAL_UNBOOKED}{deal_id}"
+
+
+def _held_close_label(
+        extras: Mapping, client_order_id: str | None,
+) -> tuple[str, float | None] | None:
+    """The ``held_execution_close`` a close fill of a position row reports, if it is one.
+
+    A close fill is the held-execution close's own only when it is reported
+    under that close's client order id (the own-close record of its DELETE,
+    or the ``closing`` stamp
+    :data:`EXTRAS_KEY_CLOSE_LEG_DISPATCHED`), which the row's
+    :data:`EXTRAS_KEY_HELD_CLOSE` stamp names. Any other close of the row
+    keeps the row's own labels.
+
+    :param extras: The position row's ``extras``.
+    :param client_order_id: The client order id the close fill reports.
+    :return: The close's Pine id and the deal's venue size it was sized
+        against (``None`` when the stamp holds none), or ``None``.
+    """
+    stamp = extras.get(EXTRAS_KEY_HELD_CLOSE)
+    if not isinstance(stamp, Mapping) or not client_order_id:
+        return None
+    coid = _wire_id(stamp.get('coid'))
+    pine_id = _wire_id(stamp.get('pine_id'))
+    if coid is None or pine_id is None or coid != client_order_id:
+        return None
+    size = _wire_float(stamp.get('size'), finite=True)
+    return pine_id, size if size is not None and size > 0.0 else None
 
 
 def _extract_numeric_value(exc: CapitalComError) -> float:

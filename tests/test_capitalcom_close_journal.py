@@ -732,7 +732,7 @@ def __test_execute_close_partial_foreign_deal_before_post_is_refused__(
         tmp_path, broker_type=_InjectSameSideBeforePostBroker,
     )
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(
         (reason, context, kind))
     ctx.upsert_order('coid-entry-a', symbol='EURUSD', side='buy', qty=2.0,
                      state='confirmed', pine_entry_id='A',
@@ -1612,7 +1612,7 @@ def __test_execute_close_partial_race_outside_window_parks__(tmp_path):
     )
 
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(kind)
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(kind)
     with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.execute_close(env))
 
@@ -1982,7 +1982,7 @@ def __test_execute_close_partial_race_confirm_mismatch_parks__(tmp_path):
     )
 
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(kind)
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(kind)
     with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.execute_close(env))
 
@@ -2036,7 +2036,7 @@ def __test_execute_close_partial_race_ttl_without_deal_id_does_not_delete__(tmp_
     )
 
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(kind)
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(kind)
     with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.execute_close(env))
 
@@ -2078,7 +2078,7 @@ def __test_parked_partial_close_beside_an_unattributable_opposite_deal_settles_a
         run_tag='test', bar_ts_ms=1700000000000,
     )
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(kind)
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(kind)
     with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.execute_close(env))
     cmd_coid = env.client_order_id(KIND_CLOSE)

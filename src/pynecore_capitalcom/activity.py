@@ -11,8 +11,9 @@ polling AsyncIterator that fuses three REST endpoints per cadence tick:
 3. ``_missing_pending_tracker`` — drives the core disappearance
    tracker's grace protocol for bot-owned rows that vanish without a
    corresponding cancel event (dual signal + ``on_unexpected_cancel``
-   policy: quarantine by default, :class:`UnexpectedCancelError` under
-   ``halt``).
+   policy: ``stop`` latches the external-intervention quarantine, with
+   :class:`UnexpectedCancelError` as its fail-safe signal when no
+   quarantine sink is wired).
 
 State touched: ``_activity_cursor`` (read/write — fingerprint dedup
 set, watermark, external-activity log dedup), ``_current_poll_id``
@@ -40,7 +41,6 @@ from pynecore.core.broker.models import (
     LegType,
     OrderEvent,
     OrderStatus,
-    QuarantineKind,
 )
 from pynecore.core.broker.store_helpers import (
     CLOSE_LEG_STATE_PENDING,
@@ -91,7 +91,9 @@ from .helpers import (
     _POLL_INTERVAL_S,
     _activity_actor,
     _activity_watermark_floor,
+    _held_close_label,
     _order_type_from_row,
+    _residual_deal_cause,
     _parse_iso_timestamp,
     _wire_float,
 )
@@ -239,8 +241,10 @@ class _ActivityMixin(_CapitalComBase, ABC):
         ``/history/activity`` before ``/positions`` updates.  Snapshot
         reconcile then covers the cases activity alone cannot pin down
         (working → position transitions, missing pending, unannounced fills).
-        The trailing monitor runs last since it depends on the current
-        positions snapshot bid/offer.
+        The trailing monitor follows since it depends on the current
+        positions snapshot bid/offer. The bot's own repairs of its troubles
+        (:mod:`~pynecore_capitalcom.order_history`) run last, against the
+        same snapshot.
         """
         # Bump *before* fetching the snapshots so any defer-stamp written
         # by :meth:`_process_activity` is keyed to the snapshot that
@@ -293,6 +297,12 @@ class _ActivityMixin(_CapitalComBase, ABC):
         async for ev in self._missing_pending_tracker(
                 working_by_deal, positions_by_deal):
             yield ev
+        # The bot's own way out of its troubles: a held take-over's fill
+        # proven from the venue's history, and every ENTRY_BLOCK cause whose
+        # condition the snapshot shows gone (or the bot itself ends).
+        async for ev in self._resolve_unproven_take_overs(positions_by_deal):
+            yield ev
+        await self._settle_own_troubles(positions_by_deal)
 
     def _activity_lookback_s(self, now: float) -> int:
         """``lastPeriod`` covering every activity since the last successful read.
@@ -564,12 +574,15 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 held = row
             if held is not None:
                 # A taken-over entry whose fill the snapshot could not prove
-                # stays held until the operator settles it: none of its
-                # activities is booked. Its execution would book a fill whose
+                # is held until the bot proves the fill from the venue's
+                # history (``order_history.py``): none of its activities is
+                # booked meanwhile. Its execution would book a fill whose
                 # later reduction the snapshot already showed, a close would
                 # reduce a fill never booked, and a cancel would release the
                 # held entry for a second send. Like an unmatched row, the
-                # activity is deferred, not consumed, and audited once.
+                # activity is deferred, not consumed, and audited once; the
+                # proof queues the deal's closes, which this loop then books
+                # in order.
                 deferred_in_batch = True
                 if (self.store_ctx is not None
                         and fingerprint not in cursor.external_logged_fingerprints):
@@ -887,6 +900,19 @@ class _ActivityMixin(_CapitalComBase, ABC):
                 and (row.extras or {}).get('entry_filled_at') is not None
                 and pending_settle_size is None
             )
+            # The engine recovered the entry's execution from the venue's
+            # history itself (``fetch_order_execution``, read in
+            # ``order_history.py``) before this stream delivered it: its
+            # receipt books the entry. The activity still settles the row as
+            # the stream's own copy would (promotion, entry stamp, exposure
+            # cursor), but its fill is not yielded a second time.
+            engine_recovered = (
+                event is not None and not entry_fill_already_recorded
+                and event.event_type == 'filled'
+                and event.leg_type == LegType.ENTRY
+                and pending_settle_size is None
+                and self._engine_booked_entry_qty(row) > 0.0
+            )
             # An entry fill no source prices (activity, snapshot, confirm)
             # is deferred like an unpriced close: the book drops a fill at a
             # zero price, and consuming the activity would stamp the entry
@@ -901,6 +927,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
                     and event.leg_type == LegType.ENTRY
                     and _wire_price(event.fill_price) <= 0.0
                     and not entry_fill_already_recorded
+                    and not engine_recovered
                     and pending_settle_size is None):
                 deferred_in_batch = True
                 if enqueue_entry(dict(row.extras or {}), date_utc):
@@ -1096,6 +1123,16 @@ class _ActivityMixin(_CapitalComBase, ABC):
                                     'symbol': row.symbol,
                                     'side': row.side,
                                 },
+                            )
+                    elif engine_recovered:
+                        suppress_fill = True
+                        if self.store_ctx is not None:
+                            self.store_ctx.log_event(
+                                'entry_fill_recovered_by_engine',
+                                client_order_id=row.client_order_id,
+                                exchange_order_id=deal_id,
+                                payload={'fingerprint': fingerprint, 'dateUTC': date_utc,
+                                         'deal_id': deal_id},
                             )
                     elif close_fill_already_recorded:
                         suppress_fill = True
@@ -1578,9 +1615,16 @@ class _ActivityMixin(_CapitalComBase, ABC):
         # ``USER`` like a manual close) reports the coid the core gave it, so
         # the core tells a hedging account's netting closes from the
         # strategy's closes; any other close reports the position row's own.
+        # A ``held_execution_close``'s close fill (its own-close record keeps
+        # the close's coid the same way) carries that close's Pine id, so the
+        # engine books it as the held-execution close, capped at its book.
         client_order_id = row.client_order_id
+        pine_id = row.pine_entry_id
         if leg_type is LegType.CLOSE and event_type == 'filled' and actor == ACTOR_CLIENT:
             client_order_id = self._own_close_leg_coid(row, activity) or client_order_id
+            held_close = _held_close_label(row.extras or {}, client_order_id)
+            if held_close is not None:
+                pine_id = held_close[0]
 
         exch_order = ExchangeOrder(
             id=row.exchange_order_id or '',
@@ -1610,7 +1654,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
             fill_qty=size if event_type == 'filled' else None,
             journal_fill_qty=size if event_type == 'filled' else None,
             timestamp=now_ts,
-            pine_id=row.pine_entry_id,
+            pine_id=pine_id,
             from_entry=row.from_entry,
             leg_type=leg_type,
             # Capital.com exposes no stable activity/execution id, so the
@@ -2385,9 +2429,14 @@ class _ActivityMixin(_CapitalComBase, ABC):
         (:meth:`_promotion_conflict`). The venue holds exposure the bot's own
         order opened, but the order's execution was retired unbooked and the
         engine took the entry back as rejected: the deal is in no book and
-        unprotected, and the bot never closes, amends or brackets it. ERROR,
-        an ``own_working_order_residual_unbooked`` audit event and an
-        ``ENTRY_BLOCK`` quarantine naming the deal, once per deal for the run.
+        unprotected, and nobody asked for it. ERROR, an
+        ``own_working_order_residual_unbooked`` audit event and an
+        ``ENTRY_BLOCK`` quarantine naming the deal under the cause
+        :func:`~pynecore_capitalcom.helpers._residual_deal_cause`, once per
+        deal for the run. The bot closes the deal itself (the safe end of
+        exposure nobody booked) and releases the cause once the venue no
+        longer lists it
+        (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._close_unbooked_residuals`).
 
         :param wo_id: The ``dealId`` of the order the deal back-links.
         :param deal_id: The deal.
@@ -2419,8 +2468,8 @@ class _ActivityMixin(_CapitalComBase, ABC):
             f"own working order {wo_id} ({symbol}) netted foreign deal "
             f"{retired.get('netted_deal_id')} and also opened deal {deal_id} "
             f"({direction} {size}): its execution was retired unbooked, so the deal is "
-            f"in no book and unprotected — the bot never closes, amends or brackets it; "
-            f"close it on the venue, new entries are blocked"
+            f"in no book and unprotected; nobody asked for this exposure, so the bot "
+            f"closes the deal itself, and new entries are blocked until it is gone"
         )
         logger.error("%s", message)
         context = {'working_order': wo_id, 'deal_id': deal_id, 'symbol': symbol,
@@ -2432,8 +2481,7 @@ class _ActivityMixin(_CapitalComBase, ABC):
             exchange_order_id=deal_id,
             payload=context,
         )
-        if self.quarantine_sink is not None:
-            self.quarantine_sink(message, context, kind=QuarantineKind.ENTRY_BLOCK)
+        self._latch_own_trouble(message, context, _residual_deal_cause(deal_id))
         return True
 
     def _promote_working_row_to_position(

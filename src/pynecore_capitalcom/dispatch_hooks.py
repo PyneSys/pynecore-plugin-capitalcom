@@ -59,6 +59,7 @@ from ._base import CapitalComHookCollaborator
 from .delivery import entry_executed
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
+    EXTRAS_KEY_CLOSE_LEG_DISPATCHED,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
     EXTRAS_KEY_TAKEN_OVER_AT,
     EXTRAS_KEY_TRAIL_COMMAND,
@@ -331,21 +332,26 @@ def _parked_on_journal_failure(coid: str, what: str) -> Iterator[None]:
         ) from failed
 
 
-def _unbooked_take_over(row: 'OrderRow') -> bool:
-    """Whether ``row`` is a taken-over working entry whose fill is not booked.
+def _unbooked_working_entry(row: 'OrderRow') -> bool:
+    """Whether ``row`` is a resting entry order whose execution no read has shown.
 
-    The take-over (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKEN_OVER_AT`)
-    learned the order's id after the order may already have executed; such
-    an execution is booked only by the snapshot loop, once its position
-    surfaces, and only onto this row.
+    A ``DELETE`` answering 404 says the order is gone, not how: an executed
+    order answers it too. A taken-over order
+    (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKEN_OVER_AT`) may have
+    executed before its id was known, and only the snapshot loop books that,
+    onto this row; an own order's execution activity may not be read yet, and
+    the activity bridge finds the order's row only while it is live. Either
+    way closing the row on the 404 alone would lose the execution, and its
+    entry would go out again.
 
     :param row: The entry row.
-    :return: ``True`` for a taken-over working row without ``entry_filled_at``.
+    :return: ``True`` for a working row without an execution read
+        (:func:`~pynecore_capitalcom.delivery.entry_executed`).
     """
     extras = row.extras or {}
-    return (extras.get(EXTRAS_KEY_TAKEN_OVER_AT) is not None
-            and extras.get('kind') == ENTRY_KIND_WORKING
-            and extras.get('entry_filled_at') is None)
+    return (extras.get('kind') == ENTRY_KIND_WORKING
+            and extras.get('entry_filled_at') is None
+            and not entry_executed(extras))
 
 
 def _surviving_sister_levels(
@@ -431,19 +437,22 @@ class _CapitalComCancelHooks:
       finds it never landed rejects it.
     * **Held take-over** (stamped
       :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`) →
-      silent skip, the row stays live for the operator. A working order
+      silent skip, the row stays live until the bot has proven its fill from
+      the venue's history (:mod:`~pynecore_capitalcom.order_history`). A working order
       the poll stamps while its DELETE is in flight is held the same way
       when the answer comes back: the row is read again, under the store's
       write lock, before it is closed, and a held row is left live and
       listed in :attr:`~_CapitalComCancelHooks.held_coids`. A row whose
       fill the poll booked while the DELETE was in flight is a filled
       position by then: ``cancel_noop``, never closed.
-    * **Unbooked take-over** whose DELETE answers 404 → the order may have
-      executed before its id was known, and only the snapshot loop books
-      that fill, onto this row. The row is closed only when the venue's
-      activity shows the order ended without a fill; otherwise it stays
-      live, a ``cancel_unsettled_take_over`` event is logged, and it is
-      listed in :attr:`~_CapitalComCancelHooks.unsettled_coids`.
+    * **Resting entry with no execution read** whose DELETE answers 404 →
+      the order may have executed (:func:`_unbooked_working_entry`). The row
+      is closed only when the venue's activity shows the order ended without
+      a fill; otherwise it stays live, a ``cancel_unsettled_execution`` event
+      is logged, and it is listed in
+      :attr:`~_CapitalComCancelHooks.unsettled_coids`. The poll books an
+      execution the activity shows, and the disappearance verdict reads the
+      history before it calls the order cancelled.
 
     The hook closes each target row it actively swept (DELETE landed,
     PUT-null landed, or broker reported already-gone). Skipped rows
@@ -461,8 +470,9 @@ class _CapitalComCancelHooks:
         self._plugin = plugin
         #: Targets found held after their DELETE: the cancel did not settle them.
         self.held_coids: list[str] = []
-        #: Unbooked take-overs whose DELETE answered 404 without the venue's
-        #: word that the order ended unfilled: left live, the cancel unsettled.
+        #: Resting entries with no execution read whose DELETE answered 404
+        #: without the venue's word that the order ended unfilled: left live,
+        #: the cancel unsettled.
         self.unsettled_coids: list[str] = []
 
     async def submit_cancel(
@@ -502,7 +512,7 @@ class _CapitalComCancelHooks:
                 # order executed, so the DELETE would answer 404 and the
                 # already-gone path would close the row and release the entry
                 # for a second send. ``execute_cancel`` keeps such rows out of
-                # the sweep; the row stays for the operator.
+                # the sweep; the row stays until the bot proves its fill.
                 continue
             if (row.state in PENDING_DISPATCH_STATES
                     and not row.exchange_order_id
@@ -749,16 +759,19 @@ class _CapitalComCancelHooks:
                 # The venue still had the order resting when it took the
                 # DELETE: evidence the close attribution may need later.
                 self._plugin.stamp_own_cancel_accepted(row.client_order_id, sent_at)
-            # A 404 is also what an executed order answers. A taken-over
-            # order may have executed before its id was known: no activity
-            # books that fill, only the snapshot loop does, onto this row,
-            # once the position surfaces. Only the venue's word that the
-            # order ended without a fill retires such a row.
+            # A 404 is also what an executed order answers, and a row closed
+            # now loses that execution (see ``_unbooked_working_entry``).
+            # Only the venue's word that the order ended without a fill
+            # retires such a row.
             gone_outcome: CancelDispositionOutcome | None = None
-            if target_already_gone and _unbooked_take_over(row):
-                gone_outcome = await self._plugin.classify_cancel_via_activity(
-                    str(row.exchange_order_id),
-                )
+            if target_already_gone and _unbooked_working_entry(row):
+                # An earlier DELETE of this order the venue accepted while it
+                # was still resting cancelled it: the 404 now is that cancel.
+                gone_outcome = (
+                    CancelDispositionOutcome.CANCEL_CONFIRMED
+                    if self._plugin.own_cancel_accepted(row.client_order_id)
+                    else await self._plugin.classify_cancel_via_activity(
+                        str(row.exchange_order_id)))
             if store_ctx is not None:
                 # The row read before the request is stale. The poll may have
                 # stamped it as a held take-over while the DELETE was in
@@ -776,7 +789,7 @@ class _CapitalComCancelHooks:
                               and (current_extras.get('kind') == ENTRY_KIND_POSITION
                                    or entry_executed(current_extras)))
                     unsettled = (not held and not filled and current is not None
-                                 and target_already_gone and _unbooked_take_over(current)
+                                 and target_already_gone and _unbooked_working_entry(current)
                                  and gone_outcome not in (
                                      CancelDispositionOutcome.CANCEL_CONFIRMED,
                                      CancelDispositionOutcome.TOO_LATE_TO_CANCEL))
@@ -793,7 +806,7 @@ class _CapitalComCancelHooks:
                         )
                     elif unsettled:
                         store_ctx.log_event(
-                            'cancel_unsettled_take_over',
+                            'cancel_unsettled_execution',
                             client_order_id=row.client_order_id,
                             exchange_order_id=row.exchange_order_id,
                             intent_key=intent.intent_key,
@@ -903,6 +916,13 @@ class _CapitalComCloseHooks:
     based on whether the intent's quantity matches the live position
     total, and passes the matching ``kind`` to
     :meth:`pynecore.core.broker.journal.DispatchJournal.run_close`.
+
+    A ``held_execution_close`` is a full close whose fills carry the close's
+    own client order id: ``held_sizes`` names the venue size of each target's
+    deal (by the target row's client order id), the own-close record of each
+    DELETE keeps the close's ``coid`` with that size, the ``closing`` state
+    stamps it (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_CLOSE_LEG_DISPATCHED`),
+    and the close reports the sum of the sizes as its quantity.
     """
 
     def __init__(
@@ -912,11 +932,13 @@ class _CapitalComCloseHooks:
             rules: '_InstrumentRules',
             target_deal_ids: frozenset[str],
             target_coid: str | None = None,
+            held_sizes: dict[str, float] | None = None,
     ) -> None:
         self._plugin = plugin
         self._rules = rules
         self._target_deal_ids = target_deal_ids
         self._target_coid = target_coid
+        self._held_sizes = held_sizes
 
     async def submit_full_close(
             self, *, coid: str, intent: CloseIntent,
@@ -940,8 +962,8 @@ class _CapitalComCloseHooks:
         persist-first close command retains every target ``dealId`` and restart
         recovery resolves the ambiguity against the authoritative positions
         snapshot. Treating the same condition as manual intervention would
-        permanently halt the engine even when the DELETE landed and the venue
-        is already flat.
+        quarantine the bot even when the DELETE landed and the venue is
+        already flat.
 
         A not-found DELETE counts the target as swept only when the deal is
         gone (:meth:`~pynecore_capitalcom.identity._DealIdentityMixin._resolve_own_deal`).
@@ -966,8 +988,11 @@ class _CapitalComCloseHooks:
         # keeps listing these, so the parked command waits on them.
         not_landed: list[str] = []
         not_landed_cause: BrokerError | None = None
+        held_sizes = self._held_sizes
+        label_coid = coid if held_sizes is not None else None
         for row in targets:
             unjournaled_target = False
+            leg_size = held_sizes.get(row.client_order_id) if held_sizes is not None else None
             try:
                 close_ref: str | None = None
                 already_gone = False
@@ -979,7 +1004,8 @@ class _CapitalComCloseHooks:
                 # yet. One more DELETE goes to the deal the row holds.
                 for attempt in range(2):
                     try:
-                        with self._plugin.own_close([deal_id], full=True, size=None):
+                        with self._plugin.own_close([deal_id], full=True, size=None,
+                                                    coid=label_coid, leg_size=leg_size):
                             resp = await self._plugin.call_api(
                                 f'positions/{deal_id}', method='delete',
                             )
@@ -1073,6 +1099,7 @@ class _CapitalComCloseHooks:
                         self._record_target_closing(
                             store_ctx, row=row, deal_id=deal_id, close_ref=close_ref,
                             intent=intent, already_gone=already_gone,
+                            dispatched_coid=label_coid,
                         )
                     except sqlite3.Error as failed:
                         # The DELETE landed (or the deal was already gone): the
@@ -1094,6 +1121,7 @@ class _CapitalComCloseHooks:
                             self._record_target_closing(
                                 store_ctx, row=row, deal_id=deal_id, close_ref=close_ref,
                                 intent=intent, already_gone=already_gone,
+                                dispatched_coid=label_coid,
                             )
                         except sqlite3.Error as again:
                             logger.error(
@@ -1137,26 +1165,33 @@ class _CapitalComCloseHooks:
             raise OrderDispositionUnknownError(
                 message, client_order_id=coid, cause=cause,
             ) from cause
+        filled_qty = intent.qty
+        if held_sizes is not None:
+            filled_qty = round(sum(held_sizes.values()), 12)
         return CloseOutcome(
             mode='full',
             applied_targets=applied_targets,
             deal_reference=None,
             exchange_id=applied_targets[0] if applied_targets else '',
-            filled_qty=intent.qty,
+            filled_qty=filled_qty,
         )
 
     @staticmethod
     def _record_target_closing(
             store_ctx: 'RunContext', *, row: 'OrderRow', deal_id: str,
             close_ref: str | None, intent: CloseIntent, already_gone: bool,
+            dispatched_coid: str | None = None,
     ) -> None:
         """Move one full-close target to ``closing``, in one write.
 
         The state, the DELETE's ``close_deal_reference`` (what the snapshot
-        prices the close fill from) and the ``close_dispatched`` audit commit
-        together, so a failed write never leaves a ``closing`` row without
-        its reference or audit. A target whose DELETE found the deal already
-        gone gets its ``close_already_gone`` audit in the same write.
+        prices the close fill from), the ``coid`` the close's fill reports
+        (``dispatched_coid``, a ``held_execution_close``'s,
+        :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_CLOSE_LEG_DISPATCHED`)
+        and the ``close_dispatched`` audit commit together, so a failed write
+        never leaves a ``closing`` row without its reference or audit. A
+        target whose DELETE found the deal already gone gets its
+        ``close_already_gone`` audit in the same write.
         """
         with store_ctx.transaction():
             if already_gone:
@@ -1167,10 +1202,13 @@ class _CapitalComCloseHooks:
                     intent_key=intent.intent_key,
                 )
             store_ctx.set_order_state(row.client_order_id, 'closing')
-            if close_ref is not None:
+            if close_ref is not None or dispatched_coid is not None:
                 refreshed = store_ctx.get_order(row.client_order_id)
                 extras = dict((refreshed or row).extras or {})
-                extras['close_deal_reference'] = close_ref
+                if close_ref is not None:
+                    extras['close_deal_reference'] = close_ref
+                if dispatched_coid is not None:
+                    extras[EXTRAS_KEY_CLOSE_LEG_DISPATCHED] = dispatched_coid
                 store_ctx.upsert_order(row.client_order_id, extras=extras)
             store_ctx.log_event(
                 'close_dispatched',

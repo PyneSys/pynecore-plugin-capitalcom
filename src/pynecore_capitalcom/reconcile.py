@@ -16,8 +16,9 @@ into:
   unexpected cancels (dual signal) and the configured
   ``on_unexpected_cancel`` policy is applied — ``stop`` latches the
   engine's external-intervention quarantine through ``quarantine_sink``;
-  ``halt`` (or an unwired sink) raises
-  :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`.
+  an unwired sink raises the fail-safe
+  :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError`, which the
+  engine latches the same quarantine on.
 
 State touched: BrokerStore through ``self.store_ctx``,
 ``_current_poll_id`` (read), ``_disappearance`` (lazy build).
@@ -84,6 +85,8 @@ from .exceptions import CapitalComError, OrderNotFoundError
 from .helpers import (
     EXTRAS_KEY_CANCEL_REQUESTED,
     EXTRAS_KEY_CLOSE_LEG_DISPATCHED,
+    EXTRAS_KEY_EXECUTION_HELD,
+    EXTRAS_KEY_HELD_CLOSE_SEEDED,
     EXTRAS_KEY_NETTED_RESIDUAL_PENDING,
     EXTRAS_KEY_OWN_CLOSES,
     EXTRAS_KEY_TAKE_OVER_UNPROVEN,
@@ -94,6 +97,7 @@ from .helpers import (
     _POLL_INTERVAL_S,
     _UNANNOUNCED_FILL_GRACE_S,
     _extract_reject_reason,
+    _held_close_label,
     _mirror_amended_level,
     _modify_entry_snapshot_verdict,
     _modify_exit_dispatch,
@@ -397,6 +401,11 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             # ``UnexpectedCancelError``.
             if (row.extras or {}).get('natural_close_at') is not None:
                 continue
+            if (row.extras or {}).get(EXTRAS_KEY_EXECUTION_HELD) is not None:
+                # Handed to the engine's held-execution recovery: its deal is
+                # closed, and the own-trouble pass settles the row
+                # (``order_history.py``, ``_settle_execution_holds``).
+                continue
             pos = positions_by_deal.get(did)
             work = working_by_deal.get(did)
 
@@ -431,18 +440,25 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 row_kind = (row.extras or {}).get('kind')
                 if (row_kind == ENTRY_KIND_WORKING
                         and (row.extras or {}).get('entry_filled_at') is None
-                        and (row.extras or {}).get(EXTRAS_KEY_TAKEN_OVER_AT) is not None):
-                    # A taken-over working order gone from ``/workingorders``
-                    # may have executed before its id was known, so no
-                    # activity books its fill: the position that back-links
-                    # it is the only evidence. Until that position surfaces
-                    # the missing-pending grace keeps re-evaluating. A row
-                    # whose position did not prove the fill stays held.
+                        and ((row.extras or {}).get(EXTRAS_KEY_TAKEN_OVER_AT) is not None
+                             or not entry_executed(row.extras or {}))):
+                    # A working order gone from ``/workingorders`` whose
+                    # execution no activity booked: a taken-over order that
+                    # executed before its id was known, or an own order whose
+                    # execution's activity the poll has not read. The one live
+                    # position that back-links it is the venue's exposure from
+                    # it, unbooked and unprotected while it waits: it is booked
+                    # now, from the snapshot's size and level, and a late
+                    # activity of the same execution is a replay. Until that
+                    # position surfaces the missing-pending grace keeps
+                    # re-evaluating. A row whose position did not prove the
+                    # fill stays held, and its fill is proven from the
+                    # history's opening.
                     if (row.extras or {}).get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
                         continue
-                    promoted = self._find_promoted_deal_id(row, [], positions_by_deal)
+                    promoted = self._sole_backlinked_deal(row, positions_by_deal)
                     if promoted:
-                        booked = self._book_taken_over_execution(
+                        booked = self._book_backlinked_execution(
                             row, promoted, positions_by_deal, now_ts)
                         if booked is not None:
                             yield booked
@@ -517,9 +533,13 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     if not delivery_pending(row.extras or {}):
                         self._tear_down_natural_close(row)
                     continue
+                # A row seeded for a held entry's deal books no journal
+                # exposure; its close is the deal's venue size
+                # (:meth:`_vanished_closing_row_fill`).
                 if (row.state == 'closing'
                         and row_kind == ENTRY_KIND_POSITION
-                        and row.filled_qty > 0.0
+                        and (row.filled_qty > 0.0
+                             or (row.extras or {}).get(EXTRAS_KEY_HELD_CLOSE_SEEDED) is not None)
                         and entry_pending_since(row.extras or {}) is None
                         and not delivery_pending(row.extras or {})):
                     # Our own DELETE was accepted (``close_dispatched``)
@@ -1171,10 +1191,13 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         row is left to the disappearance tracker rather than booked at
         a price the engine would drop.
 
-        The fill of a core leg close carries the ``coid`` of the close whose
-        DELETE the venue accepted
+        The fill of a core leg close or a ``held_execution_close`` carries the
+        ``coid`` of the close whose DELETE the venue accepted
         (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_CLOSE_LEG_DISPATCHED`),
-        as the activity path's does; any other close reports the row's own.
+        as the activity path's does; any other close reports the row's own. A
+        held-execution close's fill also carries its Pine id and the deal's
+        venue size the close was sized against
+        (:func:`~pynecore_capitalcom.helpers._held_close_label`).
         """
         assert self.store_ctx is not None
         extras = row.extras or {}
@@ -1213,7 +1236,25 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 payload={'close_deal_reference': close_ref},
             )
             return None
+        # A core leg close or a ``held_execution_close`` reports the coid the
+        # core gave it, stamped with the ``closing`` state of the accepted
+        # DELETE. A held-execution close also carries its Pine id and closes
+        # the deal's venue size it was sized against: the row's journal
+        # quantity need not hold it. A row seeded for a held entry's deal
+        # books none; its close is the venue size it was seeded with.
+        fresh = self.store_ctx.get_order(row.client_order_id) or row
+        fresh_extras = fresh.extras or {}
+        client_order_id = str(
+            fresh_extras.get(EXTRAS_KEY_CLOSE_LEG_DISPATCHED) or row.client_order_id
+        )
+        pine_id = row.pine_entry_id
         fill_qty = row.filled_qty
+        if fresh_extras.get(EXTRAS_KEY_HELD_CLOSE_SEEDED) is not None:
+            fill_qty = row.qty
+        held_close = _held_close_label(fresh_extras, client_order_id)
+        if held_close is not None:
+            pine_id = held_close[0]
+            fill_qty = held_close[1] if held_close[1] is not None else fill_qty
         self.store_ctx.log_event(
             'closing_row_vanished_close_yielded',
             client_order_id=row.client_order_id,
@@ -1223,12 +1264,6 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                      'fill_price': price, 'fill_qty': fill_qty},
         )
         close_side = 'sell' if row.side == 'buy' else 'buy'
-        # A core leg close reports the coid the core gave it, stamped with the
-        # ``closing`` state of the accepted DELETE.
-        fresh = self.store_ctx.get_order(row.client_order_id) or row
-        client_order_id = str(
-            (fresh.extras or {}).get(EXTRAS_KEY_CLOSE_LEG_DISPATCHED) or row.client_order_id
-        )
         return OrderEvent(
             order=ExchangeOrder(
                 id=deal_id, symbol=row.symbol, side=close_side,
@@ -1245,7 +1280,7 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             fill_qty=fill_qty,
             journal_fill_qty=fill_qty,
             timestamp=now_ts,
-            pine_id=row.pine_entry_id,
+            pine_id=pine_id,
             from_entry=row.from_entry,
             leg_type=LegType.CLOSE,
             fill_id=close_ref or f'{deal_id}:close',
@@ -1377,13 +1412,14 @@ class _ReconcileMixin(_CapitalComBase, ABC):
           id;
         * inconclusive: the row stays, and so does the hold.
 
-        A trace another pending submission matches as well lands neither of
-        them (:meth:`~pynecore_capitalcom.recovery._CapitalComResumeHooks._trace_contested`):
-        which one opened the deal is unknown, and a wrong guess would book the
-        deal to a submission that opened nothing and send the one that did
-        open it again. Both stay held for the operator. A deal that is
-        already owned by another row when its take-over comes is skipped, so
-        one deal is never taken over by two rows.
+        A trace another pending submission matches as well is settled with
+        that submission: each deal goes to its own compatible submission in a
+        fixed order (the venue shows nothing else that tells them apart), and
+        more deals than the submissions explain are reported as someone
+        else's trading on the epic, an external intervention
+        (:meth:`~pynecore_capitalcom.recovery._RecoveryMixin._inherited_submission_verdict`).
+        A deal that is already owned by another row when its take-over comes
+        is skipped, so one deal is never taken over by two rows.
 
         :param positions_by_deal: The poll's ``/positions`` snapshot by deal id.
         """
@@ -1431,15 +1467,18 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         * a MARKET entry whose deal is in the ``/positions`` snapshot is
           confirmed filled, gets an ``'attached'`` resolution, and its fill
           is emitted here, because no other path would deliver it; a deal
-          not in the snapshot leaves the row pending (fill-then-close within
-          the window is indistinguishable from a confirms/positions race);
+          not in the snapshot is handed to the engine's held-execution
+          recovery once the history shows it closed
+          (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._hand_over_if_closed`),
+          and leaves the row pending until then (a snapshot may lag the
+          deal's opening);
         * a working order cancelled by Pine while pending is DELETEd first;
         * any other working order is confirmed with its deal id, which
           ``get_open_orders`` maps back, so the engine promotes its park;
           it is stamped :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKEN_OVER_AT`,
           and one that already executed into a position the snapshot
           back-links is booked onto that position here
-          (:meth:`_book_taken_over_execution`), or by the snapshot loop of
+          (:meth:`_book_backlinked_execution`), or by the snapshot loop of
           the poll whose snapshot first shows the position.
 
         Either fill is booked only when the snapshot proves it
@@ -1456,10 +1495,20 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         coid = row.client_order_id
         extras = row.extras or {}
         if extras.get('kind') == ENTRY_KIND_POSITION:
+            if extras.get(EXTRAS_KEY_EXECUTION_HELD) is not None:
+                # Handed to the engine's held-execution recovery already; a
+                # refused request is asked again by the own-trouble pass
+                # (``order_history.py``, ``_settle_execution_holds``).
+                return
             pos_data = (positions_by_deal.get(deal_id) or {}) \
                 .get('position') or {}
+            if not pos_data:
+                # The deal may be closed since: the history decides, and a
+                # closed one goes to the engine's held-execution recovery.
+                await self._hand_over_if_closed(row, deal_id, positions_by_deal)
+                return
             fill_level = _wire_float(pos_data.get('level'), finite=True)
-            if not pos_data or fill_level is None or fill_level <= 0.0:
+            if fill_level is None or fill_level <= 0.0:
                 # An unpriced fill would be dropped by the book while the
                 # row read as booked: the row stays pending for the next
                 # snapshot.
@@ -1640,17 +1689,44 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                     if confirmed is not None else None)
         if confirmed is None or promoted is None:
             return
-        event = self._book_taken_over_execution(confirmed, promoted, positions_by_deal, now_ts)
+        event = self._book_backlinked_execution(confirmed, promoted, positions_by_deal, now_ts)
         if event is not None:
             yield event
 
-    def _book_taken_over_execution(
+    def _sole_backlinked_deal(
+            self, row: 'OrderRow', positions_by_deal: dict[str, dict],
+    ) -> str | None:
+        """The one live position that back-links ``row``'s working order, if exactly one does.
+
+        The candidates are the snapshot's positions whose ``workingOrderId``
+        names the order and that
+        :meth:`~pynecore_capitalcom.activity._ActivityMixin._find_promoted_deal_id`
+        accepts: no other row owns them, and the order can have opened them
+        (:meth:`~pynecore_capitalcom.foreign._ForeignExposureMixin._promotion_conflict`).
+        Two candidates prove nothing about which one is the order's.
+
+        :param row: The working entry row, still on its order id.
+        :param positions_by_deal: The poll's ``/positions`` snapshot by deal id.
+        :return: The deal id, or ``None``.
+        """
+        old_id = row.exchange_order_id
+        promoted = self._find_promoted_deal_id(row, [], positions_by_deal)
+        if not old_id or promoted is None:
+            return None
+        others = {deal_id: raw for deal_id, raw in positions_by_deal.items()
+                  if deal_id != promoted}
+        if self._find_promoted_deal_id(row, [], others) is not None:
+            return None
+        return promoted
+
+    def _book_backlinked_execution(
             self, row: 'OrderRow', promoted: str, positions_by_deal: dict[str, dict],
             now_ts: float,
     ) -> OrderEvent | None:
-        """Book the execution of a taken-over working order, once.
+        """Book the execution of a working order no activity booked, once.
 
-        The working order ``row`` (stamped :data:`EXTRAS_KEY_TAKEN_OVER_AT`)
+        The working order ``row`` (taken over, stamped
+        :data:`EXTRAS_KEY_TAKEN_OVER_AT`, or own, with no execution read)
         executed into the position ``promoted``, which back-links it. When
         the snapshot proves the fill (:meth:`_take_over_fill_proven`), the
         row moves onto the position and its fill is journalled and returned:
@@ -1722,10 +1798,12 @@ class _ReconcileMixin(_CapitalComBase, ABC):
     def _take_over_fill_proven(
             self, row: 'OrderRow', deal_id: str, pos_data: dict, now_ts: float,
     ) -> float | None:
-        """The fill a taken-over entry's snapshot position proves, or ``None``.
+        """The fill a taken-over or unbooked entry's snapshot position proves, or ``None``.
 
         A taken-over entry is booked from the ``/positions`` snapshot alone:
-        its execution's activity was read while no row owned the deal. The
+        its execution's activity was read while no row owned the deal. So is
+        an own working order whose execution's activity the poll has not read
+        while the position it opened is live (:meth:`_book_backlinked_execution`). The
         snapshot proves the fill only when the position holds exactly the
         submitted quantity. A smaller position was reduced before the
         snapshot, and nothing on the venue tells which of the close
@@ -1734,14 +1812,16 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         larger or sizeless position is not evidence of this submission's
         fill either.
 
-        An unproven fill is not booked: the row stays as it is, so the engine
-        keeps the entry held (a pending row by the inherited-dispatch hold, a
-        taken-over working row by its park), and the row is stamped
+        An unproven fill is not booked here: the row stays as it is, so the
+        engine keeps the entry held (a pending row by the inherited-dispatch
+        hold, a taken-over working row by its park), and the row is stamped
         :data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_TAKE_OVER_UNPROVEN`
-        with an operator warning, once. A stamped row stays held for good: a
-        later snapshot at the submitted size does not prove the fill either
-        (the position may have been reduced and topped up again in between),
-        and only the operator settles it.
+        with one warning. A later snapshot at the submitted size does not
+        prove the fill either (the position may have been reduced and topped
+        up again in between): the bot proves it from the deal's opening
+        activity in the venue's history instead, and books it with the deal's
+        later closes in order
+        (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._resolve_unproven_take_overs`).
 
         :param row: The taken-over entry row.
         :param deal_id: The position's deal id.
@@ -1769,10 +1849,11 @@ class _ReconcileMixin(_CapitalComBase, ABC):
                 payload={'submitted': row.qty, 'position_size': size},
             )
         broker_warning(
-            "entry submission %s (intent %s) landed as deal %s, but the venue shows "
-            "the position at size %s instead of the submitted %s: what was filled "
-            "and what was closed since cannot be proven, so the fill is not booked "
-            "and the entry stays held — check the account and settle the row by hand",
+            "entry %s (intent %s) executed into deal %s, but the venue shows the "
+            "position at size %s instead of the submitted %s: what was filled and "
+            "what was closed since cannot be proven from the snapshot, so the entry "
+            "stays held while the bot proves the fill from the venue's history and "
+            "books it with the deal's later closes",
             coid, row.intent_key, deal_id, size, row.qty,
         )
         return None
@@ -2158,9 +2239,14 @@ class _ReconcileMixin(_CapitalComBase, ABC):
           executed into a position whose fill the snapshot could not prove:
           its absence from ``/workingorders`` is that execution, and a cancel
           verdict would release the held entry for a second send.
+        * A row handed to the engine's held-execution recovery
+          (:data:`~pynecore_capitalcom.helpers.EXTRAS_KEY_EXECUTION_HELD`): its
+          deal is closed, and the engine books its execution; the bot tears
+          the row down once the engine no longer holds the order.
         """
         extras = row.extras or {}
-        if extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None:
+        if (extras.get(EXTRAS_KEY_TAKE_OVER_UNPROVEN) is not None
+                or extras.get(EXTRAS_KEY_EXECUTION_HELD) is not None):
             return True
         natural_close_at = extras.get('natural_close_at')
         if isinstance(natural_close_at, (int, float)):
@@ -2194,7 +2280,13 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         same way: the venue can execute it through its working-order machinery
         under a fresh ``dealId`` (measured 2026-08-28, cycle 84), and the
         ``cancelled`` event's ``filled_qty`` of ``0`` proves nothing executed
-        only once that execution's activity would have been read.
+        only once that execution's activity would have been read. Before
+        either cancel the history is read: an order that executed into a deal
+        no poll listed, with nothing of it booked by the stream, is never
+        cancelled, and one whose deal is gone is handed to the engine's
+        held-execution recovery
+        (:meth:`~pynecore_capitalcom.order_history._OrderHistoryMixin._hand_over_if_executed`);
+        a failed read keeps the row for a later verdict.
 
         A live POSITION row gets a direct authoritative probe before any
         terminal verdict. The bulk ``/positions`` snapshot can omit a
@@ -2256,7 +2348,21 @@ class _ReconcileMixin(_CapitalComBase, ABC):
             # row down. A terminal verdict now would retire the row with the
             # queued fills unbooked.
             return MissingConfirmation(MissingResolution.INCONCLUSIVE)
-        return self._missing_terminal_verdict(row, filled_position)
+        verdict = self._missing_terminal_verdict(row, filled_position)
+        if (verdict.resolution is MissingResolution.CANCELLED
+                and not filled_position
+                and (current.extras or {}).get('kind') in (ENTRY_KIND_WORKING,
+                                                           ENTRY_KIND_POSITION)
+                and (current.extras or {}).get(EXTRAS_KEY_WORKING_ORDER_END) is None
+                and await self._hand_over_if_executed(current)):
+            # The order (a resting one, or a market entry the venue accepted
+            # without opening it at once) executed into a deal no poll listed,
+            # and the stream booked none of it: the row was handed to the
+            # engine, which reads and books the execution (the row is exempt
+            # from this verdict until then), or the evidence is not complete
+            # yet and the verdict asks again.
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+        return verdict
 
     async def _missing_live_verdict(
             self, row: 'OrderRow', filled_position: bool,
@@ -2578,12 +2684,13 @@ class _ReconcileMixin(_CapitalComBase, ABC):
         grace window (``5 × cadence``, min 5 s) absorbs that noise. Rows
         missing past the window are retired with the tracker's dual
         signal: the synthetic ``cancelled`` event keeps the sync engine's
-        order bookkeeping consistent (essential under the non-halting
+        order bookkeeping consistent (essential under the
         ``ignore`` / ``re_place`` policies, where the event is the ONLY
         signal), while the policy separately decides the operational
         reaction — ``stop`` latches the engine's external-intervention
-        quarantine, ``halt`` raises
-        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` through the poll loop.
+        quarantine, and an unwired sink raises the fail-safe
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` through
+        the poll loop, which the engine latches the same quarantine on.
         """
         if self.store_ctx is None:
             return

@@ -139,7 +139,7 @@ def _make_plugin(ctx, *, responses=None) -> tuple[_FakeBroker, list]:
     # the real publication lag restore it); see ``_poll``.
     broker._level_edit_settle_s = 0.0
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(
         (reason, context, kind))
     return broker, latched
 
@@ -885,6 +885,44 @@ def __test_partial_trigger_blocked_past_the_bound_latches_once__(tmp_path, monke
     assert _posts(broker) == []
     assert len(_events(ctx, 'foreign_deal_blocks_own_write')) == 1
     assert len(_events(ctx, 'foreign_deal_blocks_exit_latched')) == 1
+    store.close()
+
+
+def __test_latched_exit_block_names_its_cause_and_releases_it_once_the_block_ends__(
+        tmp_path, monkeypatch):
+    """A foreign deal that merely sits on the epic is no external intervention:
+    the exit block latches an ``ENTRY_BLOCK`` under the cause
+    ``foreign_exit_block:<intent key>``, and the bot releases that cause by
+    itself once a snapshot shows the exit free (the foreign deal gone)."""
+    own = _raw('deal-L', 'BUY', 2.0)
+    foreign_buy = _raw('deal-F', 'BUY', 1.0, created='2026-10-15T09:00:00.000')
+    broker, store, ctx, _latched = _make_broker(tmp_path, responses={
+        ('positions', 'get'): {'positions': [foreign_buy, own]},
+    })
+    _seed_position(ctx)
+    causes: list = []
+    released: list = []
+    broker.quarantine_sink = (lambda reason, context, *, kind, cause=None:
+                              causes.append((kind, cause)))
+    broker.quarantine_release_sink = (lambda cause, resolution:
+                                      released.append(cause) is None)
+
+    intent_key = None
+    for offset_s, bar_ts_ms in ((0.0, 1700000000000), (60.0, 1700000060000),
+                                (121.0, 1700000120000)):
+        _clock_at(monkeypatch, offset_s)
+        envelope = _partial_close(bar_ts_ms, trigger=True)
+        intent_key = envelope.intent.intent_key
+        with pytest.raises(OrderSkippedByPlugin):
+            asyncio.run(broker.execute_close(envelope))
+    assert causes == [(QuarantineKind.ENTRY_BLOCK, f'foreign_exit_block:{intent_key}')]
+    assert released == []
+
+    broker._remember_positions_snapshot(_by_deal(own), time.time() + 300.0)
+    assert released == [f'foreign_exit_block:{intent_key}']
+    assert [e['cause'] for e in _events(ctx, 'entry_block_cause_resolved')] == [
+        f'foreign_exit_block:{intent_key}']
+    assert broker._own_trouble_causes == {}
     store.close()
 
 
@@ -3428,7 +3466,7 @@ def __test_deal_a_retired_own_working_order_opened_later_is_reported__(tmp_path)
     assert [e['exchange_order_id'] for e in residual] == ['deal-N'], "reported once"
     assert residual[0]['netted_deal_id'] == 'deal-F'
     assert len(latched) == 2 and latched[1][2] is QuarantineKind.ENTRY_BLOCK
-    assert 'deal-N' in latched[1][0] and 'close it on the venue' in latched[1][0]
+    assert 'deal-N' in latched[1][0] and 'the bot closes the deal itself' in latched[1][0]
     broker._responses[('positions', 'get')] = {'positions': [deal_n]}
     assert asyncio.run(broker.get_position('EURUSD')) is None, "the engine booked no entry"
     assert _events(ctx, 'foreign_deal_on_epic') == []

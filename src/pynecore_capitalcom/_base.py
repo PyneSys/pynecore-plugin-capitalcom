@@ -30,7 +30,7 @@ import asyncio
 import collections
 import threading
 from abc import ABC
-from collections.abc import Container, Iterable, Sequence
+from collections.abc import Container, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -115,6 +115,7 @@ class CapitalComHookCollaborator(Protocol):
 
     def own_close(
             self, deal_ids: Iterable[str], *, full: bool, size: float | None,
+            coid: str | None = None, leg_size: float | None = None,
     ) -> AbstractContextManager[_OwnCloseHandle]: ...
 
     def working_order_write(
@@ -128,6 +129,8 @@ class CapitalComHookCollaborator(Protocol):
 
     def stamp_own_cancel_accepted(self, coid: str, sent_at: float) -> None: ...
 
+    def own_cancel_accepted(self, coid: str) -> bool: ...
+
     def own_cancel(self, coid: str) -> AbstractContextManager[float]: ...
 
     def hold_take_over_dispatch(self, row: 'OrderRow', action: str) -> None: ...
@@ -135,6 +138,10 @@ class CapitalComHookCollaborator(Protocol):
     def hold_unproven_take_over(self, row: 'OrderRow') -> None: ...
 
     async def classify_cancel_via_activity(self, deal_id: str) -> CancelDispositionOutcome: ...
+
+    def execution_in_history(
+            self, row: 'OrderRow', order_id: str, activities: list[dict],
+    ) -> tuple[str, dict, list[dict]] | None: ...
 
     async def resolve_own_deal(
             self, row: 'OrderRow', deal_id: str,
@@ -245,9 +252,16 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def own_close(
             self, deal_ids: Iterable[str], *, full: bool, size: float | None,
+            coid: str | None = None, leg_size: float | None = None,
     ) -> AbstractContextManager[_OwnCloseHandle]:
-        """Record an own close of ``deal_ids`` for a standalone hook."""
-        return self._own_close(deal_ids, full=full, size=size)
+        """Record an own close of ``deal_ids`` for a standalone hook.
+
+        ``coid`` and ``leg_size`` are the client order id the close's fill
+        reports and the whole deal's venue size, for a close whose fill
+        carries the core's id (a ``held_execution_close``); see
+        :meth:`~pynecore_capitalcom.intervention._InterventionMixin._own_close`.
+        """
+        return self._own_close(deal_ids, full=full, size=size, coid=coid, leg_size=leg_size)
 
     def working_order_write(
             self, row: 'OrderRow', level: float, *, previous_level: float | None,
@@ -270,6 +284,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
         """Record an accepted own working-order ``DELETE`` for a standalone hook."""
         self._stamp_own_cancel_accepted(coid, sent_at)
 
+    def own_cancel_accepted(self, coid: str) -> bool:
+        """Whether the venue accepted an own DELETE of the working order ``coid``, for a hook."""
+        return self._own_cancel_accepted(coid)
+
     def own_cancel(self, coid: str) -> AbstractContextManager[float]:
         """Record an own working-order ``DELETE`` before it leaves, for a standalone hook."""
         return self._own_cancel(coid)
@@ -285,6 +303,12 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     async def classify_cancel_via_activity(self, deal_id: str) -> CancelDispositionOutcome:
         """Classify a working order gone on its DELETE by its activity, for a hook."""
         return await self._classify_cancel_via_activity(deal_id)
+
+    def execution_in_history(
+            self, row: 'OrderRow', order_id: str, activities: list[dict],
+    ) -> tuple[str, dict, list[dict]] | None:
+        """The deal an own entry's order executed into, from a history read, for a hook."""
+        return self._execution_in_history(row, order_id, activities)
 
     async def resolve_own_deal(
             self, row: 'OrderRow', deal_id: str,
@@ -479,6 +503,24 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # the rest of its size that were already reported.
     _netting_retired_orders: dict[str, dict] | None
     _residual_deals_reported: set[str]
+    # The ``ENTRY_BLOCK`` causes this process latched for the bot's own
+    # trouble, by cause key: the latch message (see ``foreign.py``,
+    # ``_latch_own_trouble``). Each is released by its producer once the
+    # condition is gone.
+    _own_trouble_causes: dict[str, str]
+    # Own-trouble repairs (see ``order_history.py``): when a residual deal's
+    # close was last sent, by ``dealId``; when the venue history was last
+    # read to prove a held take-over's fill (epoch seconds); and, per held
+    # take-over whose opening is older than the history, the deal size first
+    # seen and since when, by client order id.
+    _residual_close_sent_at: dict[str, float]
+    _take_over_proof_read_at: float
+    _take_over_size_seen: dict[str, tuple[float, float]]
+    # When a held take-over's deal was first missed from ``/positions``, and
+    # when a landed submission's closed deal was last looked up in the
+    # history, per client order id (``order_history.py``).
+    _take_over_absent_since: dict[str, float]
+    _closed_deal_read_at: dict[str, float]
     # Own entry rows whose deal ``/positions`` lists while their confirmed
     # fill is still unbooked, by client order id: first seen at (see
     # ``reconcile.py``, ``_unannounced_entry_fill``).
@@ -488,13 +530,18 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     # parked row's client order id (see ``reconcile.py``,
     # ``_park_after_venue_write``).
     _deferred_parks: dict[str, Callable[[], None]]
-    # Resolver of the entry submissions an earlier process left pending, and
-    # the ones of them already reported as older than the activity history or
-    # as indistinguishable from another pending submission (see
-    # ``reconcile.py``, ``_resolve_inherited_submissions``).
+    # Resolver of the entry submissions an earlier process left pending, the
+    # deal sets already reported as more than the pending submissions explain,
+    # and the submissions of those groups (see ``reconcile.py``,
+    # ``_resolve_inherited_submissions``, and ``recovery.py``,
+    # ``_report_inherited_surplus``).
     _inherited_resolver: 'ParkedDispatchResolver'
-    _inherited_unprovable_reported: set[str]
-    _inherited_ambiguity_reported: set[str]
+    _inherited_surplus_reported: set[frozenset[str]]
+    _inherited_surplus_rows: set[str]
+    # Inherited submissions older than the activity history that the open
+    # book alone judged absent, already logged and audited as such (see
+    # ``recovery.py``, ``_inherited_submission_verdict``).
+    _absent_without_history_reported: set[str]
     # Take-overs stamped ``take_over_unproven`` that a recovery pass already
     # reported as held (see ``recovery.py``, ``_hold_unproven_take_over``).
     _take_over_held_reported: set[str]
@@ -676,6 +723,37 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
             positions_by_deal: dict[str, dict] | None, details: dict,
     ) -> bool: ...
 
+    def _netting_retirements(self) -> dict[str, dict]: ...
+
+    # --- Order history and own-trouble repairs (order_history.py) ---
+    async def _read_order_history(self) -> list[dict]: ...
+
+    def _engine_booked_entry_qty(self, row: 'OrderRow') -> float: ...
+
+    def _resolve_unproven_take_overs(
+            self, positions_by_deal: dict[str, dict],
+    ) -> AsyncIterator[OrderEvent]: ...
+
+    async def _settle_own_troubles(self, positions_by_deal: dict[str, dict]) -> None: ...
+
+    async def _hand_over_if_closed(self, row: 'OrderRow', deal_id: str,
+                                   positions_by_deal: dict[str, dict]) -> bool: ...
+
+    async def _hand_over_if_executed(self, row: 'OrderRow') -> bool: ...
+
+    def _execution_in_history(
+            self, row: 'OrderRow', order_id: str, activities: list[dict],
+    ) -> tuple[str, dict, list[dict]] | None: ...
+
+    def _closed_execution_evidence(
+            self, row: 'OrderRow', activities: list[dict], listed: dict[str, dict],
+    ) -> tuple[str, dict, list[dict]] | None: ...
+
+    def _hand_over_offline_executions(
+            self, executed: list[tuple['OrderRow', str, dict | None, list[dict]]], *,
+            proof: str = 'executed_while_offline', engine_adopts_closes: bool = True,
+    ) -> set[str]: ...
+
     # --- Bracket lifecycle (bracket.py) ---
     def _close_bracket_after_natural_close(self, entry_row: 'OrderRow') -> None: ...
 
@@ -752,6 +830,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
     def _own_close_cursor_retired(self, row: 'OrderRow', activity: dict) -> bool: ...
 
     def _own_close_leg_coid(self, row: 'OrderRow', activity: dict) -> str | None: ...
+
+    def _fitting_own_closes(self, row: 'OrderRow', activity: dict) -> Iterator[dict]: ...
 
     def _note_outlived_leg_closes(
             self, positions_by_deal: dict[str, dict], read_started_at: float | None,
@@ -836,6 +916,10 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _unconfirmed_own_entries(self) -> list[tuple[str, float]]: ...
 
+    def _held_execution_order_ids(self) -> set[str]: ...
+
+    def _held_take_over_refs(self) -> set[str]: ...
+
     def _note_foreign_deals(self, positions: Iterable[dict], symbol: str) -> None: ...
 
     def _remember_positions_snapshot(
@@ -887,8 +971,12 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     def _report_foreign_block(
             self, *, reason: str, key: str, symbol: str, foreign: list[dict],
-            write: dict, latch: bool,
+            write: dict, latch: bool, cause: str | None = None,
     ) -> str: ...
+
+    def _latch_own_trouble(self, message: str, context: dict, cause: str) -> None: ...
+
+    def _release_own_trouble(self, cause: str, resolution: str) -> None: ...
 
     def _foreign_block_skip(
             self, *, reason: str, intent_key: str, symbol: str, foreign: list[dict],
@@ -902,6 +990,8 @@ class _CapitalComBase(BrokerPlugin[CapitalComConfig], ABC):
 
     # --- Reconcile (reconcile.py) ---
     def _park_after_venue_write(self, key: str, write: Callable[[], None]) -> None: ...
+
+    def _parked_partial_close_record(self, command: 'OrderRow') -> dict | None: ...
 
     def _modify_exit_legs_refused(self, command: 'OrderRow') -> bool: ...
 

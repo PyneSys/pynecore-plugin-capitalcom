@@ -109,7 +109,7 @@ def _new_broker(ctx, *, responses=None) -> tuple[_FakeBroker, list]:
     # The venue publishes every activity at once here; see ``_poll``.
     broker._level_edit_settle_s = 0.0
     latched: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: latched.append(
         (reason, context, kind))
     return broker, latched
 
@@ -1074,17 +1074,24 @@ def __test_sent_manual_close_report_is_not_repeated_on_restart__(tmp_path):
     store.close()
 
 
-def __test_halting_manual_close_report_halts_only_once__(tmp_path):
+def __test_fail_safe_manual_close_signal_is_raised_only_once__(tmp_path):
+    """Under ``stop`` with no quarantine sink to latch through, the report
+    raises the fail-safe :class:`UnexpectedCancelError` the engine latches the
+    external-intervention quarantine on. The raise is the report's action: it
+    is marked sent, so a restart neither raises it again nor latches."""
     broker, store, ctx, latched = _make_broker(tmp_path)
     _seed_position(ctx)
-    broker.on_unexpected_cancel = 'halt'
+    assert broker.on_unexpected_cancel == 'stop'
+    broker.quarantine_sink = None
     with pytest.raises(UnexpectedCancelError):
         asyncio.run(_drain(broker._process_activity([_close_activity()])))
+    assert latched == []
 
     restarted, restarted_latched = _restart(store, ctx)
-    restarted.on_unexpected_cancel = 'halt'
     restarted._send_pending_manual_close_reports()
     assert restarted_latched == []
+    restarted.quarantine_sink = None
+    restarted._send_pending_manual_close_reports()
     store.close()
 
 
