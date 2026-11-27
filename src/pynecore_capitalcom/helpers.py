@@ -6,7 +6,10 @@ touch class state, all are pure functions / constants:
 * Endpoint constants (live + demo REST hosts, WS URL, prefix).
 * Lookup tables (timeframe map, asset-type label map).
 * Error-code frozensets used by ``_RestSessionMixin._map_exception``.
-* Pure helpers: password encryption, opening-hours parser, error-code +
+* Measured TradingView session anchors of the epics whose TradingView
+  session no Capital.com boundary marks.
+* Pure helpers: password encryption, opening-hours parser and weekly
+  template repair, error-code +
   numeric-value extractors, ISO timestamp parser, order-type-from-row
   resolver.
 
@@ -17,6 +20,7 @@ import json
 import math
 import os
 from base64 import standard_b64decode, standard_b64encode, urlsafe_b64decode
+from collections import Counter
 from collections.abc import Container, Mapping
 from datetime import UTC, datetime, time
 from decimal import Decimal
@@ -83,6 +87,36 @@ TYPES: dict[str, Literal['forex', 'crypto', 'stock', 'index']] = {
     'SHARES': 'stock',
     'INDICES': 'index',
 }
+
+# TradingView's own session start of every trading day, per epic, for the epics
+# whose TradingView session no Capital.com opening-hours boundary marks: epic ->
+# (timezone of the table, ((weekday, open time), ...)), weekdays 0=Mon..6=Sun in
+# that timezone. ``update_symbol_info`` converts the entries to the SymInfo
+# timezone. An epic missing here gets no explicit anchors, and PyneCore derives
+# them from the session starts (right for the index, FX, metal and energy CFDs,
+# whose TradingView session starts on a quarter hour at or just before the
+# Capital.com reopening).
+#
+# MEASURED from TradingView on 2026-11-27: the chart session info (session string,
+# timezone, trading days) of each symbol, checked against the start of its
+# intraday bar grid on 2-240 minute charts.
+# - CAPITALCOM:AU200: session ``0930-0700`` Australia/Sydney, Mon-Fri. The overnight
+#   session opening Monday 09:30 belongs to TradingView's Tuesday trading day; the
+#   open instants are Mon..Fri 09:30 Sydney. Capital.com reopens at 22:50 UTC and
+#   pauses 05:30-06:10 UTC, and neither restarts TradingView's grid.
+# - CAPITALCOM:AAPL, CAPITALCOM:TSLA: session ``0930-1600`` America/New_York,
+#   Mon-Fri, while Capital.com trades these share CFDs from 01:00 UTC.
+# - CAPITALCOM:BTCUSD: session ``1700-1700`` America/New_York, every day. Neither the
+#   daily 22:00-22:05 UTC pause nor the Saturday maintenance reopening restarts the
+#   grid.
+_WEEKDAYS_MON_FRI = (0, 1, 2, 3, 4)
+TRADINGVIEW_SESSION_ANCHORS: dict[str, tuple[str, tuple[tuple[int, time], ...]]] = {
+    'AU200': ('Australia/Sydney', tuple((d, time(9, 30)) for d in _WEEKDAYS_MON_FRI)),
+    'AAPL': ('America/New_York', tuple((d, time(9, 30)) for d in _WEEKDAYS_MON_FRI)),
+    'TSLA': ('America/New_York', tuple((d, time(9, 30)) for d in _WEEKDAYS_MON_FRI)),
+    'BTCUSD': ('America/New_York', tuple((d, time(17, 0)) for d in range(7))),
+}
+
 
 def _is_session_error(code: str) -> bool:
     """Return True when ``code`` says the venue session behind our tokens is gone.
@@ -559,6 +593,117 @@ def _parse_opening_hours_segment(oh: str) -> tuple[time, time] | None:
     except ValueError:
         return None
     return start, end
+
+
+OPENING_HOURS_DAYS = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
+
+
+def _seconds_of_day(t: time, *, end: bool = False) -> int:
+    """Seconds since midnight of an opening-hours time; an ``end`` at 00:00 is 24:00."""
+    sec = t.hour * 3600 + t.minute * 60 + t.second
+    return 86400 if end and sec == 0 else sec
+
+
+def _format_opening_hours_row(row: list[tuple[time, time]]) -> list[str]:
+    """Format parsed segments back into Capital.com's ``"HH:MM - HH:MM"`` shape."""
+    def fmt(t: time) -> str:
+        return t.strftime('%H:%M:%S' if t.second else '%H:%M')
+    return [f"{fmt(start)} - {fmt(end)}" for start, end in row]
+
+
+def _regular_weekly_close_day(regular: list[tuple[time, time]],
+                              friday: list[tuple[time, time]]) -> list[tuple[time, time]] | None:
+    """The regular shape of the weekly close day of a near-24h market in a holiday week.
+
+    With a daily break in the regular day (a reopening segment that runs to midnight
+    after a gap), the week closes at the daily close: Capital.com's normal Friday is
+    the regular day without its reopening (MEASURED on the week of 2026-11-16 from
+    MINUTE prices: US30 22:00, GOLD 21:59, OIL_CRUDE 22:00, EURUSD 22:00 and AU200
+    21:00 UTC, each its Monday-Thursday daily close). A Friday that closes earlier,
+    or does not trade, is a holiday early close and gets that shape. Without a daily
+    break the weekly close time cannot be derived, so the Friday keeps its own close
+    and only takes the regular day's segments before it (an opening delayed by the
+    previous day's holiday closure goes back to midnight).
+
+    :param regular: The regular weekday segments, opening and running to midnight.
+    :param friday: The Friday segments of the fetched week.
+    :return: The Friday segments to use, or ``None`` to keep the fetched ones.
+    """
+    midnight = time(0, 0)
+    if (len(regular) >= 2 and regular[-1][0] != midnight
+            and regular[-2][1] != midnight
+            and _seconds_of_day(regular[-2][1]) < _seconds_of_day(regular[-1][0])):
+        daily_close = _seconds_of_day(regular[-2][1])
+        if friday and _seconds_of_day(friday[-1][1], end=True) >= daily_close:
+            return None
+        return regular[:-1]
+    if not friday or friday[-1][1] == midnight:
+        return None
+    close = _seconds_of_day(friday[-1][1])
+    clipped: list[tuple[time, time]] = []
+    for start, end in regular:
+        if _seconds_of_day(start) >= close:
+            break
+        clipped.append((start, end if _seconds_of_day(end, end=True) <= close else friday[-1][1]))
+    return clipped
+
+
+def _regular_week_opening_hours(opening_hours: Mapping) -> tuple[dict, list[str]]:
+    """Keep a holiday-week exception out of the weekly opening-hours template.
+
+    Capital.com's ``openingHours`` describe the CURRENT week, and the plugin turns them
+    into the template of every week. Fetched in a holiday week, one day's exception
+    would repeat weekly: in the Thanksgiving week of 2026 the US index CFDs list
+    Thursday 21:00-23:00 UTC closed instead of the 22:00-22:05 pause, a 19:30 Thursday
+    close for metals and energy, a Friday early close, and the share CFDs closed from
+    Thursday 05:00 to Friday 01:00. The API offers no other week and no regular hours.
+
+    HEURISTIC, applied only to near-24h markets (the regular day opens at and runs to
+    midnight) and only where the weekdays that must be alike show a strict majority
+    shape: Tuesday, Wednesday and Thursday always, Monday when the market trades into
+    it from Sunday, and Friday when the market also trades on Saturday. A deviating
+    one of those days takes the majority shape. Only in such a week, which has
+    proved to hold an exception, a five-day market's Friday that closes before the
+    daily close takes the regular weekly-close shape too (see
+    :func:`_regular_weekly_close_day`). Weekends, daytime markets, a Friday-only
+    exception and a week without a clear majority stay as fetched.
+
+    :param opening_hours: Capital.com's ``instrument.openingHours`` mapping.
+    :return: The opening hours to build the template from (the input itself when
+             nothing deviates) and the day keys that were replaced.
+    """
+    midnight = time(0, 0)
+    rows: dict[str, list[tuple[time, time]]] = {}
+    for day in OPENING_HOURS_DAYS:
+        parsed = (_parse_opening_hours_segment(oh) for oh in opening_hours.get(day) or [])
+        rows[day] = [p for p in parsed if p is not None]
+
+    def runs_to_midnight(row: list[tuple[time, time]]) -> bool:
+        return bool(row) and row[-1][1] == midnight
+
+    voters = ['tue', 'wed', 'thu']
+    if runs_to_midnight(rows['sun']):
+        voters.insert(0, 'mon')
+    seven_day = bool(rows['sat'])
+    if seven_day:
+        voters.append('fri')
+    shape, votes = Counter(tuple(rows[d]) for d in voters).most_common(1)[0]
+    regular = list(shape)
+    if votes * 2 <= len(voters) or not regular or regular[0][0] != midnight \
+            or not runs_to_midnight(regular):
+        return dict(opening_hours), []
+    replaced = [d for d in voters if rows[d] != regular]
+    if not replaced:
+        return dict(opening_hours), []
+    result = dict(opening_hours)
+    for day in replaced:
+        result[day] = _format_opening_hours_row(regular)
+    if not seven_day:
+        friday = _regular_weekly_close_day(regular, rows['fri'])
+        if friday is not None and friday != rows['fri']:
+            result['fri'] = _format_opening_hours_row(friday)
+            replaced.append('fri')
+    return result, replaced
 
 
 def _extract_error_code(exc: CapitalComError) -> str:

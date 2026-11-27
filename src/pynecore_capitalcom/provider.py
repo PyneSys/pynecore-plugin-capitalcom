@@ -9,6 +9,7 @@ State touched: ``_instrument_rules_cache`` (TTL-bounded per-epic cache),
 pipeline at the end of warm-up so the very first quote can produce an
 intra-bar update).
 """
+import logging
 from abc import ABC
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -24,7 +25,7 @@ from pynecore.core.broker.models import (
     Quote,
 )
 from pynecore.core.plugin import override
-from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
+from pynecore.core.syminfo import SymInfo, SymInfoAnchor, SymInfoInterval, SymInfoSession
 from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV, AskOHLC
 
@@ -33,12 +34,21 @@ from .exceptions import CapitalComTransportError, HistoricalPricesNotFoundError
 from .helpers import (
     TIMEFRAMES,
     TIMEFRAMES_INV,
+    TRADINGVIEW_SESSION_ANCHORS,
     TYPES,
     _INSTRUMENT_RULES_TTL_S,
     _parse_opening_hours_segment,
+    _regular_week_opening_hours,
     _wire_float,
 )
 from .models import _InstrumentRules
+
+logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    """The current instant; the week whose dates resolve DST in symbol-info conversions."""
+    return datetime.now(UTC)
 
 
 class _ProviderMixin(_CapitalComBase, ABC):
@@ -125,7 +135,13 @@ class _ProviderMixin(_CapitalComBase, ABC):
         market_details = self.get_single_market_details()
         instrument = market_details['instrument']
 
-        opening_hours_data = instrument['openingHours']
+        opening_hours_data, replaced_days = _regular_week_opening_hours(
+            instrument['openingHours'])
+        if replaced_days:
+            logger.warning(
+                "Capital.com opening hours of %s deviate on %s from the regular weekdays "
+                "(a holiday week); the weekly template uses the regular shape there",
+                instrument['epic'], ', '.join(replaced_days))
 
         from pynecore.types.weekdays import Weekdays
         tz = opening_hours_data['zone']
@@ -142,8 +158,10 @@ class _ProviderMixin(_CapitalComBase, ABC):
         # crosses local midnight against ``self.timezone``.
         # ``datetime.combine`` with ``ZoneInfo`` resolves DST on the
         # target date itself, not on ``now()``.
+        now_utc = _utc_now()
+
         def to_local_dt(_t: time, _tz: str, _day_val: int) -> datetime:
-            now_src = datetime.now(ZoneInfo(_tz))
+            now_src = now_utc.astimezone(ZoneInfo(_tz))
             target_date = (now_src + timedelta(
                 days=(_day_val - now_src.weekday()) % 7,
             )).date()
@@ -235,6 +253,17 @@ class _ProviderMixin(_CapitalComBase, ABC):
                         day=end_dt.weekday(), time=end_dt.time(),
                     ))
 
+        # Measured TradingView session opens, converted like the opening hours: the
+        # DST of each real date in this week, the weekday shift included.
+        session_anchors: list[SymInfoAnchor] = []
+        anchor_table = TRADINGVIEW_SESSION_ANCHORS.get(instrument['epic'])
+        if anchor_table is not None:
+            anchor_tz, anchor_opens = anchor_table
+            for anchor_day, anchor_time in anchor_opens:
+                anchor_dt = to_local_dt(anchor_time, anchor_tz, anchor_day)
+                session_anchors.append(SymInfoAnchor(day=anchor_dt.weekday(), time=anchor_dt.time()))
+            session_anchors.sort()
+
         dealing_rules = market_details['dealingRules']
         mintick = dealing_rules['minStepDistance']["value"]
         decimal_mintick = Decimal(str(mintick))
@@ -279,6 +308,7 @@ class _ProviderMixin(_CapitalComBase, ABC):
             opening_hours=opening_hours,
             session_starts=session_starts,
             session_ends=session_ends,
+            session_anchors=session_anchors,
             avg_spread=avg_spred,
         )
         # Cache for the feed-staleness watchdog to consult: it suppresses
